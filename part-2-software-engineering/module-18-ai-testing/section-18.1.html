@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.1: Test Generation Strategies. Unit, integration, and end-to-end test generation from specifications, code, and failures using LLMs." name="description"/>
+<title>Section 18.1: Test Generation Strategies | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: AI-Assisted Testing and QA</a></div>
+<h1>18.1 Test Generation Strategies</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"Give me a function signature and a docstring, and I will give you forty test cases. Thirty-seven of them will compile. Thirty-four will be meaningful. And at least one will find a bug you did not know you had."</p>
+<cite>A Large Language Model Moonlighting as a QA Engineer</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section opens Chapter 18. You should have completed
+<a href="../module-09-vibe-coding/index.html">Chapter 9: Vibe Coding</a>, which introduced
+executable contracts and the verify-or-repair loop, and
+<a href="../module-16-ai-implementation/index.html">Chapter 16: AI-Assisted Implementation</a>,
+which covered code generation at repository scale. Familiarity with pytest fixtures,
+parametrization, and basic assertion patterns is assumed.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Test generation is a search problem. The search space is all possible test inputs; the
+objective is to find inputs that reveal bugs. Traditional test generation explores this
+space mechanically (random fuzzing, symbolic execution, coverage-guided search). AI-assisted
+test generation adds a powerful heuristic: a language model that has seen millions of test
+files can predict which inputs are <em>likely</em> to matter based on the structure and
+semantics of the code under test. This section shows how to combine both approaches,
+using LLMs for intelligent test synthesis and coverage metrics to measure what the
+resulting tests actually verify.
+</p>
+</div>
+
+<h2>1. The Three Sources of Test Cases</h2>
+
+<p>
+Every test case originates from one of three sources: a specification (what the code
+<em>should</em> do), the code itself (what it <em>actually</em> does), and observed failures
+(what it <em>did wrong</em>). Each source produces tests with different strengths. Specification-based
+tests verify intent. Code-based tests achieve coverage. Failure-based tests prevent
+regressions. A comprehensive test suite draws from all three.
+</p>
+
+<h3>1.1 Specification-Based Test Generation</h3>
+
+<p>
+The simplest form of AI test generation starts with a function's contract: its name,
+type signature, docstring, and any formal preconditions or postconditions. The LLM
+reads the contract and generates test cases that exercise the specified behavior,
+including boundary conditions, error cases, and typical usage patterns. This approach
+mirrors how a human tester reads a requirements document and writes acceptance tests,
+but operates at the speed of token generation.
+</p>
+
+<p data-agent="02">
+A function's <em>specification</em> is the complete set of promises it makes to callers: the types and constraints on its inputs (preconditions), the guarantees about its outputs (postconditions), and the exceptions it may raise. Specification-based test generation matters because it produces tests anchored to intended behavior rather than incidental implementation details, so the tests remain valid even when the code is refactored. The mechanism is straightforward: the LLM parses the signature, docstring, and type annotations, then samples from the space of inputs that exercise each documented behavior, boundary, and error path. Prefer specification-based generation as your starting point whenever a function has a clear contract; switch to code-based generation (Section 1.2) when the specification is incomplete or when you need to target specific uncovered branches.
+</p>
+
+<pre><code class="language-python">"""
+Specification-based test generation using an LLM.
+We provide the function signature and docstring, then ask
+the model to generate pytest test cases.
+"""
+import json
+from anthropic import Anthropic
+
+def generate_tests_from_spec(
+    function_source: str,
+    model: str = "claude-sonnet-4-20250514"
+) -> str:
+    """Generate pytest test cases from a function's specification.
+
+    Args:
+        function_source: The complete source code of the function,
+            including its docstring and type annotations.
+        model: The Claude model to use for generation.
+
+    Returns:
+        A string containing valid pytest test code.
+    """
+    client = Anthropic()
+
+    prompt = f"""Analyze this Python function and generate a comprehensive
+pytest test suite. Include:
+1. Happy-path tests for typical inputs
+2. Boundary tests (empty inputs, single elements, maximum sizes)
+3. Error-handling tests (invalid types, out-of-range values)
+4. Edge cases suggested by the function's logic
+
+Return ONLY valid Python code, starting with imports.
+
+Function:
+```python
+{function_source}
+```"""
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text
+
+
+# Example: generate tests for a scientific data normalization function
+target_function = '''
+def normalize_spectrum(
+    wavelengths: list[float],
+    intensities: list[float],
+    method: str = "min-max"
+) -> list[float]:
+    """Normalize spectral intensity values to [0, 1] range.
+
+    Args:
+        wavelengths: Wavelength values in nanometers (must be sorted).
+        intensities: Raw intensity values (same length as wavelengths).
+        method: Normalization method, one of "min-max", "z-score", "peak".
+
+    Returns:
+        Normalized intensity values.
+
+    Raises:
+        ValueError: If inputs have different lengths or are empty.
+        ValueError: If method is not recognized.
+    """
+'''
+
+generated_tests = generate_tests_from_spec(target_function)
+print(generated_tests)
+</code></pre>
+<div class="code-caption">Specification-based test generation: the LLM reads the function contract and generates a pytest suite covering happy paths, boundaries, and error cases.</div>
+
+<p>
+The generated tests typically include cases the developer might overlook: what happens
+when all intensities are identical (min equals max in min-max normalization), when
+wavelengths are not sorted despite the docstring requiring it, or when the intensity
+list contains negative values. The LLM infers these edge cases from its training on
+millions of similar functions, applying a form of analogical reasoning that
+<a href="../../part-1-foundations/module-04-reasoning-for-discovery/index.html">Chapter 4: Reasoning for Discovery</a>
+would recognize as case-based reasoning.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Specification Tests Verify Intent, Not Implementation</div>
+<p>
+Tests generated from specifications are <em>black-box</em> tests: they verify what the
+function should do without depending on how it does it internally. This makes them robust
+to refactoring. If you rewrite <code>normalize_spectrum</code> to use NumPy vectorized
+operations instead of a Python loop, specification-based tests continue to pass (or fail)
+for the right reasons. Code-based tests, by contrast, may break when the implementation
+changes even if the behavior is preserved. A good test suite needs both, but specification
+tests should form the foundation.
+</p>
+</div>
+
+<h3>1.2 Code-Based Test Generation</h3>
+
+<p>
+Code-based generation analyzes the implementation itself: its branches, loops, exception
+handlers, and data transformations. The goal is to achieve high structural coverage by
+generating inputs that exercise each execution path. Where specification-based generation
+asks "what should this function do?", code-based generation asks "what does this function
+actually do, and have I tested all the paths through it?"
+</p>
+
+<pre><code class="language-python">"""
+Code-based test generation: analyze branches and generate
+inputs that exercise each path.
+"""
+import ast
+import textwrap
+
+def extract_branches(source: str) -> list[dict]:
+    """Extract conditional branches from Python source code.
+
+    Returns a list of branch descriptors, each containing the
+    condition expression and the line number.
+    """
+    tree = ast.parse(source)
+    branches = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            # Extract the condition as source text
+            condition = ast.unparse(node.test)
+            branches.append({
+                "type": "if",
+                "condition": condition,
+                "line": node.lineno,
+                "has_else": len(node.orelse) > 0
+            })
+        elif isinstance(node, ast.For):
+            branches.append({
+                "type": "for",
+                "iterable": ast.unparse(node.iter),
+                "line": node.lineno
+            })
+        elif isinstance(node, ast.ExceptHandler):
+            exc_type = ast.unparse(node.type) if node.type else "Exception"
+            branches.append({
+                "type": "except",
+                "exception": exc_type,
+                "line": node.lineno
+            })
+
+    return branches
+
+
+def generate_branch_covering_tests(
+    function_source: str,
+    branches: list[dict],
+    model: str = "claude-sonnet-4-20250514"
+) -> str:
+    """Generate tests that target specific uncovered branches."""
+    client = Anthropic()
+
+    branch_descriptions = "\n".join(
+        f"  - Line {b['line']}: {b['type']} "
+        f"({b.get('condition', b.get('exception', b.get('iterable', '')))})"
+        for b in branches
+    )
+
+    prompt = f"""Given this Python function and its branch structure,
+generate pytest tests that exercise EACH branch. For each if/else,
+generate at least one test for the true branch and one for the false branch.
+For each exception handler, generate a test that triggers it.
+
+Function:
+```python
+{function_source}
+```
+
+Branches to cover:
+{branch_descriptions}
+
+Generate one clearly-named test function per branch. Include comments
+stating which branch each test targets."""
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text
+
+
+# Example usage
+source = textwrap.dedent('''
+    def parse_measurement(raw: str) -> tuple[float, str]:
+        """Parse a measurement string like '3.14 kg' into (value, unit)."""
+        raw = raw.strip()
+        if not raw:
+            raise ValueError("Empty measurement string")
+
+        parts = raw.split()
+        if len(parts) == 1:
+            # No unit specified, assume dimensionless
+            try:
+                return (float(parts[0]), "")
+            except ValueError:
+                raise ValueError(f"Cannot parse: {raw}")
+        elif len(parts) == 2:
+            try:
+                value = float(parts[0])
+            except ValueError:
+                raise ValueError(f"Invalid number: {parts[0]}")
+            return (value, parts[1].lower())
+        else:
+            raise ValueError(f"Too many parts in: {raw}")
+''')
+
+branches = extract_branches(source)
+print(f"Found {len(branches)} branches to cover")
+# Found 5 branches to cover
+</code></pre>
+<div class="code-caption">Code-based test generation: extracting branch structure with the ast module, then prompting an LLM to generate tests targeting each branch.</div>
+
+<h3>1.3 Failure-Based Test Generation</h3>
+
+<p>
+The third source of test cases is observed failures: bug reports, stack traces, error
+logs, and user complaints. When a bug is reported, the first step in a disciplined
+workflow is to write a test that reproduces it. This test should fail on the current
+code and pass after the fix, serving as both a verification and a regression guard.
+AI accelerates this process by reading a stack trace and generating a minimal
+reproducing test case.
+</p>
+
+<pre><code class="language-python">"""
+Failure-based test generation: convert a stack trace into a
+minimal reproducing test case.
+"""
+
+def generate_regression_test(
+    stack_trace: str,
+    source_files: dict[str, str],
+    model: str = "claude-sonnet-4-20250514"
+) -> str:
+    """Generate a pytest regression test from a stack trace.
+
+    Args:
+        stack_trace: The full Python stack trace from the failure.
+        source_files: Dict mapping filenames to their source code
+            for the files mentioned in the stack trace.
+
+    Returns:
+        A pytest test function that reproduces the failure.
+    """
+    client = Anthropic()
+
+    files_context = "\n\n".join(
+        f"# {name}\n```python\n{code}\n```"
+        for name, code in source_files.items()
+    )
+
+    prompt = f"""A user reported this error. Generate a minimal pytest
+test that reproduces the failure. The test should:
+1. Set up the minimum state needed to trigger the bug
+2. Call the failing function with the inputs that cause the crash
+3. Use pytest.raises() to assert the specific exception
+4. Include a comment explaining the root cause
+
+Stack trace:
+```
+{stack_trace}
+```
+
+Relevant source files:
+{files_context}
+
+Generate ONLY the test function, with imports."""
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text
+
+
+# Example: a ZeroDivisionError in normalization
+trace = """Traceback (most recent call last):
+  File "pipeline.py", line 42, in process_batch
+    normalized = normalize_spectrum(wl, intensities, method="min-max")
+  File "spectrum.py", line 18, in normalize_spectrum
+    return [(x - min_val) / (max_val - min_val) for x in intensities]
+ZeroDivisionError: float division by zero"""
+
+test_code = generate_regression_test(
+    trace,
+    {"spectrum.py": "... (source of normalize_spectrum)"}
+)
+print(test_code)
+# Generates a test with all-equal intensities triggering max == min
+</code></pre>
+<div class="code-caption">Failure-based test generation: the LLM reads a stack trace, identifies the root cause (division by zero when all intensities are equal), and generates a reproducing test.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Scientific Pipeline That Crashed on Real Data</div>
+<p>
+A computational chemistry team built a spectrum analysis pipeline that passed all 200
+hand-written tests but crashed on the third day of production. The failure: a batch of
+calibration spectra where the detector saturated, producing a flat line (all intensities
+identical). The min-max normalization divided by zero. Using the failure-based generation
+approach above, the team generated a regression test in seconds, fixed the function to
+return a vector of 0.5 values for flat spectra, and added the LLM-generated test to their
+CI suite. They then ran specification-based generation against the updated docstring and
+discovered three more edge cases they had never considered: negative intensities (from
+baseline subtraction), NaN values (from dead detector pixels), and mismatched list lengths.
+The LLM found in minutes what months of manual testing had missed.
+</p>
+</div>
+
+<h2>2. Coverage Metrics: Measuring What Tests Actually Verify</h2>
+
+<p>
+Generating tests is only half the challenge. The other half is measuring what those
+tests actually verify. Coverage metrics quantify which parts of the code execute during
+testing. Different metrics have different strengths, and choosing the right metric for
+your risk level is an engineering decision that directly affects the bugs you catch.
+</p>
+
+<h3>2.1 Statement Coverage</h3>
+
+<p>
+Statement coverage (also called line coverage) is the simplest metric: what fraction
+of the program's executable statements were executed by the test suite? If a function
+has 20 statements and the tests execute 18 of them, statement coverage is $18/20 = 90\%$.
+</p>
+
+$$C_{\text{stmt}} = \frac{|\{\text{executed statements}\}|}{|\{\text{total executable statements}\}|}$$
+
+<p>
+Statement coverage is easy to measure (the standard Python tool is
+<code>coverage.py</code>) and easy to understand, but it provides a false sense of
+security. A function with an <code>if/else</code> branch might have 100% statement
+coverage even though only one branch has been tested, if the other branch contains
+no unique statements.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that a high coverage percentage (such as 90% or 100% statement coverage) means the code is well tested. Coverage measures only which lines or branches <em>executed</em> during testing; it says nothing about whether the test assertions checked the correct outputs, handled all meaningful input combinations, or verified important state transitions. A test suite can reach 100% statement coverage by calling every function once with trivial inputs and never asserting anything about the results, leaving serious bugs completely undetected.
+</p>
+</div>
+
+<h3>2.2 Branch Coverage</h3>
+
+<p>
+Branch coverage measures whether every branch of every decision point has been
+exercised. For an <code>if/else</code>, branch coverage requires at least one test
+where the condition is true and one where it is false. For a loop, it requires at
+least one test that enters the loop and one that skips it (if the loop can be skipped).
+</p>
+
+$$C_{\text{branch}} = \frac{|\{\text{executed branches}\}|}{|\{\text{total branches}\}|}$$
+
+<pre><code class="language-python">"""
+Measuring statement and branch coverage with coverage.py.
+"""
+# spectrum.py
+def normalize_spectrum(wavelengths, intensities, method="min-max"):
+    if len(wavelengths) != len(intensities):
+        raise ValueError("Length mismatch")
+    if not intensities:
+        raise ValueError("Empty input")
+
+    if method == "min-max":
+        min_val = min(intensities)
+        max_val = max(intensities)
+        if max_val == min_val:
+            return [0.5] * len(intensities)  # flat spectrum
+        return [(x - min_val) / (max_val - min_val) for x in intensities]
+    elif method == "z-score":
+        mean_val = sum(intensities) / len(intensities)
+        std_val = (
+            sum((x - mean_val) ** 2 for x in intensities) / len(intensities)
+        ) ** 0.5
+        if std_val == 0:
+            return [0.0] * len(intensities)
+        return [(x - mean_val) / std_val for x in intensities]
+    elif method == "peak":
+        peak = max(abs(x) for x in intensities)
+        if peak == 0:
+            return [0.0] * len(intensities)
+        return [x / peak for x in intensities]
+    else:
+        raise ValueError(f"Unknown method: {method}")
+</code></pre>
+<div class="code-caption">A normalization function with multiple branches: three methods, plus error handling for edge cases. Full branch coverage requires tests for every method and every guard condition.</div>
+
+<pre><code class="language-bash"># Run tests with branch coverage measurement
+pytest tests/test_spectrum.py --cov=spectrum --cov-branch --cov-report=term-missing
+
+# Output:
+# Name          Stmts   Miss Branch BrPart  Cover   Missing
+# spectrum.py      28      0     14      0   100%
+</code></pre>
+<div class="code-caption">Running pytest with coverage.py in branch mode. BrPart (branch partial) shows branches that are only partially covered.</div>
+
+<h3>2.3 Condition and MC/DC Coverage</h3>
+
+<p>
+For safety-critical software (avionics, medical devices, autonomous vehicles), branch
+coverage is insufficient. Modified Condition/Decision Coverage (MC/DC) requires that
+every individual condition in a compound decision independently affects the outcome.
+Consider a decision with two conditions: <code>if temperature &gt; 100 and pressure &gt; 50</code>.
+Branch coverage requires only two tests (both true, at least one false). MC/DC requires
+that each condition's effect be demonstrated independently, typically needing at least
+$n + 1$ test cases for $n$ conditions.
+</p>
+
+$$C_{\text{MC/DC}}: \forall c_i \in \text{conditions},\; \exists (t_1, t_2) \text{ s.t. } c_i \text{ differs and the decision outcome differs}$$
+
+<p>
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of MC/DC like troubleshooting a string of holiday lights wired in series. If the whole string goes dark, you need to prove that each individual bulb can independently cause the failure. You unscrew one bulb at a time while leaving all others in place; if the string stays dark only when that specific bulb is removed, you have demonstrated that bulb's independent effect. MC/DC works the same way: for each condition in a compound decision, you flip that one condition while holding all others fixed and confirm the overall decision outcome changes. Just as testing every bulb in a single on/off test of the whole string would not isolate which bulb matters, testing every branch without isolating individual conditions would not reveal which condition actually controls the decision.
+</p>
+</div>
+
+MC/DC is mandated by DO-178C for Level A avionics software. While most scientific
+software does not require this level of rigor, understanding MC/DC helps you reason
+about when simpler coverage metrics hide real gaps. In discovery systems where an
+incorrect decision could invalidate months of experimental results, MC/DC for critical
+decision logic is a reasonable investment. This connects to the evaluation frameworks
+discussed in <a href="../../part-7-autonomous-discovery/module-56-evaluating-discovery/index.html">Chapter 56: Evaluating Discovery Systems</a>,
+where test adequacy directly affects trust in automated scientific conclusions.
+</p>
+
+<pre><code class="language-python">"""
+MC/DC test case generation for compound conditions.
+Each condition must independently affect the decision.
+"""
+
+def generate_mcdc_tests(conditions: list[str], decision: str) -> list[dict]:
+    """Generate MC/DC test vectors for a compound decision.
+
+    For n conditions, produces n+1 test cases where each condition
+    independently affects the decision outcome.
+
+    Args:
+        conditions: List of condition variable names, e.g. ["temp_high", "press_high"]
+        decision: Boolean expression combining the conditions, e.g. "temp_high and press_high"
+
+    Returns:
+        List of test case dicts mapping condition names to bool values,
+        plus a "decision" key with the expected outcome.
+    """
+    n = len(conditions)
+    test_cases = []
+
+    # Start with all-true case
+    base = {c: True for c in conditions}
+    base["decision"] = eval(decision, {}, base.copy())
+    test_cases.append(base)
+
+    # For each condition, flip it while keeping others at base values
+    for i, cond in enumerate(conditions):
+        flipped = base.copy()
+        flipped[cond] = not base[cond]
+        flipped["decision"] = eval(decision, {}, {
+            c: flipped[c] for c in conditions
+        })
+        # Only include if the decision outcome actually changes
+        if flipped["decision"] != base["decision"]:
+            test_cases.append(flipped)
+        else:
+            # Need a different base for this condition; try all-false
+            alt_base = {c: False for c in conditions}
+            alt_base[cond] = True
+            alt_base["decision"] = eval(decision, {}, {
+                c: alt_base[c] for c in conditions
+            })
+            alt_flipped = alt_base.copy()
+            alt_flipped[cond] = False
+            alt_flipped["decision"] = eval(decision, {}, {
+                c: alt_flipped[c] for c in conditions
+            })
+            if alt_base["decision"] != alt_flipped["decision"]:
+                test_cases.extend([alt_base, alt_flipped])
+
+    return test_cases
+
+
+# Example: safety interlock for a robotic lab system
+conditions = ["temp_safe", "pressure_safe", "door_closed"]
+decision = "temp_safe and pressure_safe and door_closed"
+vectors = generate_mcdc_tests(conditions, decision)
+
+for v in vectors:
+    vals = {k: v for k, v in v.items() if k != "decision"}
+    print(f"  {vals} -> decision={v['decision']}")
+# {temp_safe: True, pressure_safe: True, door_closed: True}  -> True
+# {temp_safe: False, pressure_safe: True, door_closed: True}  -> False
+# {temp_safe: True, pressure_safe: False, door_closed: True}  -> False
+# {temp_safe: True, pressure_safe: True, door_closed: False}  -> False
+</code></pre>
+<div class="code-caption">MC/DC test vector generation for a three-condition safety interlock. Four test cases (n+1 for n=3) demonstrate that each condition independently affects the decision.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Coverage Measures Execution, Not Correctness</div>
+<p>
+100% branch coverage means every branch executed at least once. It does <em>not</em> mean
+every branch produced the correct output. A test that calls <code>normalize_spectrum([1], [5], "min-max")</code>
+and never checks the return value achieves coverage but verifies nothing. Coverage tells
+you where your tests <em>went</em>; assertions tell you what they <em>checked</em>.
+Section 18.2 introduces mutation testing as a metric that measures whether your assertions
+are actually strong enough to detect faults.
+</p>
+</div>
+
+<h2>3. End-to-End Test Generation with Playwright</h2>
+
+<p>
+Unit and integration tests verify components in isolation. End-to-end (E2E) tests verify
+the complete system as a user experiences it: clicking buttons, filling forms, waiting for
+responses, and checking that the right content appears on screen. For Discovery Workbench
+components (which we have been building since
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>),
+E2E tests ensure that the API, database, and UI work together correctly.
+</p>
+
+<p>
+Playwright provides a codegen mode that records user interactions and generates test
+scripts automatically. Combined with an LLM, we can transform recorded interactions
+into robust, maintainable test suites with proper assertions and error handling.
+</p>
+
+<pre><code class="language-python">"""
+End-to-end test for the Discovery Workbench experiment dashboard.
+Generated by Playwright codegen, then refined with LLM assistance
+to add proper assertions and data-testid selectors.
+"""
+import pytest
+from playwright.sync_api import Page, expect
+
+
+@pytest.fixture
+def dashboard_page(page: Page) -> Page:
+    """Navigate to the experiment dashboard and wait for data load."""
+    page.goto("http://localhost:8000/dashboard")
+    # Wait for the experiment table to populate
+    page.wait_for_selector("[data-testid='experiment-table'] tbody tr")
+    return page
+
+
+def test_experiment_list_loads(dashboard_page: Page):
+    """Verify that the experiment list shows at least one experiment."""
+    rows = dashboard_page.locator(
+        "[data-testid='experiment-table'] tbody tr"
+    )
+    expect(rows).to_have_count(count=1, timeout=5000)  # at least 1
+
+
+def test_experiment_filter_by_status(dashboard_page: Page):
+    """Verify filtering experiments by status updates the table."""
+    # Count initial rows
+    initial_count = dashboard_page.locator(
+        "[data-testid='experiment-table'] tbody tr"
+    ).count()
+
+    # Apply "completed" filter
+    dashboard_page.select_option(
+        "[data-testid='status-filter']", "completed"
+    )
+
+    # Wait for table to update
+    dashboard_page.wait_for_timeout(500)
+
+    # Filtered count should be <= initial count
+    filtered_count = dashboard_page.locator(
+        "[data-testid='experiment-table'] tbody tr"
+    ).count()
+    assert filtered_count <= initial_count
+
+    # Every visible row should show "completed" status
+    status_cells = dashboard_page.locator(
+        "[data-testid='experiment-table'] tbody tr "
+        "td[data-testid='status-cell']"
+    )
+    for i in range(status_cells.count()):
+        expect(status_cells.nth(i)).to_have_text("completed")
+
+
+def test_experiment_detail_navigation(dashboard_page: Page):
+    """Verify clicking an experiment opens its detail view."""
+    # Click the first experiment's name link
+    first_name = dashboard_page.locator(
+        "[data-testid='experiment-table'] tbody tr:first-child "
+        "a[data-testid='experiment-link']"
+    )
+    experiment_name = first_name.text_content()
+    first_name.click()
+
+    # Should navigate to detail page
+    expect(dashboard_page).to_have_url(
+        pattern=r".*/experiments/\d+"
+    )
+
+    # Detail page should show the experiment name
+    heading = dashboard_page.locator("h1[data-testid='experiment-title']")
+    expect(heading).to_have_text(experiment_name)
+
+
+def test_create_experiment_form_validation(dashboard_page: Page):
+    """Verify that the create-experiment form validates required fields."""
+    dashboard_page.click("[data-testid='create-experiment-btn']")
+
+    # Submit without filling required fields
+    dashboard_page.click("[data-testid='submit-experiment-btn']")
+
+    # Should show validation error
+    error = dashboard_page.locator("[data-testid='validation-error']")
+    expect(error).to_be_visible()
+    expect(error).to_contain_text("required")
+</code></pre>
+<div class="code-caption">Playwright E2E tests for the Discovery Workbench experiment dashboard. Tests verify loading, filtering, navigation, and form validation using data-testid selectors for resilience against UI changes.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Playwright Codegen</div>
+<p>
+Instead of writing E2E tests by hand, use Playwright's codegen to record interactions:
+<code>playwright codegen http://localhost:8000/dashboard</code>. This opens a browser
+where your clicks and keystrokes are recorded as Python test code. The generated code
+uses fragile CSS selectors; run it through an LLM with the prompt "refactor these
+selectors to use data-testid attributes and add meaningful assertions" to produce
+production-quality tests. What took 30 minutes of manual test writing becomes 2 minutes
+of recording plus 10 seconds of LLM refinement.
+</p>
+</div>
+
+<h2>4. The Coverage-Guided Generation Loop</h2>
+
+<p>
+The most effective AI test generation strategy combines all three sources in a
+coverage-guided loop. Start with specification-based tests for the contract.
+Measure coverage. Feed the uncovered lines and branches to the LLM for code-based
+generation. Measure again. If coverage plateaus, use failure-based generation from
+fuzzing or mutation testing (covered in Section 18.2) to find inputs that exercise
+stubborn paths.
+</p>
+
+<pre><code class="language-python">"""
+Coverage-guided test generation loop.
+Iteratively generates tests until a target branch coverage is reached.
+"""
+import subprocess
+import json
+from pathlib import Path
+
+
+def get_coverage_gaps(
+    test_file: str,
+    source_file: str
+) -> dict:
+    """Run tests and return uncovered lines and branches."""
+    result = subprocess.run(
+        [
+            "pytest", test_file,
+            f"--cov={Path(source_file).stem}",
+            "--cov-branch",
+            "--cov-report=json:cov.json",
+            "--quiet"
+        ],
+        capture_output=True, text=True
+    )
+
+    with open("cov.json") as f:
+        cov_data = json.load(f)
+
+    file_cov = cov_data["files"].get(source_file, {})
+    return {
+        "missing_lines": file_cov.get("missing_lines", []),
+        "missing_branches": file_cov.get("missing_branches", []),
+        "summary": {
+            "line_rate": file_cov.get("summary", {}).get("percent_covered", 0),
+            "branch_rate": file_cov.get("summary", {}).get(
+                "percent_covered_branches", 0
+            ),
+        }
+    }
+
+
+def coverage_guided_generation(
+    source_file: str,
+    test_file: str,
+    target_coverage: float = 95.0,
+    max_iterations: int = 5
+) -> dict:
+    """Iteratively generate tests until target coverage is met.
+
+    Returns:
+        Final coverage statistics.
+    """
+    source_code = Path(source_file).read_text()
+
+    for iteration in range(max_iterations):
+        gaps = get_coverage_gaps(test_file, source_file)
+        current = gaps["summary"]["branch_rate"]
+        print(f"Iteration {iteration + 1}: branch coverage = {current:.1f}%")
+
+        if current >= target_coverage:
+            print("Target coverage reached!")
+            return gaps["summary"]
+
+        # Generate tests targeting uncovered branches
+        new_tests = generate_branch_covering_tests(
+            function_source=source_code,
+            branches=[
+                {"type": "branch", "line": line, "condition": "uncovered"}
+                for line in gaps["missing_lines"][:10]  # limit context
+            ]
+        )
+
+        # Append to test file
+        with open(test_file, "a") as f:
+            f.write(f"\n\n# Generated in iteration {iteration + 1}\n")
+            f.write(new_tests)
+
+    return gaps["summary"]
+</code></pre>
+<div class="code-caption">Coverage-guided test generation loop: measure coverage, identify gaps, generate targeted tests, repeat until the target is reached or iterations are exhausted.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Coverage-Guided LLM Testing</div>
+<p>
+CoverUp (Pizzorno and Berger, 2024) implements a production-grade version of the
+coverage-guided loop shown above, achieving near-complete branch coverage on real-world
+Python projects. CodaMosa (Lemieux et al., 2023) combines search-based
+software testing (SBST) with LLM calls: the search-based engine explores easy branches
+mechanically, and the LLM is called only for branches where the search engine gets stuck.
+More recently, MuTAP (Dakhel et al., 2024) closes the loop between test generation and
+test quality by using mutation testing as the feedback signal instead of coverage alone.
+MuTAP generates tests with an LLM, runs mutation analysis to identify surviving mutants,
+then feeds descriptions of those surviving mutants back to the LLM to generate
+mutant-killing tests in subsequent iterations. On benchmarks from the HumanEval and
+EvalPlus suites, MuTAP achieves higher mutation scores than coverage-guided approaches
+alone, demonstrating that optimizing for fault detection rather than line execution
+produces stronger test suites.
+</p>
+</div>
+
+<h2>5. Test Quality Beyond Coverage</h2>
+
+<p>
+Coverage-guided generation can achieve impressive coverage numbers, but coverage is a
+necessary, not sufficient, condition for test quality. A test suite with 100% branch
+coverage but weak assertions (or no assertions at all) catches no bugs. The next section
+introduces two complementary techniques that measure test <em>strength</em>:
+property-based testing (which generates inputs that explore the full input space) and
+mutation testing (which measures whether your assertions are strong enough to detect
+injected faults).
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Measure and Close Coverage Gaps with LLM-Generated Tests</h4>
+<p>
+Pick any Python module you have written (or use a small open-source utility) and walk through the coverage-guided generation loop by hand:
+</p>
+<p>
+1. Install the coverage tool (<code>pip install pytest coverage</code>) and run your existing tests with branch coverage enabled: <code>pytest --cov=your_module --cov-branch --cov-report=term-missing</code>. Record the initial branch coverage percentage and note which lines and branches are marked as missing.<br/>
+2. Copy the source code of one function with uncovered branches. Write a prompt that includes the function source and asks an LLM (Claude, or any model you have access to) to generate pytest tests specifically targeting the uncovered lines you identified. Save the generated tests to a new file such as <code>test_generated.py</code>.<br/>
+3. Run the generated tests in isolation (<code>pytest test_generated.py</code>) and fix any that fail to compile or import correctly. Track how many of the generated tests compile, how many pass, and how many fail due to genuine bugs versus incorrect expectations.<br/>
+4. Re-run coverage with both your original and generated tests: <code>pytest tests/ test_generated.py --cov=your_module --cov-branch --cov-report=term-missing</code>. Compare the new branch coverage to your initial measurement.<br/>
+5. Inspect the remaining uncovered branches. For each, decide whether it represents dead code (remove it), an error path that needs a specific setup to trigger (write that setup), or a path the LLM missed (refine your prompt and regenerate). Document what you learned about the gap between coverage quantity and test quality.
+</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise">
+<p><strong>Exercise 18.1.1 (Conceptual):</strong>
+A function has three <code>if/elif/else</code> blocks, each with two branches. What is the
+minimum number of test cases needed for (a) 100% statement coverage, (b) 100% branch
+coverage, and (c) 100% MC/DC coverage if each condition is a single boolean? Explain
+why these numbers differ.
+</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 18.1.2 (Coding):</strong>
+Write a Python function <code>generate_tests_from_trace(trace: str) -> str</code> that
+takes a pytest failure traceback (including the assertion error message) and generates
+a minimal reproducing test. Test it against three real tracebacks from a project of your
+choice. Measure the compilation rate and reproduction rate of the generated tests.
+</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 18.1.3 (Analysis):</strong>
+Run <code>coverage.py</code> in branch mode on a Python project with at least 500 lines
+of code. Identify the three largest uncovered regions. For each, explain whether the
+gap represents (a) dead code, (b) error-handling paths that are hard to trigger, or
+(c) genuinely untested functionality. Generate tests for category (c) using the
+specification-based approach from this section.
+</p>
+</div>
+
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 18 Overview</a>
+<span class="nav-separator">|</span>
+<a href="index.html">Chapter 18 Index</a>
+<span class="nav-separator">|</span>
+<a href="section-18.2.html">18.2 Property-Based Testing and Mutation &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

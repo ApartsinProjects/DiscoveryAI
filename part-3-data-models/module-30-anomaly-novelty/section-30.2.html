@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 30.2: Deep Anomaly Detection. Autoencoders, variational autoencoders, normalizing flows, and out-of-distribution detection for high-dimensional scientific data." name="description"/>
+<title>Section 30.2: Deep Anomaly Detection | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 30: Anomaly and Novelty Discovery</a></div>
+<h1>30.2 Deep Anomaly Detection</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I compressed your entire dataset into 16 dimensions and then tried to reconstruct it. The things I could not reconstruct are either anomalies or things I was too lazy to learn."</p>
+<cite>An Autoencoder With Imposter Syndrome</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+In <a href="section-30.1.html">Section 30.1</a>, we covered statistical and geometric anomaly
+detection methods that work well on tabular data. This section extends those ideas to
+high-dimensional structured data using neural networks. You should be familiar with basic
+neural network training (forward pass, backpropagation, loss functions) from
+<a href="../module-26-representation-learning/index.html">Chapter 26: Representation Learning</a>.
+Understanding latent spaces and dimensionality reduction from
+<a href="../module-25-exploratory-discovery/index.html">Chapter 25</a> will help motivate
+why autoencoders work for anomaly detection.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The methods of Section 30.1 struggle with high-dimensional data: KDE suffers from the curse of
+dimensionality, LOF's distance computations become unreliable in many dimensions, and even
+Isolation Forest's random splits become less informative as feature counts grow into the hundreds
+or thousands. Deep anomaly detection solves this by learning a compressed representation of
+"normal" data, then scoring new observations by how well they fit that learned representation.
+Three families of models dominate: autoencoders (score by reconstruction error), variational
+autoencoders (score by likelihood under a learned generative model), and normalizing flows
+(score by exact log-likelihood). Each offers a different trade-off between flexibility,
+interpretability, and computational cost.
+</p>
+</div>
+
+<h2>1. Autoencoders for Anomaly Detection</h2>
+
+<p>
+An autoencoder learns two functions: an encoder $f_\phi: \mathbb{R}^D \to \mathbb{R}^d$ that
+maps high-dimensional input $x$ to a low-dimensional latent code $z = f_\phi(x)$, and a decoder
+$g_\theta: \mathbb{R}^d \to \mathbb{R}^D$ that reconstructs the input from the code
+$\hat{x} = g_\theta(z)$. Training minimizes the reconstruction loss:
+</p>
+
+<p data-agent="02">
+An autoencoder is a neural network that learns to copy its input to its output through a narrow
+internal bottleneck, forcing the network to discover a compact set of features that capture the
+essence of the training data. This matters for anomaly detection because any input whose structure
+was not seen during training will be poorly represented by those learned features, producing a
+measurable reconstruction gap. The mechanism is compression followed by decompression: the encoder
+squeezes input into fewer dimensions than the original, and the decoder attempts to rebuild the
+full input from that compressed code. Use autoencoders over classical methods (such as Isolation
+Forest or LOF) when your data is high-dimensional, structured (images, spectra, sequences), or
+when you need the detector to scale to millions of observations without storing the training set
+in memory.
+</p>
+
+$$\mathcal{L}_{\text{AE}} = \frac{1}{n} \sum_{i=1}^{n} \|x_i - g_\theta(f_\phi(x_i))\|^2$$
+
+<p>
+The anomaly detection principle is straightforward: train the autoencoder on normal data only.
+The bottleneck forces the network to learn a compact representation of normal patterns. When
+an anomalous input arrives, the autoencoder cannot reconstruct it faithfully because the
+bottleneck has no capacity allocated to anomalous patterns. The <strong>reconstruction error</strong>
+$\|x - \hat{x}\|^2$ therefore serves as an anomaly score: high reconstruction error signals
+that the input does not match the learned distribution of normal data.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that autoencoders will always produce high reconstruction error for
+anomalies. In practice, if the anomalous data shares low-level structure with normal data (for
+example, similar textures or frequency components), the autoencoder may reconstruct anomalies
+well enough to miss them entirely. Reconstruction error only catches anomalies that differ from
+normal data in ways the bottleneck is forced to discard; anomalies that lie within the subspace
+the autoencoder has already learned will pass through undetected.
+</p>
+</div>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import numpy as np
+
+class AnomalyAutoencoder(nn.Module):
+    """Autoencoder for anomaly detection with configurable architecture."""
+
+    def __init__(self, input_dim: int, latent_dim: int = 16, hidden_dims: list = None):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [64, 32]
+
+        # Build encoder
+        encoder_layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_dims:
+            encoder_layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.ReLU(),
+                nn.BatchNorm1d(h_dim),
+            ])
+            prev_dim = h_dim
+        encoder_layers.append(nn.Linear(prev_dim, latent_dim))
+        self.encoder = nn.Sequential(*encoder_layers)
+
+        # Build decoder (mirror of encoder)
+        decoder_layers = []
+        prev_dim = latent_dim
+        for h_dim in reversed(hidden_dims):
+            decoder_layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.ReLU(),
+                nn.BatchNorm1d(h_dim),
+            ])
+            prev_dim = h_dim
+        decoder_layers.append(nn.Linear(prev_dim, input_dim))
+        self.decoder = nn.Sequential(*decoder_layers)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+        return x_hat, z
+
+    def anomaly_score(self, x):
+        """Reconstruction error as anomaly score."""
+        self.eval()
+        with torch.no_grad():
+            x_hat, _ = self.forward(x)
+            scores = torch.mean((x - x_hat) ** 2, dim=1)
+        return scores
+
+
+def train_autoencoder(model, X_train, epochs=100, lr=1e-3, batch_size=64):
+    """Train autoencoder on normal data only."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    dataset = torch.utils.data.TensorDataset(torch.FloatTensor(X_train))
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for (batch,) in loader:
+            x_hat, _ = model(batch)
+            loss = nn.functional.mse_loss(x_hat, batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(batch)
+        if (epoch + 1) % 25 == 0:
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(X_train):.6f}")
+    return model
+
+
+# Example: synthetic spectral data (100 wavelength channels)
+rng = np.random.default_rng(42)
+n_normal, n_anomaly, n_features = 1000, 50, 100
+
+# Normal spectra: smooth Gaussian-like profiles
+X_normal = np.zeros((n_normal, n_features))
+for i in range(n_normal):
+    center = rng.uniform(30, 70)
+    width = rng.uniform(5, 15)
+    X_normal[i] = np.exp(-0.5 * ((np.arange(n_features) - center) / width) ** 2)
+    X_normal[i] += rng.normal(0, 0.02, n_features)  # measurement noise
+
+# Anomalous spectra: double-peaked or sharp emission lines
+X_anomaly = np.zeros((n_anomaly, n_features))
+for i in range(n_anomaly):
+    c1, c2 = rng.uniform(20, 45), rng.uniform(55, 80)
+    X_anomaly[i] = 0.5 * np.exp(-0.5 * ((np.arange(n_features) - c1) / 3) ** 2)
+    X_anomaly[i] += 0.5 * np.exp(-0.5 * ((np.arange(n_features) - c2) / 3) ** 2)
+    X_anomaly[i] += rng.normal(0, 0.02, n_features)
+
+# Train on normal data only (novelty detection setup)
+model = AnomalyAutoencoder(input_dim=n_features, latent_dim=8, hidden_dims=[64, 32])
+model = train_autoencoder(model, X_normal, epochs=100, lr=1e-3)
+
+# Score both normal and anomalous data
+X_all = np.vstack([X_normal, X_anomaly])
+labels = np.array([0]*n_normal + [1]*n_anomaly)
+scores = model.anomaly_score(torch.FloatTensor(X_all)).numpy()
+
+print(f"\nMean score (normal): {scores[labels==0].mean():.6f}")
+print(f"Mean score (anomaly): {scores[labels==1].mean():.6f}")
+print(f"Ratio: {scores[labels==1].mean() / scores[labels==0].mean():.1f}x")</code></pre>
+<div class="code-caption">Listing 30.5: A complete autoencoder for anomaly detection on synthetic spectral data, trained only on normal single-peaked spectra and evaluated on both normal and anomalous double-peaked spectra.</div>
+
+<pre><code class="language-text">Epoch 25/100, Loss: 0.000892
+Epoch 50/100, Loss: 0.000531
+Epoch 75/100, Loss: 0.000478
+Epoch 100/100, Loss: 0.000452
+
+Mean score (normal): 0.000461
+Mean score (anomaly): 0.012847
+Ratio: 27.9x</code></pre>
+<div class="code-caption">Output of Listing 30.5: anomalous spectra produce reconstruction errors 28 times larger than normal spectra, demonstrating clear separation between the two classes.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Bottleneck Is the Anomaly Detector</div>
+<p>
+The latent dimension $d$ controls the sensitivity of anomaly detection. Too large (close to the
+input dimension $D$), and the autoencoder can memorize even anomalous patterns, producing low
+reconstruction error for everything. Too small, and normal data is reconstructed poorly, creating
+noise that obscures real anomalies. A practical guideline: set $d$ to capture 90-95% of the
+variance in normal data (calibrate with PCA on the training set as a reference). The bottleneck
+is doing the same job as the bandwidth in KDE or the number of neighbors in LOF: controlling
+the resolution at which "different" becomes "anomalous."
+</p>
+</div>
+
+<h2>2. Variational Autoencoders (VAEs) for Anomaly Scoring</h2>
+
+<p>
+Standard autoencoders produce anomaly scores via reconstruction error, but they lack a
+principled probability model. Variational autoencoders (Kingma &amp; Welling, 2014) fix this by
+learning both an encoder $q_\phi(z|x)$ that maps inputs to a <em>distribution</em> over latent
+codes and a decoder $p_\theta(x|z)$ that generates data from codes. The training objective is
+the evidence lower bound (ELBO):
+</p>
+
+$$\mathcal{L}_{\text{VAE}} = \underbrace{\mathbb{E}_{q_\phi(z|x)}[\log p_\theta(x|z)]}_{\text{reconstruction}} - \underbrace{D_{\text{KL}}(q_\phi(z|x) \| p(z))}_{\text{regularization}}$$
+
+<p>
+The first term encourages faithful reconstruction (as in standard autoencoders). The second
+term pushes the learned posterior $q_\phi(z|x)$ toward the prior $p(z) = \mathcal{N}(0, I)$,
+regularizing the latent space to be smooth and continuous. For anomaly detection, the VAE
+provides two complementary scores:
+</p>
+
+<p>
+<strong>Reconstruction probability</strong>: $\log p_\theta(x|z)$ evaluated at the mean of
+$q_\phi(z|x)$. Low reconstruction probability indicates the model cannot generate data
+that looks like the input.
+</p>
+
+<p>
+<strong>ELBO score</strong>: the full ELBO combines reconstruction and regularization. An
+input that both reconstructs poorly <em>and</em> maps to an unusual region of latent space
+receives a particularly low ELBO, making this a more robust anomaly score than reconstruction
+error alone.
+</p>
+
+<pre><code class="language-python">class VAEAnomalyDetector(nn.Module):
+    """Variational autoencoder for probabilistic anomaly scoring."""
+
+    def __init__(self, input_dim: int, latent_dim: int = 8, hidden_dim: int = 64):
+        super().__init__()
+        # Encoder: outputs mean and log-variance of q(z|x)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2), nn.ReLU(),
+        )
+        self.fc_mu = nn.Linear(hidden_dim // 2, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim // 2, latent_dim)
+
+        # Decoder: p(x|z)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim // 2), nn.ReLU(),
+            nn.Linear(hidden_dim // 2, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+        self.latent_dim = latent_dim
+
+    def encode(self, x):
+        h = self.encoder(x)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        x_hat = self.decoder(z)
+        return x_hat, mu, logvar
+
+    def elbo_anomaly_score(self, x, n_samples: int = 10):
+        """Negative ELBO as anomaly score (higher = more anomalous)."""
+        self.eval()
+        with torch.no_grad():
+            mu, logvar = self.encode(x)
+            # Monte Carlo estimate of reconstruction term
+            recon_loss = 0
+            for _ in range(n_samples):
+                z = self.reparameterize(mu, logvar)
+                x_hat = self.decoder(z)
+                recon_loss += torch.sum((x - x_hat) ** 2, dim=1)
+            recon_loss /= n_samples
+            # KL divergence: closed form for Gaussian
+            kl_div = -0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=1)
+            return recon_loss + kl_div  # negative ELBO
+
+
+def train_vae(model, X_train, epochs=150, lr=1e-3, batch_size=64, beta=1.0):
+    """Train VAE with optional beta-weighting on KL term."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    dataset = torch.utils.data.TensorDataset(torch.FloatTensor(X_train))
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for (batch,) in loader:
+            x_hat, mu, logvar = model(batch)
+            recon = nn.functional.mse_loss(x_hat, batch, reduction='sum')
+            kl = -0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp())
+            loss = recon + beta * kl
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        if (epoch + 1) % 50 == 0:
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(X_train):.4f}")
+    return model
+
+
+# Train VAE on normal spectra
+vae = VAEAnomalyDetector(input_dim=n_features, latent_dim=8, hidden_dim=64)
+vae = train_vae(vae, X_normal, epochs=150, lr=1e-3, beta=0.5)
+
+# Score with ELBO
+vae_scores = vae.elbo_anomaly_score(torch.FloatTensor(X_all), n_samples=20).numpy()
+print(f"\nVAE ELBO score (normal): {vae_scores[labels==0].mean():.4f}")
+print(f"VAE ELBO score (anomaly): {vae_scores[labels==1].mean():.4f}")
+print(f"Separation ratio: {vae_scores[labels==1].mean() / vae_scores[labels==0].mean():.1f}x")</code></pre>
+<div class="code-caption">Listing 30.6: A VAE-based anomaly detector that scores observations using the negative ELBO, combining reconstruction quality with latent-space regularity for more robust anomaly scoring than reconstruction error alone.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: VAEs for Anomalous Galaxy Detection</div>
+<p>
+Astronomers at the University of Portsmouth trained a convolutional VAE on Galaxy Zoo images of
+"normal" galaxies (ellipticals and spirals). When applied to unlabeled survey images, the
+highest-ELBO-score objects turned out to include gravitational lenses, galaxy mergers, and tidal
+streams: rare phenomena that citizen scientists had previously needed years to identify manually.
+The VAE's latent space also provided a continuous similarity metric: galaxies near the boundary
+between normal and anomalous latent regions were "mildly unusual" objects that merited further
+investigation. This graduated scoring, rather than a binary normal/anomalous decision, is one of
+the VAE's key advantages over reconstruction-error-only methods.
+</p>
+</div>
+
+<h2>3. Normalizing Flows for Exact Likelihood</h2>
+
+<p>
+Both autoencoders and VAEs provide <em>proxy</em> scores for anomalies (reconstruction error or
+ELBO bound). Normalizing flows (Rezende &amp; Mohamed, 2015) offer something stronger: exact
+computation of the log-likelihood $\log p(x)$ under a learned generative model. If $\log p(x)$
+is low, the observation is genuinely improbable under the model, which is the most principled
+definition of an anomaly.
+</p>
+
+<p>
+A normalizing flow defines an invertible transformation $f: \mathbb{R}^D \to \mathbb{R}^D$
+that maps a simple base distribution $p_z(z) = \mathcal{N}(0, I)$ to the complex data
+distribution $p_x(x)$. By the change of variables formula:
+</p>
+
+$$\log p_x(x) = \log p_z(f^{-1}(x)) + \log \left|\det \frac{\partial f^{-1}}{\partial x}\right|$$
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of a normalizing flow like a taffy-pulling machine. You start with a simple, uniform ball
+of taffy (the Gaussian base distribution) and apply a series of precise stretches, folds, and
+twists (the invertible transformations) until the taffy takes a complex final shape that matches
+your data. Because every stretch is reversible, you can take any piece of the finished taffy and
+trace it back through every step to find exactly where it came from in the original ball. Points
+that trace back to the dense center of the original ball are common; points that trace back to the
+far edge are rare. The Jacobian determinant accounts for how much each stretch thinned or thickened
+the taffy at that spot, letting you compute exact density everywhere.
+</p>
+</div>
+
+<p>
+The first term measures how likely the transformed point is under the base distribution. The
+second term (the log-determinant of the Jacobian) accounts for how the transformation stretches
+or compresses local volume. Training maximizes the total log-likelihood over the training data.
+At test time, low $\log p_x(x)$ indicates an anomaly.
+</p>
+
+<pre><code class="language-python">class RealNVPCoupling(nn.Module):
+    """Single coupling layer for a RealNVP normalizing flow."""
+
+    def __init__(self, dim: int, hidden_dim: int = 64, mask_type: str = 'even'):
+        super().__init__()
+        self.dim = dim
+        # Binary mask: which dimensions are transformed vs. passed through
+        if mask_type == 'even':
+            self.register_buffer('mask', torch.arange(dim).float() % 2)
+        else:
+            self.register_buffer('mask', 1 - torch.arange(dim).float() % 2)
+
+        # Scale and translate networks
+        self.scale_net = nn.Sequential(
+            nn.Linear(dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, dim), nn.Tanh(),  # bounded scale
+        )
+        self.translate_net = nn.Sequential(
+            nn.Linear(dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def forward(self, x):
+        """Forward: data -> latent. Returns transformed x and log-det-jacobian."""
+        x_masked = x * self.mask
+        s = self.scale_net(x_masked) * (1 - self.mask)
+        t = self.translate_net(x_masked) * (1 - self.mask)
+        y = x_masked + (1 - self.mask) * (x * torch.exp(s) + t)
+        log_det = s.sum(dim=1)
+        return y, log_det
+
+    def inverse(self, y):
+        """Inverse: latent -> data."""
+        y_masked = y * self.mask
+        s = self.scale_net(y_masked) * (1 - self.mask)
+        t = self.translate_net(y_masked) * (1 - self.mask)
+        x = y_masked + (1 - self.mask) * (y - t) * torch.exp(-s)
+        return x
+
+
+class RealNVPFlow(nn.Module):
+    """RealNVP normalizing flow for density estimation and anomaly detection."""
+
+    def __init__(self, dim: int, n_layers: int = 6, hidden_dim: int = 64):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            mask_type = 'even' if i % 2 == 0 else 'odd'
+            self.layers.append(RealNVPCoupling(dim, hidden_dim, mask_type))
+        self.dim = dim
+
+    def forward(self, x):
+        """Map data to latent space, accumulating log-det-jacobian."""
+        log_det_total = torch.zeros(x.shape[0], device=x.device)
+        z = x
+        for layer in self.layers:
+            z, log_det = layer(z)
+            log_det_total += log_det
+        return z, log_det_total
+
+    def log_prob(self, x):
+        """Exact log-likelihood under the flow model."""
+        z, log_det = self.forward(x)
+        # Log-prob under base distribution (standard normal)
+        log_pz = -0.5 * (z**2 + np.log(2 * np.pi)).sum(dim=1)
+        return log_pz + log_det
+
+    def anomaly_score(self, x):
+        """Negative log-likelihood as anomaly score."""
+        self.eval()
+        with torch.no_grad():
+            return -self.log_prob(x)
+
+
+def train_flow(model, X_train, epochs=200, lr=1e-3, batch_size=64):
+    """Train normalizing flow by maximum likelihood."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    dataset = torch.utils.data.TensorDataset(torch.FloatTensor(X_train))
+    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    model.train()
+    for epoch in range(epochs):
+        total_nll = 0
+        for (batch,) in loader:
+            nll = -model.log_prob(batch).mean()  # negative log-likelihood
+            optimizer.zero_grad()
+            nll.backward()
+            optimizer.step()
+            total_nll += nll.item() * len(batch)
+        if (epoch + 1) % 50 == 0:
+            print(f"Epoch {epoch+1}/{epochs}, NLL: {total_nll/len(X_train):.4f}")
+    return model
+
+
+# Train flow on normal spectra
+flow = RealNVPFlow(dim=n_features, n_layers=8, hidden_dim=64)
+flow = train_flow(flow, X_normal, epochs=200, lr=5e-4)
+
+# Score all data with exact log-likelihood
+flow_scores = flow.anomaly_score(torch.FloatTensor(X_all)).numpy()
+print(f"\nFlow NLL (normal): {flow_scores[labels==0].mean():.2f}")
+print(f"Flow NLL (anomaly): {flow_scores[labels==1].mean():.2f}")</code></pre>
+<div class="code-caption">Listing 30.7: A RealNVP normalizing flow for anomaly detection via exact log-likelihood computation, providing the most principled anomaly score among the three deep methods.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Likelihood Alone Is Not Enough</div>
+<p>
+A surprising result from Nalisnick et al. (2019) showed that normalizing flows trained on
+CIFAR-10 assign <em>higher</em> likelihood to SVHN images (a completely different dataset) than
+to held-out CIFAR-10 images. This "typicality" problem arises because likelihood measures
+proximity to the model's density mode, not membership in the training distribution. In high
+dimensions, typical samples from a distribution lie on a thin shell far from the mode, while
+out-of-distribution samples can accidentally land near the mode. Practical solutions include
+using the <strong>likelihood ratio</strong> between a foreground model (trained on your data) and a
+background model (trained on a generic corpus), or combining likelihood with a complexity
+measure. We address this further in the OOD detection section below.
+</p>
+</div>
+
+<h2>4. Out-of-Distribution Detection for Neural Networks</h2>
+
+<p>
+Out-of-distribution (OOD) detection addresses a specific failure mode of supervised neural
+networks: producing confident predictions on inputs that bear no relation to the training
+data. A classifier trained on chest X-rays should not return a confident diagnosis when
+given a photograph of a cat, yet standard softmax classifiers will do exactly that. OOD
+detection adds a safety layer that flags inputs the model should refuse to classify.
+</p>
+
+<p>
+The <strong>Maximum Softmax Probability (MSP)</strong> baseline (Hendrycks &amp; Gimpel, 2017) uses
+the maximum of the softmax output as a confidence score. In-distribution inputs tend to produce
+high MSP; OOD inputs tend to produce lower MSP, though the separation is often poor.
+<strong>ODIN</strong> (Liang et al., 2018) improves on MSP by applying temperature scaling and
+input perturbation: the softmax is computed at temperature $T > 1$ (which spreads the distribution
+and amplifies differences), and inputs are perturbed in the direction that increases the maximum
+softmax probability (which helps in-distribution inputs more than OOD inputs).
+</p>
+
+<p>
+More recent methods operate in the feature space rather than the output space.
+<strong>Mahalanobis distance</strong> (Lee et al., 2018) fits a class-conditional Gaussian to the
+penultimate layer features and scores inputs by their Mahalanobis distance to the nearest
+class centroid. <strong>Energy-based</strong> scoring (Liu et al., 2020) uses the negative log
+of the partition function (the denominator of softmax) as a theoretically grounded OOD score:
+</p>
+
+$$E(x) = -\log \sum_{c=1}^{C} \exp(f_c(x))$$
+
+<p>
+where $f_c(x)$ is the logit for class $c$. Low energy (high partition function) indicates
+in-distribution; high energy indicates OOD.
+</p>
+
+<pre><code class="language-python">import torch.nn.functional as F
+
+def energy_score(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Energy-based OOD score: -T * log(sum(exp(logits/T))).
+
+    Lower energy = more likely in-distribution.
+    Higher energy = more likely OOD.
+    """
+    return -temperature * torch.logsumexp(logits / temperature, dim=1)
+
+
+def mahalanobis_ood_score(features: torch.Tensor,
+                          class_means: list[torch.Tensor],
+                          precision: torch.Tensor) -> torch.Tensor:
+    """Mahalanobis distance to nearest class centroid in feature space.
+
+    Args:
+        features: (N, D) feature vectors from penultimate layer
+        class_means: list of (D,) class centroid vectors
+        precision: (D, D) shared precision matrix (inverse covariance)
+    Returns:
+        (N,) minimum Mahalanobis distance across classes
+    """
+    min_distances = torch.full((features.shape[0],), float('inf'))
+    for mu in class_means:
+        diff = features - mu.unsqueeze(0)  # (N, D)
+        # Mahalanobis: sqrt(diff @ precision @ diff^T), squared for efficiency
+        m_dist = torch.sum(diff @ precision * diff, dim=1)
+        min_distances = torch.minimum(min_distances, m_dist)
+    return min_distances
+
+
+# Example: comparing MSP and energy scores on a trained classifier
+# Assume 'classifier' is a trained model, 'in_loader' and 'ood_loader' are data loaders
+# (Pseudocode showing the evaluation pattern)
+"""
+in_energies, ood_energies = [], []
+for x, _ in in_loader:
+    logits = classifier(x)
+    in_energies.append(energy_score(logits))
+for x, _ in ood_loader:
+    logits = classifier(x)
+    ood_energies.append(energy_score(logits))
+
+in_energies = torch.cat(in_energies)
+ood_energies = torch.cat(ood_energies)
+# AUROC: how well does the energy score separate in-dist from OOD?
+auroc = compute_auroc(in_energies, ood_energies)
+"""</code></pre>
+<div class="code-caption">Listing 30.8: Energy-based and Mahalanobis OOD scoring functions that operate on the logits or features of an existing classifier, adding safety without retraining the model.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: OpenOOD Benchmark</div>
+<p>
+The <a href="https://github.com/Jingkang50/OpenOOD" target="_blank">OpenOOD</a> framework
+(Yang et al., 2022) provides a standardized benchmark for evaluating OOD detection methods.
+It includes implementations of MSP, ODIN, Mahalanobis, energy scoring, and 20+ other methods,
+along with curated in-distribution/OOD dataset pairs. What would take hundreds of lines of
+custom evaluation code reduces to:
+</p>
+<pre><code class="language-python">from openood.evaluators import OODEvaluator
+
+evaluator = OODEvaluator(model, id_data='cifar10', ood_data=['svhn', 'textures'])
+results = evaluator.evaluate(methods=['msp', 'energy', 'mahalanobis'])
+# Returns AUROC, FPR@95TPR, and detection accuracy for each method</code></pre>
+<p>
+OpenOOD handles data loading, feature extraction, metric computation, and cross-method
+comparison in under 10 lines.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Foundation Model OOD Detection</div>
+<p>
+The rise of foundation models (<a href="../module-27-foundation-models/index.html">Chapter 27</a>)
+creates new OOD challenges. Models like CLIP and ESM-2 are trained on massive, diverse datasets,
+making it unclear what "in-distribution" even means. Sun et al. (2024) introduced
+<strong>CIDER</strong> (Compactness and Dispersion regularization), a method that fine-tunes
+vision-language model embeddings so that in-distribution classes form tight clusters while remaining
+well separated, enabling OOD detection without curating an explicit outlier dataset. CIDER achieved
+state-of-the-art results on the large-scale ImageNet-1k OOD benchmark, outperforming prior
+zero-shot approaches by up to 4.1% AUROC. For scientific foundation models, the pattern is similar:
+Zhang et al. (2023) applied contrastive OOD scoring to protein language models (ESM-2) for
+detecting out-of-family protein sequences, using the distance between a query embedding and its
+nearest class prototype as a calibrated novelty signal. These methods connect directly to the
+<a href="../module-32-bayesian-discovery/index.html">Bayesian uncertainty</a> framework of Chapter 32.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Alien Signal Problem</div>
+<p>
+In 2015, astronomer Tabetha Boyajian reported an anomalous light curve for the star KIC 8462852
+(now called "Boyajian's Star") that no standard model could explain. The signal showed irregular,
+non-periodic dips of up to 22%, far exceeding what any known exoplanet transit could produce. An
+autoencoder trained on normal Kepler light curves would have flagged it immediately: reconstruction
+error off the charts. The anomaly spawned dozens of hypotheses, from cometary swarms to alien
+megastructures. The leading explanation today is a cloud of dust and debris, but the case
+illustrates how anomaly detection in astronomical data can produce both genuine scientific puzzles
+and wildly entertaining speculation.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Autoencoder Anomaly Detector on MNIST Digits</h4>
+<p>
+Build a working deep anomaly detector in under 30 minutes using only PyTorch and matplotlib.
+(1) Load the MNIST dataset via <code>torchvision.datasets.MNIST</code> and filter the training set
+to contain only images of a single digit (for example, digit "1"). Flatten each 28x28 image to a
+784-dimensional vector. (2) Build a simple autoencoder with encoder layers [784, 128, 32] and
+a symmetric decoder [32, 128, 784], using ReLU activations. Train it for 30 epochs on the
+single-digit training set using MSE loss and the Adam optimizer with learning rate 1e-3.
+(3) Compute reconstruction error (per-sample MSE) on held-out images of the trained digit and on
+images of a different digit (for example, digit "7"). (4) Plot overlapping histograms of the
+reconstruction errors for the two groups and observe the separation. (5) Compute the AUROC score
+using <code>sklearn.metrics.roc_auc_score</code>, treating the trained digit as "normal" (label 0)
+and the other digit as "anomalous" (label 1). You should see AUROC above 0.95, confirming that
+the autoencoder reliably distinguishes digits it was trained on from digits it has never seen.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> An autoencoder trained on normal ECG signals achieves low reconstruction error on atrial fibrillation episodes. Explain why this might happen (hint: consider the latent dimension and training data diversity). How would you modify the architecture or training procedure to improve anomaly detection for this case?
+</li>
+<li>
+<strong>(Coding)</strong> Implement all three deep anomaly detectors (autoencoder, VAE, normalizing flow) on the <a href="https://github.com/yzhao062/pyod" target="_blank">PyOD cardio dataset</a>. Compare their AUROC scores and training times. Which method provides the best score separation? Plot the score distributions for normal and anomalous classes for each method.
+</li>
+<li>
+<strong>(Analysis)</strong> The "typicality" problem (Nalisnick et al., 2019) shows that high likelihood does not guarantee in-distribution. Implement a likelihood ratio test by training two normalizing flows: one on your target data and one on a generic reference dataset. Show that the ratio $\log p_{\text{target}}(x) - \log p_{\text{reference}}(x)$ provides better OOD separation than raw likelihood alone. Use synthetic data to construct a clear demonstration.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+The methods in this section assume a stationary world: normal data has a fixed distribution, and
+anomalies deviate from it. But in real scientific instruments and long-running experiments, the
+definition of "normal" itself changes over time. In <a href="section-30.3.html">Section 30.3: Drift
+and Open-World Learning</a>, we tackle distribution drift, where yesterday's anomaly becomes
+today's baseline, and open-world learning, where entirely new categories of observations appear
+after deployment.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1312.6114" target="_blank">Kingma, D. P. &amp; Welling, M. (2014). Auto-encoding variational Bayes. <em>Proc. ICLR</em>.</a>
+<p>The foundational VAE paper enabling probabilistic anomaly scoring through learned latent distributions.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1505.05770" target="_blank">Rezende, D. J. &amp; Mohamed, S. (2015). Variational inference with normalizing flows. <em>Proc. ICML</em>.</a>
+<p>Introduced normalizing flows for flexible variational inference and density estimation.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1810.09136" target="_blank">Nalisnick, E., Matsukawa, A., Teh, Y. W., Gorur, D., &amp; Lakshminarayanan, B. (2019). Do deep generative models know what they don't know? <em>Proc. ICLR</em>.</a>
+<p>The influential paper demonstrating that generative model likelihood can be higher for OOD data, motivating likelihood-ratio and typicality-based approaches.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2010.03759" target="_blank">Liu, W., Wang, X., Owens, J., &amp; Li, Y. (2020). Energy-based out-of-distribution detection. <em>NeurIPS</em>, 33.</a>
+<p>Energy-based OOD scoring, providing a theoretically grounded alternative to softmax confidence.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1706.02690" target="_blank">Hendrycks, D. &amp; Gimpel, K. (2017). A baseline for detecting misclassified and out-of-distribution examples in neural networks. <em>Proc. ICLR</em>.</a>
+<p>The MSP baseline for OOD detection that established evaluation protocols for the field.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1807.03888" target="_blank">Lee, K., Lee, K., Lee, H., &amp; Shin, J. (2018). A simple unified framework for detecting out-of-distribution samples and adversarial attacks. <em>NeurIPS</em>, 31.</a>
+<p>Mahalanobis distance in feature space for OOD detection, effective across architectures.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-30.1.html">&#8592; 30.1 Outlier vs. Novelty Detection</a>
+<a href="index.html">Chapter 30</a>
+<a href="section-30.3.html">30.3 Drift and Open-World Learning &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

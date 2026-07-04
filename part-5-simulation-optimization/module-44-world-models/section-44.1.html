@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 44.1: Latent Dynamics Models. RSSM architecture, DreamerV3, transformer world models, and the ELBO training objective for learning environment dynamics in latent space." name="description"/>
+<title>Section 44.1: Latent Dynamics Models | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation and Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 44: World Models for Discovery</a></div>
+<h1>44.1 Latent Dynamics Models</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I compress the entire universe into 256 dimensions. The remaining dimensions file complaints, but I ignore them because my ELBO is improving."</p>
+<cite>A Variational Autoencoder With Delusions of Grandeur</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section requires familiarity with PyTorch (autograd, <code>nn.Module</code>,
+training loops), variational inference basics (KL divergence, reparameterization
+trick) from
+<a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32</a>,
+and recurrent neural networks at a conceptual level. We build all components from
+scratch, so no prior world model experience is needed.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A world model learns to predict what happens next: given the current state and an
+action, it produces a distribution over the next state. When the raw observation
+space is high-dimensional (images, spectra, molecular conformations), operating
+directly in observation space is wasteful and fragile. Latent dynamics models solve
+this by learning a compact latent state that captures the information relevant for
+prediction, then modeling dynamics entirely within that latent space. The Recurrent
+State-Space Model (RSSM) is the dominant architecture for this task, splitting the
+latent state into a deterministic component (memory) and a stochastic component
+(uncertainty). Training uses the Evidence Lower Bound (ELBO), the same variational
+objective that appears in VAEs (Chapter 34) but extended to sequential data.
+</p>
+</div>
+
+<h2>1. Why Latent Dynamics?</h2>
+
+<p>
+Consider a robot arm performing chemical synthesis. Its camera produces 84x84 RGB
+images at each timestep, yielding an observation space of $\mathbb{R}^{84 \times 84 \times 3}$.
+Predicting the next image pixel-by-pixel is a 21,168-dimensional regression problem,
+and most of those pixels (the static lab bench, the walls) carry no information about
+the dynamics. A latent dynamics model first <em>encodes</em> each observation into a
+compact representation $z_t \in \mathbb{R}^d$ where $d \ll 21{,}168$, then models
+transitions in this latent space: $p(z_{t+1} | z_t, a_t)$. The savings are dramatic:
+both in the dimensionality of the prediction problem and in the amount of training
+data required.
+</p>
+
+<p data-agent="02">
+A latent dynamics model is a neural network that learns to predict environment
+transitions in a compressed, learned coordinate system rather than in the raw
+observation space. It matters because working in a low-dimensional latent space
+makes prediction, planning, and uncertainty estimation tractable for environments
+whose raw observations (images, spectra, sensor arrays) are far too large to model
+directly. The mechanism is straightforward: an encoder maps each observation to a
+latent vector, a transition network predicts the next latent vector given the current
+one and an action, and a decoder maps latent vectors back to observations so the
+whole pipeline can be trained end-to-end with reconstruction loss. Use a latent
+dynamics model when observations are high-dimensional and you need multi-step
+prediction or planning; use a direct (observation-space) dynamics model only when the
+state is already compact (fewer than roughly 20 continuous dimensions) and you want
+to avoid the overhead of learning an encoder and decoder.
+</p>
+
+<p>
+This compression is not merely a computational trick. It forces the model to identify
+the <em>factors of variation</em> that matter for prediction: the position of the robot
+arm, the color of the liquid in the beaker, the temperature reading on the display.
+These are exactly the variables a scientist would track in a lab notebook. The latent
+dynamics model discovers them automatically from raw observations.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misunderstanding is that the latent space in a latent dynamics model is
+simply a compressed copy of the observation, like a JPEG of an image. In reality, the
+latent representation is shaped by the <em>dynamics objective</em>, not just
+reconstruction quality: the model learns to keep information that helps predict the
+future and discard information that does not, even if that discarded information would
+improve pixel-level reconstruction. Two observations that look very different (a
+beaker photographed from two angles) may map to nearly the same latent state if they
+imply the same future dynamics, while two observations that look nearly identical (the
+same beaker at 99 C vs. 101 C) may map to distant latent states if the temperature
+difference triggers a phase change.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Latent States as Learned Sufficient Statistics</div>
+<p>
+A well-trained latent state $z_t$ is a <em>sufficient statistic</em> for predicting
+future observations: $p(o_{t+1:T} | o_{1:t}, a_{1:T}) \approx p(o_{t+1:T} | z_t, a_{t:T})$.
+The model strips away everything in the observation that is irrelevant to the future.
+For scientific discovery, this means the model automatically identifies the minimal
+set of variables needed to predict the outcome of an experiment, a form of automated
+dimensionality reduction that complements the representation learning methods of
+<a href="../../part-3-data-models/module-26-representation-learning/index.html">Chapter 26</a>.
+</p>
+</div>
+
+<h2>2. The Recurrent State-Space Model (RSSM)</h2>
+
+<p>
+The RSSM, introduced by Hafner et al. (2019) in the PlaNet paper and refined through
+DreamerV1, V2, and V3, is the most successful latent dynamics architecture to date.
+Its key innovation is splitting the latent state into two components:
+</p>
+
+<ul>
+<li><strong>Deterministic state</strong> $h_t \in \mathbb{R}^{d_h}$: updated by a GRU cell, this component carries forward information across time steps like a memory. It captures the predictable, deterministic aspects of the dynamics.</li>
+<li><strong>Stochastic state</strong> $s_t \in \mathbb{R}^{d_s}$: sampled from a learned distribution conditioned on $h_t$, this component captures the inherent randomness in the environment. In DreamerV3, $s_t$ uses a categorical distribution (32 classes across 32 dimensions) rather than a Gaussian, which avoids posterior collapse.</li>
+</ul>
+
+<p>
+The full RSSM consists of four components, each implemented as a neural network:
+</p>
+
+$$
+\begin{aligned}
+\text{Sequence model:} \quad & h_t = f_\phi(h_{t-1}, s_{t-1}, a_{t-1}) \\
+\text{Prior (dynamics predictor):} \quad & \hat{s}_t \sim p_\phi(s_t | h_t) \\
+\text{Posterior (representation):} \quad & s_t \sim q_\phi(s_t | h_t, o_t) \\
+\text{Decoder (observation):} \quad & \hat{o}_t \sim p_\phi(o_t | h_t, s_t)
+\end{aligned}
+$$
+
+<p>
+The sequence model is a GRU that updates the deterministic state. The prior predicts
+the stochastic state from the deterministic state alone (no observation), which is
+what we use during planning when we imagine trajectories without real observations.
+The posterior incorporates the actual observation $o_t$ to produce a more accurate
+stochastic state during training. The decoder reconstructs the observation from the
+full latent state $(h_t, s_t)$, providing the reconstruction signal for learning.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: RSSM for Chemical Reactor Monitoring</div>
+<p>
+A chemical engineer monitors a continuous stirred-tank reactor (CSTR) through
+temperature sensors, pressure gauges, and spectroscopic readings (collectively,
+the observation $o_t$). The deterministic state $h_t$ captures the slow, predictable
+evolution of the reaction: gradual temperature rise, steady pressure increase. The
+stochastic state $s_t$ captures fast, unpredictable fluctuations: turbulent mixing
+events, catalyst deactivation spikes, measurement noise. By separating these two
+timescales, the RSSM can make accurate multi-step predictions of the reactor's
+behavior, enabling the planner (Section 44.3) to optimize feed rates and cooling
+schedules without running dangerous experiments on the real reactor.
+</p>
+</div>
+
+<p>
+Let us implement the core RSSM in PyTorch. We build each component as a separate
+module, then compose them.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import OneHotCategorical
+
+
+class RSSM(nn.Module):
+    """Recurrent State-Space Model following the DreamerV3 architecture.
+
+    Splits latent state into deterministic (h) and stochastic (s) parts.
+    Stochastic state uses categorical distributions (num_classes x num_categoricals).
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        det_size: int = 256,
+        num_categoricals: int = 32,
+        num_classes: int = 32,
+        hidden_size: int = 256,
+    ):
+        super().__init__()
+        self.det_size = det_size
+        self.num_categoricals = num_categoricals
+        self.num_classes = num_classes
+        self.stoch_size = num_categoricals * num_classes
+
+        # Sequence model: GRU updates deterministic state
+        self.gru_input_proj = nn.Linear(
+            self.stoch_size + action_dim, hidden_size
+        )
+        self.gru_cell = nn.GRUCell(hidden_size, det_size)
+
+        # Prior: predict stochastic state from deterministic alone
+        self.prior_net = nn.Sequential(
+            nn.Linear(det_size, hidden_size),
+            nn.ELU(),
+            nn.Linear(hidden_size, self.stoch_size),
+        )
+
+        # Posterior: predict stochastic state from deterministic + observation
+        self.posterior_net = nn.Sequential(
+            nn.Linear(det_size + obs_dim, hidden_size),
+            nn.ELU(),
+            nn.Linear(hidden_size, self.stoch_size),
+        )
+
+        # Observation decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(det_size + self.stoch_size, hidden_size),
+            nn.ELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ELU(),
+            nn.Linear(hidden_size, obs_dim),
+        )
+
+        # Reward predictor (for RL tasks)
+        self.reward_head = nn.Sequential(
+            nn.Linear(det_size + self.stoch_size, hidden_size),
+            nn.ELU(),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def initial_state(self, batch_size: int, device: torch.device):
+        """Return zero-initialized deterministic and stochastic states."""
+        h = torch.zeros(batch_size, self.det_size, device=device)
+        s = torch.zeros(batch_size, self.stoch_size, device=device)
+        return h, s
+
+    def _categorical_straight_through(self, logits: torch.Tensor):
+        """Sample from categorical with straight-through gradients."""
+        shape = logits.shape[:-1]  # (batch, num_categoricals)
+        logits_reshaped = logits.view(*shape, self.num_categoricals, self.num_classes)
+        dist = OneHotCategorical(logits=logits_reshaped)
+        sample = dist.sample()
+        # Straight-through: forward uses sample, backward uses softmax
+        probs = dist.probs
+        sample_st = sample + probs - probs.detach()
+        return sample_st.view(*shape[:-0], self.stoch_size), dist
+
+    def sequence_step(self, h_prev, s_prev, action):
+        """One step of the sequence model (GRU)."""
+        gru_input = self.gru_input_proj(torch.cat([s_prev, action], dim=-1))
+        h = self.gru_cell(F.elu(gru_input), h_prev)
+        return h
+
+    def prior(self, h):
+        """Predict stochastic state distribution from deterministic state."""
+        logits = self.prior_net(h)
+        s, dist = self._categorical_straight_through(logits)
+        return s, dist, logits
+
+    def posterior(self, h, obs):
+        """Predict stochastic state distribution from deterministic + observation."""
+        logits = self.posterior_net(torch.cat([h, obs], dim=-1))
+        s, dist = self._categorical_straight_through(logits)
+        return s, dist, logits
+
+    def decode(self, h, s):
+        """Reconstruct observation from full latent state."""
+        latent = torch.cat([h, s], dim=-1)
+        obs_pred = self.decoder(latent)
+        reward_pred = self.reward_head(latent)
+        return obs_pred, reward_pred
+
+    def observe(self, observations, actions):
+        """Process a sequence of (observation, action) pairs.
+
+        Args:
+            observations: (batch, time, obs_dim)
+            actions: (batch, time, action_dim)
+
+        Returns:
+            Dictionary of posterior states, prior states, predictions.
+        """
+        batch_size, seq_len = observations.shape[:2]
+        device = observations.device
+        h, s = self.initial_state(batch_size, device)
+
+        prior_logits_list = []
+        posterior_logits_list = []
+        obs_preds = []
+        reward_preds = []
+
+        for t in range(seq_len):
+            # Step 1: update deterministic state
+            h = self.sequence_step(h, s, actions[:, t])
+
+            # Step 2: compute prior and posterior
+            _, _, prior_logits = self.prior(h)
+            s, _, posterior_logits = self.posterior(h, observations[:, t])
+
+            # Step 3: decode from posterior state (for training)
+            obs_pred, reward_pred = self.decode(h, s)
+
+            prior_logits_list.append(prior_logits)
+            posterior_logits_list.append(posterior_logits)
+            obs_preds.append(obs_pred)
+            reward_preds.append(reward_pred)
+
+        return {
+            "prior_logits": torch.stack(prior_logits_list, dim=1),
+            "posterior_logits": torch.stack(posterior_logits_list, dim=1),
+            "obs_preds": torch.stack(obs_preds, dim=1),
+            "reward_preds": torch.stack(reward_preds, dim=1),
+        }
+
+    def imagine(self, initial_h, initial_s, actions):
+        """Roll out the model without observations (for planning).
+
+        Args:
+            initial_h: (batch, det_size) starting deterministic state
+            initial_s: (batch, stoch_size) starting stochastic state
+            actions: (batch, horizon, action_dim) planned actions
+
+        Returns:
+            Predicted observations, rewards, and states for each step.
+        """
+        h, s = initial_h, initial_s
+        horizon = actions.shape[1]
+
+        obs_preds = []
+        reward_preds = []
+
+        for t in range(horizon):
+            h = self.sequence_step(h, s, actions[:, t])
+            s, _, _ = self.prior(h)  # No observation: use prior
+            obs_pred, reward_pred = self.decode(h, s)
+            obs_preds.append(obs_pred)
+            reward_preds.append(reward_pred)
+
+        return {
+            "obs_preds": torch.stack(obs_preds, dim=1),
+            "reward_preds": torch.stack(reward_preds, dim=1),
+        }</code></pre>
+<div class="code-caption">Listing 44.1: Complete RSSM implementation with categorical stochastic states, straight-through gradient estimation, and both observation (training) and imagination (planning) modes.</div>
+
+<p>
+Several design choices in Listing 44.1 deserve attention. The stochastic state uses
+a categorical distribution (32 categories each with 32 classes) rather than a
+Gaussian. DreamerV3 showed that categorical distributions avoid the posterior
+collapse problem that plagues Gaussian latent variables, where the KL term in the
+ELBO drives the posterior toward the prior, effectively ignoring the observations.
+The straight-through gradient estimator lets us backpropagate through the discrete
+sampling operation by using the continuous softmax probabilities in the backward pass.
+</p>
+
+<h2>3. The ELBO Training Objective</h2>
+
+<p>
+How do we train an RSSM? The model defines a generative process: at each time step,
+it samples a latent state and produces an observation. The true posterior over latent
+states given observations is intractable, so we use variational inference. The
+objective is the Evidence Lower Bound (ELBO), extended to sequential data.
+</p>
+
+<p>
+For a sequence of observations $o_{1:T}$ and actions $a_{1:T}$, the ELBO is:
+</p>
+
+$$
+\mathcal{L} = \sum_{t=1}^{T} \Big[
+\underbrace{\mathbb{E}_{q_\phi(s_t | h_t, o_t)} \big[ \log p_\phi(o_t | h_t, s_t) \big]}_{\text{reconstruction}}
+- \underbrace{\beta \cdot D_{\mathrm{KL}} \big[ q_\phi(s_t | h_t, o_t) \,\|\, p_\phi(s_t | h_t) \big]}_{\text{dynamics regularization}}
+\Big]
+$$
+
+<p>
+Each term has a clear interpretation:
+</p>
+
+<ul>
+<li><strong>Reconstruction term</strong>: the posterior state $(h_t, s_t)$ must produce accurate observation predictions. This teaches the encoder to extract relevant features and the decoder to faithfully reconstruct them.</li>
+<li><strong>KL term</strong>: the posterior (which sees the observation) must stay close to the prior (which does not). This ensures that the prior alone can make reasonable predictions, which is essential for planning when no observations are available. The coefficient $\beta$ controls the balance; DreamerV3 uses a free-bits strategy where the KL is only penalized above a minimum threshold.</li>
+</ul>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The KL Term Teaches the Dynamics Model</div>
+<p>
+The KL divergence $D_{\mathrm{KL}}[q \| p]$ penalizes disagreement between the
+posterior (what actually happened, given the observation) and the prior (what the
+model predicted would happen, without the observation). Minimizing this divergence
+forces the prior to become an accurate dynamics predictor. In effect, the posterior
+acts as a "teacher" that shows the prior the correct answer, and the KL term is the
+"exam score." Over training, the prior learns to predict the stochastic state well
+enough that it can operate independently during planning.
+</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the RSSM's prior and posterior like a weather forecaster and a rooftop
+thermometer. The <em>prior</em> is the forecaster's prediction for tomorrow's
+temperature, made the night before using only past data and a mental model of weather
+patterns. The <em>posterior</em> is the updated estimate after stepping outside and
+reading the thermometer in the morning. The KL term in the ELBO measures how far off
+the forecast was from the thermometer-corrected estimate. Over many days of training,
+the forecaster's predictions improve until they nearly match what the thermometer
+reveals, at which point the forecaster can make reliable multi-day predictions without
+checking the thermometer at all. That is exactly what happens during planning: the
+model rolls forward using only its prior (the forecast), with no access to real
+observations (the thermometer).
+</p>
+</div>
+
+<p>
+Let us implement the ELBO loss function with the free-bits strategy from DreamerV3.
+</p>
+
+<pre><code class="language-python">def compute_elbo_loss(
+    rssm_output: dict,
+    observations: torch.Tensor,
+    rewards: torch.Tensor,
+    free_bits: float = 1.0,
+    kl_beta: float = 1.0,
+    reward_weight: float = 1.0,
+):
+    """Compute the ELBO loss for RSSM training.
+
+    Args:
+        rssm_output: dictionary from RSSM.observe()
+        observations: (batch, time, obs_dim) ground truth
+        rewards: (batch, time, 1) ground truth rewards
+        free_bits: minimum KL before penalty applies (nats)
+        kl_beta: weight on KL term
+        reward_weight: weight on reward prediction loss
+
+    Returns:
+        Total loss and a dictionary of component losses for logging.
+    """
+    # Reconstruction loss: MSE between predicted and true observations
+    obs_loss = F.mse_loss(rssm_output["obs_preds"], observations)
+
+    # Reward prediction loss
+    rew_loss = F.mse_loss(
+        rssm_output["reward_preds"], rewards
+    )
+
+    # KL divergence between posterior and prior (categorical distributions)
+    prior_logits = rssm_output["prior_logits"]
+    posterior_logits = rssm_output["posterior_logits"]
+
+    # Reshape to (batch * time, num_categoricals, num_classes)
+    batch, time = prior_logits.shape[:2]
+    num_cat = 32  # num_categoricals
+    num_cls = 32  # num_classes
+
+    prior_reshaped = prior_logits.view(batch * time, num_cat, num_cls)
+    posterior_reshaped = posterior_logits.view(batch * time, num_cat, num_cls)
+
+    # Compute KL for each categorical dimension
+    prior_probs = F.softmax(prior_reshaped, dim=-1)
+    posterior_probs = F.softmax(posterior_reshaped, dim=-1)
+
+    kl_per_categorical = (
+        posterior_probs * (
+            torch.log(posterior_probs + 1e-8)
+            - torch.log(prior_probs + 1e-8)
+        )
+    ).sum(dim=-1)  # (batch*time, num_cat)
+
+    # Free bits: only penalize KL above threshold per categorical
+    kl_free = torch.clamp(kl_per_categorical, min=free_bits)
+    kl_loss = kl_free.mean()
+
+    # Total ELBO loss (negative because we maximize ELBO)
+    total_loss = obs_loss + reward_weight * rew_loss + kl_beta * kl_loss
+
+    return total_loss, {
+        "obs_loss": obs_loss.item(),
+        "reward_loss": rew_loss.item(),
+        "kl_loss": kl_loss.item(),
+        "total_loss": total_loss.item(),
+    }</code></pre>
+<div class="code-caption">Listing 44.2: ELBO loss computation with free-bits KL regularization. The free-bits threshold prevents posterior collapse by allowing a minimum amount of information to flow through the stochastic state without penalty.</div>
+
+<h2>4. Transformer World Models</h2>
+
+<p>
+The RSSM processes sequences one step at a time through its GRU cell. Transformer
+world models (Micheli et al., 2023; Robine et al., 2023) replace this recurrence
+with self-attention, processing entire trajectories in parallel. The key advantage
+is that attention can capture long-range dependencies without the information
+bottleneck of a fixed-size hidden state. The key disadvantage is that generation
+remains autoregressive (each new token depends on all previous ones), so the
+wall-clock cost of rolling out $H$ steps is $O(H^2)$ rather than $O(H)$.
+</p>
+
+<p>
+The architecture is straightforward: tokenize each timestep's state and action into
+a sequence of tokens, then apply a causal transformer (GPT-style) to predict the
+next timestep's tokens. IRIS (Micheli et al., 2023) tokenizes observations using a
+discrete autoencoder (VQ-VAE), producing a sequence of discrete tokens per image.
+The transformer then models the joint sequence of observation tokens and action
+tokens.
+</p>
+
+<pre><code class="language-python">class TransformerWorldModel(nn.Module):
+    """Simplified transformer-based world model.
+
+    Processes (state, action) sequences with causal self-attention.
+    Suitable for low-dimensional state spaces (no image tokenization).
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        d_model: int = 256,
+        nhead: int = 4,
+        num_layers: int = 4,
+        max_seq_len: int = 128,
+    ):
+        super().__init__()
+        self.d_model = d_model
+
+        # Project (obs, action) pair into transformer dimension
+        self.input_proj = nn.Linear(obs_dim + action_dim, d_model)
+
+        # Learned positional encoding
+        self.pos_embedding = nn.Embedding(max_seq_len, d_model)
+
+        # Causal transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=4 * d_model,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers
+        )
+
+        # Output heads
+        self.obs_head = nn.Linear(d_model, obs_dim)
+        self.reward_head = nn.Linear(d_model, 1)
+
+    def forward(self, observations, actions):
+        """Predict next observations and rewards.
+
+        Args:
+            observations: (batch, time, obs_dim)
+            actions: (batch, time, action_dim)
+
+        Returns:
+            obs_preds: (batch, time, obs_dim) next-obs predictions
+            reward_preds: (batch, time, 1) reward predictions
+        """
+        batch, time = observations.shape[:2]
+        x = self.input_proj(torch.cat([observations, actions], dim=-1))
+        positions = torch.arange(time, device=x.device)
+        x = x + self.pos_embedding(positions)
+
+        # Causal mask: each position attends only to itself and earlier
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            time, device=x.device
+        )
+        x = self.transformer(x, mask=causal_mask)
+
+        obs_preds = self.obs_head(x)
+        reward_preds = self.reward_head(x)
+        return obs_preds, reward_preds</code></pre>
+<div class="code-caption">Listing 44.3: A transformer world model for low-dimensional state spaces. Causal masking ensures each prediction depends only on past and present, not the future. For image observations, replace the linear input projection with a VQ-VAE tokenizer.</div>
+
+<p>
+When should you choose a transformer world model over an RSSM? The empirical
+evidence (as of 2025) suggests that transformers achieve better sample efficiency,
+reaching equivalent performance with fewer environment interactions (100k vs. 400k
+in Atari benchmarks). However, RSSMs are faster at generation time because the GRU
+state update is $O(1)$ per step, while the transformer must attend to all previous
+steps. For planning applications where you roll out thousands of trajectories
+(Section 44.3), this difference matters.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: DreamerV3 with dreamer-pytorch</div>
+<p>
+The RSSM implementation above is pedagogical. For production use, the
+<a href="https://github.com/NM512/dreamer-torch" target="_blank">dreamer-pytorch</a>
+library provides a complete DreamerV3 implementation with image encoders (CNN),
+symlog predictions, layer normalization, and the full actor-critic training loop.
+What took 200+ lines above is a single configuration:
+</p>
+<pre><code class="language-python">from dreamer_torch import DreamerV3
+
+agent = DreamerV3(
+    obs_space={"image": (3, 64, 64)},
+    act_space={"action": 6},
+    config=DreamerV3.defaults.update(
+        rssm={"deter": 4096, "units": 1024, "stoch": 32, "classes": 32},
+        encoder={"mlp_keys": "", "cnn_keys": "image"},
+    ),
+)
+# agent.train(replay_buffer) handles ELBO optimization internally</code></pre>
+<p>
+The library handles categorical straight-through gradients, free-bits KL, symlog
+transforms for reward prediction, and distributed training. The line-count reduction
+from our from-scratch implementation is roughly 10x.
+</p>
+</div>
+
+<h2>5. RSSM vs. Transformer: Architectural Trade-offs</h2>
+
+<p>
+The choice between RSSM and transformer world models involves several trade-offs
+that depend on the specific discovery application:
+</p>
+
+<table>
+<thead>
+<tr><th>Property</th><th>RSSM (DreamerV3)</th><th>Transformer (IRIS/TWM)</th></tr>
+</thead>
+<tbody>
+<tr><td>State representation</td><td>Fixed-size $(h_t, s_t)$</td><td>Growing context window</td></tr>
+<tr><td>Long-range dependencies</td><td>Limited by GRU capacity</td><td>Attention captures directly</td></tr>
+<tr><td>Generation cost per step</td><td>$O(1)$</td><td>$O(t)$ due to attention</td></tr>
+<tr><td>Sample efficiency</td><td>Good (400k interactions)</td><td>Better (100k interactions)</td></tr>
+<tr><td>Stochasticity modeling</td><td>Explicit (prior/posterior)</td><td>Implicit (next-token prediction)</td></tr>
+<tr><td>Uncertainty quantification</td><td>Built-in via KL divergence</td><td>Requires ensembles or calibration</td></tr>
+<tr><td>Planning rollout speed</td><td>Fast (parallel GRU steps)</td><td>Slower (sequential attention)</td></tr>
+</tbody>
+</table>
+
+<p>
+For scientific discovery applications where uncertainty quantification matters (and
+it almost always does), the RSSM's explicit stochastic state provides a natural
+advantage. The prior-posterior divergence gives a built-in signal for epistemic
+uncertainty: when the prior and posterior disagree strongly, the model is uncertain
+about the dynamics. Transformers require additional machinery (ensembles, conformal
+prediction) to achieve comparable uncertainty estimates.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: State-Space World Models and Diamond</div>
+<p>
+The Diamond system (Alonso et al., 2024, "Diffusion for World Modeling," ICLR 2025)
+replaces the standard decoder with a diffusion model that generates high-fidelity
+observations conditioned on the latent state, achieving state-of-the-art visual
+quality in Atari game simulation while maintaining interactive frame rates. Meanwhile,
+hybrid architectures that swap the GRU in the RSSM sequence model for structured
+state-space layers (S4, Mamba) preserve constant-cost generation while capturing
+longer-range temporal patterns. These approaches are particularly promising for
+scientific applications where trajectories span thousands of steps (climate
+simulations, protein folding dynamics) and both long-range memory and calibrated
+uncertainty estimates are essential. The convergence of diffusion decoders and
+state-space backbones suggests that the next generation of world models will combine
+the RSSM's explicit uncertainty modeling with substantially richer observation
+generation.
+</p>
+</div>
+
+<h2>6. Training an RSSM: The Complete Loop</h2>
+
+<p>
+To train an RSSM world model, we need trajectories collected from the environment
+(or simulator). Each trajectory is a sequence of (observation, action, reward)
+tuples. The training loop alternates between collecting data using the current
+policy and updating the world model on batches sampled from a replay buffer.
+</p>
+
+<pre><code class="language-python">import gymnasium as gym
+import numpy as np
+from collections import deque
+
+
+def collect_trajectories(env, policy, num_episodes=10):
+    """Collect trajectories from a Gymnasium environment.
+
+    Args:
+        env: Gymnasium environment
+        policy: callable(obs) -> action
+        num_episodes: number of episodes to collect
+
+    Returns:
+        List of trajectory dicts with obs, actions, rewards arrays.
+    """
+    trajectories = []
+    for _ in range(num_episodes):
+        obs_list, act_list, rew_list = [], [], []
+        obs, _ = env.reset()
+        done = False
+        while not done:
+            action = policy(obs)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            obs_list.append(obs)
+            act_list.append(action)
+            rew_list.append(reward)
+            obs = next_obs
+            done = terminated or truncated
+        trajectories.append({
+            "observations": np.array(obs_list, dtype=np.float32),
+            "actions": np.array(act_list, dtype=np.float32),
+            "rewards": np.array(rew_list, dtype=np.float32),
+        })
+    return trajectories
+
+
+def train_world_model(
+    rssm,
+    trajectories,
+    num_epochs=100,
+    batch_size=16,
+    seq_len=50,
+    lr=3e-4,
+):
+    """Train RSSM on collected trajectories.
+
+    Args:
+        rssm: RSSM model
+        trajectories: list of trajectory dicts
+        num_epochs: training epochs
+        batch_size: batch size
+        seq_len: subsequence length for training
+        lr: learning rate
+
+    Returns:
+        List of loss dictionaries per epoch.
+    """
+    optimizer = torch.optim.Adam(rssm.parameters(), lr=lr)
+    history = []
+
+    for epoch in range(num_epochs):
+        epoch_losses = []
+
+        # Sample random subsequences from trajectories
+        for _ in range(max(1, len(trajectories) // batch_size)):
+            obs_batch, act_batch, rew_batch = [], [], []
+            for _ in range(batch_size):
+                traj = trajectories[np.random.randint(len(trajectories))]
+                max_start = len(traj["observations"]) - seq_len
+                if max_start <= 0:
+                    start = 0
+                    sl = len(traj["observations"])
+                else:
+                    start = np.random.randint(max_start)
+                    sl = seq_len
+                obs_batch.append(traj["observations"][start:start + sl])
+                act_batch.append(traj["actions"][start:start + sl])
+                rew_batch.append(traj["rewards"][start:start + sl])
+
+            # Pad to same length and convert to tensors
+            actual_len = min(len(o) for o in obs_batch)
+            obs_t = torch.tensor(
+                np.stack([o[:actual_len] for o in obs_batch])
+            )
+            act_t = torch.tensor(
+                np.stack([a[:actual_len] for a in act_batch])
+            )
+            rew_t = torch.tensor(
+                np.stack([r[:actual_len] for r in rew_batch])
+            ).unsqueeze(-1)
+
+            # Ensure actions are float and correct shape
+            if act_t.dim() == 2:
+                act_t = act_t.unsqueeze(-1).float()
+
+            # Forward pass
+            output = rssm.observe(obs_t, act_t)
+            loss, loss_dict = compute_elbo_loss(output, obs_t, rew_t)
+
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(rssm.parameters(), 100.0)
+            optimizer.step()
+
+            epoch_losses.append(loss_dict)
+
+        avg_loss = {
+            k: np.mean([d[k] for d in epoch_losses])
+            for k in epoch_losses[0]
+        }
+        history.append(avg_loss)
+
+        if (epoch + 1) % 20 == 0:
+            print(
+                f"Epoch {epoch+1}: total={avg_loss['total_loss']:.4f} "
+                f"obs={avg_loss['obs_loss']:.4f} "
+                f"kl={avg_loss['kl_loss']:.4f}"
+            )
+
+    return history</code></pre>
+<div class="code-caption">Listing 44.4: End-to-end RSSM training loop. Trajectories are collected from a Gymnasium environment using any policy (even random), sliced into fixed-length subsequences, and used to minimize the ELBO loss. Gradient clipping at norm 100 prevents training instability from long sequences.</div>
+
+<div class="callout common-pitfall">
+<div class="callout-title">Common Pitfall: Posterior Collapse in Gaussian Latent States</div>
+<p>
+If you use Gaussian distributions instead of categoricals for the stochastic state,
+you may observe the KL term collapsing to zero while the reconstruction loss
+plateaus at a high value. This means the model is ignoring the stochastic state
+entirely, routing all information through the deterministic GRU. The free-bits
+strategy helps but does not fully solve the problem. DreamerV3's switch to
+categorical distributions was motivated precisely by this failure mode: categorical
+KL is harder to collapse because each categorical dimension independently encodes
+discrete information. If you must use Gaussians (for compatibility with downstream
+tasks that need continuous latent codes), consider adding an information bottleneck
+on the deterministic state to force information through the stochastic channel.
+</p>
+</div>
+
+<h2>7. Connecting to the Discovery Workbench</h2>
+
+<p>
+In the Discovery Workbench architecture
+(<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>),
+the world model serves as a <strong>simulation backend</strong> that slots into the
+experiment planning pipeline. When the Workbench's optimization module (Chapter 45)
+or experiment designer (Chapter 46) needs to evaluate a candidate action sequence,
+it queries the world model rather than the real environment. The RSSM's
+<code>imagine()</code> method is the Workbench API for this: pass an initial state
+and a sequence of proposed actions, receive predicted observations and rewards.
+The Workbench tracks the model's prediction uncertainty (via prior-posterior KL
+divergence) and automatically triggers real experiments when the world model's
+confidence drops below a configurable threshold.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Train an RSSM on CartPole and Visualize Imagined Rollouts</h4>
+<p>
+Build a working latent dynamics model in under an hour using the code from this section
+and standard Python libraries (PyTorch, Gymnasium, Matplotlib).
+</p>
+<ol>
+<li><strong>Collect data.</strong> Install Gymnasium (<code>pip install gymnasium</code>)
+and use the <code>collect_trajectories</code> function from Listing 44.4 to gather 50
+episodes from <code>CartPole-v1</code> with a random policy
+(<code>lambda obs: env.action_space.sample()</code>). Save the trajectories to disk
+with <code>torch.save</code>.</li>
+<li><strong>Train the RSSM.</strong> Instantiate the RSSM from Listing 44.1 with
+<code>obs_dim=4</code> and <code>action_dim=1</code>. Train for 200 epochs using
+<code>train_world_model</code> from Listing 44.4. Plot the reconstruction loss and KL
+loss curves with Matplotlib to confirm both decrease.</li>
+<li><strong>Imagine forward.</strong> Pick a trajectory from your dataset. Encode the
+first 5 steps using <code>rssm.observe()</code> to obtain a starting latent state, then
+call <code>rssm.imagine()</code> with the ground-truth actions for the remaining steps.
+Compare the predicted observations against the real observations by plotting each of
+the 4 CartPole state dimensions (cart position, cart velocity, pole angle, pole angular
+velocity) over time.</li>
+<li><strong>Measure rollout divergence.</strong> Compute the mean squared error between
+imagined and real observations at horizons of 5, 10, 20, and 40 steps. Plot MSE vs.
+horizon. You should see error grow roughly linearly or faster, illustrating the
+compounding prediction challenge that motivates replanning (Section 44.3).</li>
+<li><strong>Ablate the stochastic state.</strong> Set <code>num_categoricals=1</code> and
+<code>num_classes=2</code> (minimal stochastic capacity) and retrain. Compare the
+horizon-vs-MSE curve against the full model. Does richer stochastic capacity improve
+long-horizon prediction on this simple environment?</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Explain why the RSSM needs both a prior and a posterior
+distribution over the stochastic state. What would go wrong if we trained only
+with the posterior and then tried to use the model for planning?
+</li>
+<li>
+<strong>(Coding)</strong> Modify the RSSM to use Gaussian stochastic states instead of
+categorical ones. Train both versions on CartPole trajectories and compare the KL
+divergence curves. Do you observe posterior collapse with the Gaussian version?
+</li>
+<li>
+<strong>(Analysis)</strong> The ELBO objective has a reconstruction term and a KL term.
+Plot how the balance between these two terms (controlled by $\beta$) affects
+one-step and five-step prediction accuracy. What value of $\beta$ gives the best
+five-step predictions? Is it the same as the value that gives the best one-step
+predictions?
+</li>
+<li>
+<strong>(Research)</strong> DreamerV3 uses 32 categorical dimensions with 32 classes each,
+giving a stochastic state space of size $32^{32} \approx 10^{48}$. Is this capacity
+necessary for simple environments like CartPole? Experiment with smaller stochastic
+states (e.g., 8 categoricals with 8 classes) and measure the effect on prediction
+quality.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have a trained world model that can predict what will happen given any
+sequence of actions. In <a href="section-44.2.html">Section 44.2: Counterfactual
+Reasoning with World Models</a>, we use this capability for a more subtle purpose:
+asking what <em>would have</em> happened if we had taken a different action in the
+past. This counterfactual reasoning ability transforms the world model from a mere
+predictor into a tool for causal understanding.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2301.04104" target="_blank">Hafner, D., Pasukonis, J., Ba, J., &amp; Lillicrap, T. (2023). Mastering diverse domains through world models. <em>arXiv preprint arXiv:2301.04104</em>.</a>
+<p>DreamerV3: the definitive RSSM architecture with categorical stochastic states, symlog predictions, and free-bits KL. The primary reference for this section.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1811.04551" target="_blank">Hafner, D., et al. (2019). Learning latent dynamics for planning from pixels. <em>ICML 2019</em>.</a>
+<p>The PlaNet paper that introduced the RSSM architecture and the latent overshooting objective.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1803.10122" target="_blank">Ha, D. &amp; Schmidhuber, J. (2018). World models. <em>arXiv preprint arXiv:1803.10122</em>.</a>
+<p>The paper that popularized the "world models" framing, combining a VAE encoder with an MDN-RNN dynamics model.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2209.00588" target="_blank">Micheli, V., Alonso, E., &amp; Fleuret, F. (2023). Transformers are sample-efficient world learners. <em>ICLR 2023</em>.</a>
+<p>IRIS: the first transformer world model competitive with RSSMs, demonstrating that attention-based dynamics can achieve human-level Atari with 100k interactions.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1312.6114" target="_blank">Kingma, D. P. &amp; Welling, M. (2014). Auto-encoding variational Bayes. <em>ICLR 2014</em>.</a>
+<p>The foundational VAE paper that introduced the ELBO objective and reparameterization trick, both essential to RSSM training.</p>
+</div>
+<div class="bib-card">
+<a href="https://gymnasium.farama.org/" target="_blank">Gymnasium (Farama Foundation)</a>
+<p>The standard RL environment interface used for data collection in this section.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&#8592; Chapter 44 Index</a>
+<a href="index.html">Chapter 44</a>
+<a href="section-44.2.html">44.2 Counterfactual Reasoning &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

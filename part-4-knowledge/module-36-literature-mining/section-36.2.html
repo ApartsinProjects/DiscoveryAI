@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.2: Knowledge Extraction from Papers. PDF parsing, named entity recognition, relation extraction, claim-evidence linking, and semantic search over scientific literature." name="description"/>
+<title>Section 36.2: Knowledge Extraction from Papers | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Literature Mining</a></div>
+<h1>36.2 Knowledge Extraction from Papers</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The PDF told me it contained text. It lied. What it contained was a raster image of text, rotated 2 degrees, with a watermark that said DRAFT in a font I have never seen before."</p>
+<cite>A PDF Parser With Abandonment Issues</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the citation network and API harvesting from
+<a href="section-36.1.html">Section 36.1</a>. You should be comfortable with basic NLP concepts
+(tokenization, word embeddings) from <a href="../../part-1-foundations/module-03-knowledge-representation/index.html">Chapter 3:
+Knowledge Representation</a>. Familiarity with transformer models from
+<a href="../../part-3-data-models/module-27-foundation-models/index.html">Chapter 27: Scientific Foundation Models</a>
+is helpful for the embedding and NER sections but not strictly required. We introduce each
+technique from its practical application rather than its theoretical foundation.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Citation networks tell us <em>who cites whom</em>, but the actual knowledge (hypotheses, methods,
+results, conclusions) is locked inside the text of papers. Knowledge extraction is the process of
+converting unstructured scientific prose into structured, queryable data. This section covers four
+stages of that pipeline: (1) parsing PDFs to extract clean text, tables, and figures; (2) identifying
+scientific entities (chemicals, genes, methods, datasets); (3) extracting relations and
+claim-evidence pairs; and (4) building semantic search so you can query by meaning rather than
+keywords. Together, these stages transform a pile of PDFs into a searchable knowledge base.
+</p>
+</div>
+
+<h2>1. The PDF Parsing Challenge</h2>
+
+<p>
+Scientific papers are overwhelmingly distributed as PDFs, a format designed for visual rendering,
+not information extraction. A PDF is a collection of positioned glyphs, not a structured document.
+Text that appears as a paragraph to a human reader may be stored as hundreds of individually
+positioned characters with no explicit word boundaries, line breaks, or paragraph structure.
+Tables are especially treacherous: the visual alignment that makes them readable to humans is
+produced by absolute character positioning, with no underlying tabular data model.
+</p>
+
+<p data-agent="02">
+Knowledge extraction, in this context, is the automated process of converting the unstructured prose, tables, and figures inside scientific PDFs into structured, machine-readable records (entities, relations, claims, and vector embeddings) that software can query, aggregate, and reason over. It matters because the volume of scientific literature (over 2 million papers per year indexed by Scopus alone) makes manual reading impossible at scale, while the knowledge locked in those papers is essential for systematic reviews, drug repurposing, and research gap analysis. The core mechanism chains four stages: a PDF parser recovers raw text and layout, an NER model tags domain-specific entities, a relation classifier links entity pairs into typed triples, and a sentence encoder projects text into a vector space for semantic retrieval. Use this extraction pipeline when you need to build a queryable knowledge base from a corpus of papers; for single-paper reading, a large language model prompted with the raw text is simpler and sufficient.
+</p>
+
+<p>
+Two complementary tools address this challenge. <strong>PyMuPDF</strong> (also known by its import
+name <code>fitz</code>) provides fast, low-level PDF text extraction with layout analysis. It
+handles most single-column and two-column layouts well and extracts text in reading order.
+<strong>Docling</strong>, developed by IBM Research, adds AI-powered document understanding:
+it detects section boundaries, extracts tables into structured formats, identifies figures and
+captions, and outputs clean Markdown or JSON.
+</p>
+
+<pre><code class="language-python">import fitz  # PyMuPDF
+
+
+def extract_text_pymupdf(pdf_path: str) -> dict:
+    """Extract structured text from a PDF using PyMuPDF.
+
+    Returns a dict with full text, per-page text, and metadata.
+    """
+    doc = fitz.open(pdf_path)
+    result = {
+        "metadata": doc.metadata,
+        "num_pages": len(doc),
+        "pages": [],
+        "full_text": "",
+    }
+
+    full_text_parts = []
+    for page_num, page in enumerate(doc):
+        # Extract text blocks with position info
+        blocks = page.get_text("dict")["blocks"]
+
+        page_text = ""
+        for block in blocks:
+            if block["type"] == 0:  # Text block
+                for line in block["lines"]:
+                    line_text = " ".join(
+                        span["text"] for span in line["spans"]
+                    )
+                    page_text += line_text + "\n"
+
+        result["pages"].append({
+            "page_num": page_num + 1,
+            "text": page_text.strip(),
+            "width": page.rect.width,
+            "height": page.rect.height,
+        })
+        full_text_parts.append(page_text)
+
+    result["full_text"] = "\n\n".join(full_text_parts)
+    doc.close()
+    return result
+
+
+# Extract text from a paper
+paper_data = extract_text_pymupdf("attention_is_all_you_need.pdf")
+print(f"Extracted {len(paper_data['full_text'])} chars from "
+      f"{paper_data['num_pages']} pages")
+</code></pre>
+<div class="code-caption">Listing 36.8: Basic PDF text extraction with PyMuPDF, preserving page boundaries and reading order from the text block layout.</div>
+
+<p>
+PyMuPDF handles straightforward layouts, but scientific papers often contain multi-column text,
+embedded equations, complex tables, and figures with captions. For these cases, Docling provides
+deeper document understanding.
+</p>
+
+<pre><code class="language-python">from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+
+
+def extract_with_docling(pdf_path: str) -> dict:
+    """Extract structured content from a PDF using Docling.
+
+    Returns sections, tables, and figure captions as structured data.
+    """
+    # Configure the pipeline for scientific papers
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_table_structure = True
+    pipeline_options.do_ocr = False  # Enable if scanned PDFs
+
+    converter = DocumentConverter(
+        allowed_formats=[InputFormat.PDF],
+        format_options={InputFormat.PDF: pipeline_options},
+    )
+    result = converter.convert(pdf_path)
+    doc = result.document
+
+    # Extract structured sections
+    sections = []
+    for item in doc.iterate_items():
+        if hasattr(item, "label") and hasattr(item, "text"):
+            sections.append({
+                "label": item.label,
+                "text": item.text,
+                "level": getattr(item, "level", None),
+            })
+
+    # Extract tables as structured data
+    tables = []
+    for table in doc.tables:
+        table_data = table.export_to_dataframe()
+        tables.append({
+            "caption": getattr(table, "caption", ""),
+            "dataframe": table_data,
+            "num_rows": len(table_data),
+            "num_cols": len(table_data.columns),
+        })
+
+    # Get the full document as clean Markdown
+    markdown_text = doc.export_to_markdown()
+
+    return {
+        "sections": sections,
+        "tables": tables,
+        "markdown": markdown_text,
+        "num_sections": len(sections),
+        "num_tables": len(tables),
+    }
+
+
+doc_data = extract_with_docling("attention_is_all_you_need.pdf")
+print(f"Found {doc_data['num_sections']} sections, {doc_data['num_tables']} tables")
+</code></pre>
+<div class="code-caption">Listing 36.9: Deep PDF parsing with Docling, extracting section structure, tables as DataFrames, and clean Markdown output from a scientific paper.</div>
+
+<div class="callout warning">
+<div class="callout-title">Warning: PDF Parsing Is Never Perfect</div>
+<p>
+Even the best PDF parsers fail on some documents. Common failure modes include: scanned papers
+without OCR (PyMuPDF extracts nothing; enable Docling's OCR pipeline), papers with embedded
+fonts that use custom character encodings (text appears as gibberish), two-column layouts where
+text from adjacent columns gets interleaved, and equations that render as images rather than
+Unicode characters. Always validate extraction quality on a sample before processing a full
+corpus. A useful heuristic: if the extracted text contains more than 5% non-ASCII non-Latin
+characters in an English paper, the extraction has likely failed on some pages.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Docling Replaces a Whole Pipeline</div>
+<p>
+Before Docling, extracting structured content from scientific PDFs required chaining multiple
+tools: PyMuPDF for text, Camelot or Tabula for tables, a separate model for figure detection,
+and custom heuristics for section boundary detection. Docling replaces this entire chain with
+a single <code>converter.convert(pdf_path)</code> call (1 line vs. 50+ lines of multi-tool
+orchestration). It handles table structure recognition, section segmentation, and Markdown
+export internally using deep learning models trained on scientific documents. For production
+literature mining, Docling is the recommended starting point; fall back to PyMuPDF only for
+speed-critical pipelines that process tens of thousands of PDFs where Docling's model inference
+cost becomes prohibitive.
+</p>
+</div>
+
+<h2>2. Named Entity Recognition for Scientific Text</h2>
+
+<p>
+Once we have clean text, the next step is identifying the scientific entities it mentions:
+chemical compounds, gene names, protein structures, datasets, methods, metrics, and institutions.
+General-purpose NER models (trained on news text) perform poorly on scientific language because
+scientific entities follow different naming conventions ("CRISPR-Cas9" is not a person, "ImageNet"
+is not a place, "attention mechanism" is not a psychological concept).
+</p>
+
+<p>
+Domain-specific NER models, fine-tuned on scientific corpora, dramatically improve extraction
+quality. The Hugging Face model hub provides several options: <code>allenai/scibert_scivocab_uncased</code>
+for general scientific text, <code>dmis-lab/biobert-v1.1</code> for biomedical entities, and
+specialized models for chemistry (<code>jean-baptiste/camembert-ner</code>), materials science,
+and other domains.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+from transformers import pipeline
+
+
+@dataclass
+class ScientificEntity:
+    """A named entity extracted from scientific text."""
+    text: str
+    label: str          # CHEMICAL, METHOD, DATASET, METRIC, etc.
+    start: int          # Character offset in source text
+    end: int
+    confidence: float
+    source_section: str  # Which section it was found in
+
+
+class ScientificNER:
+    """Named entity recognition tuned for scientific papers."""
+
+    # Map model labels to our unified schema
+    LABEL_MAP = {
+        "MISC": "METHOD",
+        "ORG": "INSTITUTION",
+        "PER": "RESEARCHER",
+    }
+
+    def __init__(self, model_name: str = "allenai/scibert_scivocab_uncased"):
+        self.ner_pipeline = pipeline(
+            "ner",
+            model=model_name,
+            aggregation_strategy="simple",
+            device=-1,  # CPU; use 0 for GPU
+        )
+
+    def extract_entities(
+        self, text: str, section_name: str = "body"
+    ) -> list[ScientificEntity]:
+        """Extract scientific entities from a text passage."""
+        # Process in chunks to handle long texts
+        chunk_size = 512
+        entities = []
+
+        for start_idx in range(0, len(text), chunk_size - 50):
+            chunk = text[start_idx:start_idx + chunk_size]
+            raw_entities = self.ner_pipeline(chunk)
+
+            for ent in raw_entities:
+                label = self.LABEL_MAP.get(ent["entity_group"],
+                                            ent["entity_group"])
+                entities.append(ScientificEntity(
+                    text=ent["word"],
+                    label=label,
+                    start=start_idx + ent["start"],
+                    end=start_idx + ent["end"],
+                    confidence=ent["score"],
+                    source_section=section_name,
+                ))
+
+        # Deduplicate overlapping entities (keep highest confidence)
+        return self._deduplicate(entities)
+
+    def _deduplicate(
+        self, entities: list[ScientificEntity]
+    ) -> list[ScientificEntity]:
+        """Remove overlapping entities, keeping highest confidence."""
+        if not entities:
+            return []
+
+        sorted_ents = sorted(entities, key=lambda e: (-e.confidence, e.start))
+        kept = []
+        occupied = set()
+
+        for ent in sorted_ents:
+            positions = set(range(ent.start, ent.end))
+            if not positions & occupied:
+                kept.append(ent)
+                occupied |= positions
+
+        return sorted(kept, key=lambda e: e.start)
+
+
+# Extract entities from a paper's abstract
+ner = ScientificNER()
+abstract = """We propose a novel attention mechanism for transformer models
+that reduces computational complexity from O(n^2) to O(n log n). Experiments
+on the ImageNet and COCO benchmarks show that our method, FlashAttention-2,
+achieves comparable accuracy to standard attention while using 3x less memory.
+We evaluate using top-1 accuracy and mean Average Precision (mAP)."""
+
+entities = ner.extract_entities(abstract, section_name="abstract")
+for e in entities:
+    print(f"  [{e.label}] '{e.text}' (conf={e.confidence:.2f})")
+</code></pre>
+<div class="code-caption">Listing 36.10: Scientific named entity recognition using a SciBERT-based NER pipeline with chunked processing for long documents and overlap-aware deduplication.</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often assume that a high-accuracy NER model trained on one scientific domain (for example, biomedical text) will transfer well to another domain (for example, materials science or astrophysics). This is incorrect: scientific NER performance drops sharply across domains because entity naming conventions, abbreviation patterns, and contextual cues differ fundamentally between fields. A BioNER model will recognize "BRCA1" as a gene but may tag the materials-science term "MoS2" as gibberish or ignore it entirely. Always evaluate NER on a small annotated sample from your specific target domain before trusting its output at scale.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Entity Recognition Is Domain-Dependent</div>
+<p>
+The word "transformer" means a neural architecture in NLP, an electrical component in
+engineering, and a type of toy in popular culture. A gene named "BRCA1" looks like an
+abbreviation to a general NER model but is a critical entity in biomedical text. Scientific
+NER requires domain-specific models because the entity boundaries, types, and naming
+conventions differ fundamentally from the news corpora that general models are trained on.
+When starting a literature mining project, always evaluate NER quality on 50 to 100 manually
+annotated sentences from your target domain before processing the full corpus.
+</p>
+</div>
+
+<h2>3. Relation Extraction and Claim-Evidence Linking</h2>
+
+<p>
+Entities in isolation are useful for indexing, but the real knowledge in papers lies in the
+<em>relations</em> between entities. "Drug X inhibits protein Y" is a relation. "Method A
+outperforms baseline B on benchmark C" is a comparative claim with evidence. Extracting these
+structured triples from free text turns papers into queryable knowledge.
+</p>
+
+<p>
+We model relation extraction as a sequence classification task. Given a sentence containing
+two identified entities, we classify the relation between them from a predefined schema:
+<code>INHIBITS</code>, <code>ACTIVATES</code>, <code>OUTPERFORMS</code>,
+<code>USES_METHOD</code>, <code>EVALUATED_ON</code>, and so forth. For scientific text, the
+most practically useful relations fall into three categories.
+</p>
+
+<p>
+<strong>Method-result relations</strong> connect methods to their outcomes: "BERT achieves 93.2%
+F1 on SQuAD." <strong>Causal relations</strong> connect causes to effects: "Increasing the
+learning rate beyond 0.01 causes training divergence." <strong>Comparative relations</strong>
+connect methods to baselines: "Our approach outperforms GPT-3 by 4.2 points on MMLU."
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+
+
+@dataclass
+class Relation:
+    """A directed relation between two scientific entities."""
+    head: str         # Subject entity
+    tail: str         # Object entity
+    relation: str     # Relation type
+    confidence: float
+    evidence: str     # Source sentence
+
+
+@dataclass
+class ClaimEvidence:
+    """A scientific claim linked to its supporting evidence."""
+    claim: str
+    evidence_sentences: list[str]
+    claim_type: str   # "result", "method", "hypothesis", "limitation"
+    strength: str     # "strong", "moderate", "weak"
+
+
+class RelationExtractor:
+    """Extract typed relations between scientific entities."""
+
+    RELATION_TYPES = [
+        "OUTPERFORMS", "USES_METHOD", "EVALUATED_ON", "INHIBITS",
+        "ACTIVATES", "CAUSES", "CORRELATES_WITH", "COMPOSED_OF",
+        "APPLIED_TO", "NO_RELATION",
+    ]
+
+    def __init__(self):
+        # Use a general-purpose NLI model for zero-shot relation classification
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "cross-encoder/nli-deberta-v3-small"
+        )
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            "cross-encoder/nli-deberta-v3-small"
+        )
+        self.model.eval()
+
+    def extract_relations(
+        self, sentence: str, entity_pairs: list[tuple[str, str]]
+    ) -> list[Relation]:
+        """Classify the relation between each entity pair in a sentence."""
+        relations = []
+
+        for head, tail in entity_pairs:
+            best_relation = None
+            best_score = 0.0
+
+            for rel_type in self.RELATION_TYPES:
+                # Frame as NLI: "head [relation] tail"
+                hypothesis = self._relation_to_hypothesis(head, tail, rel_type)
+                inputs = self.tokenizer(
+                    sentence, hypothesis, return_tensors="pt",
+                    truncation=True, max_length=256
+                )
+                with torch.no_grad():
+                    logits = self.model(**inputs).logits
+                    probs = torch.softmax(logits, dim=-1)
+                    # NLI: [contradiction, neutral, entailment]
+                    entailment_score = probs[0, 2].item()
+
+                if entailment_score > best_score:
+                    best_score = entailment_score
+                    best_relation = rel_type
+
+            if best_relation != "NO_RELATION" and best_score > 0.5:
+                relations.append(Relation(
+                    head=head, tail=tail, relation=best_relation,
+                    confidence=best_score, evidence=sentence,
+                ))
+
+        return relations
+
+    @staticmethod
+    def _relation_to_hypothesis(head: str, tail: str, rel_type: str) -> str:
+        """Convert a relation type to a natural language hypothesis for NLI."""
+        templates = {
+            "OUTPERFORMS": f"{head} outperforms {tail}",
+            "USES_METHOD": f"{head} uses the method {tail}",
+            "EVALUATED_ON": f"{head} is evaluated on {tail}",
+            "INHIBITS": f"{head} inhibits {tail}",
+            "ACTIVATES": f"{head} activates {tail}",
+            "CAUSES": f"{head} causes {tail}",
+            "CORRELATES_WITH": f"{head} correlates with {tail}",
+            "COMPOSED_OF": f"{head} is composed of {tail}",
+            "APPLIED_TO": f"{head} is applied to {tail}",
+            "NO_RELATION": f"{head} is unrelated to {tail}",
+        }
+        return templates.get(rel_type, f"{head} is related to {tail}")
+
+
+# Extract relations from a results sentence
+extractor = RelationExtractor()
+sentence = "FlashAttention-2 achieves 82.1% top-1 accuracy on ImageNet, " \
+           "outperforming standard attention by 0.3 points."
+pairs = [("FlashAttention-2", "ImageNet"), ("FlashAttention-2", "standard attention")]
+relations = extractor.extract_relations(sentence, pairs)
+for r in relations:
+    print(f"  {r.head} --[{r.relation}]--> {r.tail} (conf={r.confidence:.2f})")
+</code></pre>
+<div class="code-caption">Listing 36.11: Zero-shot relation extraction using natural language inference (NLI), framing each candidate relation as a hypothesis and measuring the entailment score against the source sentence.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of NLI-based relation extraction like a courtroom fact-checker with a stack of candidate statements. The source sentence is a witness's testimony ("Drug X reduced tumor growth in mice"). The fact-checker holds up one candidate statement at a time ("Drug X inhibits tumor growth," "Drug X activates tumor growth," "Drug X is unrelated to tumor growth") and asks: "Does the testimony support this statement?" The entailment score is the fact-checker's confidence that the testimony backs each candidate. Just as the fact-checker never invents claims but only scores pre-written ones against testimony, the NLI model never generates relations from scratch; it scores each hypothesis from your predefined schema against the evidence in the sentence, and the highest-scoring hypothesis wins.
+</p>
+</div>
+
+<h3>3.1 Claim-Evidence Extraction</h3>
+
+<p>
+Beyond individual relations, we often want to extract complete <strong>claims</strong> and link
+them to their <strong>evidence</strong>. A claim is an assertion made by the authors ("Our
+method reduces training time by 40%"), and evidence is the supporting material (experimental
+results, ablation studies, statistical tests, citations to prior work).
+</p>
+
+<p>
+We use a simple but effective heuristic pipeline. First, classify each sentence by its
+rhetorical role (background, method, result, conclusion) using a fine-tuned classifier. Then,
+identify result sentences as claims and link them to nearby method and data sentences as evidence.
+</p>
+
+<pre><code class="language-python">import re
+
+
+CLAIM_PATTERNS = [
+    r"(?:we|our method|our approach|the proposed)\s+(?:achieve|obtain|reach|show|demonstrate)",
+    r"(?:outperform|surpass|exceed|improve)\s+(?:over|upon|compared)",
+    r"(?:result|finding|experiment)\s+(?:show|demonstrate|indicate|suggest|confirm)",
+    r"\b\d+\.?\d*\s*%\b",  # Percentage (often signals a quantitative claim)
+    r"(?:significant|substantial|considerable)\s+(?:improvement|increase|decrease|reduction)",
+    r"(?:state[\s-]of[\s-]the[\s-]art|SOTA|best[\s-]known)",
+]
+
+EVIDENCE_PATTERNS = [
+    r"(?:table|figure|fig\.?|tab\.?)\s+\d+",
+    r"(?:p\s*[<>=]\s*0\.\d+)",  # p-values
+    r"(?:confidence interval|CI|standard deviation|std|stderr)",
+    r"(?:ablation|baseline|control|comparison)",
+    r"(?:dataset|benchmark|corpus|test set|validation set)",
+]
+
+
+def extract_claims_and_evidence(
+    sentences: list[str], context_window: int = 3
+) -> list[ClaimEvidence]:
+    """Extract claims and link them to nearby evidence sentences."""
+    claims = []
+    claim_pattern = re.compile("|".join(CLAIM_PATTERNS), re.IGNORECASE)
+    evidence_pattern = re.compile("|".join(EVIDENCE_PATTERNS), re.IGNORECASE)
+
+    for i, sent in enumerate(sentences):
+        if not claim_pattern.search(sent):
+            continue
+
+        # Determine claim type from content
+        claim_type = _classify_claim(sent)
+
+        # Gather evidence from nearby sentences
+        evidence = []
+        for j in range(max(0, i - context_window),
+                       min(len(sentences), i + context_window + 1)):
+            if j != i and evidence_pattern.search(sentences[j]):
+                evidence.append(sentences[j])
+
+        # Assess evidence strength
+        strength = "strong" if len(evidence) >= 2 else \
+                   "moderate" if len(evidence) == 1 else "weak"
+
+        claims.append(ClaimEvidence(
+            claim=sent,
+            evidence_sentences=evidence,
+            claim_type=claim_type,
+            strength=strength,
+        ))
+
+    return claims
+
+
+def _classify_claim(sentence: str) -> str:
+    """Classify a claim sentence by type using keyword heuristics."""
+    s = sentence.lower()
+    if any(w in s for w in ["achieve", "accuracy", "f1", "performance", "score"]):
+        return "result"
+    if any(w in s for w in ["propose", "introduce", "present", "novel"]):
+        return "method"
+    if any(w in s for w in ["hypothesize", "conjecture", "expect", "predict"]):
+        return "hypothesis"
+    if any(w in s for w in ["limitation", "caveat", "however", "fail"]):
+        return "limitation"
+    return "result"
+
+
+# Example usage
+sentences = [
+    "We evaluate our model on three standard benchmarks.",
+    "Table 2 shows the full results across all datasets.",
+    "Our method achieves 94.2% accuracy on GLUE, outperforming BERT-large by 1.8 points.",
+    "This improvement is statistically significant (p < 0.001).",
+    "The ablation study in Table 3 confirms that each component contributes to performance.",
+]
+
+claims = extract_claims_and_evidence(sentences)
+for c in claims:
+    print(f"  CLAIM [{c.claim_type}, {c.strength}]: {c.claim[:80]}")
+    for ev in c.evidence_sentences:
+        print(f"    EVIDENCE: {ev[:70]}")
+</code></pre>
+<div class="code-caption">Listing 36.12: Claim-evidence extraction using regex-based rhetorical role classification and proximity-based evidence linking within a configurable context window.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Mining Drug Interaction Claims</div>
+<p>
+A pharmacology research group used claim-evidence extraction on 2,000 papers about drug
+interactions. The regex-based approach found 8,400 candidate claims, of which manual review
+confirmed 6,200 (74% precision). The most common pattern was "Drug X inhibits/activates
+enzyme Y," appearing in 3,100 claims. Linking each claim to its evidence revealed that 23%
+of claims cited only in-vitro studies, 41% cited clinical trials, and 12% cited only
+computational predictions. This evidence-strength stratification let the team prioritize
+which interactions had robust clinical support versus those needing further validation. The
+structured output fed directly into the knowledge graph construction described in
+<a href="../module-38-knowledge-graphs/index.html">Chapter 38</a>.
+</p>
+</div>
+
+<h2>4. Semantic Search over Paper Collections</h2>
+
+<p>
+Keyword search fails for scientific literature because the same concept appears under many names
+("deep learning," "neural network," "connectionist model"), and semantically similar papers may
+share few keywords. Semantic search solves this by embedding papers into a continuous vector space
+where similarity reflects meaning rather than lexical overlap.
+</p>
+
+<p>
+The pipeline has three stages: (1) encode each paper's abstract (or full text) into a dense
+vector using a sentence transformer; (2) index the vectors for fast approximate nearest-neighbor
+retrieval; (3) at query time, encode the query with the same model and retrieve the closest
+vectors.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from sentence_transformers import SentenceTransformer
+from dataclasses import dataclass
+
+
+@dataclass
+class SearchResult:
+    """A paper returned by semantic search."""
+    paper_id: str
+    title: str
+    abstract: str
+    score: float
+    year: int | None
+
+
+class PaperSearchIndex:
+    """Semantic search over paper abstracts using sentence embeddings."""
+
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.model = SentenceTransformer(model_name)
+        self.embeddings: np.ndarray | None = None
+        self.papers: list[Paper] = []
+
+    def build_index(self, papers: list[Paper]):
+        """Encode all paper abstracts and build the search index."""
+        self.papers = [p for p in papers if p.abstract]
+        abstracts = [p.abstract for p in self.papers]
+
+        print(f"Encoding {len(abstracts)} abstracts...")
+        self.embeddings = self.model.encode(
+            abstracts,
+            show_progress_bar=True,
+            normalize_embeddings=True,  # For cosine similarity via dot product
+            batch_size=64,
+        )
+        print(f"Index built: {self.embeddings.shape}")
+
+    def search(self, query: str, top_k: int = 10) -> list[SearchResult]:
+        """Find papers most semantically similar to a natural language query."""
+        if self.embeddings is None:
+            raise ValueError("Call build_index() first")
+
+        # Encode the query
+        query_vec = self.model.encode(
+            [query], normalize_embeddings=True
+        )[0]
+
+        # Cosine similarity via dot product (vectors are normalized)
+        scores = self.embeddings @ query_vec
+
+        # Get top-k indices
+        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        results = []
+        for idx in top_indices:
+            paper = self.papers[idx]
+            results.append(SearchResult(
+                paper_id=paper.openalex_id,
+                title=paper.title,
+                abstract=paper.abstract[:200] + "..." if paper.abstract else "",
+                score=float(scores[idx]),
+                year=paper.year,
+            ))
+
+        return results
+
+
+# Build index and search
+search_index = PaperSearchIndex()
+search_index.build_index(papers)
+
+results = search_index.search("methods for accelerating transformer inference")
+for r in results[:5]:
+    print(f"  [{r.score:.3f}] ({r.year}) {r.title[:70]}")
+</code></pre>
+<div class="code-caption">Listing 36.13: Semantic search over paper abstracts using Sentence Transformers with normalized embeddings for efficient cosine similarity via dot product.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Embedding Quality Determines Search Quality</div>
+<p>
+The choice of embedding model matters enormously. General-purpose sentence transformers
+(like <code>all-MiniLM-L6-v2</code>) handle broad queries well but miss domain-specific nuances.
+For biomedical literature, <code>pritamdeka/S-PubMedBert-MS-MARCO</code> produces better
+embeddings because it was trained on PubMed abstracts. For computer science papers, the
+SPECTER2 embeddings available directly through the Semantic Scholar API are hard to beat
+because they were trained specifically on scientific paper similarity. When starting a new
+literature mining project, encode 100 abstracts with two or three candidate models and
+manually evaluate search quality before committing to a model for the full corpus.
+</p>
+</div>
+
+<h2>5. Scaling to Full-Text Extraction</h2>
+
+<p>
+Abstracts capture a paper's main claims and results, but the methods section, supplementary
+materials, and figure captions contain critical details that abstracts omit. Full-text extraction
+combines the PDF parsing from subsection 1 with the NER and relation extraction from subsections
+2 and 3 into an integrated pipeline.
+</p>
+
+<pre><code class="language-python">@dataclass
+class ExtractedPaperKnowledge:
+    """Complete structured knowledge extracted from a single paper."""
+    paper_id: str
+    title: str
+    sections: list[dict]         # Section name and text
+    entities: list[ScientificEntity]
+    relations: list[Relation]
+    claims: list[ClaimEvidence]
+    embedding: np.ndarray | None  # Abstract embedding for search
+
+
+def extract_knowledge_from_pdf(
+    pdf_path: str,
+    paper_id: str,
+    ner_model: ScientificNER,
+    relation_extractor: RelationExtractor,
+    embedding_model: SentenceTransformer,
+) -> ExtractedPaperKnowledge:
+    """Full knowledge extraction pipeline for a single PDF."""
+    # Stage 1: Parse PDF
+    doc_data = extract_with_docling(pdf_path)
+
+    # Stage 2: Extract entities per section
+    all_entities = []
+    for section in doc_data["sections"]:
+        section_entities = ner_model.extract_entities(
+            section["text"], section_name=section["label"]
+        )
+        all_entities.extend(section_entities)
+
+    # Stage 3: Extract relations from entity pairs
+    all_relations = []
+    for section in doc_data["sections"]:
+        sentences = _split_sentences(section["text"])
+        section_entities = [
+            e for e in all_entities if e.source_section == section["label"]
+        ]
+        # Create entity pairs within each sentence
+        for sent in sentences:
+            entities_in_sent = [
+                e for e in section_entities
+                if e.text.lower() in sent.lower()
+            ]
+            if len(entities_in_sent) >= 2:
+                pairs = [
+                    (e1.text, e2.text)
+                    for e1 in entities_in_sent
+                    for e2 in entities_in_sent
+                    if e1 != e2
+                ]
+                rels = relation_extractor.extract_relations(sent, pairs[:10])
+                all_relations.extend(rels)
+
+    # Stage 4: Extract claims and evidence
+    all_sentences = []
+    for section in doc_data["sections"]:
+        all_sentences.extend(_split_sentences(section["text"]))
+    claims = extract_claims_and_evidence(all_sentences)
+
+    # Stage 5: Compute abstract embedding
+    abstract_text = next(
+        (s["text"] for s in doc_data["sections"]
+         if "abstract" in s["label"].lower()),
+        doc_data["sections"][0]["text"] if doc_data["sections"] else ""
+    )
+    embedding = embedding_model.encode([abstract_text], normalize_embeddings=True)[0]
+
+    return ExtractedPaperKnowledge(
+        paper_id=paper_id,
+        title=doc_data["sections"][0]["text"] if doc_data["sections"] else "",
+        sections=doc_data["sections"],
+        entities=all_entities,
+        relations=all_relations,
+        claims=claims,
+        embedding=embedding,
+    )
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Simple sentence splitter for scientific text."""
+    # Handle common abbreviations that contain periods
+    text = re.sub(r'\b(Fig|Tab|Eq|Ref|et al|vs|Dr|Prof)\.',
+                  r'\1<PERIOD>', text)
+    sentences = re.split(r'[.!?]+\s+', text)
+    return [s.replace('<PERIOD>', '.').strip() for s in sentences if len(s) > 20]
+</code></pre>
+<div class="code-caption">Listing 36.14: Integrated knowledge extraction pipeline combining Docling PDF parsing, SciBERT NER, NLI-based relation extraction, claim-evidence linking, and abstract embedding in a single pass per paper.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+In 2024, the Allen Institute for AI released <strong>Papermage</strong>, a unified framework that treats each PDF page as a layered document where text, figures, tables, and metadata coexist as first-class "Entity" objects with spatial coordinates and reading-order relationships (Lo et al., "Papermage: A Unified Toolkit for Processing, Representing, and Manipulating Visually-Rich Scientific Documents," ACL 2024). Unlike pipeline approaches that hand off between separate PDF, table, and figure tools, Papermage maintains a single in-memory document representation that supports cross-layer queries: for example, "find every sentence that overlaps spatially with Table 2" or "retrieve the caption closest to Figure 5." This cross-layer linking enables extraction tasks that are cumbersome with sequential pipelines, such as automatically associating quantitative claims in the text with the specific table cells they reference. The library is open-source and integrates directly with Hugging Face models for downstream NER and relation extraction.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: GROBID for High-Throughput Extraction</div>
+<p>
+For large-scale literature mining (10,000+ papers), the Java-based
+<a href="https://github.com/kermitt2/grobid">GROBID</a> tool provides industrial-strength
+PDF parsing with header extraction, reference parsing, and TEI-XML output. A single GROBID
+server can process 10 PDFs per second, compared to Docling's roughly 1 PDF per second with
+deep learning models enabled. GROBID's <code>processFulltextDocument</code> endpoint (1 HTTP
+call per paper) replaces the entire PDF parsing and section segmentation stages above (about
+30 lines). The trade-off is that GROBID requires running a Java server, whereas PyMuPDF and
+Docling are pure Python.
+</p>
+</div>
+
+<h2>6. Putting It Together: From PDFs to Queryable Knowledge</h2>
+
+<p>
+The extraction stages above produce a rich, structured representation of each paper: entities,
+relations, claims with evidence, and embeddings for semantic search. This structured output is
+the input to three downstream systems covered in later chapters: the
+<a href="../module-37-rag-discovery/index.html">retrieval-augmented generation</a> system of
+Chapter 37 (which uses the embeddings and extracted text for question answering), the
+<a href="../module-38-knowledge-graphs/index.html">knowledge graph</a> of Chapter 38 (which
+imports the entities and relations as graph nodes and edges), and the
+<a href="../module-41-claim-validation/index.html">claim validation</a> pipeline of Chapter 41
+(which uses the claim-evidence pairs to assess the strength of scientific assertions).
+</p>
+
+<p>
+The key architectural decision is how to store the extracted knowledge. For moderate-scale
+projects (under 10,000 papers), a combination of a JSON lines file for structured data and a
+numpy array for embeddings works well. For larger corpora, a vector database
+(Qdrant, Weaviate, or ChromaDB) provides both semantic search and metadata filtering. We
+explore this architecture in detail in <a href="section-36.3.html">Section 36.3</a>, where
+we build a complete 500+ paper literature mining pipeline.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Extract and Search a Mini Paper Corpus</h4>
+<p>
+Build a working knowledge extraction and semantic search pipeline over 10 open-access papers from arXiv.
+(1) Pick a narrow topic (for example, "graph neural networks for drug discovery") and download 10 PDFs from arXiv using the <code>arxiv</code> Python package (<code>pip install arxiv</code>), saving them to a local folder.
+(2) Extract text from each PDF using PyMuPDF (<code>pip install pymupdf</code>): loop over the files, call <code>fitz.open()</code>, and concatenate the page text into one string per paper.
+(3) Run the claim extraction function from Listing 36.12 on each paper's extracted text. Split text into sentences with a simple regex splitter, then call <code>extract_claims_and_evidence()</code> and collect the results into a list of dicts with fields for paper filename, claim text, evidence, and strength.
+(4) Encode each paper's first 500 characters (a proxy for the abstract) into a dense vector using <code>sentence-transformers</code> (<code>pip install sentence-transformers</code>) with the <code>all-MiniLM-L6-v2</code> model, and stack the vectors into a NumPy array.
+(5) Implement a search function: encode a free-text query with the same model, compute cosine similarity against all paper vectors via a dot product (the vectors are already normalized), and print the top 3 matches with their similarity scores and strongest claim. Test with two or three queries to verify that results are topically relevant.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+We now have all the components: citation network analysis from
+<a href="section-36.1.html">Section 36.1</a> and knowledge extraction from this section.
+<a href="section-36.3.html">Section 36.3: Building a Literature Miner</a> assembles these
+into a production pipeline that harvests 500+ papers on any topic, clusters them into topical
+communities, extracts structured knowledge, and identifies research gaps. The recipe is designed
+to be reusable: give it a topic and an email address, and it builds a complete research landscape
+map.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="section-36.1.html">&larr; 36.1 Citation Analysis and Bibliometrics</a>
+<a href="section-36.3.html">36.3 Building a Literature Miner &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 44.3: Building a World Model Planner. RSSM training on Gymnasium trajectories, Cross-Entropy Method planning with 5-step rollouts, and compound error diagnosis." name="description"/>
+<title>Section 44.3: Building a World Model Planner | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation and Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 44: World Models for Discovery</a></div>
+<h1>44.3 Building a World Model Planner</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I imagined 10,000 possible futures, ranked them by expected reward, and chose the best one. Then reality chose a future I had not imagined."</p>
+<cite>A Cross-Entropy Method That Learned Humility</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section is a hands-on recipe that integrates everything from Sections 44.1 and
+44.2. You will need PyTorch, Gymnasium, NumPy, and Matplotlib installed. The code
+builds directly on the RSSM implementation (Listing 44.1), the ELBO loss
+(Listing 44.2), and the training loop (Listing 44.4). Familiarity with model
+predictive control (MPC) is helpful but not required; we derive the algorithm from
+first principles.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Prediction tells us what will happen. Counterfactual reasoning tells us what would
+have happened. <em>Planning</em> tells us what to do. A model-based planner uses the
+world model as a mental simulator: it imagines many possible action sequences,
+evaluates each one by rolling out the world model, and selects the action sequence
+that leads to the best predicted outcome. This section builds a complete planner
+using the Cross-Entropy Method (CEM), trains it on the Pendulum environment, and
+then confronts the fundamental failure mode of model-based planning: compound error
+accumulation, where small per-step prediction errors snowball into catastrophic
+multi-step inaccuracy. Understanding and diagnosing this failure mode is essential
+for deploying world model planners in scientific discovery, where a wrong
+multi-step prediction can waste days of wet-lab time.
+</p>
+</div>
+
+<h2>1. Model Predictive Control with Learned Dynamics</h2>
+
+<p>
+Model Predictive Control (MPC) is a planning framework with a simple structure:
+at each time step, solve an optimization problem to find the best action sequence
+over a future horizon $H$, execute only the first action, observe the real next
+state, and re-plan. The re-planning step is critical: it corrects for prediction
+errors by grounding the planner in the actual state after each step.
+</p>
+
+<p>
+Formally, at time $t$ with current state $z_t = (h_t, s_t)$, MPC solves:
+</p>
+
+$$
+a^*_{t:t+H} = \arg\max_{a_{t:t+H}} \sum_{k=0}^{H-1} \gamma^k \hat{r}(z_{t+k}, a_{t+k})
+$$
+
+<p>
+where $\hat{r}$ is the world model's reward predictor, $\gamma$ is a discount
+factor, and the dynamics $z_{t+k+1} = f_\text{wm}(z_{t+k}, a_{t+k})$ come from
+the RSSM's <code>imagine()</code> method. After solving, the agent executes only
+$a^*_t$ in the real environment, observes the next real state, re-encodes it
+through the posterior, and re-plans from scratch. This "plan, execute one step,
+re-plan" loop is the heartbeat of MPC.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Re-planning Corrects for Model Error</div>
+<p>
+The re-planning loop is what makes MPC robust to model inaccuracy. Even if the
+world model's five-step prediction drifts significantly from reality (as we will
+measure in Section 5), the agent only commits to one step before re-anchoring
+itself to the real state. The practical horizon of trust is therefore one step
+(where the model is most accurate), not five steps (where compound error has
+accumulated). The longer planning horizon serves only to provide <em>direction</em>,
+not precision: it tells the agent which way to go, even if it cannot predict exactly
+where it will end up. This is analogous to a scientist planning a five-experiment
+campaign: the plan provides strategic direction, but after each experiment the
+scientist revises the plan based on the actual result.
+</p>
+</div>
+
+<h2>2. The Cross-Entropy Method (CEM) for Action Optimization</h2>
+
+<p>
+The optimization problem in MPC is typically non-convex and cannot be solved in
+closed form. We need a derivative-free optimizer that can handle the world model
+as a black box (even though the model is differentiable, CEM is often more robust
+in practice). The Cross-Entropy Method works by iteratively sampling action
+sequences from a distribution, evaluating them in the world model, and refitting
+the distribution to the top-performing samples.
+</p>
+
+<p data-agent="02">
+The Cross-Entropy Method is a population-based optimization algorithm that maintains
+a probability distribution (typically a diagonal Gaussian) over the solution space
+and iteratively narrows it toward high-performing regions. It matters because it
+provides a simple, parallelizable way to solve the non-convex planning problem
+without requiring gradient computation, making it compatible with any black-box
+simulator or learned model. The mechanism works in three repeated steps: sample a
+large batch of candidate solutions from the current distribution, evaluate all
+candidates and rank them by objective value, then refit the distribution to only
+the top fraction (the "elites"), thereby concentrating probability mass on
+promising regions. Prefer CEM over gradient-based planners when the reward
+landscape is noisy, discontinuous, or multi-modal; prefer gradient-based methods
+(such as backpropagation through the model) when the landscape is smooth and the
+model is fully differentiable, as gradients converge faster in that regime.
+</p>
+
+<pre><code class="language-python">import torch
+import numpy as np
+
+
+class CEMPlanner:
+    """Cross-Entropy Method planner using a learned world model.
+
+    At each step:
+    1. Sample N action sequences from a Gaussian distribution
+    2. Evaluate each sequence by rolling out the world model
+    3. Refit the Gaussian to the top-K sequences
+    4. Repeat for several iterations
+    5. Return the mean of the final distribution
+    """
+
+    def __init__(
+        self,
+        rssm,
+        action_dim: int,
+        horizon: int = 5,
+        n_candidates: int = 500,
+        n_elite: int = 50,
+        n_iterations: int = 5,
+        action_low: float = -2.0,
+        action_high: float = 2.0,
+        gamma: float = 0.99,
+        momentum: float = 0.1,
+    ):
+        """
+        Args:
+            rssm: trained RSSM world model
+            action_dim: dimension of the action space
+            horizon: planning horizon (number of steps to look ahead)
+            n_candidates: number of action sequences to sample
+            n_elite: number of top sequences to keep for refitting
+            n_iterations: CEM refinement iterations
+            action_low: minimum action value (for clamping)
+            action_high: maximum action value (for clamping)
+            gamma: reward discount factor
+            momentum: blend factor with previous plan (for temporal smoothness)
+        """
+        self.rssm = rssm
+        self.action_dim = action_dim
+        self.horizon = horizon
+        self.n_candidates = n_candidates
+        self.n_elite = n_elite
+        self.n_iterations = n_iterations
+        self.action_low = action_low
+        self.action_high = action_high
+        self.gamma = gamma
+        self.momentum = momentum
+
+        # Warm-start: carry forward the previous plan
+        self.prev_mean = None
+
+    @torch.no_grad()
+    def plan(self, h: torch.Tensor, s: torch.Tensor) -> np.ndarray:
+        """Select an action by CEM planning in the world model.
+
+        Args:
+            h: (1, det_size) current deterministic state
+            s: (1, stoch_size) current stochastic state
+
+        Returns:
+            Best action as a numpy array of shape (action_dim,).
+        """
+        device = h.device
+
+        # Initialize sampling distribution
+        mean = torch.zeros(self.horizon, self.action_dim, device=device)
+        std = torch.ones(self.horizon, self.action_dim, device=device)
+
+        # Warm start from previous plan (shift by one step)
+        if self.prev_mean is not None:
+            mean[:-1] = self.prev_mean[1:]
+            mean[-1] = 0.0  # new final step gets zero mean
+
+        for iteration in range(self.n_iterations):
+            # Sample candidate action sequences
+            noise = torch.randn(
+                self.n_candidates, self.horizon, self.action_dim,
+                device=device
+            )
+            candidates = mean.unsqueeze(0) + std.unsqueeze(0) * noise
+            candidates = candidates.clamp(self.action_low, self.action_high)
+
+            # Evaluate each candidate by rolling out the world model
+            # Expand initial state to match candidates
+            h_expanded = h.expand(self.n_candidates, -1)
+            s_expanded = s.expand(self.n_candidates, -1)
+
+            result = self.rssm.imagine(h_expanded, s_expanded, candidates)
+            rewards = result["reward_preds"].squeeze(-1)  # (N, H)
+
+            # Discounted return
+            discounts = self.gamma ** torch.arange(
+                self.horizon, device=device, dtype=torch.float32
+            )
+            returns = (rewards * discounts).sum(dim=1)  # (N,)
+
+            # Select elite candidates
+            elite_indices = returns.topk(self.n_elite).indices
+            elite_actions = candidates[elite_indices]  # (K, H, act_dim)
+
+            # Refit distribution to elites
+            new_mean = elite_actions.mean(dim=0)
+            new_std = elite_actions.std(dim=0).clamp(min=0.01)
+
+            # Momentum update for stability
+            mean = (
+                self.momentum * mean
+                + (1 - self.momentum) * new_mean
+            )
+            std = new_std
+
+        # Save mean for warm-starting the next planning step
+        self.prev_mean = mean.clone()
+
+        # Return the first action of the best plan
+        return mean[0].cpu().numpy()
+
+    def reset(self):
+        """Reset warm-start state (call at episode start)."""
+        self.prev_mean = None</code></pre>
+<div class="code-caption">Listing 44.10: Cross-Entropy Method planner. The planner samples 500 candidate action sequences, evaluates each by rolling them out in the RSSM, keeps the top 50 (elite), refits a Gaussian to the elites, and repeats for 5 iterations. Warm-starting from the previous plan (shifted by one step) provides temporal smoothness and faster convergence.</div>
+
+<p>
+Several design choices deserve attention. The warm-start mechanism carries forward
+the previous plan, shifted by one step: positions 1 through $H-1$ of the old plan
+become positions 0 through $H-2$ of the new plan, and position $H-1$ is initialized
+to zero. This exploits the fact that consecutive planning problems are similar, since
+the agent only moved one step. Without warm-starting, CEM must rediscover the plan
+from scratch at every step, which is both slower and produces jerky, inconsistent
+actions. The momentum parameter blends the CEM update with the previous mean,
+further smoothing the plan across iterations.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Planning Chemical Synthesis Steps</div>
+<p>
+A robotic chemistry platform must plan a sequence of synthesis actions: add reagent
+A (0-5 mL), heat to temperature T (20-200 C), stir for duration D (1-60 min),
+then add reagent B (0-5 mL) and cool. The action space is four-dimensional
+(volume A, temperature, duration, volume B), and each sequence of 5 actions represents
+one synthesis recipe. The CEM planner samples 500 random recipes, evaluates each
+by rolling out the world model to predict the yield and purity, keeps the top 50,
+refits the distribution, and converges to a high-yield recipe in 5 iterations. The
+entire planning computation takes about 200 ms on a GPU, compared to the 4-hour
+wall-clock time of a real synthesis. The planner then executes only the first action
+(add reagent A at the planned volume), observes the actual intermediate state
+(spectroscopic reading of the mixture), re-encodes through the posterior, and
+re-plans the remaining steps. This interleaving of model-based planning and real
+observation is the standard operating mode for
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">self-driving laboratories</a>
+(Chapter 55).
+</p>
+</div>
+
+<h2>3. End-to-End Recipe: Train, Plan, Evaluate</h2>
+
+<p>
+We now bring together all components into a complete recipe: collect data from the
+Gymnasium Pendulum environment, train an RSSM world model, build a CEM planner,
+and evaluate the planner against a random baseline.
+</p>
+
+<pre><code class="language-python">import gymnasium as gym
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+
+def run_world_model_planner_experiment(
+    env_name: str = "Pendulum-v1",
+    n_collection_episodes: int = 100,
+    n_training_epochs: int = 200,
+    n_eval_episodes: int = 20,
+    planning_horizon: int = 5,
+    seed: int = 42,
+):
+    """Complete recipe: collect data, train RSSM, plan, evaluate.
+
+    Args:
+        env_name: Gymnasium environment name
+        n_collection_episodes: episodes for initial data collection
+        n_training_epochs: RSSM training epochs
+        n_eval_episodes: episodes for evaluating the planner
+        planning_horizon: CEM planning horizon
+        seed: random seed
+
+    Returns:
+        Dictionary with training history, evaluation results, and
+        compound error measurements.
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # ---- Phase 1: Data Collection ----
+    print("Phase 1: Collecting trajectories with random policy...")
+    env = gym.make(env_name)
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    action_low = float(env.action_space.low[0])
+    action_high = float(env.action_space.high[0])
+
+    def random_policy(obs):
+        return env.action_space.sample()
+
+    trajectories = collect_trajectories(env, random_policy, n_collection_episodes)
+    print(f"  Collected {len(trajectories)} trajectories, "
+          f"total steps: {sum(len(t['observations']) for t in trajectories)}")
+
+    # ---- Phase 2: Train World Model ----
+    print("\nPhase 2: Training RSSM world model...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    rssm = RSSM(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        det_size=128,
+        num_categoricals=16,
+        num_classes=16,
+        hidden_size=128,
+    ).to(device)
+
+    history = train_world_model(
+        rssm, trajectories,
+        num_epochs=n_training_epochs,
+        batch_size=32,
+        seq_len=50,
+        lr=3e-4,
+    )
+
+    # ---- Phase 3: Evaluate Planner ----
+    print("\nPhase 3: Evaluating CEM planner...")
+    rssm.eval()
+    planner = CEMPlanner(
+        rssm=rssm,
+        action_dim=action_dim,
+        horizon=planning_horizon,
+        n_candidates=500,
+        n_elite=50,
+        n_iterations=5,
+        action_low=action_low,
+        action_high=action_high,
+    )
+
+    planned_returns = evaluate_planner(
+        env, rssm, planner, n_eval_episodes, device
+    )
+    random_returns = evaluate_random(env, n_eval_episodes)
+
+    print(f"\n  Random policy return: {np.mean(random_returns):.1f} "
+          f"(+/- {np.std(random_returns):.1f})")
+    print(f"  CEM planner return:  {np.mean(planned_returns):.1f} "
+          f"(+/- {np.std(planned_returns):.1f})")
+
+    # ---- Phase 4: Diagnose Compound Error ----
+    print("\nPhase 4: Diagnosing compound error...")
+    error_profile = diagnose_compound_error(
+        rssm, trajectories[:10], max_horizon=15, device=device
+    )
+
+    return {
+        "training_history": history,
+        "planned_returns": planned_returns,
+        "random_returns": random_returns,
+        "error_profile": error_profile,
+    }
+
+
+def evaluate_planner(env, rssm, planner, n_episodes, device):
+    """Evaluate a CEM planner on a Gymnasium environment."""
+    returns = []
+    for ep in range(n_episodes):
+        obs, _ = env.reset()
+        planner.reset()
+        h, s = rssm.initial_state(1, device)
+        total_reward = 0.0
+        done = False
+
+        while not done:
+            obs_t = torch.tensor(
+                obs, dtype=torch.float32, device=device
+            ).unsqueeze(0)
+
+            # Encode current observation through posterior
+            action_np = planner.plan(h, s)
+            action_t = torch.tensor(
+                action_np, dtype=torch.float32, device=device
+            ).unsqueeze(0)
+
+            # Update RSSM state
+            h = rssm.sequence_step(h, s, action_t)
+            s, _, _ = rssm.posterior(h, obs_t)
+
+            # Execute in real environment
+            obs, reward, terminated, truncated, _ = env.step(action_np)
+            total_reward += reward
+            done = terminated or truncated
+
+        returns.append(total_reward)
+    return returns
+
+
+def evaluate_random(env, n_episodes):
+    """Evaluate a random policy for baseline comparison."""
+    returns = []
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        total_reward = 0.0
+        done = False
+        while not done:
+            action = env.action_space.sample()
+            obs, reward, terminated, truncated, _ = env.step(action)
+            total_reward += reward
+            done = terminated or truncated
+        returns.append(total_reward)
+    return returns</code></pre>
+<div class="code-caption">Listing 44.11: End-to-end recipe for training and evaluating a world model planner. Phase 1 collects trajectories with a random policy. Phase 2 trains the RSSM. Phase 3 runs the CEM planner and compares to the random baseline. Phase 4 measures compound error across horizons. The <code>collect_trajectories</code> and <code>train_world_model</code> functions are from Listing 44.4.</div>
+
+<h2>4. Horizon-Dependent Error Accumulation</h2>
+
+<p>
+The fundamental limitation of model-based planning is <strong>compound error</strong>:
+small errors in single-step predictions accumulate and interact across multiple
+steps, producing predictions that diverge from reality. Understanding this
+accumulation is not optional. It determines the maximum useful planning horizon
+and, consequently, the scope of decisions the planner can make.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of compound error like a game of telephone played across a chain of
+translators. The first translator mishears a word slightly; the second translator,
+working only from the first translator's version, introduces another small drift;
+by the tenth translator the message may be unrecognizable. Each translator is your
+world model at one time step: it receives the previous step's (slightly wrong)
+output as its input and adds its own small error on top. The critical insight is
+that each error does not just add to the total; it <em>changes the input</em>
+for every subsequent step, so errors compound multiplicatively rather than
+simply stacking. Shortening the chain (using a shorter planning horizon) or
+periodically resetting from the original message (re-observing the real state)
+are the two fundamental remedies, which correspond exactly to the MPC strategies
+described in this section.
+</p>
+</div>
+
+<p>
+Consider a world model with single-step prediction error $\epsilon_1$. If errors
+were independent and additive, the $H$-step error would grow as
+$\epsilon_H = \sqrt{H} \cdot \epsilon_1$ (by the central limit theorem). In
+practice, the growth is worse because errors feed back through the dynamics: an
+error in $z_{t+1}$ shifts the input to the prediction of $z_{t+2}$, which shifts
+the input to $z_{t+3}$, and so on. If the dynamics are Lipschitz continuous with
+constant $L$, the worst-case error growth is exponential:
+</p>
+
+$$
+\epsilon_H \leq \epsilon_1 \sum_{k=0}^{H-1} L^k = \epsilon_1 \cdot \frac{L^H - 1}{L - 1}
+$$
+
+<p>
+For $L > 1$ (unstable or chaotic dynamics), the error grows exponentially and the
+model becomes useless after a few steps. For $L < 1$ (stable, damped dynamics),
+the error saturates at $\epsilon_1 / (1 - L)$. Most real environments have regions
+of both stability and instability, so the practical error growth is somewhere between
+$\sqrt{H}$ and exponential, depending on the state.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that a longer planning horizon always produces better
+plans, so you should set the horizon as large as your compute budget allows. This
+is wrong: beyond the point where compound error dominates the reward signal, the
+planner is optimizing against the model's hallucinations rather than against
+reality, and a longer horizon actively degrades performance. Always use the
+compound error diagnostic (Listing 44.12) to find the maximum trustworthy
+horizon and set the planner's horizon at or below that value.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Useful Planning Horizon is Environment-Dependent</div>
+<p>
+There is no universal "correct" planning horizon. In a stable chemical reaction
+(Lipschitz constant $L \approx 0.9$), a 20-step horizon is perfectly reliable. In
+a chaotic fluid simulation ($L > 1$), even a 3-step horizon produces garbage
+predictions. The compound error diagnostic (Listing 44.12) should be the first
+analysis you run when deploying a world model planner on a new environment. It
+tells you the maximum horizon at which the model's predictions are trustworthy,
+and therefore the maximum planning horizon you should use.
+</p>
+</div>
+
+<pre><code class="language-python">def diagnose_compound_error(
+    rssm,
+    test_trajectories: list,
+    max_horizon: int = 15,
+    device: torch.device = torch.device("cpu"),
+) -> dict:
+    """Measure prediction error as a function of rollout horizon.
+
+    For each test trajectory, encodes the first few steps through the
+    posterior, then rolls out the prior for increasing horizons and
+    compares to ground truth.
+
+    Args:
+        rssm: trained RSSM model
+        test_trajectories: list of trajectory dicts
+        max_horizon: maximum rollout horizon to test
+        device: torch device
+
+    Returns:
+        Dictionary with per-horizon RMSE, growth rate, and
+        recommended maximum horizon.
+    """
+    rssm.eval()
+    errors_by_horizon = {h: [] for h in range(1, max_horizon + 1)}
+
+    for traj in test_trajectories:
+        obs = torch.tensor(
+            traj["observations"], dtype=torch.float32, device=device
+        )
+        act = torch.tensor(
+            traj["actions"], dtype=torch.float32, device=device
+        )
+        if act.dim() == 1:
+            act = act.unsqueeze(-1)
+
+        T = len(obs)
+        if T < max_horizon + 5:
+            continue  # trajectory too short
+
+        # Encode first 5 steps through posterior to get a good initial state
+        warmup = 5
+        h, s = rssm.initial_state(1, device)
+        for t in range(warmup):
+            h = rssm.sequence_step(h, s, act[t:t+1])
+            s, _, _ = rssm.posterior(h, obs[t:t+1])
+
+        # For each horizon, roll out and measure error
+        for horizon in range(1, max_horizon + 1):
+            if warmup + horizon > T:
+                break
+
+            # Collect actions for this rollout
+            rollout_actions = act[warmup:warmup + horizon].unsqueeze(0)
+            ground_truth = obs[warmup:warmup + horizon]
+
+            # Roll out using prior (no observations)
+            result = rssm.imagine(h, s, rollout_actions)
+            predicted = result["obs_preds"].squeeze(0)
+
+            # RMSE per observation dimension, averaged
+            rmse = torch.sqrt(
+                ((predicted - ground_truth) ** 2).mean()
+            ).item()
+            errors_by_horizon[horizon].append(rmse)
+
+    # Compute statistics
+    mean_errors = {}
+    std_errors = {}
+    for h in range(1, max_horizon + 1):
+        if errors_by_horizon[h]:
+            mean_errors[h] = np.mean(errors_by_horizon[h])
+            std_errors[h] = np.std(errors_by_horizon[h])
+
+    # Estimate growth rate (fit log-linear model)
+    horizons = sorted(mean_errors.keys())
+    log_errors = [np.log(mean_errors[h] + 1e-8) for h in horizons]
+    if len(horizons) >= 3:
+        coeffs = np.polyfit(horizons, log_errors, 1)
+        growth_rate = np.exp(coeffs[0])  # multiplicative per-step growth
+    else:
+        growth_rate = float("nan")
+
+    # Recommend max horizon: where error exceeds 2x single-step error
+    single_step_error = mean_errors.get(1, float("inf"))
+    recommended_horizon = max_horizon
+    for h in horizons:
+        if mean_errors[h] > 3.0 * single_step_error:
+            recommended_horizon = max(1, h - 1)
+            break
+
+    return {
+        "mean_errors": mean_errors,
+        "std_errors": std_errors,
+        "growth_rate": growth_rate,
+        "recommended_max_horizon": recommended_horizon,
+        "single_step_rmse": single_step_error,
+    }
+
+
+def plot_compound_error(error_profile: dict, save_path: str = None):
+    """Visualize compound error accumulation."""
+    horizons = sorted(error_profile["mean_errors"].keys())
+    means = [error_profile["mean_errors"][h] for h in horizons]
+    stds = [error_profile["std_errors"][h] for h in horizons]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Linear scale
+    ax1.errorbar(horizons, means, yerr=stds, marker="o", capsize=4)
+    ax1.axhline(
+        y=error_profile["single_step_rmse"] * 3,
+        color="red", linestyle="--", label="3x single-step error"
+    )
+    ax1.axvline(
+        x=error_profile["recommended_max_horizon"],
+        color="green", linestyle=":", label="Recommended max horizon"
+    )
+    ax1.set_xlabel("Rollout Horizon (steps)")
+    ax1.set_ylabel("RMSE")
+    ax1.set_title("Compound Error (Linear Scale)")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Log scale to show growth rate
+    ax2.semilogy(horizons, means, marker="o")
+    growth = error_profile["growth_rate"]
+    if not np.isnan(growth):
+        fitted = [
+            means[0] * growth ** (h - horizons[0])
+            for h in horizons
+        ]
+        ax2.semilogy(
+            horizons, fitted, "--",
+            label=f"Fitted: {growth:.2f}x per step"
+        )
+    ax2.set_xlabel("Rollout Horizon (steps)")
+    ax2.set_ylabel("RMSE (log scale)")
+    ax2.set_title("Compound Error Growth Rate")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+    print(f"Growth rate: {growth:.3f}x per step")
+    print(f"Recommended max horizon: {error_profile['recommended_max_horizon']}")
+    print(f"Single-step RMSE: {error_profile['single_step_rmse']:.4f}")</code></pre>
+<div class="code-caption">Listing 44.12: Compound error diagnostic. The function rolls out the RSSM prior for increasing horizons and measures RMSE against ground truth. The growth rate (estimated by fitting a log-linear model) tells you whether errors grow sub-linearly (good), linearly (acceptable), or exponentially (dangerous). The recommended maximum horizon is where error exceeds 3x the single-step error.</div>
+
+<h2>5. Mitigating Compound Error</h2>
+
+<p>
+Once you have diagnosed the compound error profile, several strategies can extend
+the useful planning horizon:
+</p>
+
+<p>
+<strong>Strategy 1: Shorten the horizon and re-plan more frequently.</strong> This is the
+simplest and most robust approach. If the diagnostic shows that predictions become
+unreliable after 3 steps, set the planning horizon to 3 and re-plan at every step.
+The MPC loop already does this; the diagnostic tells you the appropriate horizon.
+</p>
+
+<p>
+<strong>Strategy 2: Train with multi-step predictions (latent overshooting).</strong>
+The standard ELBO loss trains the model on one-step predictions. Latent overshooting
+(Hafner et al., 2019) adds auxiliary losses that penalize multi-step prediction
+errors, directly optimizing the model for the regime where it will be used during
+planning.
+</p>
+
+<pre><code class="language-python">def latent_overshooting_loss(
+    rssm,
+    observations: torch.Tensor,
+    actions: torch.Tensor,
+    max_overshoot: int = 5,
+    overshoot_weight: float = 0.5,
+) -> torch.Tensor:
+    """Auxiliary loss that penalizes multi-step prediction errors.
+
+    In addition to the standard one-step ELBO, this loss rolls out
+    the prior for k steps (k=1..max_overshoot) from each time step
+    and penalizes divergence from the posterior at the landing step.
+
+    Args:
+        rssm: RSSM model
+        observations: (batch, time, obs_dim)
+        actions: (batch, time, act_dim)
+        max_overshoot: maximum overshooting distance
+        overshoot_weight: weight relative to standard ELBO
+
+    Returns:
+        Scalar overshooting loss.
+    """
+    batch, T = observations.shape[:2]
+    device = observations.device
+
+    # First, get all posterior states (the "ground truth" targets)
+    h, s = rssm.initial_state(batch, device)
+    posterior_states = []  # list of (h_t, s_t) tuples
+    for t in range(T):
+        h = rssm.sequence_step(h, s, actions[:, t])
+        s, _, _ = rssm.posterior(h, observations[:, t])
+        posterior_states.append((h.detach(), s.detach()))
+
+    # For each starting point, roll out k steps with prior and compare
+    overshoot_loss = torch.tensor(0.0, device=device)
+    n_terms = 0
+
+    for t in range(T - max_overshoot):
+        h_start, s_start = posterior_states[t]
+        h_roll, s_roll = h_start, s_start
+
+        for k in range(1, max_overshoot + 1):
+            if t + k >= T:
+                break
+            # One prior step
+            h_roll = rssm.sequence_step(
+                h_roll, s_roll, actions[:, t + k]
+            )
+            _, prior_dist, _ = rssm.prior(h_roll)
+            s_roll, _, _ = rssm.prior(h_roll)
+
+            # Target: posterior state at t+k
+            h_target, s_target = posterior_states[t + k]
+
+            # Loss: MSE between prior prediction and posterior target
+            state_error = F.mse_loss(
+                torch.cat([h_roll, s_roll], dim=-1),
+                torch.cat([h_target, s_target], dim=-1),
+            )
+            # Weight by 1/k to focus on near-term accuracy
+            overshoot_loss = overshoot_loss + state_error / k
+            n_terms += 1
+
+    if n_terms > 0:
+        overshoot_loss = overshoot_loss / n_terms
+
+    return overshoot_weight * overshoot_loss</code></pre>
+<div class="code-caption">Listing 44.13: Latent overshooting loss. At each time step, the model rolls out the prior for 1 to 5 steps and is penalized for diverging from the posterior (which saw the real observations). The 1/k weighting prioritizes near-term accuracy. Adding this loss to the standard ELBO typically reduces compound error at horizons 3-10 by 20-40%.</div>
+
+<p>
+<strong>Strategy 3: Use ensemble disagreement as a planning signal.</strong> Train
+multiple RSSM models (or use dropout at inference time) and measure their
+disagreement at each step of the rollout. When the ensemble members diverge,
+the planner should distrust its predictions and prefer conservative actions. This
+connects to the epistemic uncertainty ideas of
+<a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32</a>.
+</p>
+
+<p>
+<strong>Strategy 4: Collect more data in high-error regions.</strong> The compound error
+diagnostic identifies the states and horizons where the model fails. A targeted
+data collection campaign that focuses on these regions (using the methods of
+<a href="../module-46-experiment-design/index.html">Chapter 46</a>) directly reduces
+the error where it matters most.
+</p>
+
+<div class="callout common-pitfall">
+<div class="callout-title">Common Pitfall: Trusting Long-Horizon Plans in Chaotic Systems</div>
+<p>
+In chaotic systems (fluid turbulence, protein dynamics, ecological models), the
+Lyapunov exponent is positive, meaning that nearby trajectories diverge
+exponentially. No amount of model improvement can fix this: it is a fundamental
+property of the dynamics, not a modeling failure. In such systems, the compound
+error diagnostic will show exponential growth, and the recommended horizon will
+be very short (often 1-2 steps). This does not mean the world model is useless;
+it means the planner should operate in a reactive mode (plan one step, execute,
+re-plan) rather than a strategic mode (plan many steps ahead). For strategic
+decisions in chaotic systems, use the world model for Monte Carlo ensemble
+forecasting rather than single-trajectory planning. The ensemble statistics
+(mean, variance, tail probabilities) remain informative even when individual
+trajectories are unreliable.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+TD-MPC2 (Hansen et al., 2024) represents a significant advance beyond the
+CEM-based planning taught in this section. Instead of relying solely on
+multi-step reward rollouts, TD-MPC2 combines a learned latent dynamics model
+with a temporal-difference (TD) value function that provides a single-query
+estimate of long-horizon return at any state. This hybrid approach sidesteps
+much of the compound error problem: the planner only needs short imagination
+rollouts (1-3 steps) because the learned value function supplies the long-horizon
+signal that would otherwise require an unreliable 10+ step rollout. TD-MPC2
+trains a single set of model weights that generalizes across 104 continuous
+control tasks spanning multiple domains, from locomotion to manipulation,
+without per-task hyperparameter tuning. The key architectural insight is that
+embedding both the dynamics model and the value function in the same latent
+space lets the planner use the value function as a "horizon extension" that
+does not accumulate autoregressive error. For readers building discovery
+planners on complex environments, this value-augmented approach offers a
+practical path to longer effective planning horizons without paying the
+compound error penalty.
+</p>
+</div>
+
+<h2>6. Putting It All Together: The Complete Experiment</h2>
+
+<pre><code class="language-python"># Run the complete experiment
+# (requires the RSSM, CEMPlanner, and training functions from above)
+
+if __name__ == "__main__":
+    results = run_world_model_planner_experiment(
+        env_name="Pendulum-v1",
+        n_collection_episodes=100,
+        n_training_epochs=200,
+        n_eval_episodes=20,
+        planning_horizon=5,
+        seed=42,
+    )
+
+    # Plot training curves
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    epochs = range(1, len(results["training_history"]) + 1)
+    losses = results["training_history"]
+
+    axes[0].plot(epochs, [l["obs_loss"] for l in losses])
+    axes[0].set_title("Observation Reconstruction Loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("MSE")
+
+    axes[1].plot(epochs, [l["kl_loss"] for l in losses])
+    axes[1].set_title("KL Divergence (Prior vs Posterior)")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("KL (nats)")
+
+    axes[2].bar(
+        ["Random", "CEM Planner"],
+        [np.mean(results["random_returns"]),
+         np.mean(results["planned_returns"])],
+        yerr=[np.std(results["random_returns"]),
+              np.std(results["planned_returns"])],
+        capsize=5, color=["#e74c3c", "#2ecc71"],
+    )
+    axes[2].set_title("Episode Return Comparison")
+    axes[2].set_ylabel("Return")
+
+    plt.tight_layout()
+    plt.show()
+
+    # Plot compound error profile
+    plot_compound_error(results["error_profile"])</code></pre>
+<div class="code-caption">Listing 44.14: Running the complete world model planner experiment. The output includes training curves (reconstruction loss and KL divergence), a bar chart comparing CEM planner returns to the random baseline, and the compound error diagnostic plot from Listing 44.12.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Model-Based RL with Stable-Baselines3 and MBRL-Lib</div>
+<p>
+The from-scratch implementation above is educational but verbose. For production
+model-based RL, the
+<a href="https://github.com/facebookresearch/mbrl-lib" target="_blank">mbrl-lib</a>
+library (Meta Research) provides PETS, MBPO, and PlaNet implementations with
+optimized CEM planning, ensemble models, and replay buffers. The entire experiment
+above reduces to:
+</p>
+<pre><code class="language-python">import mbrl.planning as planning
+import mbrl.models as models
+
+# Configure world model + planner
+ensemble = models.GaussianMLP(
+    obs_dim + action_dim, obs_dim, ensemble_size=5
+)
+agent = planning.CEMOptimizer(
+    ensemble, horizon=5, population=500, elite_ratio=0.1
+)
+# agent.plan(obs) returns the best action</code></pre>
+<p>
+mbrl-lib handles ensemble training, CEM warm-starting, trajectory sampling, and
+uncertainty estimation internally. For RSSM-specific architectures, use
+<a href="https://github.com/NM512/dreamer-torch" target="_blank">dreamer-pytorch</a>,
+which implements the full DreamerV3 actor-critic pipeline (not just planning).
+The line-count reduction from our 400+ line implementation to production libraries
+is roughly 20x.
+</p>
+</div>
+
+<h2>7. Discovery Workbench Integration</h2>
+
+<p>
+The planner completes the world model subsystem in the Discovery Workbench. The
+integration architecture has three layers:
+</p>
+
+<ol>
+<li><strong>Data layer</strong>: the Workbench's experiment registry (<a href="../module-47-experiment-registries/index.html">Chapter 47</a>) stores all trajectories (real experiments and simulated rollouts) with full provenance metadata.</li>
+<li><strong>Model layer</strong>: the RSSM world model, trained on the registered trajectories, provides the <code>observe()</code>, <code>imagine()</code>, and posterior encoding interfaces that the other Workbench components consume.</li>
+<li><strong>Planning layer</strong>: the CEM planner, the counterfactual analyzer (Section 44.2), and the automated experiment designer (<a href="../module-46-experiment-design/index.html">Chapter 46</a>) all query the world model to propose actions. The compound error diagnostic determines the maximum planning horizon, and the confidence scoring system (Listing 44.6) flags predictions that should not be trusted.</li>
+</ol>
+
+<p>
+When the planner recommends an action that falls outside the world model's training
+distribution (detected by high prior entropy or ensemble disagreement), the
+Workbench automatically triggers a "safe exploration" mode: instead of executing
+the recommended action directly, it proposes a smaller perturbation from the most
+recent known-good state, collects the result, retrains the model, and then re-plans.
+This conservative strategy prevents catastrophic failures in real laboratory
+settings where a bad action could destroy expensive samples or damage equipment.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: CEM Planner on CartPole from Scratch</h4>
+<p>
+Build a minimal CEM planner for CartPole-v1 using only NumPy (no learned model needed
+for this exercise, since CartPole has known dynamics).
+<strong>Step 1:</strong> Install Gymnasium (<code>pip install gymnasium</code>) and create the
+CartPole-v1 environment. Write a simple dynamics function that takes a state (cart
+position, cart velocity, pole angle, pole angular velocity) and an action (0 or 1)
+and returns the next state using the equations from the
+<a href="https://gymnasium.farama.org/environments/classic_control/cart_pole/" target="_blank">Gymnasium docs</a>.
+<strong>Step 2:</strong> Implement CEM with 200 candidate action sequences of length 10
+(each action is 0 or 1), 20 elites, and 5 refinement iterations. Represent the
+distribution as a per-step probability of choosing action 1 (initialized to 0.5),
+sample candidates by drawing Bernoulli samples, and refit by computing the mean
+action of the elites at each step.
+<strong>Step 3:</strong> At each environment step, run CEM using your dynamics function to
+find the best 10-step plan, execute only the first action, observe the real next
+state, and re-plan (the MPC loop).
+<strong>Step 4:</strong> Run 20 episodes and record the total reward per episode. Compare
+to a random baseline (expected reward around 20) and verify that the CEM planner
+achieves close to the maximum of 500.
+<strong>Step 5:</strong> Add a compound error measurement: at each planning step, record the
+predicted state at horizon 10 and the actual state 10 steps later. Plot the RMSE as
+a function of horizon (1 through 10) and identify the horizon at which error exceeds
+3x the single-step error.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Coding)</strong> Run the complete experiment from Listing 44.14 on the
+Pendulum-v1 environment. Plot the compound error profile and report the
+recommended maximum horizon. Then change the planning horizon in the CEM planner
+to the recommended value. Does the planner's performance improve or degrade
+compared to the default horizon of 5?
+</li>
+<li>
+<strong>(Coding)</strong> Add the latent overshooting loss (Listing 44.13) to the
+training loop and retrain the RSSM. Re-run the compound error diagnostic. By how
+much does the overshooting loss reduce the 5-step prediction error?
+</li>
+<li>
+<strong>(Analysis)</strong> Compare the CEM planner to a random shooting baseline (sample
+500 action sequences, take the best one, no CEM refinement). How many CEM
+iterations are needed to significantly outperform random shooting? Plot planner
+performance as a function of the number of CEM iterations (1, 2, 3, 5, 10).
+</li>
+<li>
+<strong>(Research)</strong> Train the same RSSM on two environments with different
+dynamical stability: Pendulum-v1 (stable, $L < 1$) and CartPole-v1 (marginally
+stable near the upright position, $L \approx 1$). Compare their compound error
+profiles. Does the growth rate from the diagnostic correctly predict which
+environment tolerates a longer planning horizon?
+</li>
+<li>
+<strong>(Extension)</strong> Replace the CEM planner with a gradient-based planner: use
+the RSSM's differentiability to backpropagate the reward gradient through the
+imagined trajectory and optimize the actions directly with Adam. Compare the
+planning time and action quality to CEM. When does gradient-based planning outperform
+CEM, and when does it get stuck in local optima?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We have built a complete world model planner: from raw trajectories to trained
+dynamics model to action selection to compound error diagnosis. The planner
+produces cheap surrogate evaluations of candidate actions, which is exactly what
+optimization algorithms need.
+<a href="../module-45-optimization/index.html">Chapter 45: Optimization for Discovery</a>
+broadens the optimization toolkit to include Bayesian optimization, evolutionary
+strategies, and gradient-based methods, all of which can leverage the world model
+as an inner-loop surrogate evaluator. The optimization chapter will show how to
+choose among these methods based on the structure of the discovery problem: smooth
+vs. rugged landscapes, continuous vs. discrete action spaces, single vs.
+multi-objective goals.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2301.04104" target="_blank">Hafner, D., Pasukonis, J., Ba, J., &amp; Lillicrap, T. (2023). Mastering diverse domains through world models. <em>arXiv preprint arXiv:2301.04104</em>.</a>
+<p>DreamerV3: the primary architecture reference for this chapter, demonstrating that a single RSSM agent can master domains from Atari to Minecraft.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1811.04551" target="_blank">Hafner, D., et al. (2019). Learning latent dynamics for planning from pixels. <em>ICML 2019</em>.</a>
+<p>PlaNet: introduced RSSM, CEM-based planning, and the latent overshooting objective that we implement in Listing 44.13.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2010.02193" target="_blank">Schrittwieser, J., et al. (2020). Mastering Atari, Go, Chess and Shogi by planning with a learned model. <em>Nature</em>, 588, 604-609.</a>
+<p>MuZero: an alternative planning approach that uses Monte Carlo Tree Search instead of CEM, achieving superhuman performance in board games and Atari.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1805.12114" target="_blank">Chua, K., Calandra, R., McAllister, R., &amp; Levine, S. (2018). Deep reinforcement learning in a handful of transitions. <em>NeurIPS 2018</em>.</a>
+<p>PETS: Probabilistic Ensemble Trajectory Sampling, combining ensemble dynamics models with CEM planning. The ensemble approach for uncertainty-aware planning.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1007/s10479-005-5732-z" target="_blank">De Boer, P.-T., Kroese, D. P., Mannor, S., &amp; Rubinstein, R. Y. (2005). A tutorial on the cross-entropy method. <em>Annals of Operations Research</em>, 134(1), 19-67.</a>
+<p>The definitive tutorial on CEM, covering the mathematical foundations of the iterative sampling and elite selection procedure used in our planner.</p>
+</div>
+<div class="bib-card">
+<a href="https://github.com/facebookresearch/mbrl-lib" target="_blank">Pineda, L., et al. (2021). MBRL-Lib: A modular library for model-based reinforcement learning. <em>arXiv preprint arXiv:2104.10159</em>.</a>
+<p>Meta's model-based RL library, providing production-grade implementations of PETS, MBPO, and PlaNet with ensemble models and CEM planning.</p>
+</div>
+<div class="bib-card">
+<a href="http://www.incompleteideas.net/book/the-book.html" target="_blank">Sutton, R. S. &amp; Barto, A. G. (2018). <em>Reinforcement Learning: An Introduction</em>, 2nd edition. MIT Press.</a>
+<p>Chapter 8 covers model-based planning and the Dyna architecture, the conceptual ancestor of the world model planner we built in this section.</p>
+</div>
+<div class="bib-card">
+<a href="https://gymnasium.farama.org/" target="_blank">Gymnasium (Farama Foundation)</a>
+<p>The standard RL environment interface used for data collection and planner evaluation throughout this section.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-44.2.html">&#8592; 44.2 Counterfactual Reasoning</a>
+<a href="index.html">Chapter 44</a>
+<a href="../module-45-optimization/index.html">Chapter 45: Optimization &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.3: Safety, Cost, and Observability. Sandboxes, safety boundaries, cost budgets, and observability for discovery systems." name="description"/>
+<title>Section 6.3: Safety, Cost, and Observability | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Discovery System Architecture</a></div>
+<h1>6.3 Safety, Cost, and Observability</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"It was only supposed to run ten experiments. By the time anyone checked, the cloud bill had six digits and the agent was negotiating a contract with a compute provider in Singapore."</p>
+<cite>An Agent That Spent the Cloud Budget in One Afternoon</cite>
+</blockquote>
+
+<section class="prerequisites">
+<h2>Prerequisites</h2>
+<p>This section builds on the layered architecture from <a href="section-6.1.html">Section 6.1</a> and the artifact graph model from <a href="section-6.2.html">Section 6.2</a>. You should be comfortable with Python dataclasses, context managers, and the <code>subprocess</code> module. Familiarity with Docker (at the level of running containers, not writing Dockerfiles) is helpful but not required; we introduce the relevant concepts inline. No prior experience with OpenTelemetry is assumed.</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>A discovery system that cannot be trusted is worse than no system at all. When agents autonomously propose hypotheses, execute code, call APIs, and spin up compute, the failure modes go far beyond ordinary software bugs. An agent might enter an infinite loop that burns through a GPU budget in minutes. It might execute arbitrary code that corrupts a shared dataset. It might call a paid API ten thousand times because a retry loop lacks a ceiling. Safety, cost control, and observability are not afterthoughts bolted onto a finished system; they are load-bearing walls that must be poured into the foundation. This section gives you the concrete patterns: sandboxes that isolate execution, safety boundaries that limit what agents can do, budget guards that enforce spending ceilings, and telemetry that makes the invisible visible.</p>
+</div>
+
+<h2>1. Sandboxing Agent Execution</h2>
+
+<p><strong>What.</strong> A sandbox is a controlled execution environment that limits what code can access: filesystem paths, network endpoints, CPU and memory, and system calls. In a discovery system, every agent-initiated computation runs inside a sandbox so that a misbehaving experiment cannot corrupt shared state or escape into the host system.</p>
+
+<p><strong>Why.</strong> Discovery agents generate and execute code. That code might come from an LLM that hallucinates an <code>rm -rf /</code>, from a reinforcement learning policy that explores extreme parameter values, or from a perfectly reasonable script that triggers an out-of-memory condition. Without sandboxing, a single faulty experiment can take down the entire workbench, corrupt the artifact store, or leak credentials.</p>
+
+<p><strong>How.</strong> The standard approach layers three mechanisms:</p>
+
+<ol>
+<li><strong>Process isolation via <code>subprocess</code>.</strong> Each experiment runs in its own process with restricted environment variables, a working directory that is a temporary copy (not the real artifact store), and resource limits enforced by the operating system.</li>
+<li><strong>Container isolation via Docker.</strong> For stronger guarantees, the subprocess runs inside a container with cgroups limiting CPU, memory, and I/O, and a read-only filesystem except for a designated output directory.</li>
+<li><strong>Network restrictions.</strong> The container's network is either disabled entirely (for pure-compute experiments) or restricted to a specific allowlist of endpoints (for experiments that need to call APIs).</li>
+</ol>
+
+<p><strong>When.</strong> Use process-level sandboxing during local development and interactive exploration. Use container-level sandboxing for any unattended or agent-driven execution, especially when the code being run was generated by an LLM or optimizer.</p>
+
+<pre><code class="language-python">import subprocess
+import tempfile
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+@dataclass
+class SandboxConfig:
+    """Configuration for a sandboxed experiment execution."""
+    timeout_seconds: int = 300
+    max_memory_mb: int = 2048
+    allowed_network: bool = False
+    readonly_paths: list[str] = field(default_factory=list)
+    env_allowlist: list[str] = field(
+        default_factory=lambda: ["PATH", "PYTHONPATH", "HOME"]
+    )
+
+
+@dataclass
+class SandboxResult:
+    """Outcome of a sandboxed run."""
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+    output_dir: Path
+
+
+def run_in_sandbox(
+    script_path: Path,
+    config: SandboxConfig,
+    input_dir: Optional[Path] = None,
+) -> SandboxResult:
+    """Execute a Python script inside a sandboxed subprocess.
+
+    The script runs in a temporary directory with only
+    allowlisted environment variables. Outputs are written
+    to a fresh directory returned in the result.
+    """
+    with tempfile.TemporaryDirectory(prefix="sandbox_") as tmpdir:
+        output_dir = Path(tmpdir) / "output"
+        output_dir.mkdir()
+
+        # Build a minimal environment
+        sandbox_env = {
+            k: os.environ[k]
+            for k in config.env_allowlist
+            if k in os.environ
+        }
+        sandbox_env["SANDBOX_OUTPUT"] = str(output_dir)
+
+        # If input data is provided, symlink it as read-only
+        if input_dir is not None:
+            link = Path(tmpdir) / "input"
+            link.symlink_to(input_dir)
+            sandbox_env["SANDBOX_INPUT"] = str(link)
+
+        try:
+            result = subprocess.run(
+                ["python", str(script_path)],
+                cwd=tmpdir,
+                env=sandbox_env,
+                capture_output=True,
+                text=True,
+                timeout=config.timeout_seconds,
+            )
+            return SandboxResult(
+                exit_code=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                timed_out=False,
+                output_dir=output_dir,
+            )
+        except subprocess.TimeoutExpired:
+            return SandboxResult(
+                exit_code=-1,
+                stdout="",
+                stderr="Process killed: exceeded timeout",
+                timed_out=True,
+                output_dir=output_dir,
+            )</code></pre>
+<div class="code-caption">Listing 6.5: A subprocess-based sandbox for experiment execution. The script runs with a stripped environment, a timeout ceiling, and a dedicated output directory. In production, this would be wrapped in a Docker container for stronger isolation (cgroups, namespaces, filesystem restrictions).</div>
+
+<p>The subprocess sandbox is the lightweight option. For production workloads, replace the <code>subprocess.run</code> call with a Docker invocation that mounts the input directory as read-only, mounts the output directory as the sole writable volume, and sets <code>--memory</code> and <code>--cpus</code> flags. The Python code that orchestrates the sandbox stays the same; only the execution backend changes. This separation of policy (what the sandbox allows) from mechanism (how it enforces the policy) is a recurring pattern throughout this chapter.</p>
+
+<h2>2. Safety Boundaries</h2>
+
+<p><strong>What.</strong> Safety boundaries are rules that constrain what an agent is allowed to do, independent of the sandbox. While the sandbox limits <em>how</em> code runs, safety boundaries limit <em>what</em> the agent can request in the first place: which actions are permitted, how many times they can be repeated, and which decisions require human approval before proceeding.</p>
+
+<p><strong>Why.</strong> A sandbox prevents a script from deleting files outside its directory, but it does nothing to stop an agent from submitting a thousand valid, sandboxed jobs that collectively exhaust the compute budget. Safety boundaries operate at the agent level, governing the planning and decision layer rather than the execution layer.</p>
+
+<p><strong>How.</strong> We implement four complementary boundary types:</p>
+
+<ul>
+<li><strong>Action allowlists.</strong> Each agent has an explicit list of permitted actions (e.g., <code>run_experiment</code>, <code>query_database</code>, <code>submit_for_review</code>). Any action not on the list is rejected before execution.</li>
+<li><strong>Rate limits.</strong> Each action type has a maximum invocation count per time window (e.g., at most 20 API calls per minute, at most 50 experiments per hour).</li>
+<li><strong>Human-in-the-loop checkpoints.</strong> Certain actions (deleting artifacts, modifying shared configuration, spending above a threshold) require explicit human approval. The agent pauses, presents its rationale, and waits.</li>
+<li><strong>Kill switches.</strong> A global flag that, when set, halts all agent activity immediately. Every action check consults the kill switch before proceeding.</li>
+</ul>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Runaway Experiment</div>
+<p>Consider a discovery agent tasked with optimizing a chemical reaction yield. It generates a Bayesian optimization loop (as in <a href="../module-05-data-models-simulation/section-5.3.html">Section 5.3</a>) that proposes candidate parameter sets and submits each as a sandboxed simulation. The agent's acquisition function selects a parameter region where the surrogate variance is extremely high, meaning the model is maximally uncertain. Because the agent's stopping criterion checks only whether the acquisition function exceeds a threshold (and high variance guarantees it does), the loop never terminates. Each iteration is perfectly valid: a sandboxed simulation that runs in 30 seconds and produces a result. But the agent submits 500 of them in an hour, each one spinning up a GPU container. Without rate limits, the cloud bill reaches four figures before anyone notices. With the safety boundaries above, the rate limit (50 experiments per hour) triggers after the 50th submission, the agent pauses, a human reviews the situation, recognizes the degenerate stopping criterion, fixes it, and restarts. Total cost: the price of 50 simulations instead of 500.</p>
+</div>
+
+<pre><code class="language-python">import time
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+from collections import defaultdict
+
+
+@dataclass
+class SafetyBoundary:
+    """Enforces action allowlists, rate limits, and kill switches."""
+
+    allowed_actions: set[str]
+    rate_limits: dict[str, tuple[int, float]] = field(
+        default_factory=dict
+    )  # action -> (max_count, window_seconds)
+    human_approval_actions: set[str] = field(default_factory=set)
+    _kill_switch: bool = False
+    _action_log: dict[str, list[float]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    _approval_callback: Optional[Callable[[str, str], bool]] = None
+
+    def set_approval_callback(
+        self, callback: Callable[[str, str], bool]
+    ) -> None:
+        """Register a function that asks a human for approval.
+        Signature: callback(action, rationale) -> bool.
+        """
+        self._approval_callback = callback
+
+    def kill(self) -> None:
+        """Activate the kill switch. All future checks fail."""
+        self._kill_switch = True
+
+    def check(self, action: str, rationale: str = "") -> bool:
+        """Return True if the action is permitted right now."""
+        # Kill switch overrides everything
+        if self._kill_switch:
+            return False
+
+        # Action must be on the allowlist
+        if action not in self.allowed_actions:
+            return False
+
+        # Rate limit check
+        if action in self.rate_limits:
+            max_count, window = self.rate_limits[action]
+            now = time.time()
+            cutoff = now - window
+            recent = [
+                t for t in self._action_log[action] if t > cutoff
+            ]
+            self._action_log[action] = recent
+            if len(recent) >= max_count:
+                return False
+
+        # Human approval gate
+        if action in self.human_approval_actions:
+            if self._approval_callback is None:
+                return False  # no callback registered; deny
+            if not self._approval_callback(action, rationale):
+                return False
+
+        # Record this invocation
+        self._action_log[action].append(time.time())
+        return True</code></pre>
+<div class="code-caption">Listing 6.6: A SafetyBoundary class that enforces action allowlists, sliding-window rate limits, human-in-the-loop approval gates, and a global kill switch. The <code>check</code> method is called before every agent action; the agent proceeds only if it returns <code>True</code>.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Safety Boundaries Are Not Optional Guardrails</div>
+<p>It is tempting to treat safety boundaries as training wheels to be removed once the system "works." This is a mistake. In autonomous discovery, the space of possible agent behaviors is unbounded. No amount of testing can guarantee that an agent will never enter a degenerate loop, propose an unreasonable experiment, or misinterpret its objective in a way that wastes resources. Safety boundaries are structural, not provisional. They belong in the same architectural layer as authentication and data integrity constraints. Removing them is equivalent to removing the brakes from a car because the engine runs smoothly. We return to this principle in depth in <a href="../../part-8-responsible-ai/module-57-responsible-discovery/index.html">Chapter 57: Responsible AI for Discovery</a>.</p>
+</div>
+
+<h2>3. Cost and Latency Budgets</h2>
+
+<p><strong>What.</strong> A cost budget is a hard ceiling on how much a discovery campaign may spend across all resource categories. A latency budget is a set of time targets (p50, p95, p99) for individual operations, ensuring that no single step stalls the pipeline beyond acceptable limits.</p>
+
+<p data-agent="02"><strong>Precisely defined,</strong> a cost budget is a pre-allocated dollar amount that the system tracks in real time, decrementing with each resource-consuming operation and halting further spending when the balance reaches zero. Cost budgets matter because autonomous agents, unlike human researchers, have no intuitive sense of expense; they will happily consume resources at whatever rate maximizes their objective function. The mechanism is straightforward: before every cost-incurring call (launching a container, sending tokens to an LLM, writing to cloud storage), the orchestrator subtracts the estimated cost from the remaining balance and proceeds only if the balance stays positive. Use a cost budget rather than after-the-fact billing alerts whenever the system operates autonomously for extended periods, because alerts arrive too late to prevent overruns; by contrast, a synchronous budget check blocks the expensive call before it executes.</p>
+
+<p><strong>Why.</strong> Discovery systems compose multiple cost sources: cloud compute (GPU hours, container runtime), API calls (LLM inference, external databases), storage (artifact versioning, checkpoints), and human time (review, labeling, approval gates). Without explicit budgets, costs are invisible until the invoice arrives. Latency budgets serve a complementary purpose: they prevent a single slow operation from blocking the entire pipeline and provide early warning when a subsystem degrades.</p>
+
+<p>The total cost of a discovery campaign decomposes as:</p>
+
+$$C_{\text{total}} = C_{\text{compute}} + C_{\text{API}} + C_{\text{storage}} + C_{\text{human}}$$
+
+<p>Each component can be estimated before execution. Compute cost scales with runtime and instance type: $C_{\text{compute}} = \sum_{j} t_j \cdot r_j$, where $t_j$ is the wall-clock time of job $j$ and $r_j$ is the hourly rate of the instance it runs on. API cost depends on call volume and pricing: $C_{\text{API}} = \sum_{k} n_k \cdot p_k$, where $n_k$ is the number of calls to API $k$ and $p_k$ is the per-call price. Storage and human costs follow analogous patterns.</p>
+
+<p><strong>How.</strong> We implement a <code>BudgetGuard</code> that tracks cumulative spending, rejects requests that would exceed the ceiling, and exposes the current balance for dashboards.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+import threading
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class CostCategory(Enum):
+    COMPUTE = "compute"
+    API = "api"
+    STORAGE = "storage"
+    HUMAN = "human"
+
+
+@dataclass
+class BudgetGuard:
+    """Tracks cumulative spending and enforces a hard ceiling."""
+
+    ceiling_usd: float
+    warn_fraction: float = 0.8  # warn at 80% of ceiling
+    _spent: dict[CostCategory, float] = field(
+        default_factory=lambda: {c: 0.0 for c in CostCategory}
+    )
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock
+    )
+
+    @property
+    def total_spent(self) -> float:
+        return sum(self._spent.values())
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.ceiling_usd - self.total_spent)
+
+    def request(
+        self,
+        category: CostCategory,
+        amount_usd: float,
+        description: str = "",
+    ) -> bool:
+        """Attempt to spend. Returns True if within budget."""
+        with self._lock:
+            projected = self.total_spent + amount_usd
+            if projected > self.ceiling_usd:
+                logger.warning(
+                    "Budget DENIED: %s (%.2f USD) would exceed "
+                    "ceiling (%.2f / %.2f spent)",
+                    description, amount_usd,
+                    self.total_spent, self.ceiling_usd,
+                )
+                return False
+
+            self._spent[category] += amount_usd
+
+            if self.total_spent >= self.ceiling_usd * self.warn_fraction:
+                logger.warning(
+                    "Budget WARNING: %.1f%% consumed "
+                    "(%.2f / %.2f USD)",
+                    100 * self.total_spent / self.ceiling_usd,
+                    self.total_spent, self.ceiling_usd,
+                )
+            else:
+                logger.info(
+                    "Budget OK: %s charged %.2f USD (%s). "
+                    "Remaining: %.2f",
+                    category.value, amount_usd,
+                    description, self.remaining,
+                )
+            return True
+
+    def summary(self) -> dict[str, float]:
+        """Return a breakdown of spending by category."""
+        return {
+            c.value: self._spent[c] for c in CostCategory
+        } | {"total": self.total_spent, "remaining": self.remaining}</code></pre>
+<div class="code-caption">Listing 6.7: A thread-safe BudgetGuard that tracks spending by category and enforces a hard ceiling. Every cost-incurring operation (launching a container, calling an LLM, writing to cloud storage) calls <code>request</code> before proceeding. The guard logs warnings as spending approaches the ceiling and rejects requests that would exceed it.</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent mistake is believing that a cost budget alone prevents runaway spending. It does not. A budget guard checks whether each <em>individual</em> request fits within the remaining balance, so an agent that submits hundreds of cheap requests (each costing a few cents) will pass every budget check while the cumulative total climbs steadily toward the ceiling. By the time the guard finally rejects a request, the damage is already substantial. You need rate limits (from the safety boundary layer) working in concert with the budget guard: rate limits cap the <em>velocity</em> of spending, while the budget guard caps the <em>total</em>.</p>
+</div>
+
+<h3>Latency Budgets</h3>
+
+<p>Latency budgets define acceptable response times for different operation classes. The standard approach uses percentile targets:</p>
+
+<ul>
+<li><strong>Interactive queries</strong> (artifact lookups, status checks): p50 &lt; 100 ms, p99 &lt; 500 ms.</li>
+<li><strong>Agent planning steps</strong> (LLM calls, tool selection): p50 &lt; 2 s, p99 &lt; 10 s.</li>
+<li><strong>Experiment execution</strong> (sandboxed runs): p50 &lt; 5 min, p99 &lt; 30 min.</li>
+</ul>
+
+<p>When an operation exceeds its p99 target, the system should log the violation, emit a metric, and (for agent-driven operations) consider whether to retry, abort, or escalate to a human. The combination of latency budgets with the timeout in our sandbox (Listing 6.5) ensures that no single operation can block the pipeline indefinitely.</p>
+
+<h3>Reliability of Serial Components</h3>
+
+<p>A discovery pipeline chains multiple components: data loader, sandbox executor, LLM planner, artifact store, dashboard. If these components are arranged in series (each must succeed for the pipeline to succeed), the system reliability is:</p>
+
+$$R_{\text{system}} = \prod_{i=1}^{n} R_i$$
+
+<p>With five components each at 99% availability, the system reliability drops to $0.99^5 \approx 0.951$, meaning roughly one failure per twenty runs. At 99.9% per component, the system achieves $0.999^5 \approx 0.995$. This multiplicative penalty is why observability matters: when a pipeline fails, you need to identify <em>which</em> component failed, not just <em>that</em> the pipeline failed.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of serial reliability like a string of holiday lights wired in series: if any single bulb burns out, the entire string goes dark. A chain of five components at 99% reliability each is not "almost perfect five times over"; it is five chances for the whole string to fail. Each additional component you wire in series is another bulb that can kill the strand. This is why the formula multiplies rather than averages: you are computing the probability that <em>every single bulb stays lit simultaneously</em>, and that probability shrinks with each bulb you add. Parallel redundancy (running backup instances of critical components) is the equivalent of wiring bulbs in parallel, where a single burnout leaves the rest of the string glowing.</p>
+</div>
+
+<h2>4. Observability with OpenTelemetry</h2>
+
+<p><strong>What.</strong> Observability is the ability to understand a system's internal state from its external outputs. In the context of discovery systems, observability means answering questions like: Which experiments are running right now? How long did the LLM planner take on the last iteration? Why did experiment 47 fail? Where is the budget being consumed? The three pillars of observability are <strong>traces</strong> (end-to-end request flows), <strong>metrics</strong> (numerical measurements over time), and <strong>logs</strong> (structured event records).</p>
+
+<p><strong>Why.</strong> Discovery agents make decisions autonomously, often in long-running loops that span hours or days. Without observability, debugging is archaeology: sifting through stdout dumps after the fact, reconstructing what happened from incomplete evidence. With proper instrumentation, you can watch the system in real time, set alerts on anomalous behavior, and trace any result back to the exact sequence of decisions that produced it. This complements the provenance graph from <a href="section-6.2.html">Section 6.2</a>: provenance tells you <em>what</em> produced a result; observability tells you <em>how</em> it performed while doing so.</p>
+
+<p><strong>How.</strong> <a href="https://opentelemetry.io/">OpenTelemetry</a> (OTel) is the industry standard for instrumenting distributed systems. It provides a vendor-neutral API for creating traces, recording metrics, and emitting structured logs. We use the Python SDK (<code>opentelemetry-api</code>, <code>opentelemetry-sdk</code>) to instrument our discovery system.</p>
+
+<p><strong>When.</strong> Instrument from day one. Adding observability to a running system is far harder than building it in. The overhead of OTel instrumentation is negligible (microseconds per span in typical configurations), so there is no performance reason to defer it.</p>
+
+<pre><code class="language-python">from opentelemetry import trace, metrics
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.trace.export import (
+    ConsoleSpanExporter, SimpleSpanProcessor,
+)
+from opentelemetry.sdk.metrics.export import (
+    ConsoleMetricReader,
+)
+import time
+from typing import Any
+
+# --- One-time SDK setup (typically in your application entry point) ---
+trace.set_tracer_provider(TracerProvider())
+trace.get_tracer_provider().add_span_processor(
+    SimpleSpanProcessor(ConsoleSpanExporter())
+)
+metrics.set_meter_provider(
+    MeterProvider(metric_readers=[ConsoleMetricReader()])
+)
+
+# --- Per-module instrumentation ---
+tracer = trace.get_tracer("discovery.workbench")
+meter = metrics.get_meter("discovery.workbench")
+
+experiment_counter = meter.create_counter(
+    name="experiments.completed",
+    description="Number of completed experiments",
+    unit="1",
+)
+experiment_duration = meter.create_histogram(
+    name="experiments.duration_seconds",
+    description="Wall-clock duration of experiment execution",
+    unit="s",
+)
+budget_remaining = meter.create_observable_gauge(
+    name="budget.remaining_usd",
+    description="Remaining budget in USD",
+    callbacks=[],  # registered dynamically; see below
+)
+
+
+def run_instrumented_experiment(
+    experiment_id: str,
+    params: dict[str, Any],
+    sandbox_fn,
+) -> dict[str, Any]:
+    """Run an experiment with full OpenTelemetry instrumentation."""
+    with tracer.start_as_current_span(
+        "run_experiment",
+        attributes={
+            "experiment.id": experiment_id,
+            "experiment.param_count": len(params),
+        },
+    ) as span:
+        start = time.time()
+
+        # Planning sub-span
+        with tracer.start_as_current_span("plan") as plan_span:
+            plan_span.set_attribute(
+                "plan.params", str(params)
+            )
+
+        # Execution sub-span
+        with tracer.start_as_current_span("execute") as exec_span:
+            result = sandbox_fn(params)
+            exec_span.set_attribute(
+                "execute.exit_code", result.exit_code
+            )
+            exec_span.set_attribute(
+                "execute.timed_out", result.timed_out
+            )
+
+        duration = time.time() - start
+
+        # Record metrics
+        status = "success" if result.exit_code == 0 else "failure"
+        experiment_counter.add(
+            1, {"status": status}
+        )
+        experiment_duration.record(
+            duration, {"status": status}
+        )
+
+        span.set_attribute("experiment.status", status)
+        span.set_attribute("experiment.duration_s", duration)
+
+        return {
+            "experiment_id": experiment_id,
+            "status": status,
+            "duration_s": duration,
+        }</code></pre>
+<div class="code-caption">Listing 6.8: Instrumenting experiment execution with OpenTelemetry traces and metrics. Each experiment produces a parent span (<code>run_experiment</code>) with child spans for planning and execution. Counters and histograms feed dashboards that show throughput, success rates, and duration distributions in real time.</div>
+
+<h3>Structured Logging</h3>
+
+<p>Traces and metrics answer "how is the system performing?" Logs answer "what exactly happened?" Structured logging (emitting JSON records with consistent fields rather than free-form text) makes logs queryable. Every log entry should include at minimum: a timestamp, a severity level, an experiment or run identifier (for correlation with traces), and a human-readable message.</p>
+
+<pre><code class="language-python">import logging
+import json
+from datetime import datetime, timezone
+
+
+class StructuredFormatter(logging.Formatter):
+    """Emit log records as single-line JSON."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        # Carry over extra fields set by the caller
+        for key in ("experiment_id", "action", "cost_usd"):
+            if hasattr(record, key):
+                entry[key] = getattr(record, key)
+        return json.dumps(entry)
+
+
+# Usage
+handler = logging.StreamHandler()
+handler.setFormatter(StructuredFormatter())
+logger = logging.getLogger("discovery")
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# Log with structured context
+logger.info(
+    "Experiment completed",
+    extra={
+        "experiment_id": "exp-042",
+        "action": "bayesian_opt_step",
+        "cost_usd": 0.47,
+    },
+)</code></pre>
+<div class="code-caption">Listing 6.9: A structured JSON log formatter that attaches experiment identifiers and cost information to every log entry. These fields enable filtering and aggregation in log management systems (Elasticsearch, Loki, CloudWatch).</div>
+
+<h3>Dashboards and Alerts</h3>
+
+<p>The metrics from Listing 6.8 and the logs from Listing 6.9 feed into dashboards that give operators (and the agents themselves) real-time visibility into the discovery process. A minimal dashboard for a discovery workbench should display:</p>
+
+<ul>
+<li><strong>Experiment throughput:</strong> completed experiments per hour, broken down by status (success, failure, timeout).</li>
+<li><strong>Budget burn rate:</strong> cumulative spending over time, with a projection line showing when the ceiling will be reached at current rate.</li>
+<li><strong>Latency distribution:</strong> p50 and p99 durations for each operation class, with horizontal reference lines at the budget targets.</li>
+<li><strong>Active agents:</strong> count of agents currently running, with their current action and elapsed time.</li>
+<li><strong>Error rate:</strong> fraction of failed experiments in a sliding window, with an alert threshold (e.g., alert if error rate exceeds 20% over the last 30 minutes).</li>
+</ul>
+
+<p>Tools like <a href="https://grafana.com/">Grafana</a> (for metrics dashboards), <a href="https://www.jaegertracing.io/">Jaeger</a> (for trace visualization), and <a href="https://grafana.com/oss/loki/">Loki</a> (for log aggregation) integrate natively with OpenTelemetry exporters. In <a href="../../part-3-mlops/module-22-mlops/index.html">Chapter 22: MLOps for Discovery</a>, we configure a full observability stack. Here, the console exporters in Listing 6.8 are sufficient for development and serve as a drop-in replacement target for production backends.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: OpenTelemetry Ecosystem</div>
+<p>The manual instrumentation in Listings 6.8 and 6.9 gives you full control, but the OpenTelemetry ecosystem also provides <strong>auto-instrumentation</strong> libraries that patch popular frameworks without code changes. <a href="https://opentelemetry-python-contrib.readthedocs.io/">opentelemetry-instrumentation-fastapi</a> automatically traces every HTTP request to your Workbench API. <a href="https://opentelemetry-python-contrib.readthedocs.io/">opentelemetry-instrumentation-requests</a> traces outgoing HTTP calls (useful when your agent calls external APIs). <a href="https://opentelemetry-python-contrib.readthedocs.io/">opentelemetry-instrumentation-sqlalchemy</a> traces database queries to your artifact store. These auto-instrumentation libraries compose: install all three, and you get a complete trace from "API request received" through "database queried" to "external API called" to "response sent," with no manual span creation required. For LLM-specific observability, <a href="https://docs.traceloop.dev/">OpenLLMetry</a> provides auto-instrumentation for OpenAI, Anthropic, and other LLM provider SDKs, recording token counts, model names, and latencies as span attributes.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>The safety and sandboxing patterns in this section assume a single agent operating within predefined boundaries. Recent work pushes toward <em>runtime safety verification for multi-agent systems</em>. AgentHarm (Andriushchenko et al., 2024) introduces a benchmark of 440 harmful agent behaviors to systematically evaluate whether safety boundaries catch adversarial tool-use patterns that a single-layer check would miss. Complementing this, the AgentMonitor framework (Chi et al., 2024, "AgentMonitor: A Plug-and-Play Framework for Predictive and Secure Multi-Agent Systems") instruments live multi-agent pipelines with per-agent risk scores computed from token statistics, tool-call frequencies, and inter-agent communication patterns, then flags anomalous agents before they complete harmful action sequences. These systems move beyond static allowlists toward learned, adaptive safety boundaries that respond to the behavioral fingerprint of each agent in real time.</p>
+</div>
+
+<h3>Tying It All Together</h3>
+
+<p>The four mechanisms in this section, sandboxing, safety boundaries, budget guards, and observability, are not independent features. They form a layered defense:</p>
+
+<ol>
+<li>The <strong>safety boundary</strong> checks whether the agent is allowed to perform the action at all.</li>
+<li>The <strong>budget guard</strong> checks whether the action's estimated cost fits within the remaining budget.</li>
+<li>The <strong>sandbox</strong> executes the action in an isolated environment with resource limits.</li>
+<li><strong>Observability</strong> records everything that happens at each layer, feeding dashboards and alerts.</li>
+</ol>
+
+<p>If any layer rejects the action, execution stops and the reason is logged. If all layers approve and execution proceeds, the telemetry captures the outcome. This defense-in-depth pattern ensures that no single failure mode can cause unchecked damage. A determined agent might find a way past one layer (for example, by spreading cost across many small requests that individually pass the budget check). But the combination of rate limits (in the safety boundary) and cumulative tracking (in the budget guard) catches the aggregate behavior. And if even that fails, the observability layer makes the anomaly visible to human operators.</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Budget-Guarded Sandbox Runner</h4>
+<p>Wire together the sandbox, safety boundary, and budget guard from this section into a single script that safely runs a batch of experiment scripts. You will need only the Python standard library.</p>
+<ol>
+<li><strong>Create three small Python scripts</strong> in a <code>test_experiments/</code> folder. Make <code>exp_fast.py</code> print "result: 42" and exit. Make <code>exp_slow.py</code> call <code>time.sleep(10)</code> before printing. Make <code>exp_crash.py</code> raise a <code>RuntimeError</code>.</li>
+<li><strong>Instantiate the components.</strong> Create a <code>SandboxConfig</code> with a 5-second timeout, a <code>SafetyBoundary</code> that allows at most 3 experiments per 60-second window, and a <code>BudgetGuard</code> with a $2.00 ceiling (charge $0.50 per experiment as a simulated cost).</li>
+<li><strong>Write a loop</strong> that iterates over the three scripts. Before each run, call <code>boundary.check("run_experiment")</code> and <code>budget.request(CostCategory.COMPUTE, 0.50)</code>. Only call <code>run_in_sandbox</code> if both checks pass.</li>
+<li><strong>Print a summary</strong> after the loop: how many experiments succeeded, how many timed out, how many were rejected by the safety boundary or budget, and the remaining budget (via <code>budget.summary()</code>).</li>
+<li><strong>Test the limits.</strong> Duplicate the script list so it contains six entries (exceeding the rate limit of 3). Run the loop again and confirm that the fourth experiment is rejected. Then lower the budget ceiling to $1.00 and confirm that the third experiment is rejected by the budget guard.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>Conceptual:</strong> A discovery system has four serial components with individual reliabilities of 0.99, 0.995, 0.98, and 0.999. Calculate the system reliability $R_{\text{system}}$. If you could improve exactly one component to 0.999 reliability, which one should you choose and why?</li>
+<li><strong>Coding:</strong> Extend the <code>BudgetGuard</code> from Listing 6.7 to support multiple named campaigns, each with its own ceiling. Add a method <code>transfer(from_campaign, to_campaign, amount)</code> that moves unused budget between campaigns. Write tests that verify the transfer fails if the source campaign has insufficient remaining funds.</li>
+<li><strong>Coding:</strong> Implement a <code>LatencyBudget</code> class that records operation durations and checks them against p50/p95/p99 targets. Use the class to instrument the <code>run_in_sandbox</code> function from Listing 6.5. Log a warning whenever a sandbox execution exceeds the p95 target.</li>
+<li><strong>Analysis:</strong> An agent submits experiments at a rate of 12 per hour. Each experiment costs an average of \$0.85 in compute, with a standard deviation of \$0.40. The budget ceiling is \$200. Estimate the expected number of hours before the budget is exhausted. What is the probability that the agent exceeds the budget within 15 hours? (Hint: model the cumulative cost as a sum of independent random variables and apply the Central Limit Theorem.)</li>
+<li><strong>Design:</strong> Sketch the OpenTelemetry span hierarchy for a discovery agent that (a) receives a hypothesis from the planner, (b) generates a Python script to test it, (c) executes the script in a sandbox, (d) evaluates the results, and (e) updates the artifact graph. Name each span and list three attributes you would attach to the root span.</li>
+</ol>
+</section>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>With safety boundaries, cost controls, and observability in place, we have everything we need to build a working system. In <a href="section-6.4.html">Section 6.4: Bootstrapping the Discovery Workbench</a>, we assemble the artifact graph (Section 6.2), the sandbox executor, the budget guard, and the telemetry layer into a runnable Workbench v0 with a SQLite-backed artifact registry, a FastAPI layer, and a CLI that ties it all together. The patterns from this section will reappear throughout the book: in <a href="../../part-3-mlops/module-22-mlops/index.html">Chapter 22</a> (production MLOps), <a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">Chapter 55</a> (self-driving laboratories), and <a href="../../part-8-responsible-ai/module-57-responsible-discovery/index.html">Chapter 57</a> (responsible AI for discovery).</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-card">
+<a href="https://opentelemetry.io/docs/" target="_blank">OpenTelemetry Documentation. (2024). OpenTelemetry: Observability framework for cloud-native software.</a>
+<p>The official reference for the traces, metrics, and logs APIs used throughout this section. Covers SDKs for Python, Go, Java, and other languages.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://sre.google/sre-book/table-of-contents/" target="_blank">Beyer, B., Jones, C., Petoff, J., &amp; Murphy, N.R. (2016). <em>Site Reliability Engineering: How Google Runs Production Systems</em>. O'Reilly.</a>
+<p>The foundational text on reliability engineering, error budgets, and monitoring. Our latency budget and reliability formulas draw directly from its service-level objective framework.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://docs.docker.com/engine/security/" target="_blank">Docker Documentation. (2024). Docker Security.</a>
+<p>Covers container isolation mechanisms (namespaces, cgroups, seccomp profiles) that underpin production-grade sandboxing for agent-executed code.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2304.05332" target="_blank">Boiko, D.A., MacKnight, R., Kline, B., &amp; Gomes, G. (2023). Autonomous chemical research with large language models. <em>Nature</em>, 624, 570-578.</a>
+<p>Demonstrates autonomous agents executing chemistry experiments, including the safety and sandboxing measures required to prevent harmful synthesis attempts.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2302.04761" target="_blank">Weng, L. (2023). "LLM Powered Autonomous Agents." Lil'Log.</a>
+<p>Survey of LLM agent architectures with discussion of safety mechanisms, tool-use sandboxing, and the human-in-the-loop patterns adopted in this section.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://www.oreilly.com/library/view/observability-engineering/9781492076438/" target="_blank">Majors, C., Fong-Jones, L., &amp; Miranda, G. (2022). <em>Observability Engineering</em>. O'Reilly.</a>
+<p>A practitioner's guide to building observable systems. Its treatment of structured events, high-cardinality dimensions, and the distinction between monitoring and observability informs our approach.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2310.12931" target="_blank">Yang, J. et al. (2023). "SWE-bench: Can Language Models Resolve Real-World GitHub Issues?" <em>arXiv:2310.12931</em>.</a>
+<p>Introduces sandboxed evaluation of LLM-generated code patches. The benchmark's isolation and timeout mechanisms parallel our sandbox design.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://cloud.google.com/architecture/cost-management-for-machine-learning" target="_blank">Google Cloud. (2024). Cost Management for Machine Learning.</a>
+<p>Practical guidance on budgeting, monitoring, and controlling cloud costs for ML workloads. The per-component cost decomposition aligns with our $C_{\text{total}}$ model.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://docs.traceloop.dev/" target="_blank">Traceloop. (2024). OpenLLMetry: Open-source observability for LLM applications.</a>
+<p>Auto-instrumentation library that adds OpenTelemetry traces to LLM provider calls, capturing token usage, latencies, and model metadata as span attributes.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2308.08155" target="_blank">Wang, L. et al. (2024). "A Survey on Large Language Model Based Autonomous Agents." <em>Frontiers of Computer Science</em>, 18(6).</a>
+<p>Comprehensive agent architecture survey covering safety constraints, action spaces, and the layered defense patterns that inform our safety boundary design.</p>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.2.html">&#8592; 6.2 Artifact Graphs and Provenance</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="section-6.4.html">6.4 Bootstrapping the Discovery Workbench &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

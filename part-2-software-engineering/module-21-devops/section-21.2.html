@@ -1,0 +1,1120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.2: Observability and Incident Analysis. The four pillars of observability, SRE golden signals, OpenTelemetry instrumentation, and AI-driven anomaly detection and root cause analysis." name="description"/>
+<title>Section 21.2: Observability and Incident Analysis | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: AI for DevOps and Platform Engineering</a></div>
+<h1>21.2 Observability and Incident Analysis</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"You cannot debug what you cannot observe. You cannot observe what you did not instrument. And you did not instrument the one service that is currently on fire."</p>
+<cite>An On-Call Engineer at 3 AM, Composing a Haiku About Regret</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the CI/CD pipeline concepts from
+<a href="section-21.1.html">Section 21.1</a>, which established the deployment lifecycle
+that observability monitors. You should also be familiar with the testing and verification
+patterns from <a href="../module-18-ai-testing/index.html">Chapter 18</a>, as test failures
+in production (the ones testing missed) are exactly what observability systems detect. The
+statistical concepts here connect to the anomaly detection methods covered more formally in
+<a href="../../part-3-data-models/module-30-anomaly-novelty/index.html">Chapter 30</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Observability is the ability to understand a system's internal state by examining its
+external outputs. Where testing verifies behavior <em>before</em> deployment, observability
+verifies behavior <em>after</em> deployment, in the wild, under real traffic, with real
+users. The four pillars of observability (metrics, logs, traces, profiles) provide
+complementary views of system behavior, and the SRE golden signals (latency, traffic,
+errors, saturation) distill those views into the four questions that matter most: "Is the
+service fast enough? Is it handling the expected load? Is it returning errors? Is it
+running out of capacity?" AI transforms observability from a reactive discipline (wait for
+alerts, then investigate) into a proactive one (detect anomalies before users notice,
+correlate signals across services, and generate root cause hypotheses automatically).
+</p>
+</div>
+
+<h2>1. The Four Pillars of Observability</h2>
+
+<p>
+Modern observability rests on four complementary signal types. <strong>Metrics</strong> are
+numeric measurements sampled at regular intervals: request count, error rate, CPU utilization,
+memory usage. They are cheap to collect, easy to aggregate, and excellent for alerting on
+known failure modes. <strong>Logs</strong> are timestamped text records of discrete events:
+a request arrived, a query executed, an error occurred. They provide narrative detail that
+metrics lack, but are expensive to store and search at scale. <strong>Traces</strong> follow
+a single request as it flows through multiple services, recording the timing and outcome
+of each hop. They reveal the causal chain of a distributed operation. <strong>Profiles</strong>
+capture the computational cost of individual functions: CPU time, memory allocations, lock
+contention. They answer "where is the time going?" at the code level.
+</p>
+
+<p data-agent="02">
+Observability is a property of a system's design, not a product you install. A system is
+observable when its internal states can be inferred from its external outputs (telemetry)
+without deploying new code or attaching a debugger. It matters because modern distributed
+architectures produce failure modes that no one anticipated at design time, and the only
+way to diagnose those failures quickly is to have rich, correlated telemetry already flowing.
+The mechanism is straightforward: each service emits metrics, logs, and traces through a
+shared collection pipeline (such as OpenTelemetry), and a backend correlates these signals
+by request ID, timestamp, and service identity so that a single query can reveal the full
+story of any request. Use observability when you need to answer novel, ad hoc questions
+about production behavior; use traditional monitoring (static dashboards and threshold
+alerts) when you already know exactly which failure modes to watch for and need simple,
+low-cost coverage.
+</p>
+
+<p>
+Each pillar answers different questions during an incident:
+</p>
+
+<ul>
+<li><strong>Metrics</strong>: "What changed?" (latency spike at 14:32, error rate jumped from 0.1% to 5%)</li>
+<li><strong>Logs</strong>: "What happened?" (database connection timeout, authentication token expired)</li>
+<li><strong>Traces</strong>: "Where in the system?" (the slowdown is in the recommendation service, not the API gateway)</li>
+<li><strong>Profiles</strong>: "Where in the code?" (the new serialization function allocates 10x more memory)</li>
+</ul>
+
+<p>
+The power of observability comes from correlating signals across pillars. A latency spike
+(metric) leads to slow traces in the payment service (trace), which contain timeout errors
+from the database (log), caused by a query plan regression after a schema migration
+(profile). AI excels at this correlation because it can process all four signal types
+simultaneously, a task that overwhelms human operators during high-pressure incidents.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is believing that <em>more telemetry equals better observability</em>,
+leading teams to instrument everything, store every log line at maximum verbosity, and
+record traces for 100% of requests. In practice, excessive telemetry creates noise that
+buries real signals, inflates storage costs, and slows down queries during the exact
+moments (incidents) when fast answers matter most. Observability comes from collecting the
+<em>right</em> signals with proper correlation (shared trace IDs, consistent labels,
+structured formats), not from collecting <em>all</em> signals indiscriminately.
+</p>
+</div>
+
+<h2>2. The SRE Golden Signals</h2>
+
+<p>
+Google's Site Reliability Engineering framework distills service health into four golden
+signals. These are not arbitrary metrics; they are the minimal set needed to answer the
+question "is the service working for users?"
+</p>
+
+<p>
+<strong>Latency</strong> measures the time to serve a request. Critically, it must be
+measured separately for successful and failed requests, because errors often complete
+quickly (a 500 response returns faster than a successful database query), masking
+degradation in the aggregate. The standard approach uses percentile distributions rather
+than averages:
+</p>
+
+$$\text{SLO violation} \iff P_{99}(\text{latency}) > \tau_{99} \text{ over a rolling window } w$$
+
+<p>
+where $\tau_{99}$ is the latency target at the 99th percentile and $w$ is typically 5 or
+10 minutes. Percentile-based SLOs capture the tail latency that averages hide.
+</p>
+
+<p>
+<strong>Traffic</strong> measures demand: requests per second, messages per second,
+transactions per second. Traffic is the denominator in most other calculations. An error
+rate of 5% means something very different at 10 requests per second (one unhappy user per
+two seconds) versus 10,000 requests per second (500 errors per second).
+</p>
+
+<p>
+<strong>Errors</strong> measure the rate of failed requests, including explicit failures
+(HTTP 5xx), implicit failures (HTTP 200 with wrong content), and policy violations
+(responses that are technically correct but too slow). The error budget model makes this
+quantitative:
+</p>
+
+$$\text{Error Budget Remaining} = \text{SLO Target} - \text{Observed Error Rate}$$
+
+<p>
+An SLO of 99.9% availability gives a monthly error budget of approximately 43.2 minutes
+of downtime ($0.001 \times 30 \times 24 \times 60$). When the budget is exhausted, the
+team should prioritize reliability over features.
+</p>
+
+<p>
+<strong>Saturation</strong> measures how "full" a resource is: CPU at 85%, memory at 92%,
+disk at 78%, connection pool at 95%. Unlike the other signals, saturation is predictive:
+a service at 90% memory utilization will run out of memory before a service at 50%, even
+if both are currently serving requests successfully. Linear extrapolation of saturation
+trends provides a simple "time to exhaustion" estimate:
+</p>
+
+$$t_{\text{exhaust}} = \frac{\text{Capacity} - \text{Current Usage}}{\text{Rate of Change}} = \frac{C - u(t)}{\frac{du}{dt}}$$
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Observability Is Not Monitoring</div>
+<p>
+Monitoring answers predefined questions: "Is CPU above 80%?" "Is the error rate above 1%?"
+You must know what to ask before building the dashboard. Observability answers
+<em>unforeseen</em> questions: "Why are requests from the Tokyo region 3x slower than
+Frankfurt, but only for users with more than 100 items in their cart, and only on Tuesdays?"
+The difference is the difference between verification (testing a known hypothesis) and
+discovery (finding an unknown pattern). Observability is the operational analog of the
+exploratory discovery methods in
+<a href="../../part-3-data-models/module-25-exploratory-discovery/index.html">Chapter 25</a>.
+</p>
+</div>
+
+<h2>3. OpenTelemetry Instrumentation</h2>
+
+<p>
+OpenTelemetry (OTel) is a vendor-neutral framework that unifies the collection of metrics,
+logs, and traces under a single API. It provides auto-instrumentation for common frameworks
+(Flask, FastAPI, Django, requests, SQLAlchemy) and a manual instrumentation API for
+custom business logic. The key abstraction is the <em>span</em>: a named, timed operation
+that can contain attributes (key-value metadata), events (timestamped annotations), and
+links to other spans (forming a trace).
+</p>
+
+<pre><code class="language-python">"""
+OpenTelemetry instrumentation for a scientific discovery service.
+Demonstrates metrics, traces, and structured logging with correlation.
+"""
+from opentelemetry import trace, metrics
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor, ConsoleSpanExporter
+)
+from opentelemetry.sdk.metrics.export import (
+    PeriodicExportingMetricReader, ConsoleMetricExporter
+)
+from opentelemetry.semconv.trace import SpanAttributes
+import logging
+import time
+
+# --- Setup: Configure trace and metrics providers ---
+
+# Traces: each span records a timed operation with metadata
+trace_provider = TracerProvider()
+trace_provider.add_span_processor(
+    BatchSpanProcessor(ConsoleSpanExporter())  # Replace with OTLP exporter
+)
+trace.set_tracer_provider(trace_provider)
+tracer = trace.get_tracer("discovery.service")
+
+# Metrics: counters, histograms, and gauges for aggregated measurements
+metric_reader = PeriodicExportingMetricReader(
+    ConsoleMetricExporter(), export_interval_millis=10000
+)
+meter_provider = MeterProvider(metric_readers=[metric_reader])
+metrics.set_meter_provider(meter_provider)
+meter = metrics.get_meter("discovery.service")
+
+# Define the four golden signal metrics
+request_counter = meter.create_counter(
+    "discovery.requests.total",
+    description="Total number of requests",
+    unit="1"
+)
+error_counter = meter.create_counter(
+    "discovery.errors.total",
+    description="Total number of errors",
+    unit="1"
+)
+latency_histogram = meter.create_histogram(
+    "discovery.request.duration",
+    description="Request duration in milliseconds",
+    unit="ms"
+)
+active_requests_gauge = meter.create_up_down_counter(
+    "discovery.requests.active",
+    description="Number of currently active requests",
+    unit="1"
+)
+
+# Structured logging with trace correlation
+logger = logging.getLogger("discovery.service")
+
+
+def process_experiment(experiment_id: str, parameters: dict) -> dict:
+    """Process a scientific experiment with full observability.
+
+    This function demonstrates how to instrument a business operation
+    with traces (for request flow), metrics (for golden signals),
+    and structured logs (for event details).
+    """
+    # Start a trace span for the entire operation
+    with tracer.start_as_current_span(
+        "process_experiment",
+        attributes={
+            "experiment.id": experiment_id,
+            "experiment.type": parameters.get("type", "unknown"),
+            "experiment.parameters_count": len(parameters),
+        }
+    ) as span:
+        # Track active requests (saturation signal)
+        active_requests_gauge.add(1, {"endpoint": "experiment"})
+        start_time = time.time()
+
+        try:
+            # Step 1: Validate parameters (child span)
+            with tracer.start_as_current_span("validate_parameters") as val_span:
+                if not parameters:
+                    val_span.set_attribute("validation.result", "failed")
+                    raise ValueError("Empty parameters")
+                val_span.set_attribute("validation.result", "passed")
+                logger.info(
+                    "Parameters validated",
+                    extra={"experiment_id": experiment_id}
+                )
+
+            # Step 2: Run computation (child span with timing)
+            with tracer.start_as_current_span("run_computation") as comp_span:
+                # Simulate computation
+                result = {
+                    "experiment_id": experiment_id,
+                    "status": "completed",
+                    "metrics": {"accuracy": 0.94, "loss": 0.12}
+                }
+                comp_span.set_attribute(
+                    "computation.accuracy", result["metrics"]["accuracy"]
+                )
+                comp_span.add_event("computation_completed", {
+                    "accuracy": str(result["metrics"]["accuracy"])
+                })
+
+            # Step 3: Store results (child span)
+            with tracer.start_as_current_span("store_results") as store_span:
+                store_span.set_attribute("storage.backend", "postgresql")
+                logger.info(
+                    "Results stored",
+                    extra={
+                        "experiment_id": experiment_id,
+                        "accuracy": result["metrics"]["accuracy"]
+                    }
+                )
+
+            # Record success metrics
+            duration_ms = (time.time() - start_time) * 1000
+            request_counter.add(1, {"endpoint": "experiment", "status": "success"})
+            latency_histogram.record(duration_ms, {"endpoint": "experiment"})
+
+            span.set_attribute("experiment.status", "success")
+            return result
+
+        except Exception as e:
+            # Record failure metrics
+            duration_ms = (time.time() - start_time) * 1000
+            error_counter.add(1, {
+                "endpoint": "experiment",
+                "error_type": type(e).__name__
+            })
+            latency_histogram.record(duration_ms, {"endpoint": "experiment"})
+
+            span.set_attribute("experiment.status", "error")
+            span.record_exception(e)
+            logger.error(
+                f"Experiment failed: {e}",
+                extra={"experiment_id": experiment_id},
+                exc_info=True
+            )
+            raise
+
+        finally:
+            active_requests_gauge.add(-1, {"endpoint": "experiment"})</code></pre>
+<div class="code-caption">Full OpenTelemetry instrumentation of a scientific discovery service, demonstrating correlated traces (spans with parent-child relationships), golden signal metrics (counters, histograms, gauges), and structured logging with experiment context.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Auto-Instrumentation</div>
+<p>
+The manual instrumentation above teaches the concepts, but OpenTelemetry's
+auto-instrumentation libraries handle most of this automatically. For a FastAPI service,
+install <code>opentelemetry-instrumentation-fastapi</code> and call
+<code>FastAPIInstrumentor.instrument_app(app)</code>. This single line adds trace spans for
+every HTTP request, records latency histograms, tracks error rates, and propagates trace
+context across service boundaries. Auto-instrumentation packages exist for Flask, Django,
+SQLAlchemy, requests, httpx, Redis, PostgreSQL, and dozens more. The manual API is needed
+only for custom business logic (like the experiment-specific attributes above). In a
+typical service, auto-instrumentation covers 80% of the observability needs in 3 lines
+of code versus 60+ lines of manual instrumentation.
+</p>
+</div>
+
+<h2>4. AI-Driven Anomaly Detection</h2>
+
+<p>
+Traditional alerting uses static thresholds: alert when error rate exceeds 1%, when latency
+exceeds 500ms, when CPU exceeds 80%. These thresholds are fragile. A service with natural
+daily traffic patterns (high during business hours, low at night) triggers false alarms at
+night (low traffic makes error rate volatile) and misses real problems during peak hours
+(a 20% latency increase from 200ms to 240ms is invisible to a 500ms threshold but
+significant to users).
+</p>
+
+<p>
+AI-driven anomaly detection replaces static thresholds with learned baselines. The simplest
+effective approach uses exponentially weighted moving statistics:
+</p>
+
+$$\hat{\mu}_t = \alpha \cdot x_t + (1 - \alpha) \cdot \hat{\mu}_{t-1}$$
+$$\hat{\sigma}^2_t = \alpha \cdot (x_t - \hat{\mu}_t)^2 + (1 - \alpha) \cdot \hat{\sigma}^2_{t-1}$$
+
+<p>
+where $\alpha \in (0, 1)$ is the smoothing parameter (smaller values give more weight to
+history), $x_t$ is the current observation, $\hat{\mu}_t$ is the estimated mean, and
+$\hat{\sigma}^2_t$ is the estimated variance. An anomaly is flagged when the observation
+falls outside $k$ standard deviations from the estimated mean:
+</p>
+
+$$\text{anomaly} \iff |x_t - \hat{\mu}_t| > k \cdot \hat{\sigma}_t$$
+
+<p>
+The parameter $k$ controls the sensitivity: $k = 2$ catches moderate anomalies (roughly
+5% false positive rate for Gaussian data), $k = 3$ catches severe anomalies (0.3% false
+positive rate). For operational metrics, $k = 3$ is a common starting point, adjusted
+based on the cost of false positives versus missed detections.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the exponentially weighted moving average as a weather forecaster who updates
+tomorrow's prediction by blending today's actual temperature with yesterday's forecast.
+If today is unexpectedly hot, the forecaster nudges the prediction upward but does not
+throw out the entire history. The smoothing parameter $\alpha$ controls how much weight
+goes to today versus the accumulated past: a small $\alpha$ (say 0.05) is a cautious
+forecaster who trusts the long trend, while a large $\alpha$ (say 0.3) is a reactive
+forecaster who pivots quickly. An "anomaly" in this model is a day so far from the
+forecast that no reasonable weather pattern would produce it, like snow in July. The
+detector flags it not because the value is absolutely extreme, but because it is extreme
+relative to what the recent history predicts.
+</p>
+</div>
+
+<pre><code class="language-python">"""
+Time series anomaly detection for operational metrics.
+Implements exponentially weighted statistics with seasonal adjustment.
+"""
+import numpy as np
+from dataclasses import dataclass, field
+from collections import deque
+
+
+@dataclass
+class AnomalyDetector:
+    """Detects anomalies in streaming metric data.
+
+    Uses exponentially weighted moving average and variance with
+    optional seasonal decomposition for metrics with periodic patterns
+    (e.g., daily traffic cycles).
+    """
+    alpha: float = 0.1          # Smoothing parameter (0 < alpha < 1)
+    threshold_sigma: float = 3.0  # Anomaly threshold in std deviations
+    season_length: int = 0      # 0 = no seasonality; e.g., 288 for 5-min data with daily cycle
+    warmup_points: int = 100    # Minimum points before generating alerts
+
+    # Internal state
+    _mean: float = 0.0
+    _variance: float = 1.0
+    _count: int = 0
+    _seasonal_means: np.ndarray = field(default_factory=lambda: np.array([]))
+    _seasonal_counts: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    def __post_init__(self):
+        if self.season_length > 0:
+            self._seasonal_means = np.zeros(self.season_length)
+            self._seasonal_counts = np.zeros(self.season_length)
+
+    def update(self, value: float, timestamp_index: int = 0) -> dict:
+        """Process a new metric value and check for anomalies.
+
+        Args:
+            value: The metric value at the current time step.
+            timestamp_index: Position in the seasonal cycle (e.g., minute of day).
+
+        Returns:
+            Dictionary with anomaly status, score, and context.
+        """
+        self._count += 1
+
+        # Deseasonalize if seasonal model is active
+        seasonal_component = 0.0
+        if self.season_length > 0 and self._count > self.season_length:
+            season_pos = timestamp_index % self.season_length
+            seasonal_component = self._seasonal_means[season_pos]
+
+        deseasonalized = value - seasonal_component
+
+        # Update exponentially weighted statistics
+        if self._count == 1:
+            self._mean = deseasonalized
+            self._variance = 0.0
+        else:
+            delta = deseasonalized - self._mean
+            self._mean = self.alpha * deseasonalized + (1 - self.alpha) * self._mean
+            self._variance = (
+                self.alpha * delta ** 2
+                + (1 - self.alpha) * self._variance
+            )
+
+        # Update seasonal model
+        if self.season_length > 0:
+            season_pos = timestamp_index % self.season_length
+            n = self._seasonal_counts[season_pos]
+            self._seasonal_means[season_pos] = (
+                (n * self._seasonal_means[season_pos] + value) / (n + 1)
+            )
+            self._seasonal_counts[season_pos] = n + 1
+
+        # Compute anomaly score
+        std = max(np.sqrt(self._variance), 1e-10)  # Avoid division by zero
+        z_score = abs(deseasonalized - self._mean) / std
+
+        is_anomaly = (
+            z_score > self.threshold_sigma
+            and self._count > self.warmup_points
+        )
+
+        return {
+            "is_anomaly": is_anomaly,
+            "z_score": round(z_score, 2),
+            "value": value,
+            "expected": round(self._mean + seasonal_component, 2),
+            "std": round(std, 4),
+            "direction": "high" if deseasonalized > self._mean else "low",
+            "confidence": min(self._count / self.warmup_points, 1.0)
+        }
+
+
+class MultiSignalDetector:
+    """Correlates anomalies across multiple golden signals.
+
+    A single metric anomaly might be noise. Correlated anomalies
+    across latency, error rate, and traffic are almost certainly
+    a real incident.
+    """
+    def __init__(self, signals: list[str], correlation_window: int = 5):
+        """
+        Args:
+            signals: Names of the signals to monitor.
+            correlation_window: Number of time steps within which
+                anomalies are considered correlated.
+        """
+        self.detectors = {name: AnomalyDetector() for name in signals}
+        self.correlation_window = correlation_window
+        self.recent_anomalies: dict[str, deque] = {
+            name: deque(maxlen=correlation_window) for name in signals
+        }
+
+    def update(self, signal_name: str, value: float, step: int) -> dict:
+        """Update a single signal and check for correlated anomalies."""
+        result = self.detectors[signal_name].update(value, step)
+        self.recent_anomalies[signal_name].append(
+            (step, result["is_anomaly"])
+        )
+
+        # Check for correlation: how many signals have recent anomalies?
+        correlated_signals = []
+        for name, history in self.recent_anomalies.items():
+            if any(is_anom for _, is_anom in history):
+                correlated_signals.append(name)
+
+        result["correlated_signals"] = correlated_signals
+        result["incident_likelihood"] = (
+            "high" if len(correlated_signals) >= 3
+            else "medium" if len(correlated_signals) >= 2
+            else "low"
+        )
+        return result
+
+
+# Example: monitoring a service
+if __name__ == "__main__":
+    detector = MultiSignalDetector(
+        signals=["latency_p99", "error_rate", "traffic_rps", "cpu_percent"]
+    )
+
+    # Simulate normal traffic with an anomaly at step 150
+    np.random.seed(42)
+    for step in range(200):
+        # Normal baseline
+        latency = np.random.normal(200, 20)
+        error_rate = np.random.normal(0.01, 0.002)
+        traffic = np.random.normal(1000, 50)
+        cpu = np.random.normal(60, 5)
+
+        # Inject incident at step 150: latency spike + error surge
+        if 150 <= step <= 160:
+            latency += 300   # 200ms -> 500ms
+            error_rate += 0.08  # 1% -> 9%
+
+        for signal, value in [
+            ("latency_p99", latency), ("error_rate", error_rate),
+            ("traffic_rps", traffic), ("cpu_percent", cpu)
+        ]:
+            result = detector.update(signal, value, step)
+
+        if result["incident_likelihood"] in ("medium", "high"):
+            print(
+                f"Step {step}: {result['incident_likelihood']} incident, "
+                f"correlated: {result['correlated_signals']}"
+            )
+    # Output at step 150-160:
+    #   Step 150: medium incident, correlated: ['latency_p99', 'error_rate']
+    #   Step 151: high incident, correlated: ['latency_p99', 'error_rate', ...]</code></pre>
+<div class="code-caption">Multi-signal anomaly detection system that monitors golden signals independently and correlates anomalies across signals to distinguish noise from real incidents, using exponentially weighted statistics with seasonal adjustment.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Detecting a Memory Leak Before OOM</div>
+<p>
+A materials science simulation platform ran long-lived worker processes that occasionally
+developed memory leaks after processing certain molecular structures. Traditional monitoring
+used a static 90% memory threshold, which triggered alerts only minutes before
+out-of-memory (OOM) kills. By switching to the saturation extrapolation formula
+($t_{\text{exhaust}} = (C - u(t)) / (du/dt)$), the team predicted OOM events 2-4 hours
+in advance. When the predicted time-to-exhaustion dropped below 30 minutes, an automated
+handler gracefully drained the worker, restarted it, and redistributed its jobs. OOM kills
+dropped from 15 per week to zero, and the team used the time-to-exhaustion metric as
+input to their capacity planning model from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.
+</p>
+</div>
+
+<h2>5. Log Clustering and Pattern Extraction</h2>
+
+<p>
+Production services generate millions of log lines per hour. During an incident, the
+relevant signal is buried in noise: routine health checks, request logs, debug output from
+unrelated services. AI-driven log analysis clusters similar log messages, identifies novel
+patterns, and extracts the critical events that explain the incident.
+</p>
+
+<p>
+The simplest effective approach is <em>log template extraction</em>: parsing log messages
+to separate the fixed template ("Connection to {host}:{port} timed out after {duration}ms")
+from the variable parameters (host=db-primary, port=5432, duration=30000). Once templates
+are extracted, clustering reduces millions of log lines to dozens of distinct message types,
+and anomaly detection identifies templates whose frequency changed during the incident.
+</p>
+
+<pre><code class="language-python">"""
+Log clustering and anomaly detection for incident analysis.
+Extracts templates from raw log messages, clusters by pattern,
+and identifies frequency anomalies during incidents.
+"""
+import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+
+
+@dataclass
+class LogEntry:
+    """A parsed log entry."""
+    timestamp: str
+    level: str
+    service: str
+    message: str
+    template: str = ""
+    parameters: dict = None
+
+
+def extract_template(message: str) -> tuple[str, dict]:
+    """Extract a template from a log message by replacing variable parts.
+
+    Replaces IP addresses, numbers, UUIDs, paths, and quoted strings
+    with typed placeholders, leaving the structural skeleton.
+
+    Returns:
+        Tuple of (template_string, extracted_parameters).
+    """
+    params = {}
+    template = message
+
+    # Replace UUIDs
+    uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    for i, match in enumerate(re.finditer(uuid_pattern, template, re.IGNORECASE)):
+        params[f"uuid_{i}"] = match.group()
+    template = re.sub(uuid_pattern, '{UUID}', template, flags=re.IGNORECASE)
+
+    # Replace IP addresses
+    ip_pattern = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    for i, match in enumerate(re.finditer(ip_pattern, template)):
+        params[f"ip_{i}"] = match.group()
+    template = re.sub(ip_pattern, '{IP}', template)
+
+    # Replace quoted strings
+    for i, match in enumerate(re.finditer(r'"([^"]*)"', template)):
+        params[f"str_{i}"] = match.group(1)
+    template = re.sub(r'"[^"]*"', '{STR}', template)
+
+    # Replace numbers (after IPs to avoid double-replacing)
+    for i, match in enumerate(re.finditer(r'\b\d+\.?\d*\b', template)):
+        params[f"num_{i}"] = match.group()
+    template = re.sub(r'\b\d+\.?\d*\b', '{NUM}', template)
+
+    return template, params
+
+
+class LogAnalyzer:
+    """Analyzes log streams for incident investigation.
+
+    Clusters logs by template, tracks template frequency over time,
+    and identifies templates with anomalous frequency changes.
+    """
+    def __init__(self):
+        self.template_counts: Counter = Counter()
+        self.template_examples: dict[str, str] = {}
+        self.window_counts: defaultdict = defaultdict(Counter)
+
+    def ingest(self, entries: list[LogEntry], window_id: str = "current"):
+        """Process a batch of log entries.
+
+        Args:
+            entries: List of log entries to process.
+            window_id: Time window identifier for frequency comparison.
+        """
+        for entry in entries:
+            template, params = extract_template(entry.message)
+            entry.template = template
+            entry.parameters = params
+
+            self.template_counts[template] += 1
+            self.window_counts[window_id][template] += 1
+
+            if template not in self.template_examples:
+                self.template_examples[template] = entry.message
+
+    def find_anomalous_templates(
+        self,
+        baseline_window: str,
+        incident_window: str,
+        min_ratio: float = 3.0
+    ) -> list[dict]:
+        """Find templates whose frequency changed significantly.
+
+        Compares template frequency between a baseline period and an
+        incident period. Templates that appear much more (or less)
+        frequently during the incident are likely related to the
+        root cause.
+
+        Args:
+            baseline_window: Window ID for normal behavior.
+            incident_window: Window ID for incident period.
+            min_ratio: Minimum frequency ratio to flag as anomalous.
+
+        Returns:
+            List of anomalous templates with frequency ratios.
+        """
+        baseline = self.window_counts[baseline_window]
+        incident = self.window_counts[incident_window]
+
+        # Normalize by total count in each window
+        baseline_total = max(sum(baseline.values()), 1)
+        incident_total = max(sum(incident.values()), 1)
+
+        anomalies = []
+        all_templates = set(baseline.keys()) | set(incident.keys())
+
+        for template in all_templates:
+            base_rate = baseline.get(template, 0) / baseline_total
+            inc_rate = incident.get(template, 0) / incident_total
+
+            # Avoid division by zero; treat new templates as highly anomalous
+            if base_rate < 1e-10:
+                if inc_rate > 0:
+                    anomalies.append({
+                        "template": template,
+                        "type": "new_during_incident",
+                        "incident_rate": round(inc_rate, 6),
+                        "example": self.template_examples.get(template, ""),
+                        "incident_count": incident.get(template, 0)
+                    })
+                continue
+
+            ratio = inc_rate / base_rate
+
+            if ratio >= min_ratio or ratio <= 1.0 / min_ratio:
+                anomalies.append({
+                    "template": template,
+                    "type": "frequency_spike" if ratio > 1 else "frequency_drop",
+                    "ratio": round(ratio, 2),
+                    "baseline_rate": round(base_rate, 6),
+                    "incident_rate": round(inc_rate, 6),
+                    "example": self.template_examples.get(template, ""),
+                    "incident_count": incident.get(template, 0)
+                })
+
+        # Sort by severity (highest ratio first)
+        anomalies.sort(
+            key=lambda x: x.get("ratio", float("inf")), reverse=True
+        )
+        return anomalies</code></pre>
+<div class="code-caption">Log template extraction and frequency anomaly detection that identifies log patterns whose occurrence rate changed significantly during an incident, surfacing the messages most likely related to the root cause.</div>
+
+<h2>6. AI-Driven Root Cause Analysis</h2>
+
+<p>
+Root cause analysis (RCA) is the most cognitively demanding task in incident response. The
+on-call engineer must synthesize information from dashboards, log queries, trace views,
+deployment timelines, and recent changes, all under time pressure. AI assists by automating
+the evidence-gathering phase and generating structured hypotheses that the engineer can
+validate.
+</p>
+
+<pre><code class="language-python">"""
+AI-driven root cause analysis for production incidents.
+Gathers evidence from multiple observability signals and generates
+structured hypotheses using an LLM.
+"""
+from dataclasses import dataclass, field
+from datetime import datetime
+from anthropic import Anthropic
+
+
+@dataclass
+class IncidentContext:
+    """Collected evidence for an incident."""
+    incident_id: str
+    start_time: datetime
+    affected_services: list[str]
+    golden_signals: dict[str, dict]    # service -> {latency, errors, traffic, saturation}
+    anomalous_logs: list[dict]         # From LogAnalyzer.find_anomalous_templates
+    recent_deployments: list[dict]     # {service, version, timestamp, changes}
+    recent_config_changes: list[dict]  # {resource, change_type, timestamp}
+    trace_analysis: dict = field(default_factory=dict)  # Slow span summary
+
+
+def generate_root_cause_analysis(context: IncidentContext) -> dict:
+    """Generate a structured root cause analysis from incident evidence.
+
+    Synthesizes information from metrics, logs, traces, deployments,
+    and config changes to produce ranked hypotheses with supporting
+    evidence and recommended actions.
+
+    Returns:
+        Dictionary with hypotheses, evidence, and recommended actions.
+    """
+    client = Anthropic()
+
+    # Build a structured evidence summary for the LLM
+    evidence_text = f"""
+INCIDENT: {context.incident_id}
+START TIME: {context.start_time.isoformat()}
+AFFECTED SERVICES: {', '.join(context.affected_services)}
+
+GOLDEN SIGNALS:
+"""
+    for service, signals in context.golden_signals.items():
+        evidence_text += f"\n  {service}:"
+        for signal, value in signals.items():
+            evidence_text += f"\n    {signal}: {value}"
+
+    evidence_text += "\n\nANOMALOUS LOG PATTERNS:"
+    for log in context.anomalous_logs[:10]:  # Top 10 anomalous patterns
+        evidence_text += (
+            f"\n  [{log['type']}] ratio={log.get('ratio', 'N/A')}: "
+            f"{log['template']}"
+            f"\n    Example: {log['example']}"
+        )
+
+    evidence_text += "\n\nRECENT DEPLOYMENTS:"
+    for deploy in context.recent_deployments:
+        evidence_text += (
+            f"\n  {deploy['service']} v{deploy['version']} "
+            f"at {deploy['timestamp']}: {deploy.get('changes', 'unknown')}"
+        )
+
+    evidence_text += "\n\nRECENT CONFIG CHANGES:"
+    for change in context.recent_config_changes:
+        evidence_text += (
+            f"\n  {change['resource']} ({change['change_type']}) "
+            f"at {change['timestamp']}"
+        )
+
+    prompt = f"""You are an expert SRE performing root cause analysis.
+Given the following incident evidence, produce a structured analysis.
+
+{evidence_text}
+
+Produce your analysis as a structured report with these sections:
+
+1. TIMELINE: Key events in chronological order
+2. HYPOTHESES: Ranked list of possible root causes (most likely first),
+   each with:
+   - Description of the hypothesis
+   - Supporting evidence (cite specific signals, logs, or changes)
+   - Contradicting evidence (if any)
+   - Confidence level (high/medium/low)
+3. RECOMMENDED ACTIONS: Immediate mitigation steps, then investigation steps
+4. PREVENTION: What changes would prevent recurrence
+
+Be specific. Cite exact metric values, log templates, and timestamps."""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return {
+        "incident_id": context.incident_id,
+        "analysis": response.content[0].text,
+        "evidence_summary": {
+            "services_affected": len(context.affected_services),
+            "anomalous_log_patterns": len(context.anomalous_logs),
+            "recent_deployments": len(context.recent_deployments),
+            "recent_config_changes": len(context.recent_config_changes)
+        }
+    }</code></pre>
+<div class="code-caption">AI-driven root cause analysis that gathers evidence from golden signals, anomalous log patterns, deployment history, and configuration changes, then uses an LLM to generate ranked hypotheses with supporting evidence and recommended actions.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Autonomous Incident Response Agents</div>
+<p>
+The RCA function above generates hypotheses for a human engineer to validate. Research
+from Microsoft (RCACopilot, Chen et al., ICSE 2024) showed that LLM-based copilots could
+match senior engineers on root cause classification for 72% of real cloud incidents.
+More recently, Microsoft Research's AIOpsLab (2024) introduced a standardized benchmark
+and orchestration framework for evaluating autonomous AIOps agents end to end, covering
+fault detection, localization, root cause analysis, and mitigation across reproducible
+cloud failure scenarios. These agent systems navigate observability dashboards, query log
+aggregation backends, inspect Kubernetes pod states, and even roll back deployments, all
+through tool-use interfaces similar to the MCP servers in
+<a href="../module-12-mcp-servers/index.html">Chapter 12</a>. The key constraint remains
+trust: autonomous remediation in production requires strong guardrails, audit trails, and
+blast radius limits, connecting to the responsible AI practices discussed in
+<a href="../../part-7-autonomous-discovery/module-57-responsible-discovery/index.html">Chapter 57</a>.
+</p>
+</div>
+
+<h2>7. Structured Postmortem Generation</h2>
+
+<p>
+A postmortem is the discovery document of incident response: it records what happened, why
+it happened, and what the team will do to prevent recurrence. The challenge is not writing
+the postmortem (that is mostly mechanical synthesis of the investigation) but writing it
+<em>promptly</em> and <em>honestly</em>. Teams under pressure often skip postmortems or
+produce shallow ones. AI assists by generating a first draft from the incident timeline,
+chat transcripts, and resolution steps, leaving the team to review, correct, and add the
+human judgment that AI cannot provide.
+</p>
+
+<pre><code class="language-python">"""
+Structured postmortem generator from incident data.
+Produces a blameless postmortem document following the SRE template.
+"""
+from dataclasses import dataclass
+from datetime import datetime
+from anthropic import Anthropic
+
+
+@dataclass
+class IncidentTimeline:
+    """Chronological record of incident events."""
+    events: list[dict]  # [{timestamp, actor, action, detail}]
+
+
+@dataclass
+class PostmortemInput:
+    """All inputs needed to generate a postmortem."""
+    incident_id: str
+    severity: str             # "P1", "P2", "P3"
+    title: str
+    start_time: datetime
+    detection_time: datetime
+    mitigation_time: datetime
+    resolution_time: datetime
+    timeline: IncidentTimeline
+    root_cause_analysis: str  # From generate_root_cause_analysis
+    impact: dict              # {users_affected, error_count, revenue_impact}
+    responders: list[str]
+
+
+def generate_postmortem(inputs: PostmortemInput) -> str:
+    """Generate a blameless postmortem from incident data.
+
+    Follows the SRE postmortem template: summary, impact, timeline,
+    root cause, lessons learned, action items.
+    """
+    client = Anthropic()
+
+    # Calculate key time metrics
+    ttd = (inputs.detection_time - inputs.start_time).total_seconds() / 60
+    ttm = (inputs.mitigation_time - inputs.detection_time).total_seconds() / 60
+    ttr = (inputs.resolution_time - inputs.detection_time).total_seconds() / 60
+
+    timeline_text = "\n".join(
+        f"  {e['timestamp']} [{e['actor']}] {e['action']}: {e['detail']}"
+        for e in inputs.timeline.events
+    )
+
+    prompt = f"""Generate a blameless postmortem document for this incident.
+
+INCIDENT: {inputs.incident_id} ({inputs.severity})
+TITLE: {inputs.title}
+
+KEY METRICS:
+- Time to Detect (TTD): {ttd:.0f} minutes
+- Time to Mitigate (TTM): {ttm:.0f} minutes
+- Time to Resolve (TTR): {ttr:.0f} minutes
+
+IMPACT:
+- Users affected: {inputs.impact.get('users_affected', 'unknown')}
+- Total errors: {inputs.impact.get('error_count', 'unknown')}
+
+TIMELINE:
+{timeline_text}
+
+ROOT CAUSE ANALYSIS:
+{inputs.root_cause_analysis}
+
+RESPONDERS: {', '.join(inputs.responders)}
+
+Generate a complete postmortem with these sections:
+1. Executive Summary (2-3 sentences)
+2. Impact (quantified, user-facing)
+3. Timeline (table format with timestamps)
+4. Root Cause (technical explanation, blameless)
+5. What Went Well (detection, response, communication)
+6. What Went Wrong (gaps in monitoring, process, tooling)
+7. Where We Got Lucky (near-misses, things that could have been worse)
+8. Action Items (each with owner, priority, due date)
+9. Lessons Learned (what to teach the rest of the organization)
+
+Rules:
+- BLAMELESS: never name individuals as causes. Systems fail, not people.
+- SPECIFIC: cite exact timestamps, metric values, and error messages.
+- ACTIONABLE: every action item must be concrete, measurable, and assigned."""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text</code></pre>
+<div class="code-caption">Structured postmortem generator that transforms incident timeline data, root cause analysis, and impact metrics into a blameless postmortem document following the SRE template, with calculated time-to-detect, time-to-mitigate, and time-to-resolve metrics.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Postmortem Paradox</div>
+<p>
+The best postmortems come from the worst incidents. A 30-minute P3 outage affecting 50 users
+rarely produces deep insights. A 4-hour P1 outage with cascading failures across six
+services, where the monitoring system itself went down, and the runbook was three years out
+of date, produces a postmortem so rich in lessons that it becomes required reading for every
+new hire. The paradox: you learn the most from the incidents you most wish had never
+happened.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Golden Signal Anomaly Dashboard</h4>
+<p>
+1. Generate 24 hours of synthetic golden signal data using NumPy: create arrays for
+latency (normal around 200ms with a daily sine wave), error rate (baseline 0.5%), traffic
+(peak at midday, trough at 3 AM), and CPU utilization (correlated with traffic). Inject a
+simulated incident at hour 18: a 3x latency spike and 8% error rate lasting 20 minutes.<br/>
+2. Implement the <code>AnomalyDetector</code> class from this section with
+<code>alpha=0.1</code>, <code>threshold_sigma=3.0</code>, and
+<code>season_length=288</code> (5-minute intervals over 24 hours). Feed each signal
+through its own detector instance.<br/>
+3. Build a <code>MultiSignalDetector</code> that tracks which signals are simultaneously
+anomalous within a 5-step correlation window. Log every time step where two or more
+signals flag together.<br/>
+4. Visualize the results with Matplotlib: create a 4-row subplot (one per signal) showing
+the raw value, the detector's expected value, the confidence band
+($\hat{\mu} \pm k\hat{\sigma}$), and red markers on flagged anomalies.<br/>
+5. Experiment with tuning: try <code>alpha=0.01</code> (slow adaptation) and
+<code>alpha=0.3</code> (fast adaptation). Note how slow adaptation misses the end of the
+incident (it keeps flagging after recovery) and fast adaptation produces false positives
+during normal daily transitions. Find a value that correctly brackets the injected
+incident window.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.1: Golden Signal Dashboard (Conceptual)</div>
+<p>
+Design a monitoring dashboard for a three-service architecture (API gateway, recommendation
+engine, database). For each service, specify which golden signals to display, what
+visualization type to use (line chart, heatmap, counter), what alert thresholds to set,
+and how to handle the cascading failure case where the database slowing down causes latency
+spikes in both upstream services. How would you distinguish "database is slow" from
+"recommendation engine is slow" using trace data?
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.2: Anomaly Detector Tuning (Coding)</div>
+<p>
+Implement the <code>AnomalyDetector</code> with seasonal adjustment for a metric that has a
+strong daily pattern (high during business hours, low at night). Generate synthetic data
+with a 24-hour cycle and inject three types of anomalies: a sudden spike, a gradual drift,
+and a missing data gap. Tune the <code>alpha</code> and <code>threshold_sigma</code>
+parameters to detect all three anomaly types with fewer than 5% false positives. Plot the
+detector's expected value, confidence bands, and flagged anomalies.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.2.3: Postmortem Quality Audit (Analysis)</div>
+<p>
+Take the postmortem generator output for a synthetic incident and evaluate it against
+Google's postmortem criteria: Is it blameless? Are action items specific and assigned?
+Does it distinguish root cause from contributing factors? Does it identify what went well?
+Write a rubric with 10 criteria, score the generated postmortem, and identify which
+criteria the AI handles well and which require human revision.
+</p>
+</div>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-21.1.html">&larr; 21.1 CI/CD as Discovery</a>
+<a href="index.html">Chapter 21 Index</a>
+<a href="section-21.3.html">21.3 Building an Agent-Assisted Pipeline &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

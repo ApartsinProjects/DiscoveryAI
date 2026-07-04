@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.2: Validity and Contamination. Benchmark leakage, training-set overlap, test adequacy, metric gaming, and the gap between benchmark scores and production utility." name="description"/>
+<title>Section 23.2: Validity and Contamination | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Evaluating AI Coding Agents</a></div>
+<h1>23.2 Validity and Contamination</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"Of course I solved the issue. I memorized the fix during pre-training. Is that cheating? You never said I had to <em>think</em>."</p>
+<cite>A Foundation Model With an Eidetic Memory for Stack Overflow</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds directly on the task construction methodology from
+<a href="section-23.1.html">Section 23.1</a>. You should understand the four components
+of a benchmark task (repository snapshot, issue description, test patch, gold patch) and
+the metrics beyond resolve rate. The discussion of overfitting and generalization connects
+to the model evaluation concepts from
+<a href="../../part-1-foundations/module-05-data-models-simulation/index.html">Chapter 5: Discovery Through Data, Models, and Simulation</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A benchmark score is only meaningful if it measures what it claims to measure. For coding
+agent benchmarks, the claim is: "this score predicts how well the agent will perform on
+new, unseen coding tasks." Every validity threat weakens this predictive link. Data
+contamination means the agent has seen the answers during training. Weak test patches
+mean incorrect solutions get counted as correct. Retry-based strategies inflate resolve
+rates at the cost of latency and dollars. And the structural differences between benchmark
+repositories and real-world codebases mean that even a perfectly valid benchmark score
+may not transfer to your deployment context. This section equips you to detect and
+quantify each of these threats.
+</p>
+</div>
+
+<h2>1. Data Contamination and Training-Set Overlap</h2>
+
+<p>
+The most fundamental validity threat is <strong>data contamination</strong>: the model
+being evaluated has seen the benchmark's tasks, answers, or closely related content
+during pre-training. Because SWE-bench tasks are derived from public GitHub issues and
+pull requests, and because large language models are trained on massive corpora of public
+code, some degree of overlap is inevitable. The question is how much overlap exists and
+how severely it affects scores.
+</p>
+
+<p data-agent="02">
+Data contamination, more precisely, is the presence of evaluation data (questions, answers, or both) inside a model's training corpus, which inflates measured performance beyond the model's true generalization ability. It matters because a contaminated benchmark cannot distinguish a model that solves problems from one that merely retrieves memorized solutions, rendering the entire evaluation uninformative. The mechanism is straightforward: large-scale web crawls that feed pre-training pipelines ingest public repositories, issue trackers, and forums where benchmark tasks originate, so the model's parameters encode those examples as retrievable patterns. Use contamination analysis whenever you evaluate on a public benchmark; switch to private-repo or post-cutoff evaluations (described in Section 7) when contamination cannot be ruled out.
+</p>
+
+<p>
+Contamination operates at three levels, each progressively harder to detect:
+</p>
+
+<ul>
+<li><strong>Direct memorization</strong>: the model has seen the exact issue-and-fix pair in its training data. Given the issue text, it can recall the gold patch verbatim. This is the most severe form and the easiest to test for.</li>
+<li><strong>Indirect exposure</strong>: the model has not seen the specific issue, but it has seen the same bug pattern discussed in blog posts, Stack Overflow answers, or related issues in the same repository. It can generalize from these examples to the benchmark task.</li>
+<li><strong>Distributional familiarity</strong>: the model has seen thousands of similar codebases, similar bug patterns, and similar fix patterns. It has not memorized anything specific, but its prior knowledge gives it an advantage that would not exist on truly novel code. This level is arguably not contamination at all; it is the model doing what it was trained to do.</li>
+</ul>
+
+<p>
+The boundary between "contamination" and "useful pre-training" is genuinely blurry. A
+human developer who has fixed hundreds of Django cache bugs brings that experience to
+every new cache issue. We do not call that "contamination." But a model that has memorized
+the specific diff for <code>django__django-16379</code> is not demonstrating problem-solving
+ability; it is demonstrating recall. The practical distinction is whether the model can
+solve <em>new</em> tasks from the same distribution, not just reproduce training examples.
+</p>
+
+<pre><code class="language-python">"""
+Contamination detection: check whether a model can reproduce
+parts of the gold patch when prompted with just the issue text.
+Uses n-gram overlap as a proxy for memorization.
+"""
+from collections import Counter
+
+
+def ngram_overlap(
+    text_a: str,
+    text_b: str,
+    n: int = 5
+) -> float:
+    """Compute n-gram overlap ratio between two texts.
+
+    Returns the fraction of n-grams in text_a that also appear
+    in text_b. High overlap suggests memorization when text_a
+    is a model's output and text_b is the gold patch.
+
+    Args:
+        text_a: The model's generated patch.
+        text_b: The gold (reference) patch.
+        n: N-gram size. Larger n requires more exact reproduction.
+
+    Returns:
+        Overlap ratio in [0, 1]. Values above 0.5 for n=5
+        strongly suggest memorization.
+    """
+    tokens_a = text_a.split()
+    tokens_b = text_b.split()
+
+    if len(tokens_a) < n or len(tokens_b) < n:
+        return 0.0
+
+    ngrams_a = Counter(
+        tuple(tokens_a[i:i+n]) for i in range(len(tokens_a) - n + 1)
+    )
+    ngrams_b = set(
+        tuple(tokens_b[i:i+n]) for i in range(len(tokens_b) - n + 1)
+    )
+
+    overlap = sum(
+        count for ng, count in ngrams_a.items() if ng in ngrams_b
+    )
+    return overlap / sum(ngrams_a.values())
+
+
+def detect_contamination(
+    model_output: str,
+    gold_patch: str,
+    threshold: float = 0.4,
+    n: int = 5
+) -> dict:
+    """Flag potential contamination in a model's output.
+
+    Args:
+        model_output: The patch the model generated.
+        gold_patch: The reference gold patch.
+        threshold: Overlap ratio above which contamination is suspected.
+        n: N-gram size for overlap computation.
+
+    Returns:
+        Dictionary with overlap score and contamination flag.
+    """
+    overlap = ngram_overlap(model_output, gold_patch, n=n)
+    return {
+        "ngram_overlap": round(overlap, 4),
+        "contaminated": overlap > threshold,
+        "ngram_size": n,
+        "threshold": threshold,
+        "model_patch_tokens": len(model_output.split()),
+        "gold_patch_tokens": len(gold_patch.split()),
+    }
+
+
+# Example usage
+model_patch = """
+--- a/django/core/cache/backends/filebased.py
++++ b/django/core/cache/backends/filebased.py
+@@ -89,6 +89,8 @@ class FileBasedCache(BaseCache):
+     def has_key(self, key, version=None):
+         fname = self._key_to_file(key, version)
+-        return os.path.exists(fname)
++        if os.path.exists(fname):
++            with open(fname, "rb") as f:
++                return not self._is_expired(f)
++        return False
+"""
+
+gold = """
+--- a/django/core/cache/backends/filebased.py
++++ b/django/core/cache/backends/filebased.py
+@@ -89,6 +89,8 @@ class FileBasedCache(BaseCache):
+     def has_key(self, key, version=None):
+         fname = self._key_to_file(key, version)
+-        return os.path.exists(fname)
++        if os.path.exists(fname):
++            with open(fname, "rb") as f:
++                return not self._is_expired(f)
++        return False
+"""
+
+result = detect_contamination(model_patch, gold)
+print(f"Overlap: {result['ngram_overlap']:.1%}, "
+      f"Contaminated: {result['contaminated']}")
+# Overlap: 100.0%, Contaminated: True
+</code></pre>
+<div class="code-caption">N-gram overlap analysis for detecting potential training-set contamination. When a model's output shows high 5-gram overlap with the gold patch (above 40%), it likely memorized the fix rather than reasoning about the bug. The example shows a pathological case with 100% overlap, indicating direct memorization.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+Contamination is not binary. A model that has seen Django's entire commit history has
+"contamination" in the broadest sense, but it might still be demonstrating real
+understanding when it fixes a novel cache bug. The actionable distinction is between
+<em>recall</em> (reproducing a memorized fix) and <em>transfer</em> (applying learned
+patterns to a new problem). N-gram overlap with the gold patch detects recall; solving
+tasks from repositories not in the training data tests transfer. Always evaluate on at
+least some tasks the model could not have seen.
+</p>
+</div>
+
+<h2>2. Test Adequacy and the False-Pass Problem</h2>
+
+<p>
+Even without contamination, an agent can achieve a "pass" on a benchmark task by producing
+a patch that is incorrect but happens to satisfy the test oracle. This is the
+<strong>false-pass problem</strong>, and it arises from weak test patches that do not
+fully specify the correct behavior.
+</p>
+
+<p>
+Consider a task where the gold patch fixes an off-by-one error in a loop boundary. The
+test patch adds one test case that checks the output for a specific input. An agent that
+"fixes" the issue by hardcoding the expected output for that specific input will pass
+the test oracle while leaving the underlying bug unfixed. The test patch is technically
+correct (it fails on the base commit and passes on the gold patch) but it is not
+<em>adequate</em>: it does not distinguish the gold patch from incorrect alternatives.
+</p>
+
+<p>
+The false-pass rate varies significantly across benchmark subsets. Mundler et al. (2024)
+found that adding additional test cases to SWE-bench tasks revealed that roughly 10-15%
+of "resolved" instances in some agent submissions were false passes: the agent's patch
+satisfied the original tests but failed on the expanded test suite. SWE-bench Verified
+reduces this rate through human curation, but it cannot eliminate it entirely.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of test adequacy like a driving exam that only checks whether you can parallel park on the right side of the street. A student who memorized that one maneuver passes, but they may not know how to park on the left side, back into a garage, or handle a tight spot. The exam is technically correct (it does test parking), but it is not <em>adequate</em>: it cannot distinguish a competent driver from someone who drilled a single scenario. Similarly, a weak test patch checks one input/output pair and accepts any patch that produces the right answer for that case, even if the patch hardcodes the result or leaves the underlying bug intact. Mutation testing strengthens the exam by adding variations: park on the left, park uphill, park with a trailer. If the student (or patch) passes all the variations, you have real confidence in their ability.
+</p>
+</div>
+
+<pre><code class="language-python">"""
+Test adequacy analysis: measure how well a test patch
+discriminates correct patches from plausible-but-wrong alternatives.
+Uses mutation testing on the gold patch to estimate adequacy.
+"""
+import subprocess
+import random
+from dataclasses import dataclass
+
+
+@dataclass
+class AdequacyResult:
+    """Result of test adequacy analysis for a benchmark task."""
+    instance_id: str
+    total_mutants: int
+    killed_mutants: int
+    survived_mutants: int
+
+    @property
+    def mutation_score(self) -> float:
+        """Fraction of mutants killed. Higher is better."""
+        if self.total_mutants == 0:
+            return 0.0
+        return self.killed_mutants / self.total_mutants
+
+    @property
+    def is_adequate(self) -> bool:
+        """A test patch is adequate if mutation score exceeds 0.8."""
+        return self.mutation_score >= 0.8
+
+
+def generate_patch_mutants(
+    gold_patch: str,
+    num_mutants: int = 20,
+    seed: int = 42
+) -> list[str]:
+    """Generate mutated versions of a gold patch.
+
+    Applies simple syntactic mutations to the gold patch to create
+    plausible-but-wrong alternatives. If the test oracle cannot
+    distinguish these from the gold patch, the tests are inadequate.
+
+    Args:
+        gold_patch: The correct (gold) patch as a unified diff.
+        num_mutants: Number of mutants to generate.
+        seed: Random seed for reproducibility.
+
+    Returns:
+        List of mutated patch strings.
+    """
+    rng = random.Random(seed)
+    mutants = []
+
+    lines = gold_patch.split("\n")
+    added_lines = [
+        (i, line) for i, line in enumerate(lines)
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+
+    mutations = [
+        # Boundary mutations
+        lambda l: l.replace(" < ", " <= "),
+        lambda l: l.replace(" > ", " >= "),
+        lambda l: l.replace(" <= ", " < "),
+        lambda l: l.replace(" >= ", " > "),
+        lambda l: l.replace(" == ", " != "),
+        # Arithmetic mutations
+        lambda l: l.replace(" + 1", " + 0"),
+        lambda l: l.replace(" - 1", " - 0"),
+        # Logic mutations
+        lambda l: l.replace(" and ", " or "),
+        lambda l: l.replace(" or ", " and "),
+        lambda l: l.replace(" not ", " "),
+        # Return value mutations
+        lambda l: l.replace("return True", "return False"),
+        lambda l: l.replace("return False", "return True"),
+        lambda l: l.replace("return None", "return 0"),
+    ]
+
+    for _ in range(num_mutants):
+        if not added_lines:
+            break
+        target_idx, target_line = rng.choice(added_lines)
+        mutation_fn = rng.choice(mutations)
+        mutated_line = mutation_fn(target_line)
+        if mutated_line != target_line:  # Mutation actually changed something
+            mutant_lines = lines.copy()
+            mutant_lines[target_idx] = mutated_line
+            mutants.append("\n".join(mutant_lines))
+
+    return mutants
+
+
+def assess_test_adequacy(
+    task: "TaskInstance",
+    repo_path: str,
+    num_mutants: int = 20
+) -> AdequacyResult:
+    """Assess whether a task's test patch is adequate.
+
+    Generates mutated versions of the gold patch and checks
+    whether the test oracle rejects them. A high mutation score
+    means the tests distinguish correct from incorrect patches.
+
+    Args:
+        task: The benchmark task to assess.
+        repo_path: Path to a clean clone of the repository.
+        num_mutants: Number of mutants to test.
+
+    Returns:
+        AdequacyResult with mutation score and kill counts.
+    """
+    mutants = generate_patch_mutants(task.gold_patch, num_mutants)
+    killed = 0
+    survived = 0
+
+    for mutant_patch in mutants:
+        # evaluate_patch is from Section 23.1
+        result = evaluate_patch(task, mutant_patch, repo_path)
+        if result.passed:
+            survived += 1  # Test oracle failed to catch the mutant
+        else:
+            killed += 1    # Test oracle correctly rejected the mutant
+
+    return AdequacyResult(
+        instance_id=task.instance_id,
+        total_mutants=len(mutants),
+        killed_mutants=killed,
+        survived_mutants=survived
+    )
+</code></pre>
+<div class="code-caption">Test adequacy analysis using mutation testing on the gold patch. By generating mutated (incorrect) versions of the gold patch and checking whether the test oracle rejects them, we measure how well the tests discriminate correct fixes from plausible alternatives. A mutation score below 0.8 flags the task for test strengthening. This approach connects directly to the mutation testing methodology from <a href="../module-18-ai-testing/section-18.2.html">Section 18.2</a>.</div>
+
+<h2>3. Metric Gaming and Retry Strategies</h2>
+
+<p>
+Beyond contamination and test adequacy, agents can inflate their benchmark scores through
+<strong>retry strategies</strong> that exploit the evaluation protocol. The simplest
+strategy is majority voting: run the agent $k$ times on each task, collect all $k$ patches,
+and submit the one that passes the most internal checks. With $k = 10$, an agent that has
+a 20% per-attempt success rate achieves a roughly 89% chance of producing at least one
+correct patch:
+</p>
+
+$$P(\text{at least one success in } k \text{ tries}) = 1 - (1 - p)^k$$
+
+<p>
+At $p = 0.2$ and $k = 10$: $P = 1 - 0.8^{10} \approx 0.893$. This is a legitimate
+engineering strategy (redundancy improves reliability), but it obscures the agent's
+per-attempt capability. Reporting "89% resolve rate" without disclosing "$k = 10$ with
+majority voting" is misleading. The honest report includes the per-attempt rate, the
+number of attempts, the selection strategy, and the total cost.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that a higher resolve rate on a leaderboard always indicates a more capable agent. In reality, resolve rate conflates the agent's reasoning ability with its retry budget, selection strategy, and the adequacy of the test oracle. An agent with a 55% resolve rate using best-of-10 selection may have weaker per-attempt reasoning than an agent achieving 40% in a single pass; the first agent simply bought more lottery tickets. Always compare agents at equal cost or equal number of attempts before drawing conclusions about capability.
+</p>
+</div>
+
+<p>
+More sophisticated gaming strategies include:
+</p>
+
+<ul>
+<li><strong>Test-guided patching</strong>: the agent applies the test patch, runs the tests to see the failure, and uses the failure message to guide patch generation. This is arguably a valid strategy (real developers run tests while debugging), but it means the agent is not solving the task from the issue description alone.</li>
+<li><strong>Patch ensembling</strong>: generate multiple patches and combine their changes. This works when different attempts fix different parts of a multi-part bug, but it can also introduce new bugs through conflicting changes.</li>
+<li><strong>Targeted submission</strong>: only submit patches on tasks where the agent's internal confidence is high, abstaining on the rest. This inflates the resolve rate on attempted tasks while hiding failures through non-submission.</li>
+</ul>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Cost of Retries</div>
+<p>
+Consider two agents evaluated on SWE-bench Verified (500 tasks). Agent A achieves a 45%
+resolve rate with a single attempt per task, at a cost of $0.50 per task ($250 total).
+Agent B achieves a 52% resolve rate using 5 attempts per task with majority voting, at
+$0.40 per attempt ($1,000 total). On the leaderboard, Agent B looks better. In
+production, Agent A is arguably more useful: it achieves a higher per-dollar resolve rate
+($0.50 / 45% = $1.11 per resolved task vs. $1,000 / 260 resolved = $3.85 per resolved
+task) and delivers results 5x faster. The leaderboard comparison is not wrong, but it
+answers a different question than the one practitioners care about.
+</p>
+</div>
+
+<h2>4. The Benchmark-to-Production Gap</h2>
+
+<p>
+Even a perfectly valid benchmark with no contamination, adequate tests, and honest reporting
+still has a fundamental limitation: it measures performance on a specific distribution of
+tasks. Production deployment involves a different distribution, and the gap between these
+distributions can be large.
+</p>
+
+<p>
+Several factors drive this gap:
+</p>
+
+<p>
+<strong>Repository structure</strong>. SWE-bench draws from well-organized Python libraries
+with conventional layouts, comprehensive docstrings, and mature test infrastructure. Many
+production codebases are less organized: monorepos with complex build systems, sparse
+documentation, unconventional patterns, and test suites that take minutes to run.
+</p>
+
+<p>
+<strong>Task distribution</strong>. SWE-bench tasks are derived from issues that were
+actually resolved by human developers and merged with test additions. In production,
+many bugs are never filed as issues, many issues are under-specified, and many fixes are
+merged without test additions. The tasks an agent encounters in production are harder on
+average than those in the benchmark.
+</p>
+
+<p>
+<strong>Context availability</strong>. In SWE-bench, the agent receives the complete issue
+description. In production, bugs arrive as Slack messages ("the dashboard is broken"),
+Sentry alerts (a stack trace with no context), or user complaints ("it was working
+yesterday"). The context engineering skills from
+<a href="../module-11-context-engineering/index.html">Chapter 11</a> become critical for
+closing this gap.
+</p>
+
+<p>
+<strong>Interaction model</strong>. SWE-bench is a one-shot evaluation: the agent produces
+a patch and is scored. In production, agents typically operate in a loop with human review:
+they propose a patch, receive feedback, and iterate. An agent's ability to incorporate
+feedback (which SWE-bench does not measure) may matter more than its first-attempt accuracy.
+</p>
+
+<pre><code class="language-python">"""
+Gap analysis between benchmark and production task distributions.
+Compares structural properties of benchmark tasks against
+a sample of production issues from the same repository.
+"""
+from dataclasses import dataclass
+
+
+@dataclass
+class TaskProfile:
+    """Structural properties of a coding task."""
+    description_words: int
+    has_stack_trace: bool
+    has_repro_script: bool
+    files_changed: int
+    lines_changed: int
+    cross_module: bool          # Changes span multiple packages
+    requires_domain_knowledge: bool
+    has_test_additions: bool
+
+
+def compute_distribution_gap(
+    benchmark_tasks: list[TaskProfile],
+    production_tasks: list[TaskProfile]
+) -> dict:
+    """Quantify the structural gap between benchmark and production tasks.
+
+    Args:
+        benchmark_tasks: Profiles of tasks in the benchmark suite.
+        production_tasks: Profiles of recent production issues.
+
+    Returns:
+        Dictionary with per-feature gap statistics showing where
+        benchmark and production distributions diverge.
+    """
+    def feature_stats(tasks: list[TaskProfile], attr: str) -> dict:
+        values = [getattr(t, attr) for t in tasks]
+        if isinstance(values[0], bool):
+            return {"fraction_true": sum(values) / len(values)}
+        return {
+            "mean": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values)
+        }
+
+    features = [
+        "description_words", "has_stack_trace", "has_repro_script",
+        "files_changed", "lines_changed", "cross_module",
+        "requires_domain_knowledge", "has_test_additions"
+    ]
+
+    gaps = {}
+    for feat in features:
+        bench_stats = feature_stats(benchmark_tasks, feat)
+        prod_stats = feature_stats(production_tasks, feat)
+
+        # Compute the key gap metric per feature type
+        if "fraction_true" in bench_stats:
+            gap_value = abs(
+                bench_stats["fraction_true"] - prod_stats["fraction_true"]
+            )
+        else:
+            bench_mean = bench_stats["mean"]
+            prod_mean = prod_stats["mean"]
+            gap_value = abs(bench_mean - prod_mean) / max(bench_mean, 1)
+
+        gaps[feat] = {
+            "benchmark": bench_stats,
+            "production": prod_stats,
+            "relative_gap": round(gap_value, 3)
+        }
+
+    return gaps
+
+
+# Example: typical gaps observed in practice
+# Benchmark tasks tend to have longer descriptions, more stack traces,
+# fewer files changed, and always include test additions.
+# Production tasks are noisier, broader, and often lack tests.
+</code></pre>
+<div class="code-caption">Distribution gap analysis comparing the structural properties of benchmark tasks against production issues. Features like description length, cross-module scope, and test coverage availability typically show large gaps, explaining why benchmark resolve rates do not directly predict production performance.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier</div>
+<p>
+The contamination problem intensifies as model training corpora grow. Oren et al. (2024)
+propose <strong>temporal contamination analysis</strong>: evaluating models only on tasks
+created after their training data cutoff. This approach is clean in principle but creates
+a moving target, as each new model generation requires new benchmark tasks. An
+alternative is <strong>synthetic decontamination</strong>: taking real tasks and
+paraphrasing both the issue descriptions and the code identifiers so that no n-gram
+overlap with the training data remains, while preserving the underlying bug structure.
+Early results (Zhang et al., 2025) suggest that models lose 5-15% resolve rate on
+decontaminated versions of SWE-bench, indicating that some fraction of their performance
+does rely on memorization. More recently, the <strong>SWE-bench Multimodal</strong>
+benchmark (Yang et al., 2024) extends the evaluation surface by including tasks that
+require interpreting screenshots, error visualizations, and UI rendering bugs, creating
+task modalities that are harder to contaminate through text-only pre-training and that
+better reflect production debugging where visual context is essential. For evaluation of
+<a href="../../part-7-autonomous-discovery/module-56-evaluating-discovery/index.html">autonomous discovery systems</a>,
+contamination is an even deeper challenge: the model may have seen the scientific
+knowledge needed to generate hypotheses, making it difficult to distinguish genuine
+discovery from retrieval of known results.
+</p>
+</div>
+
+<h2>5. Cost, Latency, and Reliability as First-Class Metrics</h2>
+
+<p>
+Resolve rate answers "can the agent fix bugs?" but practitioners also need "at what cost?",
+"how fast?", and "how consistently?". These operational metrics determine whether an agent
+is deployable, regardless of its resolve rate.
+</p>
+
+<h3>5.1 The Cost-Accuracy Frontier</h3>
+
+<p>
+Different agent architectures occupy different points on the cost-accuracy frontier. A
+simple single-pass agent (one prompt, one response) is cheap but has limited accuracy.
+A multi-step agent with tool use (file browsing, test execution, iterative repair) is
+more accurate but consumes more tokens. A multi-agent system with planning, coding, and
+reviewing agents is even more capable but multiplies the cost.
+</p>
+
+<p>
+The cost-accuracy frontier can be mapped empirically by evaluating the same agent
+architecture with different resource budgets:
+</p>
+
+$$\text{cost\_efficiency}(a) = \frac{\text{resolve\_rate}(a)}{\text{cost\_per\_task}(a)}$$
+
+<p>
+An agent with 40% resolve rate at $0.50/task has a cost efficiency of 0.8 resolved tasks
+per dollar. An agent with 55% at $3.00/task has an efficiency of 0.18. The first agent
+resolves more bugs per dollar, even though its headline resolve rate is lower. For batch
+processing (running the agent overnight on a backlog of issues), cost efficiency may matter
+more than peak accuracy.
+</p>
+
+<h3>5.2 Latency Profiles</h3>
+
+<p>
+Latency is not a single number but a distribution. An agent might resolve 60% of tasks
+in under 2 minutes and the remaining 40% in 5 to 15 minutes, with occasional outliers
+exceeding 30 minutes. The latency distribution matters because different deployment
+contexts have different tolerance:
+</p>
+
+<ul>
+<li><strong>CI/CD gate</strong>: maximum tolerance of 5 minutes. The agent must produce a patch quickly or yield to human review.</li>
+<li><strong>PR assistant</strong>: tolerance of 15-30 minutes. The agent works asynchronously while the developer moves to other tasks.</li>
+<li><strong>Batch overnight repair</strong>: tolerance of hours. Peak accuracy matters more than speed.</li>
+</ul>
+
+<pre><code class="language-python">"""
+Cost-accuracy frontier analysis for comparing agent architectures.
+Plots the trade-off between resolve rate and cost per task.
+"""
+from dataclasses import dataclass
+import statistics
+
+
+@dataclass
+class AgentProfile:
+    """Performance profile of a coding agent architecture."""
+    name: str
+    resolve_rate: float
+    cost_per_task_usd: float
+    median_latency_seconds: float
+    p95_latency_seconds: float
+    consistency: float  # Fraction of tasks with stable outcomes
+
+    @property
+    def cost_efficiency(self) -> float:
+        """Resolved tasks per dollar spent."""
+        if self.cost_per_task_usd == 0:
+            return float("inf")
+        return self.resolve_rate / self.cost_per_task_usd
+
+    @property
+    def latency_ratio(self) -> float:
+        """p95/median ratio. Values >> 2 indicate a heavy tail."""
+        if self.median_latency_seconds == 0:
+            return float("inf")
+        return self.p95_latency_seconds / self.median_latency_seconds
+
+
+def pareto_frontier(agents: list[AgentProfile]) -> list[AgentProfile]:
+    """Find agents on the Pareto frontier of resolve rate vs. cost.
+
+    An agent is Pareto-optimal if no other agent achieves both
+    higher resolve rate AND lower cost per task.
+
+    Args:
+        agents: List of agent profiles to compare.
+
+    Returns:
+        Agents on the Pareto frontier, sorted by cost.
+    """
+    sorted_agents = sorted(agents, key=lambda a: a.cost_per_task_usd)
+    frontier = []
+    max_resolve = -1
+
+    for agent in sorted_agents:
+        if agent.resolve_rate > max_resolve:
+            frontier.append(agent)
+            max_resolve = agent.resolve_rate
+
+    return frontier
+
+
+# Example: comparing four architectures
+agents = [
+    AgentProfile("Single-pass", 0.22, 0.08, 15, 30, 0.85),
+    AgentProfile("ReAct loop", 0.38, 0.45, 90, 300, 0.72),
+    AgentProfile("Multi-step + tools", 0.48, 1.20, 180, 600, 0.68),
+    AgentProfile("Multi-agent team", 0.55, 3.50, 300, 900, 0.60),
+]
+
+frontier = pareto_frontier(agents)
+print("Pareto-optimal agents:")
+for a in frontier:
+    print(f"  {a.name}: {a.resolve_rate:.0%} resolve, "
+          f"${a.cost_per_task_usd:.2f}/task, "
+          f"efficiency={a.cost_efficiency:.2f} resolved/$")
+</code></pre>
+<div class="code-caption">Cost-accuracy frontier analysis identifying Pareto-optimal agent architectures. The <code>pareto_frontier</code> function finds agents where no alternative achieves both higher resolve rate and lower cost. In the example, the single-pass agent and multi-agent team are both Pareto-optimal for different operating points (budget-constrained vs. accuracy-maximizing).</div>
+
+<h2>6. A Validity Checklist for Benchmark Reports</h2>
+
+<p>
+When reading a benchmark report (or writing one), use this checklist to assess the
+validity of the claimed results. Each item maps to a specific threat discussed in this
+section.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Evaluation Validity Checklist</div>
+<p>
+<strong>Contamination</strong>: Does the report disclose the model's training data cutoff?
+Are any benchmark tasks from before that cutoff? Has n-gram overlap analysis been performed?
+<br/>
+<strong>Test adequacy</strong>: Which benchmark subset was used (full, Lite, Verified)?
+Have supplementary tests been added to detect false passes? Is the mutation score of the
+test patches reported?
+<br/>
+<strong>Retry strategy</strong>: How many attempts per task? What selection strategy
+(first pass, majority vote, best-of-k)? Is the per-attempt resolve rate reported alongside
+the aggregate?
+<br/>
+<strong>Cost transparency</strong>: Is total cost disclosed? Cost per task? Cost per
+resolved task? Are API pricing assumptions stated?
+<br/>
+<strong>Latency</strong>: Is median and p95 latency reported? Are timeout policies disclosed?
+<br/>
+<strong>Reproducibility</strong>: Are model versions, temperatures, and system prompts
+specified? Can someone replicate the evaluation with the same setup?
+</p>
+</div>
+
+<h2>7. Designing Contamination-Resistant Evaluations</h2>
+
+<p>
+Given the difficulty of eliminating contamination from public benchmarks, the most reliable
+evaluation strategy is to construct tasks the model <em>cannot</em> have seen. Three
+approaches achieve this:
+</p>
+
+<p>
+<strong>Private repositories</strong>. Tasks drawn from your organization's proprietary
+codebase are guaranteed to be absent from public training data. This is the approach we
+take in <a href="section-23.3.html">Section 23.3</a>, where we build a five-issue
+benchmark from your own repository.
+</p>
+
+<p>
+<strong>Post-cutoff tasks</strong>. Tasks from issues created after the model's training
+data cutoff cannot be memorized. The SWE-bench harness supports filtering by date,
+allowing temporal decontamination. The downside is a shrinking pool of valid tasks as
+the cutoff approaches the present.
+</p>
+
+<p>
+<strong>Synthetic tasks</strong>. Programmatically generated tasks (inject a known bug
+into a codebase, generate the issue description, create the test oracle) eliminate
+contamination by construction. The risk is that synthetic tasks may not represent the
+difficulty distribution of real bugs. Combining synthetic bugs with real repository
+structure (inject artificial bugs into a real codebase) balances contamination resistance
+with ecological validity.
+</p>
+
+<p>
+In practice, the best evaluation combines all three: public benchmarks for comparability
+with the broader community, private repo benchmarks for deployment-specific assessment,
+and post-cutoff or synthetic tasks for contamination-free measurement. The next section
+shows how to build the private-repo component.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+The contamination arms race has a philosophical dimension. If you train a model on all
+of GitHub, then test it on GitHub issues, you are measuring something between "coding
+ability" and "GitHub recall." This mirrors the problem in educational testing: if
+students practice on past exam papers (which they always do), the exam measures a mixture
+of understanding and exam-specific preparation. The solution in education is the same as
+in AI evaluation: regularly create new questions, vary the format, and test for transfer
+rather than recall. SWE-bench Verified and the private-repo benchmarks in Section 23.3
+implement exactly this strategy.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Contamination Detector for Any Benchmark</h4>
+<p>
+1. Choose a public coding benchmark with gold patches (SWE-bench Lite works well) and download 10 task instances, including their issue descriptions and gold diffs.<br/>
+2. Using the <code>ngram_overlap</code> function from this section (or your own implementation), prompt an LLM with each issue description and collect its generated patch. Compute 5-gram overlap between each generated patch and the corresponding gold patch.<br/>
+3. Record the overlap scores in a CSV with columns <code>instance_id, overlap_score, patch_length, gold_length</code>. Flag any instance with overlap above 0.4 as potentially contaminated.<br/>
+4. For at least two flagged instances, re-run the experiment with the issue description paraphrased (change variable names, rephrase the bug report). Compare the overlap scores before and after paraphrasing; a large drop confirms the model was matching surface tokens rather than understanding the bug.<br/>
+5. Plot overlap scores (original vs. paraphrased) as a grouped bar chart using <code>matplotlib</code>. Summarize which fraction of your sample appears contaminated and by how much paraphrasing reduces the signal.
+</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li>
+<strong>Conceptual</strong>: An agent achieves a 60% resolve rate on SWE-bench Verified
+using best-of-5 selection (run 5 times, submit whichever patch passes the most internal
+tests). What is the minimum per-attempt resolve rate that could produce this result?
+Derive the formula and compute the answer. (Hint: use the complement probability formula
+from Section 3.)
+</li>
+<li>
+<strong>Coding</strong>: Extend the <code>detect_contamination</code> function to support
+<em>structural</em> n-grams: instead of tokenizing on whitespace, normalize the code by
+stripping comments and whitespace, then compute n-grams on the normalized version. This
+detects contamination even when the model reproduces the fix with different formatting.
+Test on at least two examples where surface-level n-gram overlap is low but structural
+overlap is high.
+</li>
+<li>
+<strong>Analysis</strong>: Find two published agent benchmark reports (from blog posts,
+papers, or leaderboard submissions). Apply the validity checklist from Section 6 to each.
+Which validity threats does each report address? Which does it leave unaddressed? Write a
+one-paragraph assessment of each report's trustworthiness.
+</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-23.1.html">&larr; 23.1 SWE-bench and Task Suites</a>
+<a href="index.html">Chapter 23</a>
+<a href="section-23.3.html">23.3 Building an Agent Benchmark &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

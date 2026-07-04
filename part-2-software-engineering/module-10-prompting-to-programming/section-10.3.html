@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.3: Building a DSPy Literature Program. Recipe for converting a prompt chain into a typed, compiled DSPy program for literature discovery." name="description"/>
+<title>Section 10.3: Building a DSPy Literature Program | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Prompting to Programming</a></div>
+<h1>10.3 Building a DSPy Literature Program</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"First I chained four prompts together with string concatenation and duct tape. Then I learned about type systems. The duct tape did not survive."</p>
+<cite>A Vibe Coder Who Read the Specification</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>The previous two sections gave you the parts: structured outputs for type safety (Section 10.1) and DSPy for programmatic optimization (Section 10.2). This section assembles them into a complete, working system. You will build a literature discovery program that retrieves papers, extracts claims, identifies contradictions, and synthesizes findings, all as a typed, compiled DSPy pipeline that integrates with the Discovery Workbench. The recipe follows a repeatable pattern: start with a brittle prompt chain, refactor it into typed signatures, compose them into a module, write a metric, compile, evaluate, and deploy.</p>
+</div>
+
+<h2>1. The Starting Point: A Brittle Prompt Chain</h2>
+
+<p>Most LLM-powered research tools begin as a chain of prompts glued together with Python string formatting. Here is a typical example, representative of what a <a href="../module-09-vibe-coding/index.html">vibe coding</a> session might produce:</p>
+
+<pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()
+
+
+def brittle_literature_review(question: str) -> str:
+    """A brittle prompt chain for literature review.
+
+    Problems: no type safety, no error handling, no optimization,
+    prompt text mixed with logic, not testable.
+    """
+    # Step 1: Generate search queries
+    resp1 = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=512,
+        messages=[{
+            "role": "user",
+            "content": f"Generate 3 search queries for: {question}\n"
+                       f"Return them as a numbered list."
+        }],
+    )
+    queries_text = resp1.content[0].text
+
+    # Step 2: Pretend we searched (in reality, parse and call an API)
+    # The parsing here is fragile: what if the model uses bullets?
+    queries = [
+        line.strip().lstrip("0123456789.)")
+        for line in queries_text.strip().split("\n")
+        if line.strip()
+    ]
+
+    # Step 3: For each "result," extract claims
+    all_claims = []
+    for q in queries[:3]:
+        resp2 = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": f"Given this search query: {q}\n"
+                           f"List the key scientific claims that papers "
+                           f"matching this query would typically make. "
+                           f"Be specific and cite methodologies."
+            }],
+        )
+        all_claims.append(resp2.content[0].text)
+
+    # Step 4: Synthesize
+    claims_blob = "\n---\n".join(all_claims)
+    resp3 = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": f"Research question: {question}\n\n"
+                       f"Claims from literature:\n{claims_blob}\n\n"
+                       f"Write a synthesis paragraph. Note contradictions "
+                       f"and gaps."
+        }],
+    )
+    return resp3.content[0].text</code></pre>
+<div class="code-caption">A brittle prompt chain for literature review. Every failure mode from Section 10.1 is present: untyped outputs, fragile parsing, prompt text mixed with logic, no quality metric, and no way to test or optimize.</div>
+
+<p>This code has at least seven problems:</p>
+<ol>
+<li>Outputs are untyped strings that require ad-hoc parsing.</li>
+<li>The parsing logic (splitting on newlines, stripping numbers) breaks if the model changes its formatting.</li>
+<li>Prompt text is mixed with program logic, making both hard to change.</li>
+<li>There is no quality metric, so there is no way to know if the output is good.</li>
+<li>There is no error handling for malformed responses.</li>
+<li>The program cannot be optimized; improving it requires manual prompt tweaking.</li>
+<li>It is not testable: you cannot write a unit test that asserts properties of the synthesis without parsing free-form text.</li>
+</ol>
+
+<p>Let us fix all seven problems by refactoring this into a typed DSPy program.</p>
+
+<h2>2. Step 1: Define Signatures</h2>
+
+<p>The first step is to identify the distinct LLM tasks in the chain and define a signature for each. Our literature review has three tasks: generate search queries, extract claims from an abstract, and synthesize claims into a finding.</p>
+
+<p data-agent="02">A DSPy signature is a declarative specification of a single LLM task, expressed as a Python class whose typed fields define the exact inputs the model receives and the structured outputs it must produce. Signatures matter because they replace hand-written prompt strings with machine-readable contracts: the DSPy compiler reads the field names, types, and descriptions to generate and optimize the actual prompt text automatically. Under the hood, DSPy serializes the signature's input fields into a prompt template at compile time, then parses the model's response back into the declared output types, so you never write (or debug) prompt formatting code. Use signatures instead of raw prompt strings whenever your pipeline has a step that can be described as "given these typed inputs, produce these typed outputs"; reserve raw prompts only for one-off exploratory queries where the overhead of declaring a class is not justified.</p>
+
+<pre><code class="language-python">import dspy
+from typing import Optional
+
+
+class GenerateQueries(dspy.Signature):
+    """Generate precise search queries for a scientific literature
+    review. Each query should target a specific aspect of the
+    research question and be suitable for Semantic Scholar or
+    PubMed search."""
+
+    research_question: str = dspy.InputField(
+        desc="The research question to investigate"
+    )
+    num_queries: int = dspy.InputField(
+        desc="Number of queries to generate", default=3
+    )
+
+    queries: list[str] = dspy.OutputField(
+        desc="Search queries, each targeting a different aspect"
+    )
+    aspects: list[str] = dspy.OutputField(
+        desc="The aspect of the question each query targets"
+    )
+
+
+class ExtractClaims(dspy.Signature):
+    """Extract specific, falsifiable scientific claims from a
+    paper abstract. Each claim should be a standalone statement
+    that could be independently verified."""
+
+    abstract: str = dspy.InputField(desc="Paper abstract text")
+    title: str = dspy.InputField(desc="Paper title")
+    research_question: str = dspy.InputField(
+        desc="The guiding research question for relevance filtering"
+    )
+
+    claims: list[str] = dspy.OutputField(
+        desc="Specific scientific claims from the abstract"
+    )
+    methodology: str = dspy.OutputField(
+        desc="Primary methodology: experimental, computational, "
+        "theoretical, review, or meta-analysis"
+    )
+    relevance: str = dspy.OutputField(
+        desc="How this paper relates to the research question"
+    )
+
+
+class SynthesizeFindings(dspy.Signature):
+    """Synthesize scientific claims from multiple papers into a
+    coherent analysis. Identify agreements, contradictions,
+    and gaps in the literature."""
+
+    research_question: str = dspy.InputField()
+    claims_by_paper: list[str] = dspy.InputField(
+        desc="Claims grouped by source paper, each prefixed "
+        "with the paper title"
+    )
+    num_papers: int = dspy.InputField(
+        desc="Total number of papers reviewed"
+    )
+
+    synthesis: str = dspy.OutputField(
+        desc="Coherent synthesis paragraph covering key findings"
+    )
+    agreements: list[str] = dspy.OutputField(
+        desc="Points where multiple papers agree"
+    )
+    contradictions: list[str] = dspy.OutputField(
+        desc="Points where papers disagree or conflict"
+    )
+    gaps: list[str] = dspy.OutputField(
+        desc="Important questions not addressed by the reviewed papers"
+    )
+    confidence: str = dspy.OutputField(
+        desc="Overall confidence in the synthesis: high, medium, or low"
+    )</code></pre>
+<div class="code-caption">Three DSPy signatures that replace the brittle prompt chain. Each signature is a typed contract: inputs on the left, outputs on the right. The docstrings and field descriptions are the only natural language; the actual prompts are generated by the compiler.</div>
+
+<p>Notice how each signature maps to one step in the original chain, but with explicit types and descriptions instead of ad-hoc string formatting. The <code>GenerateQueries</code> signature outputs a list of strings, not a formatted text block that needs parsing. The <code>ExtractClaims</code> signature includes the research question as context, enabling relevance filtering. The <code>SynthesizeFindings</code> signature has structured outputs for agreements, contradictions, and gaps, making the results directly usable by downstream systems.</p>
+
+<h2>3. Step 2: Compose into a Module</h2>
+
+<p>With signatures defined, we compose them into a <code>dspy.Module</code> that implements the full pipeline. The module's <code>forward</code> method defines the program flow, using standard Python control structures.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of DSPy compilation like a cooking competition where you hand a recipe card (your signature) to a team of chefs (the optimizer's trial runs). Each chef interprets the card differently: one adds a pinch of extra seasoning (a clarifying instruction), another demonstrates a plating technique (a few-shot example). The judges (your metric function) taste each version and score it. After twenty rounds, the winning chef's exact technique is written down as the final recipe. You never dictated "add salt at minute seven"; you described the dish you wanted, and the competition discovered the best method. Compilation works the same way: you declare the task structure, the optimizer experiments with prompt wordings and demonstrations, and the metric selects the variant that produces the best outputs.</p>
+</div>
+
+<pre><code class="language-python">import dspy
+from pydantic import BaseModel, Field
+
+
+class PaperResult(BaseModel):
+    """A paper retrieved from the search API."""
+    title: str
+    abstract: str
+    doi: str
+    year: int
+    authors: list[str]
+
+
+class LiteratureReviewResult(BaseModel):
+    """The complete output of a literature review."""
+    question: str
+    papers_reviewed: int
+    synthesis: str
+    agreements: list[str]
+    contradictions: list[str]
+    gaps: list[str]
+    confidence: str
+    claims_by_paper: dict[str, list[str]]
+
+
+class LiteratureReviewProgram(dspy.Module):
+    """A three-stage literature review pipeline.
+
+    Stage 1: Generate targeted search queries.
+    Stage 2: Extract claims from retrieved papers.
+    Stage 3: Synthesize findings across all papers.
+    """
+
+    def __init__(self):
+        self.generate_queries = dspy.ChainOfThought(GenerateQueries)
+        self.extract_claims = dspy.ChainOfThought(ExtractClaims)
+        self.synthesize = dspy.ChainOfThought(SynthesizeFindings)
+
+    def forward(self, research_question: str,
+                search_fn=None, max_papers: int = 10):
+        """Execute the literature review pipeline.
+
+        Args:
+            research_question: The question to investigate.
+            search_fn: Callable that takes a query string and returns
+                a list of PaperResult objects. If None, uses a mock.
+            max_papers: Maximum papers to process.
+        """
+        # Stage 1: Generate search queries
+        query_result = self.generate_queries(
+            research_question=research_question,
+            num_queries=3
+        )
+
+        # Stage 2: Retrieve and process papers
+        if search_fn is None:
+            search_fn = _mock_search  # for testing
+
+        all_papers = []
+        seen_dois = set()
+        for query in query_result.queries:
+            papers = search_fn(query)
+            for paper in papers:
+                if paper.doi not in seen_dois:
+                    seen_dois.add(paper.doi)
+                    all_papers.append(paper)
+
+        # Limit to max_papers
+        all_papers = all_papers[:max_papers]
+
+        # Extract claims from each paper
+        claims_by_paper = {}
+        for paper in all_papers:
+            extraction = self.extract_claims(
+                abstract=paper.abstract,
+                title=paper.title,
+                research_question=research_question,
+            )
+            claims_by_paper[paper.title] = extraction.claims
+
+        # Format claims for synthesis
+        formatted_claims = [
+            f"[{title}]: {'; '.join(claims)}"
+            for title, claims in claims_by_paper.items()
+        ]
+
+        # Stage 3: Synthesize all findings
+        synthesis = self.synthesize(
+            research_question=research_question,
+            claims_by_paper=formatted_claims,
+            num_papers=len(all_papers),
+        )
+
+        # Return a structured result using Pydantic
+        return dspy.Prediction(
+            synthesis=synthesis.synthesis,
+            agreements=synthesis.agreements,
+            contradictions=synthesis.contradictions,
+            gaps=synthesis.gaps,
+            confidence=synthesis.confidence,
+            claims_by_paper=claims_by_paper,
+            papers_reviewed=len(all_papers),
+        )
+
+
+def _mock_search(query: str) -> list[PaperResult]:
+    """Mock search for testing. Replace with Semantic Scholar API."""
+    return [
+        PaperResult(
+            title=f"Paper on {query[:40]}",
+            abstract=f"We investigate {query}. Our results show...",
+            doi=f"10.1234/mock.{hash(query) % 10000}",
+            year=2024,
+            authors=["A. Researcher"],
+        )
+    ]</code></pre>
+<div class="code-caption">The complete <code>LiteratureReviewProgram</code> module. Three DSPy modules compose into a pipeline with standard Python flow control. The <code>search_fn</code> parameter allows dependency injection for testing. Compare this with the 50-line brittle chain: same functionality, fully typed, optimizable.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>The <code>search_fn</code> parameter is a crucial design choice. By injecting the search function rather than hardcoding it, the DSPy program becomes testable (pass a mock), portable (swap Semantic Scholar for PubMed), and composable (the search function might itself be an MCP tool call, connecting this program to the <a href="../module-12-mcp-servers/index.html">MCP servers from Chapter 12</a>). This is standard dependency injection, a software engineering pattern that becomes especially valuable when one of your "dependencies" is a language model.</p>
+</div>
+
+<h2>4. Step 3: Write the Quality Metric</h2>
+
+<p>The metric defines what "good" means. For a literature review, quality has multiple dimensions that we must capture in a single score.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent misconception is that DSPy compilation replaces or eliminates prompts entirely, as if the framework bypasses natural language and communicates with the model through some structured protocol. This is incorrect: compilation generates and refines the prompt text automatically, but the model still receives a natural language prompt at inference time. What DSPy eliminates is the need for you to write, debug, and manually iterate on that prompt text; the compiler searches the space of possible prompt wordings for you, guided by your metric.</p>
+</div>
+
+<pre><code class="language-python">def literature_review_metric(example, prediction, trace=None):
+    """Multi-dimensional quality metric for literature reviews.
+
+    Dimensions:
+    - Claim specificity: are claims concrete and falsifiable?
+    - Coverage: does the synthesis address the question?
+    - Structure: are agreements, contradictions, gaps populated?
+    - Grounding: do claims come from the actual paper abstracts?
+    """
+    scores = {}
+
+    # 1. Claim specificity (heuristic: specific claims are longer)
+    all_claims = []
+    if hasattr(prediction, 'claims_by_paper'):
+        for paper_claims in prediction.claims_by_paper.values():
+            all_claims.extend(paper_claims)
+
+    if all_claims:
+        # Specific claims tend to have 10+ words and contain numbers
+        specific_count = sum(
+            1 for c in all_claims
+            if len(c.split()) >= 10
+        )
+        scores['specificity'] = specific_count / len(all_claims)
+    else:
+        scores['specificity'] = 0.0
+
+    # 2. Coverage: synthesis should be substantive
+    synthesis = getattr(prediction, 'synthesis', '')
+    if synthesis and len(synthesis.split()) >= 80:
+        scores['coverage'] = 1.0
+    elif synthesis and len(synthesis.split()) >= 40:
+        scores['coverage'] = 0.5
+    else:
+        scores['coverage'] = 0.0
+
+    # 3. Structure: all output fields should be populated
+    has_agreements = bool(getattr(prediction, 'agreements', []))
+    has_gaps = bool(getattr(prediction, 'gaps', []))
+    has_confidence = getattr(prediction, 'confidence', '') in {
+        'high', 'medium', 'low'
+    }
+    scores['structure'] = (
+        (0.4 * has_agreements) +
+        (0.3 * has_gaps) +
+        (0.3 * has_confidence)
+    )
+
+    # 4. Grounding: check against expected claims if available
+    if hasattr(example, 'expected_claims') and example.expected_claims:
+        expected = set(example.expected_claims)
+        found = set(all_claims)
+        # Soft match: check if expected claim keywords appear
+        grounded = 0
+        for exp in expected:
+            exp_keywords = set(exp.lower().split())
+            for claim in found:
+                claim_keywords = set(claim.lower().split())
+                overlap = len(exp_keywords & claim_keywords)
+                if overlap >= 3:  # at least 3 keyword matches
+                    grounded += 1
+                    break
+        scores['grounding'] = grounded / len(expected)
+    else:
+        scores['grounding'] = 0.5  # no ground truth available
+
+    # Weighted combination
+    weights = {
+        'specificity': 0.25,
+        'coverage': 0.25,
+        'structure': 0.25,
+        'grounding': 0.25,
+    }
+    return sum(scores[k] * weights[k] for k in scores)</code></pre>
+<div class="code-caption">Quality metric for the literature review program. Four dimensions are combined with equal weights. The grounding check uses keyword overlap as a soft match, which is imperfect but fast. For higher-fidelity grounding, use an LLM-as-judge (see Section 10.2).</div>
+
+<h2>5. Step 4: Compile and Evaluate</h2>
+
+<p>With the program and metric in hand, compilation is straightforward. The key decisions are: which optimizer, how much training data, and how to split the data.</p>
+
+<pre><code class="language-python">import dspy
+
+# Configure the LM
+lm = dspy.LM("anthropic/claude-sonnet-4-20250514")
+dspy.configure(lm=lm)
+
+# Prepare training data
+trainset = [
+    dspy.Example(
+        research_question=(
+            "How do graph neural networks perform for "
+            "molecular property prediction?"
+        ),
+        expected_claims=[
+            "GNNs outperform traditional fingerprint methods",
+            "Message-passing networks capture local structure",
+            "3D-aware models improve binding affinity prediction",
+        ],
+    ).with_inputs("research_question"),
+    dspy.Example(
+        research_question=(
+            "What are the failure modes of large language models "
+            "in mathematical reasoning?"
+        ),
+        expected_claims=[
+            "LLMs struggle with multi-step arithmetic",
+            "Chain-of-thought improves but does not eliminate errors",
+            "Models show sensitivity to problem framing",
+        ],
+    ).with_inputs("research_question"),
+    # ... 15-20 more examples for robust optimization
+]
+
+# Split into train and validation
+train, val = trainset[:15], trainset[15:]
+
+# Compile with MIPROv2
+program = LiteratureReviewProgram()
+
+optimizer = dspy.MIPROv2(
+    metric=literature_review_metric,
+    num_candidates=7,
+    max_bootstrapped_demos=3,
+    max_labeled_demos=3,
+    num_trials=20,
+)
+
+compiled_program = optimizer.compile(
+    program,
+    trainset=train,
+    valset=val,
+    requires_permission_to_run=False,
+)
+
+# Evaluate on a held-out test set
+evaluator = dspy.Evaluate(
+    devset=test_set,
+    metric=literature_review_metric,
+    num_threads=4,
+    display_progress=True,
+)
+
+# Compare uncompiled vs compiled
+baseline_score = evaluator(program)
+compiled_score = evaluator(compiled_program)
+print(f"Baseline: {baseline_score:.3f}")
+print(f"Compiled: {compiled_score:.3f}")
+# Typical improvement: 0.45 -> 0.72</code></pre>
+<div class="code-caption">Compiling and evaluating the literature review program. The optimizer runs 20 trials, each testing a different combination of instructions and demonstrations. The evaluator reports the quality score on a held-out test set, showing the improvement from compilation.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Real-World Compilation Results</div>
+<p>In a pilot study at a computational biology lab, a team replaced their hand-tuned literature review prompt chain with the DSPy program shown above. The hand-tuned chain scored 0.52 on the composite metric (strong on coverage, weak on grounding and contradiction detection). After compilation with MIPROv2 using 25 training examples, the compiled program scored 0.74. The largest improvement came from contradiction detection: the optimizer discovered that adding the instruction "explicitly compare numerical results across papers and flag disagreements greater than 20%" dramatically improved the model's ability to spot conflicting findings. No human had thought to include this instruction. When the team later migrated from Claude Sonnet to a newer model version, they recompiled in 8 minutes and recovered equivalent quality without touching a single line of code.</p>
+</div>
+
+<h2>6. Step 5: Integrate with the Discovery Workbench</h2>
+
+<p>The compiled program is a Python object that can be saved, loaded, and called like any function. Integrating it with the <a href="../../part-1-foundations/module-06-system-architecture/index.html">Discovery Workbench</a> means wrapping it in the Workbench's typed artifact system and provenance graph.</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field
+from datetime import datetime
+from typing import Optional
+import json
+
+
+class WorkbenchLitReviewRequest(BaseModel):
+    """Request schema for the Workbench literature review endpoint."""
+    research_question: str = Field(
+        description="The question to investigate"
+    )
+    max_papers: int = Field(default=20, ge=5, le=100)
+    search_sources: list[str] = Field(
+        default=["semantic_scholar"],
+        description="APIs to search: semantic_scholar, pubmed, openalex"
+    )
+
+
+class WorkbenchLitReviewResult(BaseModel):
+    """Result schema registered as a Workbench artifact."""
+    request: WorkbenchLitReviewRequest
+    synthesis: str
+    agreements: list[str]
+    contradictions: list[str]
+    gaps: list[str]
+    confidence: str
+    papers_reviewed: int
+    claims_by_paper: dict[str, list[str]]
+    quality_score: float
+    model_id: str
+    compiled_program_version: str
+    timestamp: datetime
+
+
+class LitReviewService:
+    """Workbench service that wraps the compiled DSPy program.
+
+    Handles: loading the compiled program, connecting to search APIs,
+    logging provenance, and returning typed results.
+    """
+
+    def __init__(self, program_path: str, model_id: str):
+        import dspy
+
+        self.model_id = model_id
+        self.program_path = program_path
+
+        # Load the compiled program
+        lm = dspy.LM(f"anthropic/{model_id}")
+        dspy.configure(lm=lm)
+
+        self.program = LiteratureReviewProgram()
+        self.program.load(program_path)
+
+    def search_semantic_scholar(self, query: str) -> list[PaperResult]:
+        """Search Semantic Scholar API.
+
+        In production, this calls the real API with rate limiting,
+        caching, and error handling.
+        """
+        import requests
+
+        url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        params = {
+            "query": query,
+            "limit": 10,
+            "fields": "title,abstract,doi,year,authors",
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        results = []
+        for paper in data.get("data", []):
+            if paper.get("abstract") and paper.get("doi"):
+                results.append(PaperResult(
+                    title=paper["title"],
+                    abstract=paper["abstract"],
+                    doi=paper["doi"],
+                    year=paper.get("year", 0),
+                    authors=[
+                        a["name"] for a in paper.get("authors", [])
+                    ],
+                ))
+        return results
+
+    def run(self, request: WorkbenchLitReviewRequest
+            ) -> WorkbenchLitReviewResult:
+        """Execute a literature review and return a typed result."""
+
+        # Run the compiled DSPy program
+        prediction = self.program(
+            research_question=request.research_question,
+            search_fn=self.search_semantic_scholar,
+            max_papers=request.max_papers,
+        )
+
+        # Compute quality score using the same metric
+        # (no ground truth, so we use heuristic components only)
+        quality = _compute_heuristic_quality(prediction)
+
+        return WorkbenchLitReviewResult(
+            request=request,
+            synthesis=prediction.synthesis,
+            agreements=prediction.agreements,
+            contradictions=prediction.contradictions,
+            gaps=prediction.gaps,
+            confidence=prediction.confidence,
+            papers_reviewed=prediction.papers_reviewed,
+            claims_by_paper=prediction.claims_by_paper,
+            quality_score=quality,
+            model_id=self.model_id,
+            compiled_program_version=self.program_path,
+            timestamp=datetime.now(),
+        )
+
+
+def _compute_heuristic_quality(prediction) -> float:
+    """Heuristic quality score without ground truth."""
+    scores = []
+    # Synthesis length
+    synth_words = len(prediction.synthesis.split())
+    scores.append(min(synth_words / 100, 1.0))
+    # Structure completeness
+    scores.append(1.0 if prediction.agreements else 0.0)
+    scores.append(1.0 if prediction.gaps else 0.0)
+    scores.append(1.0 if prediction.confidence in {
+        'high', 'medium', 'low'
+    } else 0.0)
+    return sum(scores) / len(scores)</code></pre>
+<div class="code-caption">Integrating the compiled DSPy program with the Discovery Workbench. The <code>LitReviewService</code> wraps the program with search API connectivity, quality scoring, and Pydantic-typed results that slot into the Workbench's artifact registry from <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.</div>
+
+<h2>7. Step 6: Deploy and Iterate</h2>
+
+<p>The deployment pattern for compiled DSPy programs has three components: the saved program state (a JSON file), the model configuration, and the quality monitoring loop.</p>
+
+<pre><code class="language-python">import dspy
+
+# Save the compiled program
+compiled_program.save("lit_review_v1_claude_sonnet.json")
+
+# --- In production ---
+
+# Load and configure
+lm = dspy.LM("anthropic/claude-sonnet-4-20250514")
+dspy.configure(lm=lm)
+
+production_program = LiteratureReviewProgram()
+production_program.load("lit_review_v1_claude_sonnet.json")
+
+# Run with real search
+result = production_program(
+    research_question="What are the latest advances in protein "
+    "structure prediction beyond AlphaFold?",
+    search_fn=search_semantic_scholar,
+    max_papers=15,
+)
+
+# --- Model migration ---
+# When switching models, recompile (do not reuse old prompts)
+new_lm = dspy.LM("anthropic/claude-opus-4-20250514")
+dspy.configure(lm=new_lm)
+
+recompiled = optimizer.compile(
+    LiteratureReviewProgram(),
+    trainset=train,
+    valset=val,
+)
+recompiled.save("lit_review_v2_claude_opus.json")
+
+# Verify quality did not regress
+new_score = evaluator(recompiled)
+assert new_score >= compiled_score * 0.95, (
+    f"Quality regression: {new_score:.3f} < {compiled_score * 0.95:.3f}"
+)</code></pre>
+<div class="code-caption">Deployment and model migration workflow. The compiled program is saved as JSON, loaded in production, and recompiled when the model changes. The quality assertion prevents silent regressions.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: LangChain and LlamaIndex</div>
+<p><a href="https://python.langchain.com/" target="_blank">LangChain</a> and <a href="https://www.llamaindex.ai/" target="_blank">LlamaIndex</a> offer alternative approaches to building LLM pipelines. LangChain's <code>StructuredOutputParser</code> and Pydantic output parsers provide structured outputs similar to Section 10.1, and its chain abstractions (<code>LLMChain</code>, <code>SequentialChain</code>) compose LLM calls like DSPy modules. LlamaIndex specializes in retrieval-augmented generation with built-in document loaders, vector stores, and query engines. Both libraries handle the plumbing of LLM pipelines in fewer lines than raw API calls. The key difference is that neither provides automatic prompt optimization. LangChain and LlamaIndex fix the prompt at development time; DSPy compiles it at training time. For pipelines where prompt quality is critical and you have evaluation data, DSPy's compilation step provides measurable improvements. For simpler pipelines or rapid prototyping, LangChain and LlamaIndex offer faster development with less setup. Many production systems combine them: LlamaIndex for retrieval, DSPy for the reasoning stages.</p>
+</div>
+
+<h2>8. The Refactoring Pattern</h2>
+
+<p>The journey from brittle chain to compiled program follows a repeatable pattern. Here is the checklist for converting any existing prompt chain:</p>
+
+<ol>
+<li><strong>Identify the stages</strong>: each distinct LLM call becomes a signature.</li>
+<li><strong>Type the interfaces</strong>: replace string inputs/outputs with typed fields (lists, enums, nested objects).</li>
+<li><strong>Extract the logic</strong>: move control flow (loops, conditionals, error handling) into the module's <code>forward</code> method.</li>
+<li><strong>Inject dependencies</strong>: external calls (APIs, databases, file reads) become parameters, not hardcoded calls.</li>
+<li><strong>Define the metric</strong>: decide what "correct" means, then code it as a function from (example, prediction) to [0, 1].</li>
+<li><strong>Collect training data</strong>: 15 to 25 input/output examples are enough for most tasks.</li>
+<li><strong>Compile</strong>: run an optimizer to generate optimal prompts and demonstrations.</li>
+<li><strong>Evaluate</strong>: compare uncompiled vs. compiled on a held-out test set.</li>
+<li><strong>Deploy</strong>: save the compiled state, load in production, monitor quality.</li>
+</ol>
+
+<p>This pattern connects directly to the software engineering practices from <a href="../module-08-ai-software-foundations/index.html">Chapter 8</a> (testing, type safety, dependency injection) and scales to the multi-agent systems in <a href="../module-17-multi-agent-teams/index.html">Chapter 17</a>, where each agent is itself a compiled DSPy module with a typed interface.</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Self-Improving Discovery Programs</div>
+<p>The compilation step shown here is a one-time optimization. An emerging research direction extends this to continuous improvement: as the program runs in production, it collects new (input, output, quality_score) triples, periodically recompiles with the expanded dataset, and deploys the updated program if quality improves. Khattab et al. (2024) demonstrate this "self-improving pipeline" pattern in the DSPy Assertions paper, where runtime constraint violations trigger automatic retries with corrective feedback. More recently, Opsahl-Ong et al. (2024) introduced BetterTogether in DSPy 2.5, a method that jointly optimizes both the prompt instructions and the few-shot demonstrations in a single compilation pass, achieving up to 78% relative gains over optimizing either component alone. This co-optimization approach is especially relevant for multi-stage pipelines like the one in this section, where improvements to one stage's prompt can cascade through subsequent stages. Combined with the <a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">experiment registries from Chapter 47</a>, this creates a system that not only discovers scientific knowledge but also discovers better ways of discovering it. The meta-level optimization, optimizing the optimizer, connects to the ideas about autonomous discovery in <a href="../../part-7-autonomous-discovery/module-53-ai-scientists/index.html">Chapter 53</a>.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Compare a Two-Stage DSPy Summarizer</h4>
+<p>You can experience DSPy's compilation benefit in under an hour with a simplified two-stage pipeline. (1) Install DSPy and configure a language model: <code>pip install dspy</code>, then set up <code>dspy.LM</code> with your preferred provider and API key. (2) Define two signatures: <code>ExtractKeyPoints</code> (takes an article abstract, returns a list of key points) and <code>WriteSummary</code> (takes key points, returns a one-paragraph summary). Each signature needs only 2 to 3 typed fields. (3) Compose them into a <code>dspy.Module</code> with a <code>forward</code> method that calls <code>ExtractKeyPoints</code> then <code>WriteSummary</code>, and collect 10 examples by grabbing open-access abstracts from the Semantic Scholar API (<code>requests.get("https://api.semanticscholar.org/graph/v1/paper/search", params={"query": "your topic", "fields": "abstract"})</code>). Write a simple metric that scores summary length (at least 50 words) and checks that each key point appears as a keyword in the summary. (4) Compile with <code>dspy.BootstrapFewShot(metric=your_metric, max_bootstrapped_demos=2)</code> using your 10 examples, then run both the uncompiled and compiled versions on 3 held-out abstracts. (5) Print the metric scores side by side and inspect the generated prompts with <code>dspy.inspect_history(n=1)</code> to see exactly what instructions and demonstrations the compiler chose. The compiled version should score noticeably higher, and the auto-generated prompt text will likely include phrasing you would not have written yourself.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>The DSPy documentation describes the framework's philosophy as "programming, not prompting." The irony is that DSPy programs still use prompts internally; the model still receives natural language instructions and demonstrations. The difference is who writes them. In prompt engineering, a human writes the prompt. In DSPy, a program writes the prompt. The human writes the program that writes the prompt. It is turtles all the way down, but each turtle is more reliable than the one below it.</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual</strong>: The refactoring pattern in this section transforms a brittle prompt chain into a typed, compiled program. Identify two additional benefits that this transformation provides for scientific reproducibility beyond the seven problems listed in the "Starting Point" section. How does the compiled program's JSON state file contribute to the provenance requirements of the <a href="../../part-1-foundations/module-06-system-architecture/index.html">Discovery Workbench</a>?</li>
+
+<li><strong>Coding</strong>: Extend the <code>LiteratureReviewProgram</code> with a fourth stage: <code>GenerateHypotheses</code>. This stage takes the synthesis, gaps, and contradictions from Stage 3 and proposes three testable hypotheses that could address the identified gaps. Define the signature, add it to the module, extend the quality metric to score hypothesis quality (specificity, testability, novelty), recompile, and compare the four-stage program against the three-stage version.</li>
+
+<li><strong>Analysis</strong>: Run the compiled literature review program on five different research questions from different scientific domains (e.g., protein folding, battery materials, climate modeling, drug resistance, social network dynamics). For each, measure the quality score and inspect the generated prompts. Does the compiled program generalize across domains, or does it overfit to the training distribution? What modifications to the training set or metric would improve cross-domain performance?</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-10.2.html">&#8592; 10.2 Programmatic Prompt Optimization</a>
+<a href="index.html">Chapter 10</a>
+<a class="next" href="../module-11-context-engineering/index.html">Chapter 11: Context Engineering &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</body>
+</html>

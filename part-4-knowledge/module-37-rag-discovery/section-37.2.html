@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.2: Evidence Grounding and Hallucination Control. Faithfulness metrics, hallucination taxonomies, citation verification, PaperQA2, and automated faithfulness scoring for scientific RAG." name="description"/>
+<title>Section 37.2: Evidence Grounding and Hallucination Control | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Retrieval Augmented Discovery Systems</a></div>
+<h1>37.2 Evidence Grounding and Hallucination Control</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I cited a paper that does not exist, from a journal that was never published, by an author who would be very surprised to learn of their contribution. Otherwise, the answer was excellent."</p>
+<cite>A Citation Manager Who Has Seen Things</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Retrieval reduces hallucination, but it does not eliminate it. A RAG system can retrieve the right passage and still generate an answer that misrepresents what the passage says, omits critical qualifications, or invents details that appear nowhere in the evidence. For scientific applications, where a fabricated statistic or a misattributed finding can derail an entire line of research, faithfulness is not a nice-to-have quality; it is the central engineering challenge. This section formalizes what faithfulness means, categorizes the ways RAG systems fail, introduces PaperQA2 as a state-of-the-art approach to verifiable scientific QA, and builds automated pipelines for detecting and measuring unfaithful generation.</p>
+</div>
+
+<h2>1. A Taxonomy of RAG Hallucinations</h2>
+
+<p><strong>What.</strong> A hallucination in RAG is any generated content that cannot be verified against the retrieved evidence. This definition is deliberately strict: even a true statement is a hallucination if it does not appear in the provided sources, because the system's contract is to answer from evidence, not from memory.</p>
+
+<p data-agent="02">Evidence grounding is the practice of requiring every claim in a generated answer to trace back to a specific passage in the retrieved documents, so that no statement rests on the model's parametric memory alone. It matters because without it, a RAG system offers no meaningful advantage over a plain language model: the retrieved documents become decoration rather than evidence, and the user has no way to distinguish verified facts from plausible fabrications. The mechanism is straightforward: after generation, each sentence (or atomic claim) is aligned to a source passage using entailment checking, and any claim that lacks a supporting passage is flagged or removed. Use evidence grounding whenever the downstream consumer needs to audit or reproduce the reasoning behind an answer; for exploratory brainstorming where creativity matters more than traceability, lighter constraints may be appropriate.</p>
+
+<p><strong>Why.</strong> Different hallucination types require different mitigation strategies. A system that fabricates citations needs a different fix than one that subtly distorts reported statistics. Categorizing failures is the first step toward systematic prevention.</p>
+
+<p><strong>How.</strong> We distinguish four hallucination types, ordered from most to least obvious.</p>
+
+<p><strong>Type 1: Fabricated citations.</strong> The model invents a paper title, author list, or DOI that does not exist. This is the most dangerous hallucination type in scientific RAG because it creates a false evidence trail that a reader might follow. Example: citing "Smith et al. (2023)" when no such paper exists in the retrieved evidence or in the literature.</p>
+
+<p><strong>Type 2: Unsupported claims.</strong> The model generates a factual statement that does not appear in any retrieved passage. The statement may be true (drawn from the model's training data) or false, but either way it violates the evidence-grounding contract. Example: reporting a specific p-value that appears nowhere in the retrieved text.</p>
+
+<p><strong>Type 3: Distorted evidence.</strong> The model references a real passage but misrepresents its content. This includes flipping the direction of a finding ("increased" becomes "decreased"), omitting critical qualifiers ("in vitro" or "in a small cohort"), or combining results from different studies as if they came from one. This is the subtlest and most insidious type.</p>
+
+<p><strong>Type 4: Incomplete attribution.</strong> The model produces a correct, evidence-supported statement but fails to cite the source, or cites the wrong source. Less dangerous than the other types, but it undermines verifiability.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent misconception is that adding retrieval to a language model automatically makes its answers trustworthy, as if the presence of source documents guarantees the generated text faithfully reflects them. This is wrong: retrieval provides the model with evidence, but the generation step can still ignore, distort, or supplement that evidence with fabricated details. Faithfulness must be measured and enforced as a separate engineering concern on top of retrieval, not assumed as a byproduct of it.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: RAG Can Amplify Hallucination, Not Just Reduce It</div>
+<p>A counterintuitive finding from the RAG evaluation literature: retrieval can sometimes <em>increase</em> hallucination rates compared to closed-book generation. This happens when the retriever surfaces irrelevant or contradictory passages. The model, instructed to answer from the provided context, tries to force an answer from unsuitable evidence and produces distorted or fabricated connections. The implication is that retrieval quality and generation faithfulness are coupled: improving one without the other can make the system worse. A high-precision retriever with a faithful generator outperforms a high-recall retriever with an unfaithful one.</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of a RAG system like a student writing an open-book exam. Having the textbook on the desk (retrieval) does not prevent the student from writing an incorrect answer; the student can misread a paragraph, copy a number from the wrong table, or fill in a gap from a half-remembered lecture instead of flipping to the right page. A diligent student checks each sentence against the book before moving on, and an instructor who grades the exam verifies that every cited page actually says what the student claims. Evidence grounding is that verification step: not whether the book was on the desk, but whether every sentence in the essay points to a real passage that supports it.</p>
+</div>
+
+<h2>2. Measuring Faithfulness</h2>
+
+<p>Faithfulness quantifies the degree to which a generated answer is supported by the retrieved evidence. Unlike factual accuracy (which requires ground truth), faithfulness can be evaluated automatically by comparing the answer against the provided context.</p>
+
+<p>The core idea is <strong>atomic claim decomposition</strong>. Break the generated answer into atomic claims (single, verifiable statements), then check each claim against the evidence passages. The faithfulness score is the fraction of claims that are supported:</p>
+
+$$\text{Faithfulness} = \frac{|\{\text{atomic claims supported by evidence}\}|}{|\{\text{all atomic claims in the answer}\}|}$$
+
+<p>This is the approach used by FActScore and adopted by the RAGAS evaluation framework. Let us implement it.</p>
+
+<pre><code class="language-python">import anthropic
+import json
+
+client = anthropic.Anthropic()
+
+def extract_atomic_claims(answer: str) -> list[str]:
+    """Decompose a generated answer into atomic, verifiable claims."""
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": f"""Decompose the following text into atomic claims.
+Each atomic claim should be a single, self-contained factual statement
+that can be independently verified. Do not include opinions, hedging
+language, or meta-statements about the answer itself.
+
+Text: {answer}
+
+Return a JSON array of claim strings. Example:
+["Claim 1", "Claim 2", "Claim 3"]"""
+        }],
+    )
+    return json.loads(response.content[0].text)
+
+
+def verify_claim(claim: str, evidence_passages: list[str]) -> dict:
+    """Check whether a single claim is supported by the evidence."""
+    evidence_text = "\n\n".join(
+        f"[Passage {i+1}]: {p}"
+        for i, p in enumerate(evidence_passages)
+    )
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=512,
+        messages=[{
+            "role": "user",
+            "content": f"""Determine whether the following claim is
+supported by the evidence passages.
+
+Claim: {claim}
+
+Evidence:
+{evidence_text}
+
+Respond with a JSON object:
+{{
+  "verdict": "supported" | "not_supported" | "contradicted",
+  "supporting_passage": <passage number or null>,
+  "reasoning": "<one sentence explaining the verdict>"
+}}"""
+        }],
+    )
+    return json.loads(response.content[0].text)
+
+
+def compute_faithfulness(
+    answer: str,
+    evidence_passages: list[str],
+) -> dict:
+    """Compute faithfulness score for a generated answer."""
+    claims = extract_atomic_claims(answer)
+    results = [verify_claim(c, evidence_passages) for c in claims]
+
+    supported = sum(1 for r in results if r["verdict"] == "supported")
+    contradicted = sum(1 for r in results if r["verdict"] == "contradicted")
+
+    return {
+        "faithfulness_score": supported / len(claims) if claims else 0.0,
+        "total_claims": len(claims),
+        "supported": supported,
+        "not_supported": len(claims) - supported - contradicted,
+        "contradicted": contradicted,
+        "details": [
+            {"claim": c, **r} for c, r in zip(claims, results)
+        ],
+    }</code></pre>
+<div class="code-caption">Listing 37.9: Atomic claim decomposition and verification pipeline. The answer is decomposed into self-contained factual claims, each claim is checked against the evidence passages, and the faithfulness score is the fraction of supported claims. Contradicted claims are tracked separately because they represent a more severe failure than merely unsupported ones.</div>
+
+<pre><code class="language-python"># Example: evaluate faithfulness of a RAG-generated answer
+answer = """EGFR mutations are found in approximately 15-20% of non-small
+cell lung cancer (NSCLC) patients. These mutations confer sensitivity to
+tyrosine kinase inhibitors (TKIs) such as erlotinib and gefitinib [Source 1].
+The T790M resistance mutation emerges in about 60% of patients after
+initial TKI treatment, leading to disease progression."""
+
+evidence = [
+    "EGFR mutations in non-small cell lung cancer confer sensitivity "
+    "to tyrosine kinase inhibitors such as erlotinib and gefitinib.",
+]
+
+result = compute_faithfulness(answer, evidence)
+print(f"Faithfulness: {result['faithfulness_score']:.2f}")
+print(f"Claims: {result['total_claims']} total, "
+      f"{result['supported']} supported, "
+      f"{result['contradicted']} contradicted")
+for detail in result["details"]:
+    print(f"  [{detail['verdict']}] {detail['claim']}")
+    print(f"    Reason: {detail['reasoning']}")</code></pre>
+<div class="code-caption">Listing 37.10: Evaluating a RAG answer against its evidence. The answer contains three claims: EGFR mutation prevalence (15-20%), TKI sensitivity, and T790M resistance. Only the TKI sensitivity claim is supported by the evidence passage. The prevalence statistic and T790M detail are unsupported (possibly true, but not in the retrieved evidence), illustrating Type 2 hallucination.</div>
+
+<h2>3. PaperQA2: Verifiable Scientific Question Answering</h2>
+
+<p>PaperQA2, developed by Future House, represents the current state of the art in scientific RAG. It achieves superhuman accuracy on scientific question answering benchmarks by combining several techniques that address the hallucination types we cataloged above.</p>
+
+<p><strong>What.</strong> PaperQA2 is a RAG agent (not just a pipeline) that iteratively searches, reads, and synthesizes answers from scientific papers. Unlike a single-pass retrieve-then-generate pipeline, PaperQA2 can decide that its initial retrieval was insufficient, reformulate queries, fetch additional papers, and verify its own citations before producing a final answer.</p>
+
+<p><strong>Why.</strong> The single-pass RAG pipeline has a fundamental limitation: it commits to a set of retrieved passages before generation begins. If the retriever missed a critical paper, or if the question requires information from a paper that was not in the initial result set, the generator has no recourse. PaperQA2's agentic loop allows it to recognize gaps and fill them.</p>
+
+<p><strong>How.</strong> The system operates through a sequence of tool calls:</p>
+
+<ol>
+<li><strong>Paper search:</strong> queries a scientific search engine (Semantic Scholar, CrossRef) to find relevant papers.</li>
+<li><strong>Gather evidence:</strong> retrieves and chunks the full text of found papers, embedding and storing them for similarity search.</li>
+<li><strong>Generate answer:</strong> synthesizes a cited answer from the gathered evidence, with each claim linked to a specific passage.</li>
+<li><strong>Citation verification:</strong> checks each citation against the source text, flagging any claim that is not directly supported.</li>
+</ol>
+
+<pre><code class="language-python">from paperqa import Settings, ask
+
+# Configure PaperQA2
+settings = Settings(
+    llm="claude-sonnet-4-20250514",
+    summary_llm="claude-sonnet-4-20250514",
+    embedding="sentence-transformers/all-MiniLM-L6-v2",
+    answer=Settings.AnswerSettings(
+        evidence_k=10,          # Number of evidence passages to gather
+        answer_max_sources=5,   # Maximum sources in final answer
+    ),
+)
+
+# Ask a scientific question
+# PaperQA2 will search, retrieve papers, gather evidence, and generate
+answer = await ask(
+    "What are the mechanisms of resistance to EGFR tyrosine "
+    "kinase inhibitors in non-small cell lung cancer?",
+    settings=settings,
+)
+
+print(f"Answer: {answer.answer}")
+print(f"\nCitations ({len(answer.references)}):")
+for ref in answer.references:
+    print(f"  - {ref.citation}")
+print(f"\nEvidence quality: {answer.quality_score:.2f}")</code></pre>
+<div class="code-caption">Listing 37.11: Using PaperQA2 for scientific question answering. The system searches for relevant papers, gathers evidence passages, generates a cited answer, and provides a quality score reflecting evidence coverage and citation accuracy. The agentic loop allows it to iteratively refine its search if initial results are insufficient.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: PaperQA2 vs. Single-Pass RAG in Drug Discovery</div>
+<p>A computational chemist asks: "What is the binding affinity of compound X to the JAK2 kinase, and how does it compare to ruxolitinib?" A single-pass RAG system retrieves passages mentioning compound X and passages mentioning ruxolitinib, but the retrieved passages report binding affinities in different units (IC50 vs. Ki) measured under different assay conditions. The generator, lacking the context to recognize this incompatibility, produces a direct numerical comparison that is scientifically meaningless. PaperQA2's agentic loop, after gathering initial evidence, can recognize that the comparison requires matched assay conditions, reformulate its search to find head-to-head comparisons, and either report a valid comparison or explicitly state that the available evidence does not support a direct comparison. This ability to recognize and communicate the limits of the evidence is what makes PaperQA2 suitable for scientific use cases where a confidently wrong answer is worse than no answer.</p>
+</div>
+
+<h2>4. Citation Verification</h2>
+
+<p>Citation verification is the process of checking whether each citation in a generated answer actually supports the claim it is attached to. This is distinct from faithfulness scoring: faithfulness asks "is the claim supported by <em>any</em> evidence?", while citation verification asks "is the claim supported by <em>the specific source cited</em>?"</p>
+
+<p>The distinction matters because models frequently attach the wrong citation to a correct claim. A claim about protein folding might cite a paper about protein expression, and while the claim may be true and supported by another passage in the context, the specific citation is misleading.</p>
+
+<pre><code class="language-python">def verify_citations(
+    answer_with_citations: str,
+    sources: dict[str, str],  # {source_id: passage_text}
+) -> list[dict]:
+    """Verify that each citation supports its associated claim.
+
+    Args:
+        answer_with_citations: Answer text with [Source N] markers.
+        sources: Mapping from source identifiers to passage text.
+
+    Returns:
+        List of verification results per citation.
+    """
+    import re
+
+    # Extract claims with their citations
+    # Pattern: sentence ending with [Source N] or [Source N, Source M]
+    citation_pattern = r'([^.]+\[Source \d+(?:,\s*Source \d+)*\]\.?)'
+    cited_segments = re.findall(citation_pattern, answer_with_citations)
+
+    results = []
+    for segment in cited_segments:
+        # Extract cited source IDs
+        source_ids = re.findall(r'Source (\d+)', segment)
+        # Remove citation markers to get the claim text
+        claim = re.sub(r'\[Source \d+(?:,\s*Source \d+)*\]', '', segment).strip()
+
+        for source_id in source_ids:
+            source_key = f"Source {source_id}"
+            if source_key not in sources:
+                results.append({
+                    "claim": claim,
+                    "cited_source": source_key,
+                    "verdict": "source_not_found",
+                    "reasoning": f"{source_key} does not exist in the "
+                                 f"provided evidence.",
+                })
+                continue
+
+            # Verify this specific citation supports this specific claim
+            verification = verify_claim(claim, [sources[source_key]])
+            results.append({
+                "claim": claim,
+                "cited_source": source_key,
+                "verdict": verification["verdict"],
+                "reasoning": verification["reasoning"],
+            })
+
+    return results
+
+
+# Example usage
+answer_text = (
+    "EGFR mutations confer sensitivity to TKIs such as erlotinib "
+    "and gefitinib [Source 1]. The T790M gatekeeper mutation is the "
+    "most common mechanism of acquired resistance [Source 2]. "
+    "Osimertinib overcomes T790M resistance with a median "
+    "progression-free survival of 18.9 months [Source 3]."
+)
+
+sources = {
+    "Source 1": "EGFR mutations in non-small cell lung cancer confer "
+                "sensitivity to tyrosine kinase inhibitors such as "
+                "erlotinib and gefitinib.",
+    "Source 2": "TP53 is the most frequently mutated gene in human "
+                "cancers, with loss-of-function mutations found in "
+                "over 50% of tumors.",
+    # Source 3 intentionally missing
+}
+
+verifications = verify_citations(answer_text, sources)
+for v in verifications:
+    status = "PASS" if v["verdict"] == "supported" else "FAIL"
+    print(f"  [{status}] {v['cited_source']}: {v['claim'][:60]}...")
+    print(f"         {v['reasoning']}")</code></pre>
+<div class="code-caption">Listing 37.12: Citation verification pipeline. Each cited claim is checked against the specific source it references. Source 1 passes (the EGFR/TKI claim matches). Source 2 fails because the cited passage discusses TP53, not T790M resistance. Source 3 fails because it does not exist in the evidence set. This catches both misattribution (Type 3) and fabricated citation (Type 1) hallucinations.</div>
+
+<h2>5. The RAGAS Evaluation Framework</h2>
+
+<p>Evaluating a RAG system requires measuring multiple dimensions simultaneously. A system might have excellent retrieval but poor generation, or faithful generation but low recall. The RAGAS framework (Retrieval Augmented Generation Assessment) provides four complementary metrics that together give a complete picture of system quality.</p>
+
+<p><strong>Faithfulness</strong> (already covered): the fraction of generated claims supported by the retrieved context. Measures generation quality independent of retrieval.</p>
+
+<p><strong>Answer Relevancy</strong>: the degree to which the generated answer addresses the original question. A faithful answer that discusses irrelevant aspects of the retrieved evidence scores low on relevancy. Measured by generating questions from the answer and computing their semantic similarity to the original question:</p>
+
+$$\text{Answer Relevancy} = \frac{1}{N} \sum_{i=1}^{N} \text{sim}(\mathbf{e}_q, \mathbf{e}_{q_i^{\text{gen}}})$$
+
+<p>where $q_i^{\text{gen}}$ are questions generated from the answer and $\mathbf{e}$ denotes embeddings.</p>
+
+<p><strong>Context Precision</strong>: the fraction of retrieved passages that are actually relevant to answering the question. High precision means the retriever is not wasting context window space on irrelevant passages.</p>
+
+<p><strong>Context Recall</strong>: the fraction of the ground-truth answer's claims that are attributable to the retrieved context. High recall means the retriever found all the evidence needed to answer the question fully.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+
+@dataclass
+class RAGEvaluation:
+    """Complete RAGAS-style evaluation of a RAG response."""
+    faithfulness: float        # Claims supported / total claims
+    answer_relevancy: float    # Answer addresses the question
+    context_precision: float   # Retrieved passages are relevant
+    context_recall: float      # Needed evidence was retrieved
+
+    @property
+    def harmonic_mean(self) -> float:
+        """Overall score as harmonic mean of all four metrics."""
+        scores = [self.faithfulness, self.answer_relevancy,
+                  self.context_precision, self.context_recall]
+        if any(s == 0 for s in scores):
+            return 0.0
+        return len(scores) / sum(1.0 / s for s in scores)
+
+    def summary(self) -> str:
+        lines = [
+            f"Faithfulness:      {self.faithfulness:.3f}",
+            f"Answer Relevancy:  {self.answer_relevancy:.3f}",
+            f"Context Precision: {self.context_precision:.3f}",
+            f"Context Recall:    {self.context_recall:.3f}",
+            f"Overall (H-mean):  {self.harmonic_mean:.3f}",
+        ]
+        return "\n".join(lines)
+
+
+def evaluate_context_precision(
+    question: str,
+    retrieved_passages: list[str],
+    client: anthropic.Anthropic,
+) -> float:
+    """Evaluate what fraction of retrieved passages are relevant."""
+    relevant_count = 0
+    for passage in retrieved_passages:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=64,
+            messages=[{
+                "role": "user",
+                "content": f"""Is this passage relevant to answering
+the following question? Respond with only "yes" or "no".
+
+Question: {question}
+Passage: {passage}""",
+            }],
+        )
+        if response.content[0].text.strip().lower() == "yes":
+            relevant_count += 1
+
+    return relevant_count / len(retrieved_passages) if retrieved_passages else 0.0
+
+
+def evaluate_rag_response(
+    question: str,
+    answer: str,
+    retrieved_passages: list[str],
+    ground_truth: str | None = None,
+) -> RAGEvaluation:
+    """Run full RAGAS evaluation on a RAG response."""
+    client = anthropic.Anthropic()
+
+    # Faithfulness
+    faith_result = compute_faithfulness(answer, retrieved_passages)
+
+    # Context precision
+    ctx_precision = evaluate_context_precision(
+        question, retrieved_passages, client
+    )
+
+    # Answer relevancy (simplified: use embedding similarity)
+    from sentence_transformers import SentenceTransformer
+    embed_model = SentenceTransformer("BAAI/bge-large-en-v1.5")
+    q_emb = embed_model.encode([question], normalize_embeddings=True)
+    a_emb = embed_model.encode([answer], normalize_embeddings=True)
+    relevancy = float((q_emb @ a_emb.T)[0, 0])
+
+    # Context recall (requires ground truth)
+    ctx_recall = 0.0
+    if ground_truth:
+        gt_claims = extract_atomic_claims(ground_truth)
+        supported = sum(
+            1 for c in gt_claims
+            if verify_claim(c, retrieved_passages)["verdict"] == "supported"
+        )
+        ctx_recall = supported / len(gt_claims) if gt_claims else 0.0
+
+    return RAGEvaluation(
+        faithfulness=faith_result["faithfulness_score"],
+        answer_relevancy=max(0.0, relevancy),  # Clamp negatives
+        context_precision=ctx_precision,
+        context_recall=ctx_recall,
+    )</code></pre>
+<div class="code-caption">Listing 37.13: Implementing the four RAGAS evaluation dimensions. Faithfulness checks generated claims against evidence. Context precision checks retrieved passages against the question. Answer relevancy uses embedding similarity between question and answer. Context recall checks whether the retrieved evidence covers the ground-truth answer. The harmonic mean combines all four into a single score that penalizes weakness in any dimension.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: RAGAS in 5 Lines</div>
+<p>The <code>ragas</code> library provides all four metrics with a single function call, using LLM-based evaluation internally. Our from-scratch implementation spans ~80 lines and gives you full control over the evaluation prompts, but for benchmarking a pipeline quickly, the library reduces this to five lines (plus data preparation). It also provides additional metrics like answer correctness and aspect critique that we did not implement.</p>
+<pre><code class="language-python">from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy
+from ragas.metrics import context_precision, context_recall
+from datasets import Dataset
+
+# Prepare evaluation data
+eval_data = Dataset.from_dict({
+    "question": [question],
+    "answer": [answer],
+    "contexts": [[p for p in retrieved_passages]],
+    "ground_truth": [ground_truth],
+})
+result = evaluate(eval_data, metrics=[
+    faithfulness, answer_relevancy,
+    context_precision, context_recall,
+])
+print(result)  # DataFrame with all scores</code></pre>
+</div>
+
+<h2>6. Strategies for Reducing Hallucination</h2>
+
+<p>Measuring faithfulness is necessary but not sufficient. This section presents five concrete strategies for reducing hallucination in scientific RAG systems, ordered by implementation effort.</p>
+
+<h3>6.1 Constrained Generation Prompting</h3>
+
+<p>The simplest intervention is prompt engineering. The generator prompt from <a href="section-37.1.html">Section 37.1</a> (Listing 37.8) already includes instructions to cite sources and acknowledge gaps. Additional constraints that improve faithfulness include:</p>
+
+<ul>
+<li><strong>Enumerate before synthesize:</strong> ask the model to first list the key facts from each source, then synthesize them into a coherent answer. This forces attention to the evidence before generation begins.</li>
+<li><strong>Self-check instruction:</strong> append "Before finalizing, verify each citation by re-reading the cited passage and confirming it supports the claim" to the prompt.</li>
+<li><strong>Confidence calibration:</strong> ask the model to flag claims it is uncertain about with a confidence level, making potential hallucinations visible to the reader.</li>
+</ul>
+
+<h3>6.2 Post-Generation Verification</h3>
+
+<p>Run the citation verification pipeline (Listing 37.12) on every generated answer. Flag or remove claims that fail verification. For production systems, this adds one LLM call per citation but catches the most egregious errors before they reach the user.</p>
+
+<h3>6.3 Retrieval Quality Gates</h3>
+
+<p>Do not generate answers from low-quality evidence. If the top reranker score falls below a threshold, or if the retriever returns fewer than a minimum number of relevant passages, the system should respond with "I could not find sufficient evidence to answer this question" rather than attempting an answer from weak evidence.</p>
+
+<pre><code class="language-python">def gated_generate(
+    question: str,
+    evidence: list[dict],
+    min_evidence: int = 2,
+    min_rerank_score: float = 0.5,
+) -> str:
+    """Generate an answer only if evidence quality meets thresholds."""
+    # Filter to high-quality evidence
+    strong_evidence = [
+        e for e in evidence
+        if e["rerank_score"] >= min_rerank_score
+    ]
+
+    if len(strong_evidence) < min_evidence:
+        return (
+            f"Insufficient evidence to answer this question. "
+            f"Found {len(strong_evidence)} passages above the "
+            f"relevance threshold (minimum {min_evidence} required). "
+            f"Consider refining the question or expanding the corpus."
+        )
+
+    return generate_cited_answer(question, strong_evidence, client)</code></pre>
+<div class="code-caption">Listing 37.14: Evidence quality gating. The generator only produces an answer when the evidence meets minimum quality thresholds. This prevents the system from hallucinating answers to questions that the corpus cannot support, converting potential hallucinations into honest "insufficient evidence" responses.</div>
+
+<h3>6.4 Structured Output with Source Mapping</h3>
+
+<p>Instead of generating free-text answers with inline citations, use structured output to enforce a strict mapping between claims and sources. Each claim is a separate object linked to specific source passages, making verification trivial and hallucination structurally harder.</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field
+
+class CitedClaim(BaseModel):
+    """A single factual claim with its supporting evidence."""
+    claim: str = Field(description="A single factual statement")
+    source_ids: list[str] = Field(
+        description="Source identifiers supporting this claim"
+    )
+    verbatim_support: str = Field(
+        description="Direct quote from the source that supports "
+                    "this claim, copied verbatim"
+    )
+    confidence: float = Field(
+        ge=0.0, le=1.0,
+        description="Confidence that the source supports this claim"
+    )
+
+class StructuredAnswer(BaseModel):
+    """A research answer decomposed into individually cited claims."""
+    summary: str = Field(
+        description="One-sentence summary of the answer"
+    )
+    claims: list[CitedClaim] = Field(
+        description="Individual claims with source mappings"
+    )
+    limitations: list[str] = Field(
+        description="Aspects of the question not covered by "
+                    "the available evidence"
+    )
+
+
+def generate_structured_answer(
+    question: str,
+    evidence: list[dict],
+) -> StructuredAnswer:
+    """Generate a structured answer with per-claim source mapping."""
+    context = "\n\n".join(
+        f"[Source {i+1}]: {ev['passage']}"
+        for i, ev in enumerate(evidence)
+    )
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{
+            "role": "user",
+            "content": f"""Answer this research question using ONLY
+the provided sources. Structure your response as a JSON object
+matching this schema:
+
+- summary: one-sentence answer
+- claims: array of objects, each with:
+  - claim: a single factual statement
+  - source_ids: which sources support it (e.g., ["Source 1"])
+  - verbatim_support: exact quote from the source
+  - confidence: 0.0 to 1.0
+- limitations: aspects not covered by the evidence
+
+Question: {question}
+
+Sources:
+{context}""",
+        }],
+    )
+    return StructuredAnswer.model_validate_json(
+        response.content[0].text
+    )</code></pre>
+<div class="code-caption">Listing 37.15: Structured output generation with per-claim source mapping. By requiring a verbatim quote from the source alongside each claim, the model is forced to ground every statement in specific text. Claims that cannot be matched to a verbatim passage are structurally prevented. The confidence field makes uncertainty visible to downstream consumers.</div>
+
+<h3>6.5 Iterative Refinement with Self-Critique</h3>
+
+<p>The most effective (and most expensive) strategy: generate an answer, evaluate it for faithfulness, identify unsupported claims, and regenerate with explicit instructions to fix or remove them. This mirrors PaperQA2's agentic loop at the claim level.</p>
+
+<pre><code class="language-python">def iterative_faithful_generation(
+    question: str,
+    evidence: list[dict],
+    max_iterations: int = 3,
+    target_faithfulness: float = 0.95,
+) -> dict:
+    """Generate and iteratively refine until faithfulness target is met."""
+    evidence_passages = [e["passage"] for e in evidence]
+    answer = generate_cited_answer(question, evidence, client)
+
+    for iteration in range(max_iterations):
+        eval_result = compute_faithfulness(answer, evidence_passages)
+
+        if eval_result["faithfulness_score"] >= target_faithfulness:
+            return {
+                "answer": answer,
+                "faithfulness": eval_result["faithfulness_score"],
+                "iterations": iteration + 1,
+                "details": eval_result["details"],
+            }
+
+        # Identify unsupported claims
+        unsupported = [
+            d for d in eval_result["details"]
+            if d["verdict"] != "supported"
+        ]
+        unsupported_text = "\n".join(
+            f"- {d['claim']} (verdict: {d['verdict']})"
+            for d in unsupported
+        )
+
+        # Regenerate with feedback
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            messages=[{
+                "role": "user",
+                "content": f"""Your previous answer to the question
+"{question}" contained claims not supported by the evidence.
+
+Unsupported claims:
+{unsupported_text}
+
+Please regenerate the answer, removing or correcting these claims.
+Only include information that is directly stated in the sources.
+If removing these claims leaves gaps in the answer, acknowledge
+those gaps explicitly.
+
+Sources:
+{chr(10).join(f'[Source {i+1}]: {e["passage"]}' for i, e in enumerate(evidence))}""",
+            }],
+        )
+        answer = response.content[0].text
+
+    # Return best effort after max iterations
+    final_eval = compute_faithfulness(answer, evidence_passages)
+    return {
+        "answer": answer,
+        "faithfulness": final_eval["faithfulness_score"],
+        "iterations": max_iterations,
+        "details": final_eval["details"],
+    }</code></pre>
+<div class="code-caption">Listing 37.16: Iterative refinement loop for faithful generation. After each generation attempt, the system evaluates faithfulness, identifies unsupported claims, and regenerates with explicit instructions to fix them. Typical convergence: 1.5 iterations for well-scoped questions, 2-3 for complex multi-source syntheses.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Cost of Faithfulness Is Worth Paying</div>
+<p>The strategies above add computational cost: citation verification requires one LLM call per citation, structured output increases prompt length, and iterative refinement doubles or triples the generation cost. For general-purpose chatbots, this overhead may not be justified. For scientific research copilots, it is a bargain. A single hallucinated drug interaction, fabricated experimental result, or misattributed finding can waste weeks of research effort. The cost of three LLM calls per answer is negligible compared to the cost of acting on false information. Build faithfulness checking into the pipeline from the start, not as an afterthought.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>The FACTS Grounding benchmark, released by Google DeepMind in late 2024, provides a standardized leaderboard for measuring how well language models ground their responses in supplied documents. Unlike earlier faithfulness benchmarks that relied on synthetic or small-scale evaluation sets, FACTS Grounding uses 1,719 examples spanning long documents (average ~32k tokens) with human-annotated eligibility and grounding labels. Models are scored on two axes: whether they correctly refuse unanswerable requests and whether answerable responses are fully grounded in the provided text. As of early 2025, no model exceeds 90% on the combined metric, revealing that even frontier systems still hallucinate at meaningful rates when handling long, complex source documents. The benchmark is openly available and designed as a drop-in evaluation for any RAG pipeline, making it a practical tool for measuring progress beyond what the RAGAS metrics and FActScore capture.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Faithfulness Scorer from Scratch</h4>
+<p>Build a minimal faithfulness evaluation pipeline using only Python, an LLM API, and a few paragraphs of text. This project takes about 30 minutes and requires no special libraries beyond an API client.</p>
+<p><strong>Step 1.</strong> Choose a Wikipedia article on a scientific topic (for example, CRISPR or mRNA vaccines). Copy three paragraphs as your "evidence corpus" and save them in a Python list of strings.</p>
+<p><strong>Step 2.</strong> Write a short (3-4 sentence) answer to a question about that topic. Intentionally include one claim that is supported by your evidence, one claim that is true but not in the evidence, and one claim that contradicts the evidence.</p>
+<p><strong>Step 3.</strong> Implement the <code>extract_atomic_claims</code> function from Listing 37.9, using your preferred LLM API. Run it on your answer and inspect the decomposed claims. Verify that each claim is truly atomic (a single checkable fact).</p>
+<p><strong>Step 4.</strong> Implement the <code>verify_claim</code> function from the same listing. Run it on each atomic claim against your evidence paragraphs. Confirm that it correctly identifies the supported, unsupported, and contradicted claims you planted.</p>
+<p><strong>Step 5.</strong> Compute the faithfulness score (supported / total) and print a per-claim report. Experiment with modifying your answer to raise the score to 1.0 by removing unsupported claims, then observe how the score drops when you add plausible but unsourced statistics.</p>
+</div>
+
+<h2>Section Summary</h2>
+
+<p>RAG reduces hallucination but does not eliminate it. Scientific RAG systems face four hallucination types (fabricated citations, unsupported claims, distorted evidence, incomplete attribution), each requiring targeted mitigation. Faithfulness, measured through atomic claim decomposition and verification, is the central metric for scientific RAG quality. PaperQA2 demonstrates that agentic architectures with iterative search and citation verification can achieve superhuman performance on scientific QA. Five practical strategies (constrained prompting, post-generation verification, retrieval quality gates, structured output, and iterative refinement) reduce hallucination rates progressively, with diminishing returns above 95% faithfulness. The RAGAS framework provides a standard evaluation toolkit covering faithfulness, answer relevancy, context precision, and context recall. In the next section, we assemble all of these components into a complete research copilot.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-37.1.html">&#8592; 37.1 RAG Architecture</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="section-37.3.html">37.3 Building a Research Copilot &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

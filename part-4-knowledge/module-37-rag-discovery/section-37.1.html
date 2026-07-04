@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.1: RAG Architecture. Retriever, reranker, generator pipeline with embedding models, vector databases, cross-encoder reranking, and query planning for scientific discovery." name="description"/>
+<title>Section 37.1: RAG Architecture | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Retrieval Augmented Discovery Systems</a></div>
+<h1>37.1 RAG Architecture</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My context window is 200,000 tokens long, and I still cannot find my keys. Retrieval is about relevance, not capacity."</p>
+<cite>A Language Model With a Very Large, Very Disorganized Desk</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>A RAG system has three stages: a retriever that finds relevant passages from a corpus, a reranker that sharpens relevance ordering, and a generator that synthesizes a cited answer. Each stage involves distinct engineering choices. This section builds the complete pipeline from first principles, starting with how documents become vectors, moving through vector search and cross-encoder reranking, and ending with the generator prompt that produces grounded, citable answers. We pay special attention to the tradeoff between stuffing everything into a long context window and using targeted retrieval, a decision that every scientific RAG system must make.</p>
+</div>
+
+<h2>1. The Three-Stage Pipeline</h2>
+
+<p><strong>What.</strong> Retrieval Augmented Generation is a design pattern that augments a language model's generation with evidence retrieved from an external knowledge base. Instead of relying on what the model memorized during pre-training, RAG fetches relevant documents at query time and includes them in the prompt.</p>
+
+<p><strong>Why.</strong> Language models trained on scientific literature have a knowledge cutoff date, cannot access proprietary corpora, and hallucinate with confidence. For scientific discovery, where correctness is non-negotiable and recency matters, retrieval provides a verifiable evidence trail that parametric memory cannot.</p>
+
+<p><strong>How.</strong> The pipeline processes a query through three stages: (1) the retriever converts the query to a vector and finds candidate passages by similarity search, (2) the reranker scores each candidate with a more expensive cross-attention model and reorders them, and (3) the generator receives the top-ranked passages as context and produces a cited answer.</p>
+
+<p><strong>When.</strong> Use RAG when your corpus exceeds what fits in a single context window, when you need verifiable citations, when the corpus changes frequently, or when you must answer questions about proprietary documents the model has never seen.</p>
+
+<p>The mathematical foundation is straightforward. Given a query $q$ and a corpus of $N$ passages $\{p_1, p_2, \ldots, p_N\}$, the retriever computes a relevance score for each passage:</p>
+
+$$\text{score}_{\text{retrieve}}(q, p_i) = \text{sim}(\mathbf{e}_q, \mathbf{e}_{p_i})$$
+
+<p>where $\mathbf{e}_q$ and $\mathbf{e}_{p_i}$ are dense vector embeddings and $\text{sim}$ is typically cosine similarity or inner product. The reranker then refines the top-$k$ candidates with a cross-encoder score:</p>
+
+$$\text{score}_{\text{rerank}}(q, p_i) = \text{CrossEncoder}([q; p_i])$$
+
+<p>where $[q; p_i]$ denotes concatenation. The cross-encoder attends jointly to query and passage tokens, capturing fine-grained relevance that independent embeddings miss.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Bi-Encoders Scale, Cross-Encoders Score</div>
+<p>The retriever uses a bi-encoder: query and passage are embedded independently, so you can pre-compute all passage embeddings offline and search in milliseconds. The reranker uses a cross-encoder: query and passage are processed together, which is far more accurate but requires running the model for every candidate pair. This is why RAG uses two stages: the bi-encoder narrows millions of passages to a manageable shortlist, and the cross-encoder picks the best ones from that shortlist. Trying to cross-encode every passage in the corpus would take hours per query.</p>
+</div>
+
+<h2>2. Embedding Models for Scientific Text</h2>
+
+<p>The quality of a RAG system depends first on the quality of its embeddings. General-purpose embedding models (trained on web text, Wikipedia, and Stack Overflow) capture broad semantic similarity but miss the nuances of scientific language. The phrase "inhibition of EGFR" and "EGFR antagonism" are semantically identical to a domain expert but may land in distant regions of a general embedding space.</p>
+
+<p>Several embedding models are well-suited to scientific retrieval. <strong>SPECTER2</strong> (from the Allen Institute for AI) is trained on scientific paper abstracts and citation links. <strong>SciBERT</strong> provides domain-adapted embeddings for biomedical and computer science text. For general scientific use, modern models like <strong>E5-large-v2</strong> and <strong>GTE-large</strong> offer strong performance across domains thanks to large-scale contrastive training.</p>
+
+<p>Let us build the embedding stage. We use the sentence-transformers library, which wraps these models with a consistent API.</p>
+
+<pre><code class="language-python">from sentence_transformers import SentenceTransformer
+import numpy as np
+
+# Load a strong general-purpose embedding model
+# For scientific corpora, consider 'allenai/specter2' instead
+model = SentenceTransformer("BAAI/bge-large-en-v1.5")
+
+# Scientific passages to index
+passages = [
+    "EGFR mutations in non-small cell lung cancer confer sensitivity "
+    "to tyrosine kinase inhibitors such as erlotinib and gefitinib.",
+    "The tumor suppressor p53 regulates apoptosis through both "
+    "transcription-dependent and transcription-independent mechanisms.",
+    "CRISPR-Cas9 enables precise genome editing by creating "
+    "double-strand breaks at guide RNA-specified genomic loci.",
+    "Transformer architectures process sequences through self-attention, "
+    "computing pairwise interactions between all input tokens.",
+    "Phase separation of intrinsically disordered proteins drives "
+    "the formation of membraneless organelles in eukaryotic cells.",
+]
+
+# Compute embeddings (768-dimensional vectors)
+passage_embeddings = model.encode(
+    passages,
+    normalize_embeddings=True,  # Unit vectors for cosine similarity
+    show_progress_bar=False,
+    batch_size=32,
+)
+
+print(f"Embedding shape: {passage_embeddings.shape}")
+print(f"Norm of first embedding: {np.linalg.norm(passage_embeddings[0]):.4f}")
+
+# Query embedding
+query = "What drugs target EGFR in lung cancer?"
+query_embedding = model.encode(
+    [query], normalize_embeddings=True
+)
+
+# Cosine similarity (dot product of unit vectors)
+similarities = query_embedding @ passage_embeddings.T
+ranked_indices = np.argsort(-similarities[0])
+
+print(f"\nQuery: {query}")
+for rank, idx in enumerate(ranked_indices[:3]):
+    print(f"  Rank {rank+1} (sim={similarities[0][idx]:.4f}): "
+          f"{passages[idx][:80]}...")</code></pre>
+<div class="code-caption">Listing 37.1: Building the embedding stage of a RAG pipeline. Passages are encoded into 768-dimensional unit vectors. The query is encoded with the same model, and cosine similarity identifies the most relevant passages. The EGFR passage correctly ranks first.</div>
+
+<h2>3. Vector Databases: Qdrant and pgvector</h2>
+
+<p>NumPy dot products work for a few thousand passages, but scientific corpora contain millions of papers with tens of millions of chunks. At that scale, you need a vector database that supports approximate nearest neighbor (ANN) search, metadata filtering, and persistent storage.</p>
+
+<p data-agent="02">Approximate nearest neighbor (ANN) search is a family of algorithms that find vectors close to a query vector without comparing against every vector in the database. It matters because exact nearest neighbor search is linear in the number of vectors, making it impractical for corpora with tens of millions of chunks where each query would require billions of floating-point operations. ANN algorithms such as HNSW (Hierarchical Navigable Small World) build a graph structure over the vectors during indexing, so that at query time the search traverses only a small fraction of the graph to find near-optimal neighbors in logarithmic time rather than linear time. Use ANN (via a vector database) whenever your corpus exceeds roughly 100,000 passages; below that threshold, exact brute-force search with NumPy or FAISS flat indices is simpler, fast enough, and guarantees perfect recall.</p>
+
+<p>Two options cover most use cases. <strong>Qdrant</strong> is a purpose-built vector search engine with rich filtering, payload indexing, and both in-memory and on-disk storage modes. <strong>pgvector</strong> extends PostgreSQL with vector similarity search, ideal when your team already relies on PostgreSQL and wants to avoid a separate infrastructure dependency.</p>
+
+<h3>3.1 Indexing with Qdrant</h3>
+
+<pre><code class="language-python">from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, Filter,
+    FieldCondition, MatchValue
+)
+
+# In-memory client for development; use url="http://..." for production
+client = QdrantClient(":memory:")
+
+# Create a collection with cosine similarity
+client.create_collection(
+    collection_name="papers",
+    vectors_config=VectorParams(
+        size=1024,        # Embedding dimension
+        distance=Distance.COSINE,
+    ),
+)
+
+# Index passages with metadata
+points = [
+    PointStruct(
+        id=i,
+        vector=embedding.tolist(),
+        payload={
+            "text": passage,
+            "source": f"paper_{i}.pdf",
+            "year": 2023,
+            "domain": domain,
+        },
+    )
+    for i, (passage, embedding, domain) in enumerate(zip(
+        passages, passage_embeddings,
+        ["oncology", "oncology", "genomics", "ml", "cell_bio"]
+    ))
+]
+client.upsert(collection_name="papers", points=points)
+
+# Search with metadata filter: only oncology papers
+results = client.query_points(
+    collection_name="papers",
+    query=query_embedding[0].tolist(),
+    query_filter=Filter(
+        must=[FieldCondition(key="domain", match=MatchValue(value="oncology"))]
+    ),
+    limit=3,
+)
+
+for result in results.points:
+    print(f"Score: {result.score:.4f} | {result.payload['text'][:60]}...")</code></pre>
+<div class="code-caption">Listing 37.2: Indexing scientific passages in Qdrant with metadata payloads. The query filter restricts search to oncology papers, demonstrating hybrid search that combines vector similarity with structured metadata constraints.</div>
+
+<h3>3.2 pgvector for PostgreSQL Teams</h3>
+
+<p>If your infrastructure already includes PostgreSQL, pgvector avoids the operational overhead of a separate vector database. It adds a <code>vector</code> column type and supports exact and approximate (IVFFlat, HNSW) nearest-neighbor search.</p>
+
+<pre><code class="language-python">import psycopg2
+
+# Connect to a PostgreSQL database with pgvector extension
+conn = psycopg2.connect("postgresql://user:pass@localhost/papers_db")
+cur = conn.cursor()
+
+# Enable pgvector and create table
+cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS paper_chunks (
+        id SERIAL PRIMARY KEY,
+        text TEXT NOT NULL,
+        source TEXT,
+        year INTEGER,
+        domain TEXT,
+        embedding vector(1024)
+    )
+""")
+
+# Create HNSW index for fast approximate search
+cur.execute("""
+    CREATE INDEX IF NOT EXISTS paper_chunks_embedding_idx
+    ON paper_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200)
+""")
+
+# Insert a passage
+cur.execute(
+    "INSERT INTO paper_chunks (text, source, year, domain, embedding) "
+    "VALUES (%s, %s, %s, %s, %s)",
+    (passages[0], "paper_0.pdf", 2023, "oncology",
+     passage_embeddings[0].tolist())
+)
+
+# Query with cosine similarity, filtered by domain
+cur.execute("""
+    SELECT text, 1 - (embedding <=> %s::vector) AS similarity
+    FROM paper_chunks
+    WHERE domain = 'oncology'
+    ORDER BY embedding <=> %s::vector
+    LIMIT 5
+""", (query_embedding[0].tolist(), query_embedding[0].tolist()))
+
+for row in cur.fetchall():
+    print(f"Similarity: {row[1]:.4f} | {row[0][:60]}...")
+
+conn.commit()
+conn.close()</code></pre>
+<div class="code-caption">Listing 37.3: Using pgvector to store and search embeddings within PostgreSQL. The HNSW index provides sub-millisecond approximate nearest neighbor search. The <code>&lt;=&gt;</code> operator computes cosine distance; we subtract from 1 to get cosine similarity.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Choosing Between Qdrant and pgvector</div>
+<p>A pharmaceutical research team building a drug-target interaction copilot faces this choice. Their existing infrastructure runs on PostgreSQL, and the team has two database administrators but no vector database experience. They start with pgvector: the embeddings live alongside their relational drug and trial data, queries can join vector similarity with SQL predicates (drug class, trial phase, approval status), and the DBAs can manage it with familiar tools. Six months later, the corpus grows to 20 million chunks and query latency exceeds their 200ms target. They migrate to Qdrant for the retrieval layer while keeping PostgreSQL for metadata, using Qdrant's payload filtering to replicate the SQL predicates. The lesson: pgvector is the right starting point when you have existing PostgreSQL infrastructure; Qdrant (or Weaviate, Pinecone, Milvus) becomes necessary at scale or when you need features like multi-tenancy, quantization, or built-in hybrid search.</p>
+</div>
+
+<h2>4. Cross-Encoder Reranking</h2>
+
+<p>Bi-encoder retrieval is fast but imprecise. Because the query and passage are encoded independently, the model cannot capture fine-grained interactions between them. A passage might score highly because it shares vocabulary with the query but actually discusses a different aspect of the topic.</p>
+
+<p>Cross-encoder rerankers solve this by processing the query and each candidate passage together through a transformer that attends to both simultaneously. The cross-attention layers can detect subtle relevance signals: negation ("does <em>not</em> inhibit EGFR"), specificity ("in <em>non-small cell</em> lung cancer, not small cell"), and argumentative structure ("contrary to previous findings...").</p>
+
+<pre><code class="language-python">from sentence_transformers import CrossEncoder
+
+# Load a cross-encoder reranker
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2")
+
+# Candidate passages from the retriever (top-k bi-encoder results)
+query = "What is the role of p53 in cancer cell death?"
+candidates = [
+    "The tumor suppressor p53 regulates apoptosis through both "
+    "transcription-dependent and transcription-independent mechanisms.",
+    "EGFR mutations in non-small cell lung cancer confer sensitivity "
+    "to tyrosine kinase inhibitors such as erlotinib and gefitinib.",
+    "p53 activates the intrinsic apoptotic pathway by upregulating "
+    "pro-apoptotic BCL-2 family members BAX and PUMA.",
+    "TP53 is the most frequently mutated gene in human cancers, "
+    "with loss-of-function mutations found in over 50% of tumors.",
+    "Caffeine inhibits ATR kinase activity, abrogating the G2/M "
+    "checkpoint and sensitizing p53-deficient cells to DNA damage.",
+]
+
+# Score each (query, passage) pair
+pairs = [(query, candidate) for candidate in candidates]
+scores = reranker.predict(pairs)
+
+# Rerank by cross-encoder score
+ranked = sorted(zip(scores, candidates), reverse=True)
+for rank, (score, text) in enumerate(ranked):
+    print(f"  Rank {rank+1} (score={score:.4f}): {text[:70]}...")</code></pre>
+<div class="code-caption">Listing 37.4: Cross-encoder reranking of retriever candidates. The cross-encoder processes each query-passage pair jointly, capturing fine-grained relevance. The p53 apoptosis passage ranks above the general TP53 mutation passage because the cross-encoder understands that the query asks specifically about cell death mechanisms.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Reranking with Cohere or Voyage</div>
+<p>Building your own reranking pipeline requires loading a cross-encoder model and managing GPU inference. Cloud reranking APIs reduce this to a single API call. Cohere's <code>rerank</code> endpoint and Voyage AI's reranker accept a query and a list of documents, returning relevance scores. The tradeoff: API rerankers cost per query and add network latency, but they eliminate GPU management and often use larger, more accurate models than you could run locally. For a production research copilot, start with an API reranker and switch to self-hosted only if cost or latency becomes prohibitive.</p>
+<pre><code class="language-python"># Cohere reranking in 4 lines (vs. ~15 for self-hosted)
+import cohere
+co = cohere.ClientV2("your-api-key")
+response = co.rerank(
+    model="rerank-v3.5",
+    query=query,
+    documents=candidates,
+    top_n=3,
+)
+for result in response.results:
+    print(f"  Rank {result.index}: score={result.relevance_score:.4f}")</code></pre>
+</div>
+
+<h2>5. Retrieval Metrics: Recall@k, MRR, and NDCG</h2>
+
+<p>You cannot improve what you do not measure. Retrieval quality is evaluated with three complementary metrics, each capturing a different aspect of system performance.</p>
+
+<p><strong>Recall@k</strong> measures the fraction of relevant documents that appear in the top-$k$ results. For a query with $R$ relevant documents in the corpus:</p>
+
+$$\text{Recall@}k = \frac{|\{\text{relevant documents in top-}k\}|}{R}$$
+
+<p>Recall@k answers: "Did we find everything?" A Recall@10 of 0.8 means 80% of relevant documents appear in the top 10 results. For RAG, high recall is critical because the generator can only cite what the retriever surfaces.</p>
+
+<p><strong>Mean Reciprocal Rank (MRR)</strong> measures how early the first relevant document appears:</p>
+
+$$\text{MRR} = \frac{1}{|Q|} \sum_{i=1}^{|Q|} \frac{1}{\text{rank}_i}$$
+
+<p>where $\text{rank}_i$ is the position of the first relevant document for query $i$. MRR answers: "How quickly did we find something useful?" An MRR of 0.5 means the first relevant document appears at rank 2 on average.</p>
+
+<p><strong>Normalized Discounted Cumulative Gain (NDCG)</strong> measures the quality of the entire ranking, giving more credit to relevant documents that appear earlier:</p>
+
+$$\text{DCG@}k = \sum_{i=1}^{k} \frac{\text{rel}_i}{\log_2(i + 1)}, \quad \text{NDCG@}k = \frac{\text{DCG@}k}{\text{IDCG@}k}$$
+
+<p>where $\text{rel}_i$ is the relevance grade of the document at rank $i$ and $\text{IDCG@}k$ is the DCG of the ideal ranking. NDCG supports graded relevance (highly relevant, somewhat relevant, not relevant), making it the most informative single metric for retrieval quality.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of NDCG like judging a bookstore's "Staff Picks" shelf. A perfect shelf puts the life-changing masterpiece at eye level (position 1), the excellent novel on the next shelf down (position 2), and the decent beach read lower still. The logarithmic discount in NDCG mirrors how shoppers behave: almost everyone looks at the top shelf, fewer bend down to scan the middle, and almost nobody checks the bottom row. A highly relevant book placed at position 10 earns far less credit than the same book at position 1, just as a great recommendation buried on the bottom shelf helps almost no one. NDCG normalizes against the "ideal shelf" (a perfect arrangement) so the score always falls between 0 and 1, telling you how close your actual ranking is to the best possible one.</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+
+def recall_at_k(retrieved_ids: list, relevant_ids: set, k: int) -> float:
+    """Fraction of relevant documents found in top-k results."""
+    found = len(set(retrieved_ids[:k]) & relevant_ids)
+    return found / len(relevant_ids) if relevant_ids else 0.0
+
+def mrr(retrieved_ids: list, relevant_ids: set) -> float:
+    """Reciprocal rank of the first relevant document."""
+    for rank, doc_id in enumerate(retrieved_ids, start=1):
+        if doc_id in relevant_ids:
+            return 1.0 / rank
+    return 0.0
+
+def ndcg_at_k(retrieved_ids: list, relevance_grades: dict, k: int) -> float:
+    """Normalized Discounted Cumulative Gain at position k."""
+    dcg = sum(
+        relevance_grades.get(doc_id, 0) / np.log2(rank + 2)
+        for rank, doc_id in enumerate(retrieved_ids[:k])
+    )
+    # Ideal DCG: sort all grades descending
+    ideal_grades = sorted(relevance_grades.values(), reverse=True)[:k]
+    idcg = sum(
+        grade / np.log2(rank + 2)
+        for rank, grade in enumerate(ideal_grades)
+    )
+    return dcg / idcg if idcg > 0 else 0.0
+
+# Example: evaluate a retrieval result
+retrieved = ["doc_3", "doc_1", "doc_7", "doc_2", "doc_5"]
+relevant = {"doc_1", "doc_2", "doc_5"}
+grades = {"doc_1": 3, "doc_2": 2, "doc_5": 1}  # Graded relevance
+
+print(f"Recall@3: {recall_at_k(retrieved, relevant, 3):.3f}")   # 1/3
+print(f"Recall@5: {recall_at_k(retrieved, relevant, 5):.3f}")   # 3/3
+print(f"MRR:      {mrr(retrieved, relevant):.3f}")               # 1/2
+print(f"NDCG@5:   {ndcg_at_k(retrieved, grades, 5):.3f}")</code></pre>
+<div class="code-caption">Listing 37.5: Implementing Recall@k, MRR, and NDCG from scratch. For the example ranking, doc_1 (highly relevant) appears at rank 2, giving an MRR of 0.5. Recall@3 is only 0.33 because two of three relevant documents fall below rank 3.</div>
+
+<h2>6. Long-Context vs. Retrieval: The Tradeoff</h2>
+
+<p>Modern language models offer context windows of 100,000 to 1,000,000 tokens. This raises a natural question: why bother with retrieval at all? Why not load the entire corpus into the context window and let the model find what it needs?</p>
+
+<p>The answer involves four factors, and the right choice depends on where your use case falls along each axis.</p>
+
+<p><strong>Cost.</strong> Processing 200,000 tokens costs roughly 100x more than processing 2,000 tokens of retrieved context. For a research copilot handling thousands of queries per day, the cost difference is substantial. Retrieval lets you pay for relevance, not volume.</p>
+
+<p><strong>Accuracy.</strong> Long-context models suffer from the "lost in the middle" effect: they attend more reliably to information at the beginning and end of the context than to information in the middle. A 100-paper context window may contain the answer on page 47, but the model may miss it. A retriever that surfaces the right paragraph puts it front and center.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent mistake is assuming that retrieving more passages always produces better answers. In practice, stuffing the generator's context with 50 retrieved passages instead of 5 often degrades answer quality because irrelevant or marginally relevant passages dilute the signal, confuse the model about which sources to trust, and trigger the same "lost in the middle" attention failures that plague long-context approaches. The goal of retrieval is high precision in the top positions, not exhaustive recall; a well-reranked set of 3 to 5 highly relevant passages almost always outperforms a larger set with mixed relevance.</p>
+</div>
+
+<p><strong>Latency.</strong> Time-to-first-token scales with context length. A 200,000-token prompt takes seconds to process; a 2,000-token prompt with retrieved passages responds in under a second.</p>
+
+<p><strong>Freshness.</strong> Retrieval indices can be updated incrementally as new papers are published. Long-context approaches require re-assembling the entire context for each query, making it hard to keep current.</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: When Long Context Wins</div>
+<p>A materials scientist analyzing a single 80-page review paper about perovskite solar cells wants to ask a series of questions about it. Here, long context wins: the entire paper fits in a single context window (~40,000 tokens), there is no corpus to index, and the scientist wants the model to understand cross-references between sections ("How does the efficiency reported in Table 3 compare to the theoretical limit discussed in Section 2.4?"). Building a RAG pipeline for a single document adds complexity without benefit. The rule of thumb: use long context for deep analysis of a small number of documents; use retrieval for broad search across a large corpus.</p>
+</div>
+
+<h2>7. Query Planning for Multi-Hop Questions</h2>
+
+<p>Scientific questions are rarely simple. "What evidence supports the hypothesis that gut microbiome composition influences response to PD-1 checkpoint inhibitors in melanoma patients?" requires finding papers on gut microbiome composition, papers on PD-1 inhibitor response, and papers that connect the two in the context of melanoma. No single retrieval query will surface all the relevant evidence.</p>
+
+<p>Query planning decomposes a complex question into simpler sub-queries, retrieves evidence for each, and combines the results. This is the multi-hop pattern that separates research copilots from basic QA systems.</p>
+
+<pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()
+
+def decompose_query(complex_question: str) -> list[str]:
+    """Decompose a complex scientific question into retrieval sub-queries."""
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        messages=[{
+            "role": "user",
+            "content": f"""Decompose this scientific question into 2-4 simpler
+sub-queries that can each be answered by searching a scientific paper database.
+Each sub-query should target a specific aspect of the question.
+
+Question: {complex_question}
+
+Return ONLY a JSON array of sub-query strings, nothing else.
+Example: ["sub-query 1", "sub-query 2", "sub-query 3"]"""
+        }],
+    )
+    import json
+    return json.loads(response.content[0].text)
+
+# Example decomposition
+question = (
+    "What evidence supports the hypothesis that gut microbiome "
+    "composition influences response to PD-1 checkpoint inhibitors "
+    "in melanoma patients?"
+)
+sub_queries = decompose_query(question)
+for i, sq in enumerate(sub_queries, 1):
+    print(f"  Sub-query {i}: {sq}")</code></pre>
+<div class="code-caption">Listing 37.6: Query decomposition using Claude. The model breaks a complex multi-hop question into targeted sub-queries that can each be answered by a single retrieval call. Typical decomposition for this example produces sub-queries about gut microbiome and immunotherapy, PD-1 inhibitor mechanisms in melanoma, and clinical evidence linking microbiome to treatment response.</div>
+
+<pre><code class="language-python">async def multi_hop_retrieve(
+    question: str,
+    retriever,  # Any retriever with a .search(query, k) method
+    reranker,
+    k_retrieve: int = 20,
+    k_rerank: int = 5,
+) -> dict:
+    """Multi-hop retrieval: decompose, retrieve, rerank, deduplicate."""
+    # Step 1: Decompose the question
+    sub_queries = decompose_query(question)
+
+    # Step 2: Retrieve candidates for each sub-query
+    all_candidates = {}
+    for sq in sub_queries:
+        results = retriever.search(sq, k=k_retrieve)
+        for doc_id, passage, score in results:
+            if doc_id not in all_candidates:
+                all_candidates[doc_id] = {
+                    "passage": passage,
+                    "retrieval_scores": {},
+                }
+            all_candidates[doc_id]["retrieval_scores"][sq] = score
+
+    # Step 3: Rerank all unique candidates against the original question
+    candidate_list = list(all_candidates.items())
+    pairs = [(question, info["passage"]) for _, info in candidate_list]
+    rerank_scores = reranker.predict(pairs)
+
+    # Step 4: Combine and return top-k
+    for (doc_id, info), score in zip(candidate_list, rerank_scores):
+        info["rerank_score"] = float(score)
+
+    ranked = sorted(
+        candidate_list,
+        key=lambda x: x[1]["rerank_score"],
+        reverse=True,
+    )[:k_rerank]
+
+    return {
+        "question": question,
+        "sub_queries": sub_queries,
+        "evidence": [
+            {
+                "doc_id": doc_id,
+                "passage": info["passage"],
+                "rerank_score": info["rerank_score"],
+                "retrieval_scores": info["retrieval_scores"],
+            }
+            for doc_id, info in ranked
+        ],
+    }</code></pre>
+<div class="code-caption">Listing 37.7: Multi-hop retrieval pipeline. Each sub-query retrieves candidates independently, candidates are deduplicated by document ID, and all unique candidates are reranked against the original question. This captures evidence that no single query would surface alone.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Rerank Against the Original Question</div>
+<p>A subtle but important design choice in multi-hop retrieval: rerank all candidates against the <em>original</em> complex question, not against the sub-queries that retrieved them. A passage might be retrieved by a sub-query about "gut microbiome composition" but actually be most relevant to the full question because it discusses microbiome composition <em>in the context of immunotherapy response</em>. The cross-encoder, processing the full question jointly with the passage, can detect this contextual relevance. Reranking against sub-queries would miss it.</p>
+</div>
+
+<h2>8. The Generator: Producing Cited Answers</h2>
+
+<p>The generator is where evidence becomes answers. The prompt structure matters enormously for scientific RAG: the model must synthesize information from multiple passages, cite its sources, and refrain from adding information not present in the retrieved evidence.</p>
+
+<pre><code class="language-python">def generate_cited_answer(
+    question: str,
+    evidence: list[dict],
+    client: anthropic.Anthropic,
+) -> str:
+    """Generate a cited answer from retrieved evidence passages."""
+    # Format evidence with source identifiers
+    context_parts = []
+    for i, ev in enumerate(evidence):
+        context_parts.append(
+            f"[Source {i+1}] (from {ev['doc_id']}, "
+            f"relevance={ev['rerank_score']:.3f}):\n{ev['passage']}"
+        )
+    context = "\n\n".join(context_parts)
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        system="""You are a scientific research assistant. Answer questions
+based ONLY on the provided source passages. Follow these rules strictly:
+
+1. Every factual claim must cite its source as [Source N].
+2. If multiple sources support a claim, cite all of them.
+3. If the sources do not contain enough information to answer
+   the question fully, say so explicitly.
+4. Do not add information from your training data. Only use
+   what appears in the provided sources.
+5. Distinguish between what the sources state directly and
+   what you infer from combining multiple sources.""",
+        messages=[{
+            "role": "user",
+            "content": f"""Based on the following source passages, answer
+this research question:
+
+Question: {question}
+
+Sources:
+{context}
+
+Provide a detailed, cited answer."""
+        }],
+    )
+    return response.content[0].text</code></pre>
+<div class="code-caption">Listing 37.8: The generator stage of the RAG pipeline. The system prompt enforces citation discipline: every claim must reference a source, and the model must not inject information from its training data. The evidence passages are formatted with source identifiers that the model references in its answer.</div>
+
+<p>This generator prompt is deliberately restrictive. In scientific contexts, an answer that cites a non-existent fact is worse than no answer at all. The instruction to "say so explicitly" when evidence is insufficient is critical: it converts the model's tendency to confabulate into an honest acknowledgment of gaps. We will formalize this as a measurable property (faithfulness) in <a href="section-37.2.html">Section 37.2</a>.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: LlamaIndex and LangChain RAG Pipelines</div>
+<p>The retriever-reranker-generator pipeline we built from components is available as a pre-assembled pipeline in LlamaIndex and LangChain. LlamaIndex's <code>VectorStoreIndex</code> with a <code>SentenceTransformerRerank</code> postprocessor and a <code>CitationQueryEngine</code> provides the entire pipeline in roughly 20 lines (compared to our ~120). LangChain's <code>create_retrieval_chain</code> with a <code>ContextualCompressionRetriever</code> offers similar functionality. These frameworks handle chunking, embedding, vector store integration, and prompt formatting automatically. The tradeoff: they accelerate development but obscure the pipeline's behavior behind abstractions. For production scientific RAG, we recommend building with raw components (as shown here) until you understand the failure modes, then migrating to a framework for operational convenience.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Late interaction retrieval models are closing the accuracy gap between bi-encoders and cross-encoders without sacrificing search speed. ColBERT v2 (Santhanam et al., 2022) and its successor ColPali (Faysse et al., 2024) store per-token embeddings for each passage rather than a single vector, then compute relevance via a cheap MaxSim operation at query time. This "late interaction" approach captures token-level matching signals (similar to a cross-encoder) while still allowing offline precomputation of passage representations (similar to a bi-encoder). On the BEIR benchmark suite, ColBERT v2 matches or exceeds cross-encoder reranking quality at retrieval-stage latency, potentially collapsing the two-stage retrieve-then-rerank pipeline into a single stage. For scientific RAG, this is especially promising because domain-specific terms (gene names, chemical formulae, acronyms) benefit heavily from token-level matching that single-vector bi-encoders compress away.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini RAG Pipeline Over arXiv Abstracts</h4>
+<p>Build a working RAG system in under 50 lines of Python using only open-source tools and a small corpus of arXiv abstracts.</p>
+<ol>
+<li><strong>Collect a corpus.</strong> Use the <code>arxiv</code> Python package to download 100 abstracts on a topic of your choice: <code>arxiv.Search(query="retrieval augmented generation", max_results=100)</code>. Store each abstract as a dictionary with fields for title, abstract text, and arXiv ID.</li>
+<li><strong>Embed and index.</strong> Install <code>sentence-transformers</code> and encode all 100 abstracts using <code>SentenceTransformer("BAAI/bge-base-en-v1.5")</code>. Store the embeddings in a NumPy array (at 100 documents, brute-force search is fast enough).</li>
+<li><strong>Retrieve.</strong> Encode a test query such as "How does chunking strategy affect RAG accuracy?" and compute cosine similarities against all passage embeddings. Return the top 5 passages.</li>
+<li><strong>Rerank.</strong> Install a cross-encoder model (<code>cross-encoder/ms-marco-MiniLM-L-6-v2</code>) and rerank the top 5 candidates. Compare the ordering before and after reranking to see how often the cross-encoder changes the top result.</li>
+<li><strong>Generate.</strong> Format the top 3 reranked passages into a prompt following the citation template from Listing 37.8 and send it to any LLM API (Claude, a local Ollama model, or OpenAI). Verify that the generated answer cites sources correctly and does not introduce claims absent from the retrieved passages.</li>
+</ol>
+</div>
+
+<h2>Section Summary</h2>
+
+<p>The RAG pipeline transforms a language model from a closed-world system (limited to training data) into an open-world system that can answer questions about any corpus. The three stages (bi-encoder retrieval, cross-encoder reranking, constrained generation) each contribute a distinct capability: scale, precision, and synthesis. For scientific applications, the key architectural decisions are embedding model selection (domain-specific models outperform general ones), vector database choice (pgvector for existing PostgreSQL infrastructure, Qdrant for dedicated deployments), and the long-context versus retrieval tradeoff (retrieval wins for large, changing corpora; long context wins for deep analysis of small document sets). Query planning through decomposition enables multi-hop reasoning that single-query retrieval cannot achieve. The next section tackles the hardest remaining problem: ensuring that the generated answers are actually faithful to their sources.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 37 Overview</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="section-37.2.html">37.2 Evidence Grounding and Hallucination Control &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

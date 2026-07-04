@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 39.2: AI-Generated Hypotheses. LLM prompting for hypothesis generation, structured scoring for plausibility, novelty as embedding distance, testability as experiment cost, and human-AI refinement loops." name="description"/>
+<title>Section 39.2: AI-Generated Hypotheses | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 39: Hypothesis Generation</a></div>
+<h1>39.2 AI-Generated Hypotheses</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The human asked me to be creative. I generated 500 hypotheses, each grounded in published evidence, internally consistent, and experimentally testable. She said that was not what she meant by creative."</p>
+<cite>A Hypothesis That Refused to Be Falsified</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the gap analysis techniques from
+<a href="section-39.1.html">Section 39.1</a> and requires familiarity with LLM prompting
+from <a href="../../part-2-software-engineering/module-10-prompting-to-programming/index.html">Chapter 10:
+Prompting to Programming</a>. The structured output techniques draw on the API patterns
+from <a href="../../part-2-software-engineering/module-12-mcp-servers/index.html">Chapter 12:
+Building MCP Servers</a>. The embedding-based novelty scoring assumes comfort with vector
+similarity from <a href="../module-37-rag-discovery/index.html">Chapter 37</a>. Bayesian
+plausibility estimation uses concepts from
+<a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32:
+Bayesian Discovery</a>, but we provide sufficient context to follow the code without
+having read that chapter in detail.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Gap analysis tells us <em>where</em> hypotheses might live. This section addresses
+<em>how</em> to generate them and <em>how</em> to evaluate them. We use large language
+models as hypothesis generators, grounding their output in retrieved scientific context
+to prevent hallucination. We then develop three orthogonal scoring dimensions: plausibility
+(consistency with existing evidence), novelty (distance from known claims in embedding
+space), and testability (estimated cost and feasibility of experimental verification).
+These scores transform a raw list of LLM-generated statements into a ranked portfolio of
+research directions, ready for human review or autonomous pursuit by the research agents
+of <a href="../module-40-research-agents/index.html">Chapter 40</a>.
+</p>
+</div>
+
+<h2>1. From Gaps to Hypotheses: LLM-Based Generation</h2>
+
+<p>
+A knowledge gap is a structural observation: "entities A and B are close in embedding space
+but have no documented relation." A hypothesis is a scientific claim: "compound A inhibits
+enzyme B through allosteric binding, reducing downstream inflammatory signaling." Bridging
+this gap requires domain knowledge, mechanistic reasoning, and scientific language. Large
+language models, trained on the scientific literature, possess all three.
+</p>
+
+<p data-agent="02">
+A <em>structured prompting pipeline</em> is a sequence of carefully designed LLM interactions where each stage has a distinct role and a constrained output format, as opposed to a single open-ended prompt. It matters because unconstrained generation produces text that reads well but lacks the internal structure (explicit mechanisms, falsifiable predictions, stated assumptions) needed for scientific evaluation. The pipeline works by first retrieving relevant literature passages, then prompting the LLM to generate hypotheses that conform to a rigid JSON schema enforcing each required field, and finally passing each candidate through a self-critique stage that flags weaknesses. Use a structured pipeline rather than free-form generation whenever hypotheses must be machine-scored or fed into downstream automation; use free-form generation only for early brainstorming where volume matters more than rigor.
+</p>
+
+<p>
+The challenge is to channel LLM generation toward hypotheses that are genuinely useful,
+not just plausible-sounding text. We achieve this through a structured prompting pipeline
+with three stages: context retrieval, constrained generation, and self-critique.
+</p>
+
+<pre><code class="language-python">import anthropic
+import json
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Hypothesis:
+    """A generated scientific hypothesis with metadata."""
+    statement: str
+    domain: str
+    mechanism: str
+    supporting_evidence: list[str]
+    predictions: list[str]
+    assumptions: list[str]
+    plausibility_score: float = 0.0
+    novelty_score: float = 0.0
+    testability_score: float = 0.0
+
+
+HYPOTHESIS_SYSTEM_PROMPT = """You are a scientific hypothesis generator.
+Given a knowledge gap (two entities that may be related but have no
+documented connection) and supporting context from the scientific
+literature, generate a concrete, testable hypothesis.
+
+Your hypothesis must include:
+1. A clear statement of the proposed relationship
+2. A plausible mechanism connecting the entities
+3. Specific, falsifiable predictions
+4. Explicit assumptions that must hold
+
+Respond in JSON with this schema:
+{
+  "statement": "The hypothesis in one sentence",
+  "domain": "Scientific domain (e.g., molecular biology, materials science)",
+  "mechanism": "Proposed causal mechanism in 2-3 sentences",
+  "supporting_evidence": ["Evidence point 1", "Evidence point 2", ...],
+  "predictions": ["Testable prediction 1", "Testable prediction 2", ...],
+  "assumptions": ["Assumption 1", "Assumption 2", ...]
+}
+
+Rules:
+- Be specific: name concrete entities, pathways, and measurable outcomes.
+- Be honest about uncertainty: flag speculative steps in the mechanism.
+- Generate predictions that could FAIL: a hypothesis that cannot be
+  falsified is not a scientific hypothesis.
+- Do not generate hypotheses that are already established knowledge."""
+
+
+def generate_hypotheses(
+    entity_a: str,
+    entity_b: str,
+    context_passages: list[str],
+    n_hypotheses: int = 5,
+    model: str = "claude-sonnet-4-20250514",
+) -> list[Hypothesis]:
+    """Generate hypotheses for a knowledge gap using Claude.
+
+    Args:
+        entity_a: First entity in the gap.
+        entity_b: Second entity in the gap.
+        context_passages: Retrieved passages about both entities.
+        n_hypotheses: Number of hypotheses to generate.
+        model: Anthropic model to use.
+
+    Returns:
+        List of generated Hypothesis objects.
+    """
+    client = anthropic.Anthropic()
+
+    context_block = "\n\n".join(
+        f"[Passage {i+1}]: {p}" for i, p in enumerate(context_passages)
+    )
+
+    user_prompt = f"""Knowledge gap detected between:
+- Entity A: {entity_a}
+- Entity B: {entity_b}
+
+Supporting context from the literature:
+{context_block}
+
+Generate {n_hypotheses} distinct hypotheses about the potential
+relationship between {entity_a} and {entity_b}. Each hypothesis
+should propose a DIFFERENT mechanism or relationship type.
+Return a JSON array of hypothesis objects."""
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=HYPOTHESIS_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    # Parse the structured output
+    text = response.content[0].text
+    # Extract JSON from potential markdown code fences
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0]
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0]
+
+    raw_hypotheses = json.loads(text)
+    if isinstance(raw_hypotheses, dict):
+        raw_hypotheses = [raw_hypotheses]
+
+    return [
+        Hypothesis(
+            statement=h["statement"],
+            domain=h.get("domain", "unknown"),
+            mechanism=h.get("mechanism", ""),
+            supporting_evidence=h.get("supporting_evidence", []),
+            predictions=h.get("predictions", []),
+            assumptions=h.get("assumptions", []),
+        )
+        for h in raw_hypotheses
+    ]</code></pre>
+<div class="code-caption">Figure 39.6: LLM-based hypothesis generation using the Anthropic API. The system prompt enforces structured output with mechanism, predictions, and assumptions, ensuring each hypothesis is concrete enough to evaluate and test.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Retrieval Grounds Generation</div>
+<p>
+Without retrieved context, LLMs generate hypotheses that sound scientific but may
+contradict established knowledge or propose mechanisms that violate known constraints.
+The context passages in the prompt above serve the same function as the retrieved
+documents in a RAG system (<a href="../module-37-rag-discovery/index.html">Chapter 37</a>):
+they anchor the model's generation in real evidence. The quality of the context directly
+determines the quality of the hypotheses. In the pipeline recipe of
+<a href="section-39.3.html">Section 39.3</a>, we integrate the full RAG retrieval
+stack to ensure that every hypothesis is grounded in the actual literature, not
+the model's parametric memory alone.
+</p>
+</div>
+
+<h2>2. Self-Critique and Refinement</h2>
+
+<p>
+Raw LLM-generated hypotheses often have weaknesses: vague mechanisms, predictions that
+are too easy to confirm, or implicit assumptions that are actually false. A self-critique
+step uses the same LLM (or a more capable model) to identify and address these weaknesses
+before scoring:
+</p>
+
+<pre><code class="language-python">CRITIQUE_PROMPT = """You are a scientific reviewer evaluating a hypothesis.
+
+Hypothesis: {statement}
+Mechanism: {mechanism}
+Predictions: {predictions}
+
+Critique this hypothesis on four dimensions:
+1. SPECIFICITY: Are the entities and mechanisms named concretely enough
+   to design an experiment?
+2. FALSIFIABILITY: Could the predictions actually fail? A prediction
+   like "gene expression may change" is not falsifiable.
+3. MECHANISM: Is the proposed causal chain plausible given known
+   biology/chemistry/physics? Identify any steps that require
+   unknown or speculative interactions.
+4. NOVELTY: Is this genuinely new, or is it a restatement of
+   known results?
+
+Return JSON:
+{{
+  "critique": "2-3 sentence summary of weaknesses",
+  "specificity_ok": true/false,
+  "falsifiable": true/false,
+  "mechanism_gaps": ["gap 1", ...],
+  "is_novel": true/false,
+  "refined_statement": "Improved version of the hypothesis",
+  "refined_predictions": ["More specific prediction 1", ...]
+}}"""
+
+
+def critique_and_refine(
+    hypothesis: Hypothesis,
+    model: str = "claude-sonnet-4-20250514",
+) -> Hypothesis:
+    """Apply self-critique to improve a hypothesis.
+
+    Returns a refined version with more specific predictions
+    and explicit mechanism gaps.
+    """
+    client = anthropic.Anthropic()
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": CRITIQUE_PROMPT.format(
+                statement=hypothesis.statement,
+                mechanism=hypothesis.mechanism,
+                predictions=json.dumps(hypothesis.predictions),
+            ),
+        }],
+    )
+
+    text = response.content[0].text
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0]
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0]
+
+    critique = json.loads(text)
+
+    # Update hypothesis with refined versions
+    refined = Hypothesis(
+        statement=critique.get("refined_statement", hypothesis.statement),
+        domain=hypothesis.domain,
+        mechanism=hypothesis.mechanism,
+        supporting_evidence=hypothesis.supporting_evidence,
+        predictions=critique.get(
+            "refined_predictions", hypothesis.predictions
+        ),
+        assumptions=hypothesis.assumptions + critique.get(
+            "mechanism_gaps", []
+        ),
+    )
+    return refined</code></pre>
+<div class="code-caption">Figure 39.7: Self-critique and refinement loop. The LLM evaluates each hypothesis for specificity, falsifiability, mechanism plausibility, and novelty, then produces an improved version with more precise predictions and explicit mechanism gaps.</div>
+
+<h2>3. Scoring Dimension 1: Plausibility</h2>
+
+<p>
+A plausible hypothesis is one that is consistent with existing evidence. We quantify
+plausibility using two complementary signals: the semantic consistency of the hypothesis
+with retrieved literature, and a Bayesian estimate of the hypothesis's prior probability
+given the evidence.
+</p>
+
+<p>
+For semantic consistency, we compute the average cosine similarity between the hypothesis
+embedding and the embeddings of the supporting context passages. A hypothesis that aligns
+well with the literature (high similarity) is more plausible than one that contradicts
+it (low similarity), though extremely high similarity may indicate redundancy rather
+than novelty (a tension we resolve in the combined scoring of Section 39.3).
+</p>
+
+<p>
+For Bayesian plausibility, we use PyMC to estimate the posterior probability of the
+hypothesis given the evidence. The model treats each piece of evidence as a noisy
+observation of the hypothesis's truth:
+</p>
+
+$$P(H \mid E_1, \ldots, E_n) \propto P(H) \prod_{i=1}^{n} P(E_i \mid H)$$
+
+<p>
+where $P(H)$ is the prior probability (set by the structural gap score from Section 39.1),
+and $P(E_i \mid H)$ is the likelihood of observing evidence $E_i$ if hypothesis $H$ is true.
+We model each evidence term as a Bernoulli trial with a relevance-weighted probability:
+</p>
+
+$$P(E_i \mid H) = \text{sim}(\mathbf{e}_{E_i}, \mathbf{e}_H)^{\beta}$$
+
+<p>
+where $\text{sim}$ is cosine similarity and $\beta$ controls how sharply similarity
+translates into evidential support. Higher $\beta$ makes the scoring more selective;
+lower $\beta$ treats all moderately relevant evidence as equally supportive.
+</p>
+
+<pre><code class="language-python">import pymc as pm
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+
+class PlausibilityScorer:
+    """Score hypothesis plausibility using embedding similarity
+    and Bayesian evidence accumulation."""
+
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.embedder = SentenceTransformer(model_name)
+
+    def semantic_consistency(
+        self,
+        hypothesis: str,
+        evidence_passages: list[str],
+    ) -> float:
+        """Cosine similarity between hypothesis and evidence."""
+        all_texts = [hypothesis] + evidence_passages
+        embeddings = self.embedder.encode(all_texts, normalize_embeddings=True)
+
+        h_emb = embeddings[0]
+        e_embs = embeddings[1:]
+
+        similarities = e_embs @ h_emb
+        return float(np.mean(similarities))
+
+    def bayesian_plausibility(
+        self,
+        hypothesis: str,
+        evidence_passages: list[str],
+        prior_gap_score: float = 0.5,
+        beta: float = 2.0,
+    ) -> float:
+        """Bayesian posterior estimate of hypothesis plausibility.
+
+        Args:
+            hypothesis: The hypothesis statement.
+            evidence_passages: Supporting evidence texts.
+            prior_gap_score: Prior from structural gap analysis (0 to 1).
+            beta: Sharpness of the similarity-to-likelihood mapping.
+
+        Returns:
+            Posterior plausibility score (0 to 1).
+        """
+        # Compute similarities as evidence strengths
+        all_texts = [hypothesis] + evidence_passages
+        embeddings = self.embedder.encode(all_texts, normalize_embeddings=True)
+        h_emb = embeddings[0]
+        e_embs = embeddings[1:]
+        similarities = np.clip(e_embs @ h_emb, 0.0, 1.0)
+
+        # Bayesian model: each evidence piece is a noisy indicator
+        with pm.Model() as model:
+            # Prior: informed by structural gap score
+            h_true = pm.Beta("h_true", alpha=prior_gap_score * 10 + 1,
+                             beta=(1 - prior_gap_score) * 10 + 1)
+
+            # Likelihood: evidence relevance given hypothesis truth
+            for i, sim in enumerate(similarities):
+                likelihood = h_true * sim**beta + (1 - h_true) * 0.1
+                pm.Bernoulli(f"e_{i}", p=likelihood, observed=1)
+
+            # Sample posterior
+            trace = pm.sample(
+                1000, tune=500, cores=1,
+                return_inferencedata=False,
+                progressbar=False,
+            )
+
+        posterior_mean = float(np.mean(trace["h_true"]))
+        return posterior_mean
+
+    def score(
+        self,
+        hypothesis: str,
+        evidence_passages: list[str],
+        prior_gap_score: float = 0.5,
+    ) -> float:
+        """Combined plausibility score (0 to 1)."""
+        sem = self.semantic_consistency(hypothesis, evidence_passages)
+        bay = self.bayesian_plausibility(
+            hypothesis, evidence_passages, prior_gap_score
+        )
+        # Geometric mean balances both signals
+        return float(np.sqrt(sem * bay))</code></pre>
+<div class="code-caption">Figure 39.8: Plausibility scoring combining semantic consistency (embedding similarity with evidence) and Bayesian posterior estimation via PyMC. The prior is informed by the structural gap score from Section 39.1, creating a principled connection between graph-level and text-level evidence.</div>
+
+<h2>4. Scoring Dimension 2: Novelty as Embedding Distance</h2>
+
+<p>
+A novel hypothesis says something that existing knowledge does not. We operationalize
+novelty as the distance between the hypothesis embedding and the nearest existing claim
+in our knowledge base. If a hypothesis is very close to something already published, it
+is a restatement; if it is very far from everything known, it is either genuinely novel
+or nonsensical (a distinction resolved by the plausibility score).
+</p>
+
+<p>
+Formally, given a hypothesis embedding $\mathbf{h}$ and a database of known claim
+embeddings $\{\mathbf{c}_1, \ldots, \mathbf{c}_m\}$, the novelty score is:
+</p>
+
+$$\text{Novelty}(\mathbf{h}) = 1 - \max_{i} \text{sim}(\mathbf{h}, \mathbf{c}_i)$$
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common mistake is to treat a high novelty score as automatically desirable, equating "far from existing knowledge" with "scientifically valuable." In practice, the most distant hypotheses in embedding space are usually incoherent or nonsensical rather than groundbreaking. Novelty is meaningful only when combined with high plausibility; a hypothesis that scores 0.95 on novelty but 0.1 on plausibility is not a bold idea waiting to be tested, it is noise.
+</p>
+</div>
+
+<p>
+where $\text{sim}$ is cosine similarity. A score near 0 means the hypothesis is a near-exact
+match to something known; a score near 1 means it is far from anything in the database.
+We compute this efficiently using Qdrant:
+</p>
+
+<pre><code class="language-python">import numpy as np
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from sentence_transformers import SentenceTransformer
+
+
+class NoveltyScorer:
+    """Score hypothesis novelty as embedding distance from known claims."""
+
+    def __init__(
+        self,
+        known_claims: list[str],
+        model_name: str = "all-MiniLM-L6-v2",
+        collection_name: str = "known_claims",
+    ):
+        self.embedder = SentenceTransformer(model_name)
+        self.client = QdrantClient(":memory:")
+        self.collection_name = collection_name
+
+        # Embed and index all known claims
+        embeddings = self.embedder.encode(
+            known_claims, normalize_embeddings=True
+        )
+        dim = embeddings.shape[1]
+
+        self.client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(
+                size=dim, distance=Distance.COSINE
+            ),
+        )
+
+        points = [
+            PointStruct(
+                id=i,
+                vector=emb.tolist(),
+                payload={"claim": claim},
+            )
+            for i, (claim, emb) in enumerate(zip(known_claims, embeddings))
+        ]
+        self.client.upsert(collection_name=collection_name, points=points)
+
+    def score(self, hypothesis: str, k: int = 5) -> dict:
+        """Compute novelty score for a hypothesis.
+
+        Args:
+            hypothesis: The hypothesis statement.
+            k: Number of nearest claims to retrieve for context.
+
+        Returns:
+            Dict with novelty_score and nearest_claims.
+        """
+        h_emb = self.embedder.encode(
+            [hypothesis], normalize_embeddings=True
+        )[0]
+
+        results = self.client.search(
+            collection_name=self.collection_name,
+            query_vector=h_emb.tolist(),
+            limit=k,
+        )
+
+        if not results:
+            return {"novelty_score": 1.0, "nearest_claims": []}
+
+        max_similarity = results[0].score
+        novelty = 1.0 - max_similarity
+
+        nearest = [
+            {
+                "claim": r.payload["claim"],
+                "similarity": r.score,
+            }
+            for r in results
+        ]
+
+        return {
+            "novelty_score": float(novelty),
+            "nearest_claims": nearest,
+        }</code></pre>
+<div class="code-caption">Figure 39.9: Novelty scoring using Qdrant for nearest-neighbor search over known scientific claims. The novelty score is the complement of the maximum cosine similarity to any known claim: higher scores indicate more novel hypotheses.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Novelty-Plausibility Trade-off</div>
+<p>
+Novelty and plausibility are naturally in tension. The most plausible hypotheses are
+those closest to established knowledge (and therefore least novel). The most novel
+hypotheses are those farthest from established knowledge (and therefore least plausible).
+The sweet spot lies in the "adjacent possible": hypotheses that are close enough to
+existing knowledge to be mechanistically grounded, but far enough to propose something
+genuinely new. In the combined scoring of Section 39.3, we implement this as a Pareto
+frontier: we seek hypotheses that are not dominated on either dimension, rather than
+maximizing a single weighted sum.
+</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the novelty-plausibility trade-off like choosing a restaurant in a city you are visiting. Picking a cuisine you already know well (Italian in Rome) is the high-plausibility, low-novelty choice: safe but unlikely to surprise you. Picking a completely unfamiliar cuisine with no reviews and no recognizable menu items is the high-novelty, low-plausibility choice: you might discover something extraordinary, but you are far more likely to have a bad meal. The best strategy is the "adjacent possible": a cuisine related to one you already enjoy, recommended by a trusted source, with enough familiar ingredients that you can evaluate quality while still experiencing something new. The scoring system in this section formalizes exactly that strategy, ranking hypotheses that sit in the productive zone between the well-trodden and the uncharted.
+</p>
+</div>
+
+<h2>5. Scoring Dimension 3: Testability as Experiment Cost</h2>
+
+<p>
+A testable hypothesis is one that can be confirmed or refuted through a feasible experiment.
+We decompose testability into three components: (1) whether the predictions are
+operationally measurable, (2) the estimated cost and time of the required experiment, and
+(3) the statistical power achievable with practical sample sizes.
+</p>
+
+<p>
+The first component (measurability) we delegate to the LLM, which has domain knowledge
+about what can and cannot be measured with current technology. The second component
+(experiment cost) we estimate using a lookup table of typical experimental costs by
+assay type, augmented by LLM reasoning for novel assay designs. The third component
+(statistical power) we compute analytically for standard experimental designs:
+</p>
+
+$$n = \frac{(z_{\alpha/2} + z_{\beta})^2 \cdot 2\sigma^2}{\delta^2}$$
+
+<p>
+where $n$ is the required sample size per group, $\delta$ is the minimum detectable
+effect size, $\sigma$ is the expected standard deviation, and $z_{\alpha/2}$, $z_{\beta}$
+are the critical values for significance level $\alpha$ and power $1-\beta$.
+</p>
+
+<pre><code class="language-python">import anthropic
+import json
+import math
+from dataclasses import dataclass
+
+
+@dataclass
+class TestabilityAssessment:
+    """Assessment of how testable a hypothesis is."""
+    measurable: bool
+    experiment_type: str
+    estimated_cost_usd: float
+    estimated_duration_days: int
+    required_sample_size: int
+    statistical_power: float
+    testability_score: float  # Combined score 0-1
+    reasoning: str
+
+
+# Typical costs by experiment type (order-of-magnitude estimates)
+EXPERIMENT_COSTS = {
+    "computational_simulation": {"cost_per_run": 10, "time_days": 1},
+    "cell_culture_assay": {"cost_per_run": 500, "time_days": 14},
+    "animal_model": {"cost_per_run": 5000, "time_days": 90},
+    "clinical_trial_phase1": {"cost_per_run": 1_000_000, "time_days": 365},
+    "survey_study": {"cost_per_run": 50, "time_days": 30},
+    "materials_synthesis": {"cost_per_run": 1000, "time_days": 7},
+    "spectroscopy_measurement": {"cost_per_run": 200, "time_days": 1},
+    "genomics_sequencing": {"cost_per_run": 300, "time_days": 7},
+    "proteomics_mass_spec": {"cost_per_run": 800, "time_days": 14},
+    "behavioral_experiment": {"cost_per_run": 100, "time_days": 60},
+}
+
+
+def required_sample_size(
+    effect_size: float,
+    std_dev: float = 1.0,
+    alpha: float = 0.05,
+    power: float = 0.8,
+) -> int:
+    """Compute required sample size for a two-group comparison.
+
+    Uses the standard formula for a two-sample t-test.
+    """
+    from scipy import stats
+    z_alpha = stats.norm.ppf(1 - alpha / 2)
+    z_beta = stats.norm.ppf(power)
+    n = math.ceil((z_alpha + z_beta)**2 * 2 * std_dev**2 / effect_size**2)
+    return max(n, 3)  # Minimum 3 per group
+
+
+def assess_testability(
+    hypothesis: str,
+    predictions: list[str],
+    model: str = "claude-sonnet-4-20250514",
+) -> TestabilityAssessment:
+    """Assess hypothesis testability using LLM reasoning
+    and analytical cost estimation.
+
+    Args:
+        hypothesis: The hypothesis statement.
+        predictions: Testable predictions from the hypothesis.
+        model: Anthropic model for experiment design reasoning.
+
+    Returns:
+        TestabilityAssessment with cost, duration, and score.
+    """
+    client = anthropic.Anthropic()
+
+    prompt = f"""Assess the testability of this scientific hypothesis.
+
+Hypothesis: {hypothesis}
+Predictions: {json.dumps(predictions)}
+
+Determine:
+1. Can the predictions be measured with current technology? (yes/no)
+2. What type of experiment is needed? Choose from:
+   {json.dumps(list(EXPERIMENT_COSTS.keys()))}
+3. What is the expected effect size (Cohen's d)?
+   Small = 0.2, Medium = 0.5, Large = 0.8
+4. Brief reasoning (2-3 sentences).
+
+Return JSON:
+{{"measurable": true/false, "experiment_type": "...",
+  "effect_size": 0.5, "reasoning": "..."}}"""
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    text = response.content[0].text
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0]
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0]
+
+    assessment = json.loads(text)
+
+    # Look up experiment costs
+    exp_type = assessment.get("experiment_type", "computational_simulation")
+    costs = EXPERIMENT_COSTS.get(exp_type, EXPERIMENT_COSTS["computational_simulation"])
+
+    # Compute required sample size
+    effect_size = assessment.get("effect_size", 0.5)
+    n = required_sample_size(effect_size)
+
+    total_cost = costs["cost_per_run"] * n
+    duration = costs["time_days"]
+
+    # Testability score: inverse log of cost, normalized
+    # Cheaper and faster experiments are more testable
+    max_cost = 10_000_000  # $10M as upper bound
+    cost_score = 1.0 - math.log10(total_cost + 1) / math.log10(max_cost)
+    cost_score = max(0.0, min(1.0, cost_score))
+
+    measurable = assessment.get("measurable", False)
+    testability = cost_score * (1.0 if measurable else 0.1)
+
+    return TestabilityAssessment(
+        measurable=measurable,
+        experiment_type=exp_type,
+        estimated_cost_usd=total_cost,
+        estimated_duration_days=duration,
+        required_sample_size=n,
+        statistical_power=0.8,  # Fixed target
+        testability_score=testability,
+        reasoning=assessment.get("reasoning", ""),
+    )</code></pre>
+<div class="code-caption">Figure 39.10: Testability assessment combining LLM-based experiment design reasoning with analytical cost estimation. The testability score is driven by estimated experiment cost (cheaper is more testable) and measurability of the predicted outcomes.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Scoring Hypotheses in Drug Repurposing</div>
+<p>
+Consider three hypotheses generated from gaps in a drug-gene-disease knowledge graph:
+(A) "Metformin reduces Alzheimer's risk through AMPK-mediated tau phosphorylation
+inhibition," (B) "A novel compound X (not yet synthesized) inhibits aging through
+telomerase activation," and (C) "Aspirin reduces pancreatic cancer risk through
+COX-2 mediated inflammation suppression." Hypothesis A scores high on plausibility
+(metformin/AMPK and tau/Alzheimer's pathways are well-documented) and testability
+(cell culture assays exist for tau phosphorylation, costing roughly $15,000 total).
+Hypothesis B scores highest on novelty (no one has proposed compound X) but lowest
+on testability (the compound must first be synthesized and characterized, adding
+months and six-figure costs). Hypothesis C has moderate novelty (aspirin's
+anti-inflammatory properties are known, but the pancreatic cancer link is less
+studied) and high testability (epidemiological data already exists for
+retrospective analysis). A scoring system that balances all three dimensions
+would rank C or A above B, despite B being the most "creative."
+</p>
+</div>
+
+<h2>6. Human-AI Refinement Loops</h2>
+
+<p>
+Automated scoring provides a first-pass ranking, but the most productive hypothesis
+generation systems keep the human scientist in the loop. The AI generates and scores;
+the human provides domain expertise, experimental intuition, and strategic direction.
+We implement this as an iterative refinement cycle:
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+
+
+@dataclass
+class RefinementFeedback:
+    """Human feedback on a generated hypothesis."""
+    hypothesis_id: int
+    action: str  # "accept", "reject", "refine", "merge", "split"
+    comment: str
+    refined_statement: str | None = None
+    priority: int = 0  # 1-5, scientist's subjective ranking
+
+
+def apply_refinement(
+    hypotheses: list[Hypothesis],
+    feedback: list[RefinementFeedback],
+    model: str = "claude-sonnet-4-20250514",
+) -> list[Hypothesis]:
+    """Apply human feedback to refine generated hypotheses.
+
+    Processes scientist feedback through the LLM to produce
+    improved hypothesis versions.
+    """
+    client = anthropic.Anthropic()
+    refined = []
+
+    for fb in feedback:
+        if fb.action == "reject":
+            continue  # Drop rejected hypotheses
+
+        h = hypotheses[fb.hypothesis_id]
+
+        if fb.action == "accept":
+            h.plausibility_score += 0.1  # Human endorsement bonus
+            refined.append(h)
+            continue
+
+        if fb.action == "refine":
+            # Use the scientist's comment to guide LLM refinement
+            prompt = f"""A scientist reviewed this hypothesis and
+provided feedback. Refine the hypothesis accordingly.
+
+Original: {h.statement}
+Mechanism: {h.mechanism}
+Feedback: {fb.comment}
+{f"Scientist's revised statement: {fb.refined_statement}" if fb.refined_statement else ""}
+
+Generate a refined hypothesis in JSON format with the same
+schema as the original (statement, mechanism, predictions,
+assumptions)."""
+
+            response = client.messages.create(
+                model=model,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            text = response.content[0].text
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0]
+
+            data = json.loads(text)
+            refined_h = Hypothesis(
+                statement=data.get("statement", h.statement),
+                domain=h.domain,
+                mechanism=data.get("mechanism", h.mechanism),
+                supporting_evidence=h.supporting_evidence,
+                predictions=data.get("predictions", h.predictions),
+                assumptions=data.get("assumptions", h.assumptions),
+            )
+            refined.append(refined_h)
+
+    return refined</code></pre>
+<div class="code-caption">Figure 39.11: Human-AI refinement loop. The scientist reviews scored hypotheses and provides structured feedback (accept, reject, refine, merge, split). The LLM incorporates this feedback to produce improved versions while preserving the original evidence grounding.</div>
+
+<p>
+The refinement loop is not just a convenience; it addresses a fundamental limitation of
+automated hypothesis generation. LLMs lack access to the scientist's tacit knowledge:
+which experiments are feasible in their specific lab, which collaborators they can
+engage, which funding calls align with which research directions. The human scientist
+brings this context to the ranking, transforming a general-purpose hypothesis list into
+a personalized research strategy.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: LangChain for Hypothesis Generation Chains</div>
+<p>
+The generation, critique, and scoring pipeline above involves multiple LLM calls with
+structured output parsing. <a href="https://python.langchain.com/" target="_blank">LangChain</a>
+reduces this boilerplate significantly. Using <code>ChatAnthropic</code> with
+<code>PydanticOutputParser</code>, the entire generation chain (context retrieval,
+hypothesis generation, self-critique, and scoring) can be expressed as a single
+<code>SequentialChain</code> with automatic output validation. The 200+ lines of
+manual JSON parsing and prompt formatting above become roughly 60 lines of chain
+definitions. LangChain also provides built-in retry logic for malformed outputs and
+streaming support for long generation tasks. For production systems,
+<a href="https://docs.llamaindex.ai/" target="_blank">LlamaIndex</a>'s
+<code>SubQuestionQueryEngine</code> can further decompose complex hypotheses into
+sub-questions, each answered against the knowledge base, providing finer-grained
+evidence grounding.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Autonomous Scientific Ideation</div>
+<p>
+The hypothesis generation systems in this section keep humans firmly in the loop for
+evaluation and refinement. Recent research pushes toward more autonomous ideation.
+Si et al. (2024) demonstrated that LLMs can generate research ideas rated as more novel
+(though less feasible) than ideas from human NLP researchers. The ChemCrow system
+(Bran et al., 2024) autonomously generates and tests chemical hypotheses by integrating
+LLMs with computational chemistry tools. Going further, Swanson et al. (2025) introduced
+the "Virtual Lab" framework, in which multiple AI agents role-playing as domain specialists
+(a computational biologist, a medicinal chemist, a machine learning expert) debate and
+co-refine hypotheses in structured multi-agent discussions, producing nanobody binding
+candidates that were experimentally validated. This multi-agent ideation approach
+demonstrates that diversity of simulated perspective, not just scale of generation,
+improves the quality and testability of machine-generated hypotheses.
+The key open challenge remains evaluation: how do we measure whether a machine-generated
+hypothesis is genuinely worth investigating, without waiting years for experimental
+confirmation?
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Score and Rank Hypotheses from Wikipedia Gaps</h4>
+<p>
+Build a minimal hypothesis scorer using only free, local tools.
+(1) Pick two Wikipedia articles on related but distinct topics (for example, "melatonin" and "neuroplasticity") and extract five key claim sentences from each article into a list of known claims.
+(2) Install <code>sentence-transformers</code> and embed all ten claims using the <code>all-MiniLM-L6-v2</code> model. Write three short hypothesis statements that propose a connection between the two topics, and embed those as well.
+(3) For each hypothesis, compute its novelty score as $1 - \max(\text{cosine similarity to any known claim})$ and its plausibility score as the mean cosine similarity to the five most relevant claims.
+(4) Plot the three hypotheses on a 2D scatter plot (x-axis: plausibility, y-axis: novelty) using <code>matplotlib</code>, labeling each point with a short hypothesis identifier.
+(5) Identify which hypothesis sits closest to the "adjacent possible" (moderate plausibility, moderate novelty) and write one falsifiable prediction for it. The entire project runs locally without API keys and takes under 30 minutes.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> The novelty score measures distance from known claims in
+embedding space. But embedding models have finite resolution: two genuinely different
+hypotheses might have similar embeddings if their surface wording is similar. Design a
+novelty scoring method that is more sensitive to semantic differences. Consider using
+the <em>predictions</em> rather than the <em>statement</em> as the basis for novelty
+comparison, and explain why this might better capture scientific novelty.
+</li>
+<li>
+<strong>(Coding)</strong> Implement an A/B test of two hypothesis generation prompts:
+one that asks the LLM to "be creative and generate surprising hypotheses" versus one
+that asks it to "identify the most likely missing connections based on the evidence."
+Generate 20 hypotheses with each prompt for the same set of knowledge gaps, score
+them on all three dimensions, and compare the distributions. Which prompt strategy
+produces better hypotheses, and by which metric?
+</li>
+<li>
+<strong>(Analysis)</strong> The Bayesian plausibility model treats each evidence
+passage as an independent observation. In reality, evidence passages from the same
+paper or research group are correlated. Extend the PyMC model to include a hierarchical
+structure where evidence passages are grouped by source, with a shared noise parameter
+per source. How does this change the posterior plausibility estimates compared to the
+independence assumption?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have all the components: gap detection (Section 39.1), hypothesis generation,
+and multi-dimensional scoring. In <a href="section-39.3.html">Section 39.3: Building a
+Hypothesis Generator</a>, we assemble these into a complete, end-to-end pipeline. Starting
+from a knowledge graph and a corpus of scientific papers, the pipeline detects gaps,
+generates hypotheses grounded in retrieved evidence, scores them for plausibility,
+novelty, and testability, and produces a ranked portfolio of research directions ready
+for human review or autonomous pursuit.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://docs.anthropic.com/" target="_blank">Anthropic. (2024). Claude API documentation.</a>
+<p>The Anthropic API used for structured hypothesis generation and self-critique.</p>
+</div>
+<div class="bib-card">
+<a href="https://www.pymc.io/" target="_blank">Abril-Pla, O., et al. (2023). PyMC: A modern and comprehensive probabilistic programming framework in Python. <em>PeerJ Computer Science</em>, 9, e1516.</a>
+<p>The Bayesian modeling framework used for plausibility estimation.</p>
+</div>
+<div class="bib-card">
+<a href="https://qdrant.tech/documentation/" target="_blank">Qdrant. (2024). Qdrant vector database documentation.</a>
+<p>The vector database used for efficient novelty scoring via nearest-neighbor search over claim embeddings.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2409.04109" target="_blank">Si, C., Yang, D., &amp; Hashimoto, T. (2024). Can LLMs generate novel research ideas? A large-scale human study with 100+ NLP researchers. <em>arXiv:2409.04109</em>.</a>
+<p>Landmark study showing that LLM-generated research ideas are rated as more novel than expert-generated ideas, though with lower feasibility scores.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s42256-024-00832-8" target="_blank">Bran, A. M., Cox, S., Schilter, O., et al. (2024). Augmenting large language models with chemistry tools. <em>Nature Machine Intelligence</em>, 6, 525-535.</a>
+<p>The ChemCrow system for autonomous chemical hypothesis generation and testing through LLM-tool integration.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s41586-025-08757-x" target="_blank">Swanson, K., Wu, G., Zou, J., &amp; Levy, D. (2025). Virtual Lab: AI agents design new SARS-CoV-2 nanobodies with experimental validation. <em>Nature</em>.</a>
+<p>Multi-agent AI system where simulated domain specialists collaboratively generate and refine scientific hypotheses, with experimental validation of generated nanobody candidates.</p>
+</div>
+<div class="bib-card">
+<a href="https://www.sbert.net/" target="_blank">Reimers, N. &amp; Gurevych, I. (2019). Sentence-BERT: Sentence embeddings using Siamese BERT-networks. <em>Proc. EMNLP</em>.</a>
+<p>The sentence embedding framework used for semantic consistency and novelty scoring.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-39.1.html">&#8592; 39.1 Gap Analysis and Analogical Transfer</a>
+<a href="index.html">Chapter 39</a>
+<a href="section-39.3.html">39.3 Building a Hypothesis Generator &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

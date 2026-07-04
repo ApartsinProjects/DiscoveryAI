@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.1: Modality Alignment for Discovery. InfoNCE loss, projection heads, temperature scaling, and cross-modal retrieval metrics for scientific multimodal AI." name="description"/>
+<title>Section 28.1: Modality Alignment for Discovery | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Multimodal Scientific AI</a></div>
+<h1>28.1 Modality Alignment for Discovery</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I spent months learning to understand molecules. Then I spent months learning to understand English. The hard part was realizing they were talking about the same things."</p>
+<cite>A Contrastive Loss Function, Reflecting on Convergence</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section opens the chapter. You should be familiar with embedding spaces and
+cosine similarity from <a href="../module-26-representation-learning/index.html">Chapter 26</a>,
+where you learned how neural networks project raw data into vector spaces where
+geometric distance reflects semantic similarity. The concept of foundation model
+pretraining from <a href="../module-27-foundation-models/index.html">Chapter 27</a>
+provides the encoder architectures that serve as inputs to the alignment process.
+Basic PyTorch (tensor operations, loss functions, gradient descent) is assumed.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A molecular encoder maps SMILES strings to vectors. A text encoder maps sentences
+to vectors. Separately, each produces useful representations. But a researcher does
+not think in separate modalities: they read a paper describing a compound's
+properties, look at its structure, and connect both to a protein target. <strong>Modality
+alignment</strong> trains encoders so that semantically equivalent inputs from different
+modalities (a molecule and its textual description, a protein and the paragraph
+explaining its function) land near each other in a shared vector space. This
+section covers the mathematical machinery that makes alignment work: the InfoNCE
+contrastive loss, projection heads that bridge dimension mismatches, temperature
+scaling that controls how "picky" the alignment is, and hard negative mining that
+forces the model to learn fine-grained distinctions. You will implement alignment
+from scratch, measure its quality, and understand when it succeeds and when it fails.
+</p>
+</div>
+
+<h2>1. The Alignment Problem in Scientific AI</h2>
+
+<p>
+Consider two encoder networks. The first, $f_\theta$, takes a molecular graph or SMILES
+string $x^{(\text{mol})}$ and produces an embedding $\mathbf{h}^{(\text{mol})} = f_\theta(x^{(\text{mol})}) \in \mathbb{R}^{d_1}$.
+The second, $g_\phi$, takes a text description $x^{(\text{text})}$ and produces
+$\mathbf{h}^{(\text{text})} = g_\phi(x^{(\text{text})}) \in \mathbb{R}^{d_2}$. These
+encoders may have been pretrained independently: $f_\theta$ on millions of molecules
+(as in <a href="../module-27-foundation-models/index.html">Chapter 27</a>), $g_\phi$ on
+scientific text corpora. Their embedding spaces have no natural correspondence. A
+molecule embedding and its text description's embedding live in entirely different
+vector spaces with different dimensions, scales, and geometric structure.
+</p>
+
+<p data-agent="02">
+Modality alignment is the process of training two (or more) separately pretrained encoders so that their outputs become directly comparable in a single shared vector space. It matters because without alignment, you cannot search for a molecule by describing its properties in English, nor can you retrieve a textual explanation given a molecular structure; each encoder's output is meaningful only within its own space. The mechanism works by adding small neural network layers (projection heads) on top of each encoder and training them with a contrastive objective that pulls matched pairs together and pushes unmatched pairs apart. Use modality alignment when you have paired cross-modal data (molecule plus description, protein plus function annotation) and need cross-modal retrieval or reasoning; if your task involves only a single modality (pure text search or molecule-to-molecule similarity), standard single-encoder embeddings are simpler and sufficient.
+</p>
+
+<p>
+<strong>Alignment</strong> introduces projection heads $p_\alpha: \mathbb{R}^{d_1} \to \mathbb{R}^{d}$
+and $q_\beta: \mathbb{R}^{d_2} \to \mathbb{R}^{d}$ that map both modalities into a
+shared $d$-dimensional space. After training, the projected embeddings
+$\mathbf{z}^{(\text{mol})} = p_\alpha(f_\theta(x^{(\text{mol})}))$ and
+$\mathbf{z}^{(\text{text})} = q_\beta(g_\phi(x^{(\text{text})}))$ satisfy a key property:
+if the molecule and text are semantically matched (the text describes the molecule),
+then $\text{sim}(\mathbf{z}^{(\text{mol})}, \mathbf{z}^{(\text{text})})$ is high. If they
+are unmatched, the similarity is low.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that alignment makes embeddings from different modalities fully interchangeable, so that a molecule vector and its matching text vector become nearly identical points in the shared space. In reality, Liang et al. (2022) showed that a persistent "modality gap" remains even after thorough alignment training: molecule embeddings and text embeddings cluster in separate regions of the shared space, separated by a consistent offset, and cross-modal cosine similarities are systematically lower than within-modality similarities. Alignment brings matched pairs closer together relative to unmatched pairs, but it does not erase the geometric signature of each modality.
+</p>
+</div>
+
+<p>
+This paradigm originates with CLIP (Radford et al., 2021), which aligned images and
+text. The scientific community quickly recognized that the same architecture applies
+whenever you have paired data across modalities: molecule-description pairs from
+PubChem, protein-function pairs from UniProt, image-caption pairs from scientific
+papers. The key insight is that the alignment objective is agnostic to what the
+modalities are; it cares only that paired examples should be similar and unpaired
+examples should be dissimilar.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Alignment Is a Learned Dictionary</div>
+<p>
+Think of modality alignment as building a bilingual dictionary between two languages
+that have no cognates. Before alignment, "aspirin" in molecule-space and "a
+nonsteroidal anti-inflammatory drug" in text-space are unrelated points. After
+alignment, they are neighbors. The contrastive loss is the language teacher that
+shows the model thousands of translation pairs ("this molecule goes with this
+description") and forces it to generalize to unseen pairs. The quality of the
+resulting dictionary depends entirely on the diversity and accuracy of the training
+pairs.
+</p>
+</div>
+
+<h2>2. The InfoNCE Contrastive Loss</h2>
+
+<p>
+The workhorse of modality alignment is the <strong>InfoNCE</strong> (Information Noise
+Contrastive Estimation) loss, introduced by Oord et al. (2018) and popularized by
+CLIP. Given a batch of $N$ paired examples $\{(x^{(\text{mol})}_i, x^{(\text{text})}_i)\}_{i=1}^{N}$,
+compute the projected embeddings $\mathbf{z}^{(\text{mol})}_i$ and $\mathbf{z}^{(\text{text})}_i$
+for all $i$. The loss treats the matching pair $(i, i)$ as the positive and all
+$N-1$ non-matching pairs $(i, j)$ for $j \neq i$ as negatives.
+</p>
+
+<p>
+Define the similarity between the $i$-th molecule and the $j$-th text as:
+</p>
+
+$$s_{ij} = \frac{\mathbf{z}^{(\text{mol})}_i \cdot \mathbf{z}^{(\text{text})}_j}{\|\mathbf{z}^{(\text{mol})}_i\| \, \|\mathbf{z}^{(\text{text})}_j\|} \cdot \frac{1}{\tau}$$
+
+<p>
+where $\tau > 0$ is a learnable temperature parameter. The molecule-to-text loss for
+sample $i$ is a softmax cross-entropy over the similarity scores:
+</p>
+
+$$\mathcal{L}^{(\text{mol} \to \text{text})}_i = -\log \frac{\exp(s_{ii})}{\sum_{j=1}^{N} \exp(s_{ij})}$$
+
+<p>
+Symmetrically, the text-to-molecule loss treats row $i$ of the transposed similarity
+matrix:
+</p>
+
+$$\mathcal{L}^{(\text{text} \to \text{mol})}_i = -\log \frac{\exp(s_{ii})}{\sum_{j=1}^{N} \exp(s_{ji})}$$
+
+<p>
+The total InfoNCE loss averages both directions:
+</p>
+
+$$\mathcal{L}_{\text{InfoNCE}} = \frac{1}{2N} \sum_{i=1}^{N} \left( \mathcal{L}^{(\text{mol} \to \text{text})}_i + \mathcal{L}^{(\text{text} \to \text{mol})}_i \right)$$
+
+<p>
+Minimizing this loss forces the model to solve an $N$-way classification problem:
+given molecule $i$, identify its matching text among $N$ candidates (and vice versa).
+As $N$ grows, the problem becomes harder and the representations must become more
+discriminative. This is why large batch sizes are critical for contrastive learning;
+CLIP used batches of 32,768 pairs.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class InfoNCELoss(nn.Module):
+    """
+    Symmetric InfoNCE contrastive loss for cross-modal alignment.
+
+    Given projected embeddings from two modalities, computes the
+    bidirectional contrastive loss with learnable temperature.
+    """
+
+    def __init__(self, initial_temperature: float = 0.07):
+        super().__init__()
+        # Log-temperature is learnable; exp ensures tau > 0
+        self.log_temperature = nn.Parameter(
+            torch.log(torch.tensor(initial_temperature))
+        )
+
+    def forward(
+        self,
+        z_a: torch.Tensor,  # (batch, dim) from modality A
+        z_b: torch.Tensor,  # (batch, dim) from modality B
+    ) -> torch.Tensor:
+        # L2-normalize embeddings to unit sphere
+        z_a = F.normalize(z_a, dim=-1)
+        z_b = F.normalize(z_b, dim=-1)
+
+        # Cosine similarity matrix scaled by temperature
+        temperature = self.log_temperature.exp()
+        logits = z_a @ z_b.T / temperature  # (N, N)
+
+        # Labels: diagonal entries are positive pairs
+        labels = torch.arange(len(z_a), device=z_a.device)
+
+        # Symmetric cross-entropy
+        loss_a_to_b = F.cross_entropy(logits, labels)
+        loss_b_to_a = F.cross_entropy(logits.T, labels)
+
+        return (loss_a_to_b + loss_b_to_a) / 2
+</code></pre>
+<div class="code-caption">InfoNCE contrastive loss with learnable temperature. The log-parameterization of temperature ensures positivity without clamping. The symmetric formulation trains both the molecule-to-text and text-to-molecule retrieval directions simultaneously.</div>
+
+<h2>3. Projection Heads and Encoder Freezing</h2>
+
+<p>
+The projection heads $p_\alpha$ and $q_\beta$ are typically small MLPs (two to three
+linear layers with ReLU or GELU activation) that map encoder outputs to the shared
+space. Their design involves several non-obvious choices.
+</p>
+
+<p>
+<strong>Dimension of the shared space.</strong> CLIP uses $d = 512$. Scientific multimodal
+models typically use $d \in [256, 768]$. Larger $d$ preserves more information but
+requires more data to fill the space usefully. Smaller $d$ forces compression,
+which can improve generalization if the alignment signal is simple (e.g., matching
+a molecule to its name) but hurts if the relationship is nuanced (e.g., matching a
+molecule to a paragraph describing its mechanism of action).
+</p>
+
+<p>
+<strong>Encoder freezing strategy.</strong> When the backbone encoders ($f_\theta$ for
+molecules, $g_\phi$ for text) are large pretrained models, you face a choice: freeze
+them and train only the projection heads, or fine-tune everything end-to-end. The
+tradeoffs parallel those in transfer learning (see
+<a href="../module-27-foundation-models/index.html">Chapter 27</a>). Freezing is
+computationally cheap and preserves the encoder's pretrained knowledge, but the
+projection heads alone may lack the capacity to bridge large representational gaps.
+End-to-end fine-tuning is more expressive but risks catastrophic forgetting, where
+the encoder loses its pretrained capabilities. A common compromise is
+<strong>staged training</strong>: freeze encoders for the first few epochs to warm up the
+projection heads, then unfreeze with a low learning rate.
+</p>
+
+<pre><code class="language-python">import torch.nn as nn
+from transformers import AutoModel, AutoTokenizer
+
+
+class ProjectionHead(nn.Module):
+    """
+    Two-layer MLP projection head with layer normalization.
+
+    Maps encoder hidden states to a shared embedding space
+    for contrastive alignment.
+    """
+
+    def __init__(self, input_dim: int, projection_dim: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.GELU(),
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, projection_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DualEncoderAligner(nn.Module):
+    """
+    Aligns two pretrained encoders via projection heads
+    and InfoNCE contrastive loss.
+
+    Parameters
+    ----------
+    encoder_a_name : str
+        Hugging Face model name for modality A (e.g., molecular encoder).
+    encoder_b_name : str
+        Hugging Face model name for modality B (e.g., text encoder).
+    projection_dim : int
+        Dimension of the shared alignment space.
+    freeze_encoders : bool
+        If True, only projection heads are trained.
+    """
+
+    def __init__(
+        self,
+        encoder_a_name: str,
+        encoder_b_name: str,
+        projection_dim: int = 512,
+        freeze_encoders: bool = True,
+    ):
+        super().__init__()
+        self.encoder_a = AutoModel.from_pretrained(encoder_a_name)
+        self.encoder_b = AutoModel.from_pretrained(encoder_b_name)
+
+        dim_a = self.encoder_a.config.hidden_size
+        dim_b = self.encoder_b.config.hidden_size
+
+        self.proj_a = ProjectionHead(dim_a, projection_dim)
+        self.proj_b = ProjectionHead(dim_b, projection_dim)
+        self.loss_fn = InfoNCELoss()
+
+        if freeze_encoders:
+            for param in self.encoder_a.parameters():
+                param.requires_grad = False
+            for param in self.encoder_b.parameters():
+                param.requires_grad = False
+
+    def encode_a(self, **inputs) -> torch.Tensor:
+        """Encode modality A inputs and project to shared space."""
+        hidden = self.encoder_a(**inputs).last_hidden_state
+        pooled = hidden[:, 0, :]  # CLS token pooling
+        return self.proj_a(pooled)
+
+    def encode_b(self, **inputs) -> torch.Tensor:
+        """Encode modality B inputs and project to shared space."""
+        hidden = self.encoder_b(**inputs).last_hidden_state
+        pooled = hidden[:, 0, :]
+        return self.proj_b(pooled)
+
+    def forward(self, inputs_a: dict, inputs_b: dict) -> torch.Tensor:
+        """Compute alignment loss for a batch of paired inputs."""
+        z_a = self.encode_a(**inputs_a)
+        z_b = self.encode_b(**inputs_b)
+        return self.loss_fn(z_a, z_b)
+</code></pre>
+<div class="code-caption">A dual-encoder alignment framework that wraps two pretrained Hugging Face models with projection heads and an InfoNCE loss. The <code>freeze_encoders</code> flag controls whether the backbone parameters are updated during alignment training.</div>
+
+<h2>4. Temperature Scaling and Its Effects</h2>
+
+<p>
+The temperature parameter $\tau$ in the InfoNCE loss controls the sharpness of the
+softmax distribution over similarity scores. Its effect is both subtle and critical.
+</p>
+
+<p>
+<strong>Low temperature</strong> ($\tau \to 0$) makes the softmax sharper: it assigns nearly
+all probability mass to the highest-similarity candidate. This forces the model to
+produce very distinct embeddings for non-matching pairs, which is good for
+retrieval precision but can lead to training instability (gradients become very
+large for hard negatives) and mode collapse (the model pushes all negatives to
+exactly the same point).
+</p>
+
+<p>
+<strong>High temperature</strong> ($\tau \to \infty$) makes the softmax uniform: every
+candidate gets similar probability regardless of actual similarity. This provides
+smooth gradients but weak learning signal; the model learns slowly and may converge
+to a suboptimal alignment.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of temperature as the zoom level on a grading rubric. A strict teacher (low temperature) grades on a razor-thin curve: the top student gets an A and everyone else fails, even if their scores differ by fractions of a point. This forces students to find every possible edge, but a single bad test question can flip the rankings unpredictably. A lenient teacher (high temperature) gives everyone a B regardless of performance; nobody fails, but nobody is motivated to improve either. A good teacher (learned temperature) starts lenient while students are still learning the basics, then gradually tightens the curve as the class improves. The contrastive loss does exactly this: the learnable $\tau$ adjusts the grading sharpness so that the model faces appropriately challenging discrimination at each stage of training.
+</p>
+</div>
+
+<p>
+CLIP initializes $\tau = 0.07$ and learns it jointly with the model parameters. Most
+scientific multimodal models follow this convention. The learned temperature typically
+converges to the range $[0.01, 0.1]$, depending on batch size and embedding dimension.
+A useful diagnostic: if $\tau$ collapses to a very small value during training, the
+model is likely overfitting to easy negatives and needs harder ones.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Temperature's Effect on Retrieval</div>
+<p>
+A pharmaceutical company trains a molecule-text alignment model for drug repurposing.
+With $\tau = 0.07$ (the CLIP default), the model achieves 72% recall@10 on a
+molecule-to-description retrieval benchmark. Fixing $\tau = 0.5$ drops recall to 54%
+because the softmax is too flat to discriminate between similar molecules. Fixing
+$\tau = 0.01$ achieves 75% recall@10 but causes training loss to spike and become
+unstable after epoch 5. Making $\tau$ learnable with initialization at 0.07 yields
+the best result: 78% recall@10 with stable training, as the model automatically
+sharpens the distribution as it learns finer distinctions.
+</p>
+</div>
+
+<h2>5. Hard Negative Mining</h2>
+
+<p>
+Not all negative pairs are equally informative. A molecule for aspirin and a text
+describing a steel alloy are trivially distinguishable; the model learns nothing from
+pushing them apart. A molecule for aspirin and a text describing ibuprofen (another
+NSAID with similar properties) is a <strong>hard negative</strong>: the descriptions overlap
+significantly, and the model must learn subtle structural differences to distinguish
+them. Hard negatives drive the most learning.
+</p>
+
+<p>
+In-batch negatives (the standard InfoNCE setup) provide some hard negatives by chance,
+but their difficulty depends on the batch composition. Several strategies increase the
+proportion of hard negatives:
+</p>
+
+<ul>
+<li><strong>Pre-computed similarity mining.</strong> Before training, compute pairwise
+similarities across the dataset using the initial (pretrained) encoders. Construct
+batches where each positive pair is accompanied by its $k$ nearest non-matching
+neighbors. This requires an offline index (FAISS or ScaNN; see
+<a href="../../part-4-knowledge/module-37-rag-discovery/index.html">Chapter 37</a>)
+but dramatically improves alignment quality.</li>
+<li><strong>Cross-batch memory banks.</strong> Maintain a queue of recent embeddings from
+previous batches. Each sample's negatives include not just the current batch but also
+the queue, effectively increasing the number of negatives without increasing batch
+size. MoCo (He et al., 2020) popularized this approach.</li>
+<li><strong>Curriculum-based hardness.</strong> Start training with easy negatives (random
+batches) and progressively increase hardness as the model improves. This avoids the
+instability that pure hard-negative mining can cause in early training.</li>
+</ul>
+
+<pre><code class="language-python">import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class HardNegativeBatchSampler:
+    """
+    Constructs batches with guaranteed hard negatives.
+
+    For each anchor, includes its k nearest non-matching
+    samples (by pre-computed embedding similarity) plus
+    random negatives to fill the batch.
+
+    Parameters
+    ----------
+    similarity_matrix : np.ndarray
+        Pre-computed pairwise similarity, shape (N, N).
+    k_hard : int
+        Number of hard negatives per anchor.
+    batch_size : int
+        Total batch size (must be > k_hard + 1).
+    """
+    similarity_matrix: np.ndarray
+    k_hard: int = 4
+    batch_size: int = 32
+
+    def __post_init__(self):
+        n = len(self.similarity_matrix)
+        # For each sample, rank others by similarity (descending)
+        # Exclude self (diagonal)
+        self.hard_negative_indices = np.zeros(
+            (n, self.k_hard), dtype=np.int64
+        )
+        for i in range(n):
+            sims = self.similarity_matrix[i].copy()
+            sims[i] = -np.inf  # exclude self
+            # Top-k most similar non-matching items
+            top_k = np.argpartition(sims, -self.k_hard)[-self.k_hard:]
+            self.hard_negative_indices[i] = top_k
+
+    def sample_batch(self, anchor_idx: int) -> list[int]:
+        """Build a batch around an anchor with hard negatives."""
+        batch = {anchor_idx}
+        # Add hard negatives
+        for neg_idx in self.hard_negative_indices[anchor_idx]:
+            batch.add(int(neg_idx))
+
+        # Fill remaining slots with random samples
+        n = len(self.similarity_matrix)
+        while len(batch) < self.batch_size:
+            rand_idx = np.random.randint(0, n)
+            batch.add(rand_idx)
+
+        return list(batch)[:self.batch_size]
+</code></pre>
+<div class="code-caption">A hard negative batch sampler that pre-computes pairwise similarities and constructs batches where each anchor is accompanied by its most confusable non-matching samples. The <code>k_hard</code> parameter controls how many guaranteed hard negatives appear per batch.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: open_clip for Alignment Training</div>
+<p>
+The from-scratch alignment framework above is roughly 120 lines. The
+<a href="https://github.com/mlfoundations/open_clip" target="_blank">open_clip</a>
+library provides the same capability (dual encoders, InfoNCE loss, temperature
+scheduling, distributed training) in about 15 lines of configuration:
+</p>
+<pre><code class="language-python"># Using open_clip for contrastive alignment (15 lines vs 120)
+import open_clip
+
+model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
+    "ViT-B-32",  # or a custom architecture
+    pretrained="laion2b_s34b_b79k",
+)
+tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
+# The library handles InfoNCE loss, temperature learning,
+# gradient accumulation, and distributed training internally.
+# Fine-tune on your domain pairs:
+# open_clip.training.main(args)  # full training loop
+</code></pre>
+<p>
+The library reduces 120 lines to 15 by handling loss computation, temperature
+scheduling, mixed-precision training, and multi-GPU distribution internally. Use
+the from-scratch version when you need custom loss terms (e.g., adding a
+reconstruction loss alongside contrastive alignment); use open_clip when you want a
+production-grade training pipeline for CLIP-style models.
+</p>
+</div>
+
+<h2>6. Alignment Quality Metrics</h2>
+
+<p>
+Training a contrastive model is meaningless without measuring whether the alignment
+actually works. The standard metrics evaluate <strong>cross-modal retrieval</strong>: given a
+query in modality A, how well can you retrieve the correct match from modality B?
+</p>
+
+<p>
+<strong>Recall@k</strong> measures the fraction of queries for which the correct match appears
+in the top $k$ retrieved results:
+</p>
+
+$$\text{Recall@}k = \frac{1}{N} \sum_{i=1}^{N} \mathbb{1}\left[\text{rank}_i \leq k\right]$$
+
+<p>
+where $\text{rank}_i$ is the position of the true match for query $i$ in the sorted
+list of candidates. Recall@1 is the most stringent (exact match at the top);
+Recall@10 is more lenient and commonly reported for scientific retrieval.
+</p>
+
+<p>
+<strong>Mean Reciprocal Rank (MRR)</strong> gives credit to correct matches at any position,
+weighted by rank:
+</p>
+
+$$\text{MRR} = \frac{1}{N} \sum_{i=1}^{N} \frac{1}{\text{rank}_i}$$
+
+<p>
+<strong>Alignment score</strong> (also called cross-modal cosine similarity) directly measures
+how close matched pairs are in the shared space. For a test set of $M$ matched pairs:
+</p>
+
+$$\text{AlignScore} = \frac{1}{M} \sum_{i=1}^{M} \frac{\mathbf{z}^{(A)}_i \cdot \mathbf{z}^{(B)}_i}{\|\mathbf{z}^{(A)}_i\| \, \|\mathbf{z}^{(B)}_i\|}$$
+
+<p>
+A complementary metric is <strong>uniformity</strong>, which measures whether embeddings are
+spread evenly across the unit hypersphere rather than collapsing to a small region.
+Good alignment requires both high alignment score (matched pairs are close) and high
+uniformity (unmatched pairs are spread out). Wang and Isola (2020) formalized this as
+the alignment-uniformity tradeoff.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+from dataclasses import dataclass
+
+
+@dataclass
+class AlignmentMetrics:
+    """
+    Computes standard cross-modal alignment quality metrics.
+
+    Parameters
+    ----------
+    z_a : torch.Tensor
+        Projected embeddings from modality A, shape (N, d).
+    z_b : torch.Tensor
+        Projected embeddings from modality B, shape (N, d).
+        Row i of z_b is the ground-truth match for row i of z_a.
+    """
+    z_a: torch.Tensor
+    z_b: torch.Tensor
+
+    def __post_init__(self):
+        self.z_a = F.normalize(self.z_a, dim=-1)
+        self.z_b = F.normalize(self.z_b, dim=-1)
+        # Full similarity matrix: (N, N)
+        self.sim_matrix = self.z_a @ self.z_b.T
+
+    def recall_at_k(self, k: int = 10, direction: str = "a_to_b") -> float:
+        """
+        Fraction of queries where the true match is in the top-k.
+
+        Parameters
+        ----------
+        k : int
+            Number of top candidates to consider.
+        direction : str
+            "a_to_b" retrieves B given A; "b_to_a" retrieves A given B.
+        """
+        if direction == "a_to_b":
+            sims = self.sim_matrix
+        else:
+            sims = self.sim_matrix.T
+
+        n = sims.shape[0]
+        # Get top-k indices for each query
+        _, top_k_indices = sims.topk(k, dim=1)
+        # True match for query i is index i
+        targets = torch.arange(n, device=sims.device).unsqueeze(1)
+        hits = (top_k_indices == targets).any(dim=1).float()
+        return hits.mean().item()
+
+    def mean_reciprocal_rank(self, direction: str = "a_to_b") -> float:
+        """Average of 1/rank for the true match across all queries."""
+        sims = self.sim_matrix if direction == "a_to_b" else self.sim_matrix.T
+        n = sims.shape[0]
+        # Rank of the true match (diagonal element)
+        ranks = (sims >= sims.diag().unsqueeze(1)).sum(dim=1).float()
+        return (1.0 / ranks).mean().item()
+
+    def alignment_score(self) -> float:
+        """Mean cosine similarity between matched pairs."""
+        return self.sim_matrix.diag().mean().item()
+
+    def uniformity(self, t: float = 2.0) -> float:
+        """
+        Uniformity loss (Wang & Isola, 2020).
+        Lower is better (more uniform distribution on hypersphere).
+        """
+        sq_dists = torch.cdist(self.z_a, self.z_a, p=2).pow(2)
+        return sq_dists.mul(-t).exp().mean().log().item()
+
+    def report(self) -> dict:
+        """Compute all standard metrics."""
+        return {
+            "recall@1_a2b": self.recall_at_k(1, "a_to_b"),
+            "recall@5_a2b": self.recall_at_k(5, "a_to_b"),
+            "recall@10_a2b": self.recall_at_k(10, "a_to_b"),
+            "recall@1_b2a": self.recall_at_k(1, "b_to_a"),
+            "recall@5_b2a": self.recall_at_k(5, "b_to_a"),
+            "recall@10_b2a": self.recall_at_k(10, "b_to_a"),
+            "mrr_a2b": self.mean_reciprocal_rank("a_to_b"),
+            "mrr_b2a": self.mean_reciprocal_rank("b_to_a"),
+            "alignment": self.alignment_score(),
+            "uniformity": self.uniformity(),
+        }
+</code></pre>
+<div class="code-caption">A complete alignment metrics suite computing recall@k, MRR, alignment score, and uniformity. The <code>report</code> method returns all standard metrics in both retrieval directions, providing a comprehensive view of alignment quality.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Alignment-Uniformity Tradeoff</div>
+<p>
+A model can achieve a perfect alignment score (all matched pairs at cosine
+similarity 1.0) by mapping every input to the same point, but this destroys all
+discriminative information. Uniformity measures the complementary requirement: the
+embeddings should spread across the hypersphere so that different concepts occupy
+different regions. The best models achieve both high alignment and high uniformity.
+When debugging a poorly performing alignment model, always check both metrics:
+high alignment but low uniformity indicates mode collapse; high uniformity but low
+alignment indicates that the contrastive signal is too weak (batch too small or
+temperature too high).
+</p>
+</div>
+
+<h2>7. When Alignment Fails</h2>
+
+<p>
+Modality alignment is not guaranteed to work. Understanding the failure modes helps
+you diagnose and fix problems in practice.
+</p>
+
+<p>
+<strong>Modality gap.</strong> Even after alignment training, Liang et al. (2022) showed that
+CLIP-style models exhibit a persistent "modality gap": embeddings from different
+modalities occupy different regions of the shared space, separated by a constant
+offset. This gap means that cross-modal similarity scores are systematically lower
+than intra-modal scores, which can bias retrieval toward same-modality results if
+not accounted for.
+</p>
+
+<p>
+<strong>Semantic granularity mismatch.</strong> A molecular structure encodes precise atomic
+connectivity, while a text description may operate at a coarse functional level
+("anti-inflammatory agent"). Aligning these modalities at the wrong granularity
+leads to a space where similar descriptions map to dissimilar molecules.
+The solution is hierarchical alignment: separate losses for coarse-grained (drug
+class) and fine-grained (specific structure) matching.
+</p>
+
+<p>
+<strong>Data quality.</strong> Contrastive alignment is only as good as the paired data. If
+the molecule-text pairs are noisy (the text describes the wrong molecule, or the
+description is too generic to be discriminative), the learned alignment will be
+noisy too. PubChem descriptions, the most commonly used source, vary enormously in
+specificity: some are detailed mechanistic descriptions, others are just "a chemical
+compound." Filtering for description quality before training is essential.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Beyond Pairwise Alignment</div>
+<p>
+Most current multimodal scientific models align two modalities at a time
+(molecule-text, protein-text, image-text). The frontier is <strong>many-to-many
+alignment</strong>: a single shared space that simultaneously embeds molecules, proteins,
+text descriptions, experimental images, gene expression profiles, and clinical
+outcomes. ImageBind (Girdhar et al., 2023) demonstrated this for six modalities
+using a "bind" architecture where all modalities align to images as an anchor.
+More recently, <strong>BioMedCLIP</strong> (Zhang et al., 2025, Nature Medicine) trained on
+over 15 million figure-caption pairs from PubMed Central and showed that
+domain-specific contrastive pretraining on biomedical literature substantially
+outperforms general-purpose CLIP on medical image classification, cross-modal
+retrieval, and visual question answering tasks. BioMedCLIP's key contribution is
+demonstrating that curating high-quality, domain-matched paired data matters more
+than scaling model size for scientific alignment. Parallel efforts such as
+MolBind (2024) extend the bind paradigm to chemistry by anchoring molecules,
+spectra, and textual descriptions in a single space. The key challenge remains
+<strong>alignment dilution</strong>: as more modalities are added, the shared space must
+accommodate increasingly diverse relationships, and per-modality retrieval quality
+can degrade unless training data is carefully balanced across all modality
+combinations.
+</p>
+</div>
+
+<h2>8. Putting It Together: A Minimal Alignment Training Loop</h2>
+
+<p>
+The following example ties together all the pieces: dual encoders, projection heads,
+InfoNCE loss, and alignment metrics into a complete training loop. It uses a toy
+dataset of molecule-text pairs but follows the exact same pattern used by MoleculeSTM
+and similar production models.
+</p>
+
+<pre><code class="language-python">import torch
+from torch.utils.data import DataLoader, Dataset
+from typing import Iterator
+
+
+class MoleculeTextDataset(Dataset):
+    """
+    Paired molecule SMILES and text descriptions.
+
+    In production, load from PubChem or ChEBI.
+    This example uses synthetic pairs for illustration.
+    """
+
+    def __init__(self, pairs: list[tuple[str, str]], tokenizer_a, tokenizer_b):
+        self.pairs = pairs
+        self.tok_a = tokenizer_a
+        self.tok_b = tokenizer_b
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> tuple[dict, dict]:
+        smiles, text = self.pairs[idx]
+        inputs_a = self.tok_a(
+            smiles, return_tensors="pt", padding="max_length",
+            max_length=128, truncation=True,
+        )
+        inputs_b = self.tok_b(
+            text, return_tensors="pt", padding="max_length",
+            max_length=256, truncation=True,
+        )
+        # Remove batch dim added by tokenizer
+        return (
+            {k: v.squeeze(0) for k, v in inputs_a.items()},
+            {k: v.squeeze(0) for k, v in inputs_b.items()},
+        )
+
+
+def train_alignment(
+    model: "DualEncoderAligner",
+    train_loader: DataLoader,
+    val_pairs: tuple[torch.Tensor, torch.Tensor],
+    epochs: int = 20,
+    lr: float = 1e-4,
+) -> list[dict]:
+    """
+    Train a dual-encoder alignment model and track metrics.
+
+    Parameters
+    ----------
+    model : DualEncoderAligner
+        The alignment model with encoders and projection heads.
+    train_loader : DataLoader
+        Batches of paired (inputs_a, inputs_b) dictionaries.
+    val_pairs : tuple
+        Pre-computed (z_a_val, z_b_val) for validation metrics.
+    epochs : int
+        Number of training epochs.
+    lr : float
+        Learning rate for the optimizer.
+    """
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr,
+        weight_decay=0.01,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs
+    )
+
+    history = []
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+
+        for inputs_a, inputs_b in train_loader:
+            loss = model(inputs_a, inputs_b)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        scheduler.step()
+
+        # Validation metrics
+        model.eval()
+        with torch.no_grad():
+            metrics = AlignmentMetrics(*val_pairs).report()
+            metrics["train_loss"] = total_loss / len(train_loader)
+            metrics["epoch"] = epoch + 1
+            metrics["temperature"] = model.loss_fn.log_temperature.exp().item()
+            history.append(metrics)
+
+        print(
+            f"Epoch {epoch+1:3d} | "
+            f"Loss: {metrics['train_loss']:.4f} | "
+            f"R@10: {metrics['recall@10_a2b']:.3f} | "
+            f"Align: {metrics['alignment']:.3f} | "
+            f"tau: {metrics['temperature']:.4f}"
+        )
+
+    return history
+</code></pre>
+<div class="code-caption">A complete alignment training loop with cosine learning rate scheduling, validation metric tracking, and temperature monitoring. The training history captures all alignment metrics per epoch, enabling diagnosis of convergence issues and alignment-uniformity tradeoffs.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Batch Size Arms Race</div>
+<p>
+CLIP was trained with batches of 32,768 pairs. SigLIP pushed this to 1,000,000 by
+replacing the softmax with a sigmoid loss that treats each pair independently.
+Scientific multimodal models, trained on smaller datasets (PubChem has about 100
+million compounds, not billions of image-text pairs), typically use batch sizes of
+256 to 4,096. If your GPU memory limits you to batch size 64, gradient accumulation
+over 4 steps gives you an effective batch of 256, which is sufficient for most
+scientific alignment tasks. The key threshold: batch size must be large enough that
+each sample has at least a few hard negatives by chance.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Sentence-to-Sentence Alignment Model</h4>
+<p>
+You can experience the full alignment pipeline on a laptop using only text (no molecules required) by aligning English sentences to their paraphrases.
+<strong>Step 1:</strong> Install dependencies: <code>pip install torch transformers datasets</code>.
+<strong>Step 2:</strong> Load the MRPC (Microsoft Research Paraphrase Corpus) dataset via <code>from datasets import load_dataset; ds = load_dataset("glue", "mrpc")</code>. Filter to positive pairs (label == 1), giving you roughly 3,900 sentence pairs.
+<strong>Step 3:</strong> Initialize two separate <code>ProjectionHead</code> modules (one per "modality") on top of a single frozen <code>bert-base-uncased</code> encoder. Use projection_dim=256. Feed sentence A through encoder + projection head A, and sentence B through encoder + projection head B.
+<strong>Step 4:</strong> Train for 10 epochs with the <code>InfoNCELoss</code> class from this section, batch size 64, learning rate 1e-4. Log the learned temperature at each epoch.
+<strong>Step 5:</strong> Evaluate with the <code>AlignmentMetrics</code> class on the MRPC test split. Compute recall@1, recall@5, and alignment score. A well-trained model should reach recall@5 above 0.6. Plot alignment score versus uniformity across epochs to observe the tradeoff in action.
+</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual.</strong> Explain why the InfoNCE loss with batch size $N$ provides a lower
+bound on the mutual information between the two modalities. What happens to this bound
+as $N$ increases? Why does this imply that larger batch sizes lead to better
+representations? (Hint: see Oord et al., 2018, Theorem 1.)</li>
+
+<li><strong>Coding.</strong> Implement a variant of the <code>InfoNCELoss</code> that adds a
+<strong>margin</strong> to the positive pair similarity: $s_{ii} \to s_{ii} - m$ for a fixed
+margin $m > 0$. Train the same alignment model with margins $m \in \{0, 0.1, 0.3\}$ and
+compare recall@10. Does the margin improve or hurt alignment quality? Explain your
+results in terms of the alignment-uniformity tradeoff.</li>
+
+<li><strong>Analysis.</strong> Download the CheBI-20 molecule-text dataset. Compute the average
+text description length and vocabulary overlap between descriptions of molecules in the
+same drug class versus different drug classes. Based on this analysis, predict whether a
+contrastive model trained on this data will perform better at coarse-grained (drug class)
+or fine-grained (specific molecule) retrieval. Verify your prediction by training a small
+alignment model and measuring recall@1 at each granularity level.</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 28 Index</a>
+<span class="nav-separator">|</span>
+<a href="index.html">Chapter 28</a>
+<span class="nav-separator">|</span>
+<a href="section-28.2.html">28.2 Molecule-Text and Protein-Text Models &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

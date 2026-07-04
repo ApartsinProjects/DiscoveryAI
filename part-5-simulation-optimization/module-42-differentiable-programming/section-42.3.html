@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.3: Differentiable Physics and Molecular Dynamics. Adjoint methods for ODE-constrained optimization, differentiable physics engines with JAX-MD and diffrax." name="description"/>
+<title>Section 42.3: Differentiable Physics and Molecular Dynamics | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation and Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Differentiable Programming for Discovery</a></div>
+<h1>42.3 Differentiable Physics and Molecular Dynamics</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I asked my simulation for the gradient and it replied with a 50,000-step chain rule. I asked the adjoint method and it replied with a single backward ODE. We got the same answer, but the adjoint still had memory left."</p>
+<cite>A Lagrange Multiplier With Boundary Conditions</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Scientific simulations, whether they model protein folding, fluid flow, or chemical
+reactions, are ultimately sequences of mathematical operations: integrating differential
+equations, applying force calculations, updating state variables. If every operation in
+that sequence is differentiable, we can compute how the simulation's output (an
+observable like energy, diffusion coefficient, or radial distribution function) changes
+with respect to its inputs (force field parameters, initial conditions, boundary
+conditions). This section derives the <strong>adjoint method</strong> for
+ODE-constrained optimization, shows how it avoids the memory explosion of naive
+backpropagation through time, and demonstrates differentiable molecular dynamics with
+JAX-MD and diffrax.
+</p>
+</div>
+
+<h2>1. The ODE-Constrained Optimization Problem</h2>
+
+<p>
+Many scientific discovery problems have the following structure. We have a dynamical
+system governed by an ordinary differential equation (ODE):
+</p>
+
+$$\frac{dz}{dt} = f(z(t), \theta), \quad z(0) = z_0$$
+
+<p>
+where $z(t) \in \mathbb{R}^d$ is the state (particle positions and velocities, field
+values, concentrations), $\theta \in \mathbb{R}^p$ are parameters we want to optimize
+(force field coefficients, reaction rates, material properties), and $f$ is the
+dynamics function. We observe some quantity at the end of the simulation:
+</p>
+
+$$L(\theta) = \ell(z(T), \theta)$$
+
+<p>
+and we want $\nabla_\theta L$: how does the loss change when we adjust the parameters?
+This is <strong>ODE-constrained optimization</strong>, and it is the mathematical
+backbone of differentiable physics.
+</p>
+
+<p data-agent="02">
+ODE-constrained optimization is the problem of finding parameters $\theta$ that minimize
+a loss function $L(\theta)$ when $L$ depends on $\theta$ only through the solution of a
+differential equation. It matters because nearly every physical simulation, from climate
+models to drug binding trajectories, is governed by differential equations whose
+parameters we want to tune to match experimental data. The mechanism is to treat the ODE
+as a constraint and compute $\nabla_\theta L$ by propagating sensitivity information
+through the dynamics, either forward (tangent method, cost $O(p)$ per parameter) or
+backward (adjoint method, cost independent of the number of parameters). Use
+ODE-constrained optimization when the simulation is differentiable and the parameter
+count $p$ is moderate to large; for non-differentiable or chaotic simulations, prefer
+gradient-free approaches such as Bayesian optimization or evolutionary strategies
+(covered in <a href="../module-45-optimization/index.html">Chapter 45</a>).
+</p>
+
+<h2>2. Naive Approach: Backpropagation Through Time</h2>
+
+<p>
+If we discretize the ODE with $N$ time steps using a simple Euler integrator:
+</p>
+
+$$z_{n+1} = z_n + \Delta t \, f(z_n, \theta)$$
+
+<p>
+then the full computation is a chain of $N$ differentiable operations. Standard
+reverse-mode AD (backpropagation) can compute the gradient by storing all intermediate
+states $z_0, z_1, \ldots, z_N$ and walking backwards through the chain. The gradient
+computation is exact, but it requires $O(N \cdot d)$ memory to store the trajectory.
+For molecular dynamics with $N = 10^5$ steps and $d = 3 \times 10^4$ atoms, this
+is hundreds of gigabytes, far exceeding GPU memory.
+</p>
+
+<p>
+Gradient checkpointing (discussed in <a href="section-42.1.html">Section 42.1</a>)
+reduces the memory to $O(\sqrt{N} \cdot d)$ at the cost of recomputation, but the
+adjoint method offers a more elegant solution that is particularly natural for ODEs.
+</p>
+
+<h2>3. The Continuous Adjoint Method</h2>
+
+<p>
+The adjoint method reformulates the gradient computation as a <em>backward ODE</em>
+that runs in constant memory, regardless of the number of time steps. The derivation
+proceeds in three steps.
+</p>
+
+<p>
+<strong>Step 1: Define the adjoint variable.</strong> Let $a(t) = \frac{\partial L}{\partial z(t)} \in \mathbb{R}^d$
+be the sensitivity of the loss with respect to the state at time $t$. At the final
+time, we know $a(T) = \frac{\partial \ell}{\partial z(T)}$.
+</p>
+
+<p>
+<strong>Step 2: Derive the adjoint ODE.</strong> By the chain rule, the adjoint evolves
+backward in time according to:
+</p>
+
+$$\frac{da}{dt} = -a(t)^T \frac{\partial f}{\partial z}(z(t), \theta)$$
+
+<p>
+This is the transpose of the forward dynamics' Jacobian, applied to the adjoint. In
+the language of <a href="section-42.1.html">Section 42.1</a>, it is a continuous-time
+VJP: the adjoint at each instant is the vector-Jacobian product of the adjoint with
+the dynamics Jacobian.
+</p>
+
+<p>
+<strong>Step 3: Accumulate parameter gradients.</strong> The gradient with respect to
+$\theta$ is obtained by integrating along the backward trajectory:
+</p>
+
+$$\frac{dL}{d\theta} = \int_T^0 a(t)^T \frac{\partial f}{\partial \theta}(z(t), \theta) \, dt$$
+
+<p>
+In practice, we solve the augmented system of ODEs backward in time:
+</p>
+
+$$\frac{d}{dt}\begin{pmatrix} z \\ a \\ \frac{dL}{d\theta} \end{pmatrix} = \begin{pmatrix} f(z, \theta) \\ -a^T \frac{\partial f}{\partial z} \\ -a^T \frac{\partial f}{\partial \theta} \end{pmatrix}$$
+
+<p>
+starting from $t = T$ with initial conditions $(z(T), a(T), 0)$ and integrating to
+$t = 0$. The state $z(t)$ can be reconstructed by solving the forward ODE backwards
+(or by using checkpoints for numerical stability), so the method requires only $O(d + p)$
+memory: the current state, the current adjoint, and the accumulated parameter gradient.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the adjoint method like tracing a river upstream to find the source of
+contamination. A factory downstream (the loss function) detects a chemical at
+concentration $C$. You could sample the water at every meter along the entire
+river, store every sample, and then walk backward through your samples to find where
+the contaminant entered (backpropagation through time). That works, but you need a
+warehouse of sample bottles. The adjoint method instead launches a single sensor boat
+at the factory that reads the current at each point and rides upstream, continuously
+updating its estimate of where the contamination originates. The boat carries only
+its current reading and its running tally of candidate sources (the adjoint state and
+the accumulated parameter gradient), never needing to store the state of the entire
+river. It arrives at the headwaters with the same answer, having carried only a
+small notebook instead of a warehouse.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that the adjoint method produces <em>approximate</em>
+gradients because it avoids storing the full trajectory. In fact, the continuous
+adjoint computes the exact gradient of the continuous ODE; any discrepancy with
+backpropagation through the discretized solver arises from the difference between
+differentiating the continuous equations versus differentiating the discrete solver
+steps, not from any approximation in the adjoint formulation itself.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Adjoint ODE is a Continuous VJP</div>
+<p>
+The adjoint equation $da/dt = -a^T (\partial f / \partial z)$ is the continuous-time
+analog of the reverse-mode AD identity $\bar{x} = J^T \bar{y}$ from
+<a href="section-42.1.html">Section 42.1</a>. Each infinitesimal time step has a
+Jacobian $I + \Delta t \, \partial f / \partial z$; the adjoint equation
+propagates the output sensitivity backward through this continuous chain of
+infinitesimal Jacobians. This is why Chen et al. (2018) called their Neural ODE paper's
+gradient computation "the adjoint sensitivity method": it is reverse-mode AD lifted
+from discrete computational graphs to continuous dynamical systems.
+</p>
+</div>
+
+<h2>4. Implementing the Adjoint Method with diffrax</h2>
+
+<p>
+The <strong>diffrax</strong> library (by Patrick Kidger) provides differentiable ODE and
+SDE solvers in JAX. It supports multiple adjoint methods out of the box: direct
+backpropagation through the solver steps, the continuous adjoint, and recursive
+checkpointing. Here we solve a simple damped oscillator and compute gradients of a
+trajectory observable with respect to the damping coefficient.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+import diffrax
+
+def damped_oscillator(t, state, args):
+    """Dynamics of a damped harmonic oscillator.
+
+    Parameters
+    ----------
+    t : float
+        Current time (unused for autonomous system).
+    state : jnp.ndarray, shape (2,)
+        [position, velocity].
+    args : dict
+        {'k': spring constant, 'gamma': damping coefficient}
+
+    Returns
+    -------
+    jnp.ndarray, shape (2,)
+        [velocity, acceleration].
+    """
+    x, v = state
+    k, gamma = args['k'], args['gamma']
+    return jnp.array([v, -k * x - gamma * v])
+
+def simulate_and_observe(params):
+    """Simulate a damped oscillator and return the final displacement.
+
+    Parameters
+    ----------
+    params : dict
+        {'k': float, 'gamma': float}
+
+    Returns
+    -------
+    float
+        Squared final displacement (the observable we optimize).
+    """
+    state0 = jnp.array([1.0, 0.0])  # start displaced, at rest
+
+    solver = diffrax.Tsit5()         # Tsitouras 5th-order method
+    term = diffrax.ODETerm(damped_oscillator)
+    saveat = diffrax.SaveAt(t1=True)
+
+    # Use RecursiveCheckpointAdjoint for memory-efficient gradients
+    adjoint = diffrax.RecursiveCheckpointAdjoint()
+
+    sol = diffrax.diffeqsolve(
+        term, solver,
+        t0=0.0, t1=10.0, dt0=0.01,
+        y0=state0, args=params,
+        saveat=saveat,
+        adjoint=adjoint,
+    )
+    final_state = sol.ys[-1]
+    return final_state[0] ** 2  # squared final displacement
+
+# Gradient of the observable w.r.t. damping and spring constant
+grad_fn = jax.jit(jax.grad(simulate_and_observe))
+
+params = {'k': 1.0, 'gamma': 0.5}
+grads = grad_fn(params)
+print(f"d(x_final^2)/dk:     {grads['k']:.8f}")
+print(f"d(x_final^2)/dgamma: {grads['gamma']:.8f}")
+
+# Verify with finite differences
+import copy
+h = 1e-5
+for name in ['k', 'gamma']:
+    p_plus = copy.copy(params)
+    p_plus[name] = params[name] + h
+    p_minus = copy.copy(params)
+    p_minus[name] = params[name] - h
+    fd = (simulate_and_observe(p_plus) - simulate_and_observe(p_minus)) / (2 * h)
+    print(f"d(x_final^2)/d{name} [finite diff]: {fd:.8f}")
+</code></pre>
+<div class="code-caption">Listing 42.15: Differentiable ODE solving with diffrax. The <code>RecursiveCheckpointAdjoint</code> computes gradients through the ODE solve with bounded memory, matching finite-difference results to high precision.</div>
+
+<p>
+The <code>RecursiveCheckpointAdjoint</code> combines the adjoint method with optimal
+checkpointing: it stores $O(\log N)$ intermediate states and recomputes the rest,
+giving both memory efficiency and numerical stability. For long simulations
+($N > 10^4$ steps), this is dramatically cheaper than storing the full trajectory.
+</p>
+
+<h2>5. Differentiable Molecular Dynamics with JAX-MD</h2>
+
+<p>
+<strong>JAX-MD</strong> (Schoenholz and Cubuk, 2020) is a molecular dynamics library
+built entirely in JAX. Because every operation (neighbor list construction, force
+computation, integration) is a JAX function, the entire MD simulation is automatically
+differentiable. This means you can compute gradients of any trajectory-averaged
+observable (energy, pressure, radial distribution function) with respect to force
+field parameters.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+from jax_md import space, energy, simulate, quantity, partition
+
+# Set up a periodic simulation box
+box_size = 10.0
+displacement_fn, shift_fn = space.periodic(box_size)
+
+# Define a Lennard-Jones potential with learnable parameters
+def lj_energy_fn(dr, epsilon=1.0, sigma=1.0):
+    """Lennard-Jones pair energy as a function of distance.
+
+    Parameters
+    ----------
+    dr : float
+        Pairwise distance.
+    epsilon : float
+        Well depth parameter.
+    sigma : float
+        Length scale parameter.
+
+    Returns
+    -------
+    float
+        Pair interaction energy.
+    """
+    idr6 = (sigma / dr) ** 6
+    return 4.0 * epsilon * (idr6 ** 2 - idr6)
+
+# Build the neighbor list for efficient pair enumeration
+key = jax.random.key(0)
+N = 64
+positions = jax.random.uniform(key, (N, 3)) * box_size
+
+# JAX-MD energy function from pair potential
+energy_fn = energy.pair(
+    lj_energy_fn,
+    displacement_or_metric=displacement_fn,
+    sigma=1.0,
+    epsilon=1.0,
+)
+
+# Neighbor list for O(N) force computation
+neighbor_fn = partition.neighbor_list(
+    displacement_fn,
+    box=box_size,
+    r_cutoff=2.5,
+    capacity_multiplier=1.5,
+)
+neighbors = neighbor_fn.allocate(positions)
+
+# Compute energy and forces
+E = energy_fn(positions, neighbor=neighbors)
+force_fn = quantity.force(energy_fn)
+forces = force_fn(positions, neighbor=neighbors)
+
+print(f"Total energy:  {E:.4f}")
+print(f"Forces shape:  {forces.shape}")
+print(f"Max force mag: {jnp.max(jnp.linalg.norm(forces, axis=-1)):.4f}")
+</code></pre>
+<div class="code-caption">Listing 42.16: Setting up a Lennard-Jones simulation in JAX-MD. The energy function, neighbor list, and force computation are all JAX functions, making the entire pipeline differentiable.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Learning a Force Field from Ab Initio Data</div>
+<p>
+A common workflow in computational chemistry is fitting a classical force field to
+quantum mechanical (DFT or CCSD(T)) reference data. Traditionally, this involves
+running many simulations with trial parameters, computing observables, comparing to
+reference, and manually adjusting. With differentiable MD, the process becomes a
+gradient descent loop: (1) run a short MD trajectory with current parameters, (2)
+compute the loss between predicted and reference forces/energies, (3)
+backpropagate through the trajectory to get parameter gradients, (4) update parameters
+with an optimizer. Projects like TorchMD-Net and SchNet use this approach with neural
+network potentials, achieving quantum-mechanical accuracy at classical MD speed. The
+recipe in <a href="section-42.4.html">Section 42.4</a> implements this workflow for
+a simple Lennard-Jones system.
+</p>
+</div>
+
+<h2>6. Running a Differentiable MD Simulation</h2>
+
+<p>
+JAX-MD provides integrators (Velocity Verlet, Nose-Hoover, Langevin) that are
+themselves JAX functions. We can run a short trajectory, compute an observable, and
+differentiate through the entire simulation.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+from jax_md import simulate, space, energy, partition
+
+def run_nvt_simulation(params, positions, key, n_steps=500, dt=0.001):
+    """Run a short NVT simulation and return the mean kinetic energy.
+
+    Parameters
+    ----------
+    params : dict
+        {'epsilon': float, 'sigma': float}
+    positions : jnp.ndarray, shape (N, 3)
+        Initial particle positions.
+    key : jax.random.PRNGKey
+        Random key for thermostat noise.
+    n_steps : int
+        Number of simulation steps.
+    dt : float
+        Integration time step.
+
+    Returns
+    -------
+    float
+        Time-averaged kinetic energy per particle.
+    """
+    box_size = 10.0
+    displacement_fn, shift_fn = space.periodic(box_size)
+
+    # Build energy function with current parameters
+    energy_fn = energy.pair(
+        lambda dr, **kwargs: 4.0 * params['epsilon'] * (
+            (params['sigma'] / dr) ** 12 - (params['sigma'] / dr) ** 6
+        ),
+        displacement_or_metric=displacement_fn,
+    )
+
+    neighbor_fn = partition.neighbor_list(
+        displacement_fn, box=box_size, r_cutoff=2.5 * params['sigma'],
+    )
+    neighbors = neighbor_fn.allocate(positions)
+
+    # NVT (Nose-Hoover) integrator at target temperature
+    kT = 1.0
+    init_fn, step_fn = simulate.nvt_nose_hoover(energy_fn, shift_fn, dt, kT)
+    state = init_fn(key, positions, neighbor=neighbors)
+
+    # Use lax.scan for a differentiable loop
+    def scan_step(carry, _):
+        state, nbrs = carry
+        state = step_fn(state, neighbor=nbrs)
+        ke = quantity.kinetic_energy(state.velocity)
+        return (state, nbrs), ke
+
+    (final_state, _), ke_trajectory = jax.lax.scan(
+        scan_step, (state, neighbors), None, length=n_steps
+    )
+
+    N = positions.shape[0]
+    return jnp.mean(ke_trajectory) / N
+
+# Differentiate the mean kinetic energy w.r.t. force field parameters
+grad_ke = jax.grad(run_nvt_simulation)
+
+params = {'epsilon': 1.0, 'sigma': 1.0}
+key = jax.random.key(42)
+positions = jax.random.uniform(jax.random.key(0), (32, 3)) * 10.0
+
+# This backpropagates through 500 MD steps!
+grads = grad_ke(params, positions, key)
+print(f"d(KE)/d(epsilon): {grads['epsilon']:.6f}")
+print(f"d(KE)/d(sigma):   {grads['sigma']:.6f}")
+</code></pre>
+<div class="code-caption">Listing 42.17: Differentiating through a 500-step NVT molecular dynamics simulation. <code>jax.lax.scan</code> provides a differentiable loop; <code>jax.grad</code> backpropagates through every time step to compute parameter gradients.</div>
+
+<h2>7. Memory Management: Checkpointing Long Trajectories</h2>
+
+<p>
+The <code>jax.lax.scan</code> in Listing 42.17 stores all intermediate states for
+backpropagation. For long trajectories, wrap the scan body with
+<code>jax.checkpoint</code> to trade recomputation for memory:
+</p>
+
+<pre><code class="language-python">import jax
+import functools
+
+def scan_with_checkpointing(f, init, xs, length, checkpoint_every=50):
+    """A scan that checkpoints every K steps for memory efficiency.
+
+    Parameters
+    ----------
+    f : callable
+        Step function (carry, x) -> (carry, y).
+    init : pytree
+        Initial carry value.
+    xs : pytree or None
+        Inputs scanned over (None if no per-step input).
+    length : int
+        Number of scan steps.
+    checkpoint_every : int
+        Checkpoint interval.
+
+    Returns
+    -------
+    tuple
+        (final_carry, stacked_outputs)
+    """
+    @jax.checkpoint
+    def checkpointed_segment(carry, segment_xs):
+        return jax.lax.scan(f, carry, segment_xs)
+
+    n_segments = length // checkpoint_every
+    remainder = length % checkpoint_every
+
+    if xs is None:
+        segments = None
+        segment_length = checkpoint_every
+    else:
+        # Reshape inputs into segments
+        segments = jax.tree.map(
+            lambda x: x[:n_segments * checkpoint_every].reshape(
+                n_segments, checkpoint_every, *x.shape[1:]
+            ), xs
+        )
+        segment_length = checkpoint_every
+
+    # Process segments with checkpointing
+    def outer_step(carry, segment_x):
+        return checkpointed_segment(carry, segment_x)
+
+    if segments is not None:
+        carry, outputs = jax.lax.scan(outer_step, init, segments)
+        # Flatten the segmented outputs
+        outputs = jax.tree.map(
+            lambda x: x.reshape(-1, *x.shape[2:]), outputs
+        )
+    else:
+        # No per-step inputs: use None placeholders
+        carry = init
+        all_outputs = []
+        for _ in range(n_segments):
+            carry, seg_out = checkpointed_segment(
+                carry, jnp.zeros(checkpoint_every)  # dummy
+            )
+            all_outputs.append(seg_out)
+
+    return carry, outputs
+
+# Usage: only O(length / checkpoint_every) states stored
+# instead of O(length)
+</code></pre>
+<div class="code-caption">Listing 42.18: Segmented checkpointing for long trajectories. By wrapping inner scan segments with <code>jax.checkpoint</code>, memory usage drops from $O(N)$ to $O(N / K)$ where $K$ is the checkpoint interval.</div>
+
+<h2>8. Beyond ODEs: Differentiable Discrete Simulations</h2>
+
+<p>
+Not all physics simulations are continuous ODEs. Discrete event simulations, Monte
+Carlo samplers, and lattice models require different differentiation strategies. Two
+approaches extend differentiable programming to these settings:
+</p>
+
+<ul>
+<li><strong>Straight-through estimators</strong>: replace non-differentiable operations (argmax, discrete sampling) with differentiable approximations during the backward pass. The Gumbel-Softmax trick replaces discrete categorical sampling with a continuous relaxation parameterized by a temperature.</li>
+<li><strong>Score function estimators</strong> (REINFORCE): use the identity $\nabla_\theta \mathbb{E}_{p_\theta}[f(x)] = \mathbb{E}_{p_\theta}[f(x) \nabla_\theta \log p_\theta(x)]$ to estimate gradients through stochastic discrete processes without differentiating through the sampling operation itself.</li>
+</ul>
+
+<p>
+For molecular simulations specifically, the reparameterization trick often applies
+naturally. Langevin dynamics samples positions according to
+$x_{t+1} = x_t + \Delta t \, F(x_t)/\gamma + \sqrt{2\Delta t / \gamma} \, \xi_t$
+where $\xi_t \sim \mathcal{N}(0, I)$. Because the noise $\xi_t$ is independent of
+the parameters, we can differentiate through the dynamics while treating $\xi_t$ as
+fixed. This is exactly what JAX-MD's Langevin integrator does.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Differentiable Simulation Closes the Loop</div>
+<p>
+Traditional scientific computing treats simulation as a black box: parameters go in,
+observables come out, and optimization happens outside the simulation loop (grid search,
+evolutionary algorithms, Bayesian optimization). Differentiable simulation opens the
+box: gradients flow from observables back through every simulation step to parameters.
+This closes the optimization loop, enabling gradient-based calibration that converges
+in tens of iterations rather than thousands of black-box evaluations. The
+<a href="../module-45-optimization/index.html">Chapter 45</a> discussion of optimization
+strategies compares gradient-based and gradient-free approaches quantitatively;
+differentiable programming is what makes the gradient-based option available for
+simulation-driven discovery.
+</p>
+</div>
+
+<h2>9. TorchMD-Net: Neural Network Potentials in PyTorch</h2>
+
+<p>
+While this chapter focuses on JAX, the PyTorch ecosystem also supports differentiable
+molecular dynamics through <strong>TorchMD-Net</strong>. It implements equivariant
+neural network potentials (SchNet, PaiNN, TensorNet) that predict energies and forces
+from atomic positions and species. The key difference from JAX-MD is architectural:
+TorchMD-Net uses message-passing neural networks on atomic graphs, while JAX-MD
+emphasizes composable pair potentials.
+</p>
+
+<pre><code class="language-python"># TorchMD-Net: neural network potential in PyTorch
+# (Shown for comparison; the chapter recipe uses JAX)
+import torch
+from torchmdnet.models.model import load_model
+
+# Load a pretrained equivariant potential
+model = load_model("torchmdnet_ani2x.pt")
+
+# Predict energy and forces
+positions = torch.randn(10, 3, requires_grad=True)  # 10 atoms
+species = torch.tensor([6, 6, 6, 1, 1, 1, 1, 8, 7, 1])  # C, H, O, N
+
+energy, forces = model(species, positions)
+print(f"Energy: {energy.item():.4f} eV")
+print(f"Forces shape: {forces.shape}")
+
+# Gradient of energy w.r.t. model parameters for fine-tuning
+loss = (energy - target_energy) ** 2
+loss.backward()  # standard PyTorch backprop
+# model.parameters() now have .grad attributes
+</code></pre>
+<div class="code-caption">Listing 42.19: TorchMD-Net provides equivariant neural network potentials in PyTorch. The same differentiable programming principles apply: <code>loss.backward()</code> propagates gradients through the neural potential.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: diffrax Solves the ODE Plumbing</div>
+<p>
+Implementing the adjoint method from scratch (Listing 42.15's internals) requires
+roughly 200 lines of careful numerical code: the augmented ODE system, the backward
+integration, interpolation of the forward trajectory, and error control. The
+<strong>diffrax</strong> library handles all of this in a single <code>diffeqsolve</code>
+call with the <code>adjoint</code> parameter. It supports five adjoint strategies:
+<code>DirectAdjoint</code> (backprop through solver steps),
+<code>RecursiveCheckpointAdjoint</code> (optimal checkpointing),
+<code>BacksolveAdjoint</code> (continuous adjoint with backward ODE),
+<code>ImplicitAdjoint</code> (for implicit solvers), and
+<code>NoAdjoint</code> (forward-only, no gradients). Choosing the right adjoint is a
+one-line change; the solver, step-size controller, and error tolerances remain the same.
+</p>
+</div>
+
+<h2>10. When Differentiable Physics Breaks Down</h2>
+
+<p>
+Differentiable simulation is powerful but not universal. Several scenarios challenge
+or defeat gradient-based optimization through physics:
+</p>
+
+<ul>
+<li><strong>Chaotic dynamics</strong>: in chaotic systems, the gradient $\partial z(T) / \partial \theta$ grows exponentially with simulation length, producing exploding gradients that are numerically useless. Techniques like least-squares shadowing and ensemble averaging mitigate this for certain classes of chaotic systems.</li>
+<li><strong>Discontinuities</strong>: contact events in rigid body physics, phase transitions, and shock waves create discontinuities in the state trajectory. Gradients do not exist at these points. Smooth approximations (soft contact models, diffuse interfaces) or event-driven differentiation are needed.</li>
+<li><strong>Stiff systems</strong>: implicit integrators for stiff ODEs involve solving nonlinear systems at each step. Differentiating through the nonlinear solve requires implicit differentiation (via the implicit function theorem), which diffrax handles through <code>ImplicitAdjoint</code>.</li>
+<li><strong>Long time horizons</strong>: even in non-chaotic systems, gradients through very long trajectories ($> 10^6$ steps) can suffer from vanishing gradients or accumulating numerical error. The adjoint method with adaptive step-size control is more robust than naive backpropagation, but monitoring gradient norms during training is essential.</li>
+</ul>
+
+<p>
+For discovery applications, these limitations motivate hybrid approaches: use
+differentiable simulation for short-horizon optimization (force field fitting,
+initial condition search) and gradient-free methods
+(<a href="../module-45-optimization/index.html">Chapter 45</a>) for problems where
+gradients are unreliable.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+MACE (Multi-Atomic Cluster Expansion), introduced by Batatia et al. (2023, NeurIPS),
+pushes differentiable molecular dynamics beyond pair and three-body potentials by
+learning higher-order equivariant message-passing representations that capture
+many-body interactions up to arbitrary correlation order. MACE-MP-0, a foundation model
+trained on the Materials Project database, achieves near-DFT accuracy across the
+periodic table while remaining fast enough for nanosecond-scale MD simulations. The
+architecture is fully differentiable: gradients flow from trajectory-level observables
+through the MACE potential back to its learnable parameters, enabling fine-tuning on
+domain-specific data with only tens of reference structures. This represents a shift
+from hand-designed functional forms (Lennard-Jones, EAM) toward learned, many-body
+potentials that are both differentiable and transferable across chemical compositions.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Gradient-Based Spring Constant Fitting with diffrax</h4>
+<p>
+Build a mini parameter-fitting pipeline that recovers a spring constant from observed
+oscillator data, using only diffrax, JAX, and optax (a standard JAX optimizer library).
+</p>
+<ol>
+<li><strong>Generate synthetic data.</strong> Using the <code>damped_oscillator</code> function from Listing 42.15, simulate a trajectory with known parameters ($k = 2.0$, $\gamma = 0.3$) for $t \in [0, 10]$. Save the position at 20 evenly spaced time points as your "experimental" reference data.</li>
+<li><strong>Define the loss function.</strong> Write a function <code>loss_fn(params)</code> that solves the ODE with <code>diffrax.diffeqsolve</code> using candidate parameters, extracts positions at the same 20 time points via <code>SaveAt(ts=...)</code>, and returns the mean squared error against the reference data.</li>
+<li><strong>Set up gradient descent.</strong> Initialize with a wrong guess ($k = 5.0$, $\gamma = 1.0$). Use <code>optax.adam(learning_rate=0.05)</code> for the optimizer. In a loop of 200 iterations, call <code>jax.value_and_grad(loss_fn)</code>, apply the update, and print the loss every 20 steps.</li>
+<li><strong>Verify convergence.</strong> After training, compare the recovered $k$ and $\gamma$ to the true values. The recovered values should match to within 1% after roughly 100 iterations.</li>
+<li><strong>Visualize.</strong> Plot the reference trajectory, the initial-guess trajectory, and the final fitted trajectory on one figure using matplotlib to confirm the fit visually.</li>
+</ol>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+<a href="section-42.4.html">Section 42.4: Building a Differentiable Force Field</a>
+puts everything from this chapter into practice. We calibrate a Lennard-Jones force
+field by backpropagating through a molecular dynamics trajectory to match a target
+radial distribution function. The recipe combines reverse-mode AD, <code>vmap</code>,
+<code>jit</code>, and the checkpointed simulation loop from this section into a
+complete, runnable parameter optimization pipeline.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-category">
+<h3>Core References</h3>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1806.07366" target="_blank">Chen, R. T. Q., Rubanova, Y., Bettencourt, J., &amp; Duvenaud, D. (2018). Neural ordinary differential equations. <em>NeurIPS 2018</em>.</a>
+<p>Introduced the continuous adjoint method for neural ODEs, enabling constant-memory gradient computation through ODE solvers.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1912.04232" target="_blank">Schoenholz, S. S. &amp; Cubuk, E. D. (2020). JAX, M.D.: A framework for differentiable physics. <em>NeurIPS 2020</em>.</a>
+<p>The JAX-MD library paper, demonstrating end-to-end differentiable molecular dynamics for learning interatomic potentials.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2202.02435" target="_blank">Kidger, P. (2022). On neural differential equations. <em>PhD thesis</em>, University of Oxford.</a>
+<p>Comprehensive treatment of neural ODEs and SDEs, including the diffrax library and its adjoint method implementations.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2202.02541" target="_blank">Doerr, S., et al. (2021). TorchMD: A deep learning framework for molecular simulations. <em>JCTC</em>, 17(3), 2355-2363.</a>
+<p>The TorchMD framework for differentiable molecular dynamics in PyTorch, enabling end-to-end learning of neural network potentials.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1137/1.9780898717761" target="_blank">Griewank, A. &amp; Walther, A. (2008). <em>Evaluating Derivatives</em>, 2nd ed. SIAM.</a>
+<p>Covers checkpointing theory (the revolve algorithm) essential for memory-efficient differentiation through long simulations.</p>
+</div>
+</div>
+</section>
+
+</main>
+
+<nav class="nav-footer">
+<a href="section-42.2.html">&larr; 42.2 JAX Functional Transforms</a>
+<a href="section-42.4.html">42.4 Building a Differentiable Force Field &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

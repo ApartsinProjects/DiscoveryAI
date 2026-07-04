@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.2: Protein and Molecular Models. ESM-2, ESM-3, ProGen2, Uni-Mol2, MolFormer: architectures, pretraining, and practical usage." name="description"/>
+<title>Section 27.2: Protein and Molecular Models | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Scientific Foundation Models</a></div>
+<h1>27.2 Protein and Molecular Models</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"Every protein is a sentence written in a twenty-letter alphabet by three billion years of editors who never held a meeting. Good luck parsing that without pretraining."</p>
+<cite>A Diffusion Model, Halfway Through Denoising a Protein</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Proteins and small molecules are the workhorses of biology and drug discovery. This section surveys five foundation models that have transformed how we compute with these molecular systems: ESM-2 and ESM-3 for protein understanding, ProGen2 for protein generation, and Uni-Mol2 and MolFormer for molecular property prediction. For each model, we explain the architecture, the pretraining strategy, and how to use it in practice. By the end, you will know which model to reach for given a specific scientific question and how to extract useful representations from each.</p>
+</div>
+
+<h2>1. ESM-2: The Protein Language Model</h2>
+
+<p>ESM-2 (Lin et al., 2023) is the most widely used protein foundation model. Developed by Meta AI, it is a transformer encoder trained with masked language modeling (MLM) on 65 million protein sequences from the UniRef50 database. The model family spans six sizes, from 8 million to 15 billion parameters, with the 650M variant (esm2_t33_650M_UR50D) offering the best balance of performance and computational cost for most applications.</p>
+
+<p data-agent="02">Masked language modeling on proteins works by analogy to a fill-in-the-blank test: the model sees most of the amino acid sequence but must guess the identity of hidden positions, forcing it to learn which residues are compatible at each site given the rest of the protein. This matters because the co-occurrence patterns the model absorbs are not arbitrary; they encode the biophysical constraints that evolution has enforced over billions of years, including 3D contacts, stability requirements, and functional roles. The mechanism is straightforward: each masked position is predicted via a softmax classifier over the 20 standard amino acids, and the cross-entropy loss drives the model to internalize deep co-evolutionary statistics that rival dedicated multiple sequence alignment methods like EVcouplings, but at a fraction of the inference cost. Use ESM-2's learned representations over traditional alignment-based features (e.g., PSSM profiles) when you have limited homologous sequences, need GPU-speed throughput, or want a single embedding model that transfers across many downstream tasks without per-family curation.</p>
+
+<p><strong>What.</strong> A BERT-style transformer encoder that takes amino acid sequences as input and produces per-residue embeddings as output.</p>
+
+<p><strong>Why.</strong> Protein sequences are the most abundant form of biological data. UniProt contains over 250 million sequences, but fewer than 200,000 have experimentally determined 3D structures. ESM-2 bridges this gap by learning structural and functional information directly from sequences.</p>
+
+<p><strong>How.</strong> During pretraining, 15% of residues in each sequence are randomly masked, and the model predicts their identity from the surrounding context. This forces the model to learn co-evolutionary patterns: which residues tend to co-occur at specific positions across homologous proteins. These patterns encode 3D contacts, allosteric networks, and functional constraints.</p>
+
+<p><strong>When.</strong> Use ESM-2 when you need per-residue or per-protein representations for downstream tasks. It excels at property prediction (stability, solubility, function), variant effect prediction (which mutations are deleterious), and contact/structure prediction.</p>
+
+<div class="callout warning" data-agent="10"><h4>Common Misconception</h4><p>A frequent misconception is that ESM-2 "knows" protein 3D structure because it was trained on structural data. In reality, ESM-2 was trained exclusively on amino acid sequences with no 3D coordinates whatsoever; its ability to predict residue contacts and infer structural features emerges entirely from the statistical patterns of co-evolution encoded in millions of sequences, not from any explicit structural supervision.</p></div>
+
+<p>The masked language modeling objective maximizes:</p>
+
+$$\mathcal{L}_{\text{MLM}} = \sum_{i \in \mathcal{M}} \log p(x_i \mid x_{\setminus \mathcal{M}})$$
+
+<p>where $\mathcal{M}$ is the set of masked positions and $x_{\setminus \mathcal{M}}$ denotes the unmasked residues. The probability $p(x_i \mid x_{\setminus \mathcal{M}})$ is computed by a softmax over the 20 standard amino acids (plus special tokens) at each masked position.</p>
+
+<pre><code class="language-python">from transformers import AutoTokenizer, EsmModel
+import torch
+
+# Load ESM-2 (650M variant)
+tokenizer = AutoTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
+model = EsmModel.from_pretrained("facebook/esm2_t33_650M_UR50D")
+model.eval()
+
+# Three proteins with known properties
+proteins = {
+    "GFP":    "MSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTFSYGVQCFSRYPDHMKQHDFFKSAMPEGYVQERTIFFKDDGNYKTRAEVKFEGDTLVNRIELKGIDFKEDGNILGHKLEYNYNSHNVYIMADKQKNGIKVNFKIRHNIEDGSVQLADHYQQNTPIGDGPVLLPDNHYLSTQSALSKDPNEKRDHMVLLEFVTAAGITHGMDELYK",
+    "Insulin": "FVNQHLCGSHLVEALYLVCGERGFFYTPKT",
+    "Ubiquitin": "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG"
+}
+
+for name, seq in proteins.items():
+    inputs = tokenizer(seq, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    # Per-residue embeddings (exclude BOS/EOS)
+    residue_embs = outputs.last_hidden_state[0, 1:len(seq)+1]
+    # Protein-level embedding by mean pooling
+    protein_emb = residue_embs.mean(dim=0)
+
+    print(f"{name:12s} | length={len(seq):4d} | "
+          f"residue_emb={residue_embs.shape} | "
+          f"protein_emb={protein_emb.shape} | "
+          f"norm={protein_emb.norm():.2f}")</code></pre>
+<div class="code-caption">Listing 27.4: Loading ESM-2 and extracting both per-residue and protein-level embeddings for three well-known proteins. Mean pooling over residue positions produces a fixed-length vector regardless of sequence length.</div>
+
+<pre><code class="language-text">GFP          | length= 238 | residue_emb=torch.Size([238, 1280]) | protein_emb=torch.Size([1280]) | norm=5.73
+Insulin      | length=  30 | residue_emb=torch.Size([30, 1280])  | protein_emb=torch.Size([1280]) | norm=6.81
+Ubiquitin    | length=  76 | residue_emb=torch.Size([76, 1280])  | protein_emb=torch.Size([1280]) | norm=6.12</code></pre>
+<div class="code-caption">Output 27.4: Each protein maps to a 1280-dimensional vector. The embedding norms vary, suggesting that the model captures intrinsic differences in sequence complexity.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Attention Heads as Structure Predictors</div>
+<p>Rao et al. (2021) showed that individual attention heads in protein language models specialize in predicting specific structural features. Some heads track sequence-local patterns (alpha helices, beta strands); others track long-range contacts between residues that are distant in sequence but close in 3D space. Extracting the attention maps from ESM-2 and using logistic regression on the symmetrized attention weights yields contact prediction accuracy competitive with coevolution-based methods like DCA, without ever seeing a 3D structure during training. This is a concrete example of the emergent reasoning we discussed in <a href="section-27.1.html">Section 27.1</a>.</p>
+</div>
+
+<h2>2. ESM-3: Multimodal Protein Intelligence</h2>
+
+<p>ESM-3 (Hayes et al., 2024) extends the ESM line from sequence-only to multimodal. It jointly processes three tracks: amino acid sequence, 3D structure (represented as discrete structure tokens from a VQ-VAE), and function annotations (represented as keyword tokens from InterPro and Gene Ontology). The model uses a single transformer architecture with all three modalities projected into a shared token space.</p>
+
+<p>The pretraining objective is masked generative modeling across all three tracks simultaneously. A fraction of tokens from each track is masked, and the model predicts them conditioned on whatever tokens remain visible from any track. This means ESM-3 can:</p>
+
+<ul>
+<li>Predict structure from sequence (like ESMFold)</li>
+<li>Predict function from structure (structure-based annotation)</li>
+<li>Generate sequence given a desired structure and function (inverse folding + function conditioning)</li>
+<li>Complete any partial specification across modalities</li>
+</ul>
+
+<div class="callout tip" data-agent="06"><h4>Mental Model</h4><p>Think of ESM-3's multimodal masking like a crossword puzzle with three overlapping grids: one grid holds the letters (sequence), another holds the shape of each letter's bounding box (structure), and a third holds the clue category (function). When you erase some cells in all three grids, a solver can use a visible letter to infer the shape of a neighboring box, or use a shape to narrow down which clue category applies. The three grids share enough mutual information that partial knowledge in any one grid constrains the others. ESM-3 works the same way: visible tokens from any track help predict masked tokens in the other two, because sequence, structure, and function are three correlated views of the same underlying protein.</p></div>
+
+<pre><code class="language-python"># ESM-3 usage through the esm Python package
+# Note: ESM-3 requires the 'esm' package from EvolutionaryScale
+# pip install esm
+
+from esm.models.esm3 import ESM3
+from esm.sdk.api import ESMProtein, GenerationConfig
+
+# Initialize ESM-3 (open small model, 1.4B parameters)
+model = ESM3.from_pretrained("esm3_sm_open_v1")
+
+# Create a protein from sequence
+protein = ESMProtein(
+    sequence="MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG"
+)
+
+# Generate structure tokens conditioned on sequence
+structure_prediction = model.generate(
+    protein,
+    GenerationConfig(
+        track="structure",      # predict structure track
+        num_steps=10,           # iterative refinement steps
+        temperature=0.7         # sampling temperature
+    )
+)
+
+print(f"Input sequence length: {len(protein.sequence)}")
+print(f"Generated structure tokens: {len(structure_prediction.structure)}")</code></pre>
+<div class="code-caption">Listing 27.5: Using ESM-3 to predict structure from sequence. The model generates discrete structure tokens that can be decoded into 3D coordinates. The iterative refinement procedure progressively unmasks structure positions.</div>
+
+<p>The multimodal design of ESM-3 produced one of the most striking demonstrations in computational biology. By conditioning generation on a desired function ("green fluorescence") and iteratively sampling across sequence and structure tracks, ESM-3 generated a novel fluorescent protein, esmGFP, that shares only 58% sequence identity with known GFPs but folds and fluoresces in the laboratory. This is the protein equivalent of writing a grammatically correct, meaningful sentence in an alien language: the model has internalized enough biophysics to create functional proteins from scratch.</p>
+
+<h2>3. ProGen2: Autoregressive Protein Generation</h2>
+
+<p>While ESM-2 and ESM-3 use masked objectives (bidirectional context), ProGen2 (Nijkamp et al., 2023) takes the GPT approach: autoregressive, left-to-right generation. The model is trained to predict each amino acid conditioned on all previous amino acids:</p>
+
+$$p(x_1, x_2, \ldots, x_L) = \prod_{i=1}^{L} p(x_i \mid x_1, \ldots, x_{i-1})$$
+
+<p>ProGen2 was trained on protein sequences from UniRef90 and BFD (Big Fantastic Database), with the largest variant reaching 6.4 billion parameters. The autoregressive design makes ProGen2 naturally suited for <em>generation</em> tasks: designing new proteins by sampling from the learned distribution.</p>
+
+<p><strong>When to use ProGen2 vs. ESM-2.</strong> Use ESM-2 when you need embeddings or per-residue predictions (classification, regression, variant effects). Use ProGen2 when you need to generate new protein sequences (protein design, library construction, directed evolution in silico). The distinction mirrors the BERT-vs-GPT divide in NLP: encoders for understanding, decoders for generation.</p>
+
+<pre><code class="language-python">from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+# Load ProGen2 (small variant for demonstration)
+tokenizer = AutoTokenizer.from_pretrained("hugohrban/progen2-small")
+model = AutoModelForCausalLM.from_pretrained("hugohrban/progen2-small")
+model.eval()
+
+# Generate a protein sequence by sampling
+# Start with a seed (first few residues of a kinase)
+seed = "MTEYKLVVVGAVGVGKSALT"
+input_ids = tokenizer(seed, return_tensors="pt").input_ids
+
+with torch.no_grad():
+    output = model.generate(
+        input_ids,
+        max_new_tokens=80,
+        do_sample=True,
+        temperature=0.8,
+        top_k=40,
+        repetition_penalty=1.2,
+    )
+
+generated = tokenizer.decode(output[0], skip_special_tokens=True)
+print(f"Seed:      {seed}")
+print(f"Generated: {generated}")
+print(f"Total length: {len(generated)}")</code></pre>
+<div class="code-caption">Listing 27.6: Autoregressive protein generation with ProGen2. Given a seed sequence (the first 20 residues of KRAS), the model generates a plausible continuation by sampling from the learned amino acid distribution.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: In Silico Directed Evolution</div>
+<p>A synthetic biology startup wants to create a library of enzyme variants with improved thermostability for an industrial biocatalysis application. Instead of random mutagenesis (which explores sequence space blindly), they use ProGen2 to generate 10,000 candidate sequences by conditioning on the wild-type enzyme's first 50 residues and sampling at temperature 0.6. They filter the generated sequences using ESM-2 embeddings, keeping only variants whose embeddings cluster near the wild-type in representation space (suggesting they fold similarly). This two-model pipeline, ProGen2 for generation and ESM-2 for filtering, produces a focused library where 40% of variants are expressible and functional, compared to 5% for random mutagenesis. We will build a similar pipeline in <a href="../../part-6-scientific-domains/module-48-biology-medicine/index.html">Chapter 48</a>.</p>
+</div>
+
+<h2>4. Uni-Mol2: Molecular Pretraining at Scale</h2>
+
+<p>Moving from proteins to small molecules, Uni-Mol2 (Ji et al., 2024) is a molecular foundation model that combines three levels of representation: atomic features (element type, charge, hybridization), pairwise features (bond type, spatial distance), and molecular features (global descriptors). The model uses a transformer architecture with specialized attention mechanisms for each level.</p>
+
+<p>Uni-Mol2 was pretrained on 800 million molecular conformations generated by RDKit from a cleaned subset of the ZINC database. The pretraining objective combines three tasks:</p>
+
+<ol>
+<li><strong>Atom-level:</strong> predict masked atomic features from surrounding context</li>
+<li><strong>Pair-level:</strong> predict pairwise distances between atoms</li>
+<li><strong>Molecule-level:</strong> predict global molecular properties (LogP, molecular weight) from the learned representation</li>
+</ol>
+
+<p>This multi-level design enables Uni-Mol2 to capture both local chemical bonding patterns and global molecular shape, making it effective for tasks ranging from ADMET property prediction to binding affinity estimation.</p>
+
+<pre><code class="language-python"># Preparing molecular features for a foundation model
+# Demonstrates the three levels of molecular representation
+
+import numpy as np
+from rdkit import Chem
+from rdkit.Chem import AllChem, Descriptors
+
+def prepare_molecule_features(smiles: str) -> dict:
+    """Prepare input features for a molecular foundation model.
+
+    Demonstrates the three levels of molecular representation
+    that models like Uni-Mol2 consume.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    mol = Chem.AddHs(mol)
+
+    # Generate a 3D conformation
+    AllChem.EmbedMolecule(mol, randomSeed=42)
+    AllChem.MMFFOptimizeMolecule(mol)
+    conf = mol.GetConformer()
+
+    # Level 1: Atomic features
+    atom_features = []
+    for atom in mol.GetAtoms():
+        atom_features.append({
+            "element": atom.GetSymbol(),
+            "atomic_num": atom.GetAtomicNum(),
+            "formal_charge": atom.GetFormalCharge(),
+            "hybridization": str(atom.GetHybridization()),
+            "aromatic": atom.GetIsAromatic(),
+            "position": list(conf.GetAtomPosition(atom.GetIdx()))
+        })
+
+    # Level 2: Pairwise distances
+    n_atoms = mol.GetNumAtoms()
+    distance_matrix = np.zeros((n_atoms, n_atoms))
+    for i in range(n_atoms):
+        for j in range(n_atoms):
+            pos_i = conf.GetAtomPosition(i)
+            pos_j = conf.GetAtomPosition(j)
+            distance_matrix[i, j] = pos_i.Distance(pos_j)
+
+    # Level 3: Molecular descriptors
+    mol_no_h = Chem.RemoveHs(mol)
+    mol_features = {
+        "molecular_weight": Descriptors.MolWt(mol_no_h),
+        "logp": Descriptors.MolLogP(mol_no_h),
+        "num_rotatable_bonds": Descriptors.NumRotatableBonds(mol_no_h),
+        "tpsa": Descriptors.TPSA(mol_no_h),
+        "num_heavy_atoms": mol_no_h.GetNumHeavyAtoms()
+    }
+
+    return {
+        "atoms": atom_features,
+        "distances": distance_matrix,
+        "molecule": mol_features
+    }
+
+# Example: aspirin
+features = prepare_molecule_features("CC(=O)OC1=CC=CC=C1C(=O)O")
+print(f"Atoms: {len(features['atoms'])} (including hydrogens)")
+print(f"Distance matrix: {features['distances'].shape}")
+print(f"Molecular weight: {features['molecule']['molecular_weight']:.1f}")
+print(f"LogP: {features['molecule']['logp']:.2f}")
+print(f"Heavy atoms: {features['molecule']['num_heavy_atoms']}")</code></pre>
+<div class="code-caption">Listing 27.7: Preparing the three levels of molecular features that Uni-Mol2 consumes: atom-level (element, charge, hybridization, 3D position), pair-level (distance matrix), and molecule-level (global descriptors). RDKit handles conformation generation and descriptor computation.</div>
+
+<h2>5. MolFormer: Linear Attention for Molecular SMILES</h2>
+
+<p>MolFormer (Ross et al., 2022) takes a deliberately simpler approach than Uni-Mol2. Instead of 3D conformations and multi-level features, MolFormer treats molecules as SMILES strings and applies a transformer with linear attention. The model was pretrained on 1.1 billion molecules from the PubChem and ZINC databases using masked SMILES token prediction.</p>
+
+<p>The key architectural choice is <strong>linear attention</strong>, which replaces the standard $O(L^2)$ self-attention with a $O(L)$ approximation. Standard attention computes:</p>
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V$$
+
+<p>Linear attention replaces the softmax with a kernel function $\phi$:</p>
+
+$$\text{LinearAttn}(Q, K, V) = \frac{\phi(Q)(\phi(K)^T V)}{\phi(Q)(\phi(K)^T \mathbf{1})}$$
+
+<p>By computing $\phi(K)^T V$ first (an $O(d \cdot d)$ operation), the overall complexity drops from $O(L^2 d)$ to $O(L d^2)$, which is linear in sequence length. For long SMILES strings (macrocycles, polymers), this is a significant speedup.</p>
+
+<pre><code class="language-python">from transformers import AutoModel, AutoTokenizer
+import torch
+
+# Load MolFormer
+tokenizer = AutoTokenizer.from_pretrained("ibm/MoLFormer-XL-both-10pct")
+model = AutoModel.from_pretrained(
+    "ibm/MoLFormer-XL-both-10pct", trust_remote_code=True
+)
+model.eval()
+
+# Encode a set of drug molecules
+drugs = {
+    "Aspirin":    "CC(=O)OC1=CC=CC=C1C(=O)O",
+    "Ibuprofen":  "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O",
+    "Caffeine":   "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
+    "Penicillin": "CC1(C(N2C(S1)C(C2=O)NC(=O)CC3=CC=CC=C3)C(=O)O)C",
+}
+
+embeddings = {}
+for name, smiles in drugs.items():
+    inputs = tokenizer(smiles, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    # CLS token embedding
+    embeddings[name] = outputs.last_hidden_state[0, 0]
+
+# Compute pairwise similarities
+names = list(embeddings.keys())
+print("Pairwise cosine similarities:")
+print(f"{'':15s}", end="")
+for n in names:
+    print(f"{n:12s}", end="")
+print()
+
+for i, n1 in enumerate(names):
+    print(f"{n1:15s}", end="")
+    for j, n2 in enumerate(names):
+        sim = torch.nn.functional.cosine_similarity(
+            embeddings[n1].unsqueeze(0), embeddings[n2].unsqueeze(0)
+        ).item()
+        print(f"{sim:12.3f}", end="")
+    print()</code></pre>
+<div class="code-caption">Listing 27.8: Encoding drug molecules with MolFormer and computing pairwise cosine similarities. Structurally related molecules (aspirin and ibuprofen, both NSAIDs) should show higher similarity than unrelated molecules.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DeepChem for Molecular Property Prediction</div>
+<p>If you need molecular property predictions without building a custom pipeline, DeepChem provides pretrained models with a scikit-learn-like API: <code>dc.molnet.load_tox21()</code> loads a toxicity dataset, <code>dc.models.AttentiveFPModel()</code> trains a graph neural network, and <code>model.predict(dataset)</code> returns predictions. DeepChem wraps over 30 molecular featurizers and 15 model architectures into a unified interface, reducing what would be hundreds of lines of RDKit + PyTorch code to about 10 lines. The tradeoff is flexibility: for custom architectures or novel pretraining objectives, you will need the lower-level tools shown in this section.</p>
+</div>
+
+<h2>6. Choosing the Right Model</h2>
+
+<p>With five protein and molecular models to choose from, the selection can feel overwhelming. The following decision tree simplifies the choice:</p>
+
+<ol>
+<li><strong>Is your data protein sequences?</strong> If yes, use ESM-2 for understanding/prediction tasks and ProGen2 for generation tasks. If you need structure prediction, use ESM-3 or ESMFold.</li>
+<li><strong>Is your data small molecules with known 3D conformations?</strong> If yes, use Uni-Mol2 for the best accuracy on property prediction tasks.</li>
+<li><strong>Is your data small molecules as SMILES strings (no 3D)?</strong> If yes, use MolFormer for fast embedding extraction and property prediction.</li>
+<li><strong>Do you need to combine protein and molecular data?</strong> Consider the multimodal approaches in <a href="../module-28-multimodal-scientific-ai/index.html">Chapter 28</a>.</li>
+</ol>
+
+<p>Computational cost also matters. ESM-2 at 650M parameters requires about 2.5 GB of GPU memory for inference; at 3B parameters, it requires about 12 GB. MolFormer at 47M parameters runs comfortably on a CPU. ProGen2 at 6.4B parameters needs at least 24 GB of GPU memory (or quantization). When choosing a model, always benchmark the inference latency on your specific hardware before committing to a pipeline design. We will discuss how to make these large models practical through parameter-efficient fine-tuning in <a href="section-27.4.html">Section 27.4</a>.</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: All-Atom Generative Models</div>
+<p>The models in this section treat proteins and small molecules as separate domains. A newer wave of all-atom generative models collapses this boundary. Boltz-1 (Wohlwend et al., 2024), an open-source system from MIT, predicts the joint 3D structure of protein-ligand, protein-nucleic acid, and multimeric complexes with accuracy approaching AlphaFold 3, using a diffusion-based architecture trained on the Protein Data Bank. Similarly, Chai-1 (Chai Discovery, 2024) achieves state-of-the-art performance on the CASP15 ligand-binding benchmark while accepting arbitrary molecular inputs (proteins, small molecules, nucleic acids, covalent modifications) in a single forward pass. These all-atom co-folding models move beyond the "dock first, then score" pipeline toward end-to-end prediction of biomolecular interactions, although training data for non-protein complexes remains a limiting factor.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<div class="callout-title">Try It: Compare Protein Embeddings Across Model Sizes</div>
+<p>Build a mini-benchmark to see how ESM-2 model scale affects embedding quality for a simple classification task.
+(1) Pick 10 protein sequences from UniProt spanning two families (e.g., 5 kinases and 5 proteases); store them in a Python dictionary mapping name to sequence.
+(2) Install the <code>transformers</code> and <code>torch</code> packages, then load two ESM-2 checkpoints: <code>facebook/esm2_t6_8M_UR50D</code> (8M parameters) and <code>facebook/esm2_t33_650M_UR50D</code> (650M parameters).
+(3) For each model, extract per-protein embeddings by mean-pooling the last hidden state over residue positions (excluding special tokens), producing one vector per protein.
+(4) Use <code>sklearn.metrics.pairwise.cosine_similarity</code> to build a 10x10 similarity matrix for each model. Visualize both matrices side by side with <code>matplotlib.pyplot.imshow</code>.
+(5) Observe whether the 650M model produces tighter within-family clusters and larger between-family gaps than the 8M model. Compute the ratio of mean within-family similarity to mean between-family similarity for each model and compare. This ratio quantifies how much extra "biological signal" the larger model captures.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Protein Alphabet</div>
+<p>English uses 26 letters. Proteins use 20 amino acids (or 25, counting selenocysteine, pyrrolysine, and ambiguity codes). But the effective vocabulary is far richer: ESM-2's tokenizer maps each amino acid to a single token, but the model's internal representations reveal that the "meaning" of alanine at position 42 is completely different from alanine at position 200, just as the word "bank" means different things on a river and in a financial district. The context window of a protein language model is the entire evolutionary history of a protein family, compressed into a single forward pass.</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise">
+<p><strong>Exercise 27.4 (Conceptual):</strong> Compare the masked language modeling objective (ESM-2) with the autoregressive objective (ProGen2). What are the inductive biases of each? Why is masked modeling preferred for representation learning while autoregressive modeling is preferred for generation?</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 27.5 (Coding):</strong> Using MolFormer, compute embeddings for a set of 20 common drug molecules. Cluster them using k-means (from <a href="../module-25-exploratory-discovery/index.html">Chapter 25</a>) and visualize the clusters with UMAP (from <a href="../module-26-representation-learning/index.html">Chapter 26</a>). Do the clusters correspond to known drug classes (e.g., NSAIDs, antibiotics, antihistamines)?</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 27.6 (Analysis):</strong> Download ESM-2 at two different sizes (8M and 650M parameters). Compute embeddings for the same 100 proteins and train a simple linear classifier for subcellular localization on each set of embeddings. Quantify the accuracy improvement from scaling and discuss whether it follows the scaling laws from <a href="section-27.1.html">Section 27.1</a>.</p>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-27.1.html">&#8592; 27.1 What Makes a Scientific Foundation Model</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="section-27.3.html">27.3 Materials and Genomics Models &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 30.4: Building an Anomaly Discovery Pipeline. Three-method ensemble anomaly detection with consensus scoring, ground-truth validation, and Discovery Workbench integration." name="description"/>
+<title>Section 30.4: Building an Anomaly Discovery Pipeline | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 30: Anomaly and Novelty Discovery</a></div>
+<h1>30.4 Building an Anomaly Discovery Pipeline</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"Three detectors agreed it was anomalous. Two of them agreed on why. The third detector was not even looking at the same features, and that is exactly why I trust it."</p>
+<cite>An Ensemble Method That Learned to Appreciate Disagreement</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section brings together every technique from the chapter. You should be comfortable with
+the classical detectors from <a href="section-30.1.html">Section 30.1</a> (LOF, HDBSCAN, Isolation
+Forest), the deep methods from <a href="section-30.2.html">Section 30.2</a> (autoencoders, VAEs),
+and the drift detection concepts from <a href="section-30.3.html">Section 30.3</a>. We also
+draw on the data pipeline architecture from <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>
+and the evaluation methodology from <a href="../../part-2-software-engineering/module-22-mlops-llmops/index.html">Chapter 22: MLOps</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+No single anomaly detection method dominates across all data types and anomaly patterns. LOF
+catches local density anomalies that Isolation Forest misses. Isolation Forest catches
+high-dimensional anomalies that KDE cannot handle. Autoencoders catch structural anomalies
+invisible to all tabular methods. The solution is an <strong>ensemble pipeline</strong>: run
+multiple detectors with complementary assumptions, combine their scores, and rank anomalies by
+consensus. This section builds exactly that pipeline, end to end, from raw data ingestion
+through consensus scoring to ground-truth validation. The result is a reusable component for
+the Discovery Workbench that can be deployed in any scientific domain.
+</p>
+</div>
+
+<h2>1. The Three-Method Ensemble Strategy</h2>
+
+<p>
+The design principle is deliberate diversity. We combine three methods chosen for
+complementary strengths:
+</p>
+
+<ol>
+<li><strong>Isolation Forest</strong>: a tree-based method that detects anomalies through ease of
+isolation. It makes no density assumptions, scales linearly, and handles high-dimensional data
+naturally. Its blind spot is anomalies near cluster boundaries.</li>
+<li><strong>LOF (Local Outlier Factor)</strong>: a density-based method that detects local anomalies
+by comparing each point's density to its neighbors'. It excels at finding anomalies in datasets
+with clusters of varying density. Its blind spot is global anomalies in uniformly distributed data.</li>
+<li><strong>Autoencoder reconstruction error</strong>: a deep method that detects anomalies through
+learned data representations. It captures structural and nonlinear patterns invisible to
+distance-based methods. Its blind spot is anomalies that the network can reconstruct well
+(when the bottleneck is too wide).</li>
+</ol>
+
+<p>
+Each method scores anomalies on a different scale. To combine them meaningfully, we need score
+normalization. The standard approach is to convert each method's raw scores to a common scale
+using one of three strategies:
+</p>
+
+<p>
+<strong>Rank normalization</strong>: replace each score with its rank divided by the number of samples.
+This is the most robust option because it is invariant to the score distribution shape. A point
+ranked 5th out of 1,000 by Isolation Forest and 3rd out of 1,000 by LOF receives normalized
+scores of 0.005 and 0.003 regardless of the raw score magnitudes.
+</p>
+
+<p data-agent="02">
+Rank normalization is a nonparametric score calibration technique that converts each detector's raw anomaly scores into a uniform distribution on $[0, 1]$ by replacing each score with its fractional position in the sorted order. It matters because raw anomaly scores from different detectors live on incomparable scales: Isolation Forest might output values near $-0.5$, LOF might output values near 1.2, and an autoencoder might output reconstruction errors near 0.01. Without normalization, averaging these numbers would let whichever detector produces the largest magnitudes dominate the ensemble. The mechanism is simple: sort the $n$ scores, assign each its rank (1 through $n$), then divide by $n - 1$ so the least anomalous point maps to 0 and the most anomalous maps to 1. Prefer rank normalization over min-max or z-score alternatives whenever the raw score distributions are skewed, heavy-tailed, or contain extreme outliers, which is the typical case for anomaly scores; reserve z-score normalization for the rare scenario where all detectors produce approximately Gaussian score distributions.
+</p>
+
+<p>
+<strong>Min-max normalization</strong>: scale scores to $[0, 1]$ using $\hat{s} = (s - s_{\min}) / (s_{\max} - s_{\min})$. Simple but sensitive to extreme outliers in the score distribution.
+</p>
+
+<p>
+<strong>Z-score normalization</strong>: transform to zero mean and unit variance. Assumes roughly
+Gaussian score distributions, which is often violated for anomaly scores (they are typically
+right-skewed).
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of consensus scoring like three independent food inspectors evaluating restaurants. One inspector checks kitchen cleanliness (structural patterns, like the autoencoder). Another checks whether the restaurant's health record differs from neighboring restaurants in the same district (local density, like LOF). A third checks how easy it is to find something wrong compared to a random restaurant (isolation ease, like Isolation Forest). If all three inspectors flag the same restaurant, you can be confident there is a real problem, even though each inspector used entirely different criteria. A restaurant flagged by only one inspector might just be unusual along one dimension (a messy kitchen in an otherwise fine establishment). The key mechanism is that each inspector's blind spot is covered by the others: the cleanliness inspector might miss a restaurant that looks clean but has suspicious supplier patterns, but the density-based inspector will notice it stands out from its neighborhood.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Why Three Methods, Not Thirty?</div>
+<p>
+Adding more detectors to an ensemble does not always improve performance. Each method brings both
+signal (genuine anomaly sensitivity) and noise (false positives specific to its assumptions). If
+two methods share the same blind spot (e.g., both are distance-based), adding the second does not
+add independent evidence. The sweet spot is 3 to 5 methods from <em>different algorithmic
+families</em> (tree-based, density-based, reconstruction-based, likelihood-based). Beyond 5 methods,
+the marginal benefit of each additional detector shrinks while the computational cost and
+complexity of score combination grow. The PyOD library's SUOD (Scalable Unsupervised Outlier
+Detection) framework formalizes this with automatic method selection based on dataset
+characteristics.
+</p>
+</div>
+
+<h2>2. The Complete Pipeline Implementation</h2>
+
+<p>
+The pipeline below processes a dataset through three detectors, normalizes and combines scores,
+and produces a ranked anomaly report. It is designed to be domain-agnostic: swap in your
+scientific data and adjust the contamination estimate, and the pipeline handles the rest.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is believing that the <code>contamination</code> parameter controls how sensitive the pipeline is to anomalies: "set contamination higher to catch more real anomalies." This is wrong. The contamination parameter is an estimate of the fraction of anomalies already present in your data, not a sensitivity knob. Setting it to 0.20 when only 2% of your data is anomalous does not improve recall; it forces every detector to label 20% of points as anomalous, flooding your results with false positives and diluting the consensus signal. Always set contamination to your best prior estimate of the true anomaly rate, and if you are unsure, start low (0.01 to 0.05) and increase only after inspecting results.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional
+
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import StandardScaler
+from pyod.models.auto_encoder import AutoEncoder
+
+@dataclass
+class AnomalyReport:
+    """Container for anomaly detection results."""
+    scores: np.ndarray              # combined anomaly scores
+    rankings: np.ndarray            # indices sorted by anomaly score (descending)
+    per_method_scores: dict         # method_name -> normalized scores
+    labels: np.ndarray              # binary labels: 1 = anomaly, 0 = normal
+    consensus_counts: np.ndarray    # how many methods agree each point is anomalous
+    threshold: float                # score threshold used for labeling
+    metadata: dict = field(default_factory=dict)
+
+
+class AnomalyDiscoveryPipeline:
+    """Three-method ensemble anomaly detection pipeline.
+
+    Combines Isolation Forest, LOF, and Autoencoder with
+    rank-based score normalization and consensus voting.
+    """
+
+    def __init__(self, contamination: float = 0.05, random_state: int = 42):
+        self.contamination = contamination
+        self.random_state = random_state
+        self.scaler = StandardScaler()
+        self.detectors = {}
+        self.is_fitted = False
+
+    def _build_detectors(self, n_features: int):
+        """Initialize detectors with appropriate hyperparameters."""
+        self.detectors = {
+            'isolation_forest': IsolationForest(
+                n_estimators=200,
+                contamination=self.contamination,
+                random_state=self.random_state,
+                max_samples='auto',
+            ),
+            'lof': LocalOutlierFactor(
+                n_neighbors=20,
+                contamination=self.contamination,
+                novelty=False,  # outlier detection mode
+            ),
+            'autoencoder': AutoEncoder(
+                hidden_neurons=[n_features, 64, 32, 16, 32, 64, n_features],
+                epochs=100,
+                contamination=self.contamination,
+                preprocessing=True,
+                verbose=0,
+            ),
+        }
+
+    def fit_score(self, X: np.ndarray) -> AnomalyReport:
+        """Fit all detectors and produce anomaly report.
+
+        Args:
+            X: (n_samples, n_features) data matrix
+        Returns:
+            AnomalyReport with combined scores and rankings
+        """
+        n_samples, n_features = X.shape
+        self._build_detectors(n_features)
+
+        # Standardize features
+        X_scaled = self.scaler.fit_transform(X)
+
+        # Run each detector and collect raw scores
+        raw_scores = {}
+
+        # Isolation Forest: score_samples returns negative scores
+        iso = self.detectors['isolation_forest']
+        iso.fit(X_scaled)
+        raw_scores['isolation_forest'] = -iso.score_samples(X_scaled)
+
+        # LOF: negative_outlier_factor_ gives negative scores
+        lof = self.detectors['lof']
+        lof.fit_predict(X_scaled)
+        raw_scores['lof'] = -lof.negative_outlier_factor_
+
+        # Autoencoder: decision_function returns anomaly scores
+        ae = self.detectors['autoencoder']
+        ae.fit(X_scaled)
+        raw_scores['autoencoder'] = ae.decision_function(X_scaled)
+
+        # Rank-normalize each method's scores to [0, 1]
+        normalized_scores = {}
+        for name, scores in raw_scores.items():
+            ranks = np.argsort(np.argsort(scores)).astype(float)
+            normalized_scores[name] = ranks / (n_samples - 1)
+
+        # Combine: average of normalized scores
+        combined = np.mean(
+            [normalized_scores[m] for m in normalized_scores], axis=0
+        )
+
+        # Consensus counting: how many methods label each point as anomaly?
+        n_anomalies = max(1, int(n_samples * self.contamination))
+        consensus = np.zeros(n_samples, dtype=int)
+        for name, scores in raw_scores.items():
+            top_k = np.argsort(scores)[-n_anomalies:]
+            consensus[top_k] += 1
+
+        # Threshold: top contamination fraction by combined score
+        threshold = np.percentile(combined, 100 * (1 - self.contamination))
+        labels = (combined >= threshold).astype(int)
+
+        # Ranking: most anomalous first
+        rankings = np.argsort(combined)[::-1]
+
+        self.is_fitted = True
+        return AnomalyReport(
+            scores=combined,
+            rankings=rankings,
+            per_method_scores=normalized_scores,
+            labels=labels,
+            consensus_counts=consensus,
+            threshold=threshold,
+            metadata={
+                'n_samples': n_samples,
+                'n_features': n_features,
+                'contamination': self.contamination,
+                'n_flagged': labels.sum(),
+            }
+        )
+
+    def report_summary(self, report: AnomalyReport,
+                       top_k: int = 20) -> str:
+        """Generate a human-readable summary of the anomaly report."""
+        lines = [
+            "=" * 60,
+            "ANOMALY DISCOVERY REPORT",
+            "=" * 60,
+            f"Dataset: {report.metadata['n_samples']} samples, "
+            f"{report.metadata['n_features']} features",
+            f"Contamination: {report.metadata['contamination']:.1%}",
+            f"Total flagged: {report.metadata['n_flagged']}",
+            f"Score threshold: {report.threshold:.4f}",
+            "",
+            f"Top {top_k} anomalies:",
+            "-" * 60,
+            f"{'Rank':>4}  {'Index':>6}  {'Score':>8}  "
+            f"{'Consensus':>9}  {'Methods Agreeing'}",
+            "-" * 60,
+        ]
+        for rank, idx in enumerate(report.rankings[:top_k], 1):
+            methods = []
+            for name in report.per_method_scores:
+                if report.per_method_scores[name][idx] >= (1 - self.contamination):
+                    methods.append(name[:3].upper())
+            lines.append(
+                f"{rank:>4}  {idx:>6}  {report.scores[idx]:>8.4f}  "
+                f"{report.consensus_counts[idx]:>9}/3  "
+                f"{'  '.join(methods)}"
+            )
+        return "\n".join(lines)
+</code></pre>
+<div class="code-caption">Listing 30.13: The complete AnomalyDiscoveryPipeline class combining Isolation Forest, LOF, and Autoencoder with rank-based score normalization, consensus voting, and structured reporting.</div>
+
+<h2>3. Running the Pipeline on Scientific Data</h2>
+
+<p>
+We demonstrate the pipeline on a realistic synthetic dataset that mimics a common scientific
+scenario: a large population of normal observations, a small population of known anomalies
+(instrument errors), and an even smaller population of genuinely novel observations (potential
+discoveries). The pipeline's job is to rank the genuine novelties above the instrument errors.
+</p>
+
+<pre><code class="language-python"># Generate a realistic scientific dataset
+rng = np.random.default_rng(42)
+n_features = 20
+
+# Population 1: Normal observations (95%)
+n_normal = 950
+X_normal = rng.multivariate_normal(
+    mean=np.zeros(n_features),
+    cov=np.eye(n_features) * 0.5 + 0.1,  # slight correlation
+    size=n_normal
+)
+
+# Population 2: Instrument errors (3%) - random spikes in single features
+n_errors = 30
+X_errors = rng.multivariate_normal(
+    mean=np.zeros(n_features),
+    cov=np.eye(n_features) * 0.5 + 0.1,
+    size=n_errors
+)
+# Inject random spikes (single-feature anomalies)
+for i in range(n_errors):
+    spike_feat = rng.integers(0, n_features)
+    X_errors[i, spike_feat] += rng.choice([-1, 1]) * rng.uniform(5, 10)
+
+# Population 3: Genuine novelties (2%) - coherent multi-feature pattern
+n_novel = 20
+novel_direction = rng.standard_normal(n_features)
+novel_direction /= np.linalg.norm(novel_direction)
+X_novel = rng.multivariate_normal(
+    mean=novel_direction * 4.0,  # shifted in a specific direction
+    cov=np.eye(n_features) * 0.3,
+    size=n_novel
+)
+
+# Combine
+X = np.vstack([X_normal, X_errors, X_novel])
+labels = np.array(
+    ['normal'] * n_normal + ['error'] * n_errors + ['novel'] * n_novel
+)
+
+# Run the pipeline
+pipeline = AnomalyDiscoveryPipeline(contamination=0.05, random_state=42)
+report = pipeline.fit_score(X)
+
+# Print summary
+print(pipeline.report_summary(report, top_k=15))
+
+# Detailed evaluation: how well does the pipeline separate categories?
+top_50_indices = report.rankings[:50]
+top_50_labels = labels[top_50_indices]
+print(f"\nCategory breakdown in top 50 anomalies:")
+for cat in ['novel', 'error', 'normal']:
+    count = (top_50_labels == cat).sum()
+    total = (labels == cat).sum()
+    print(f"  {cat}: {count}/{total} ({count/total:.0%} recall)")
+
+# Consensus analysis: do genuine novelties get higher consensus?
+for cat in ['novel', 'error', 'normal']:
+    mask = labels == cat
+    mean_consensus = report.consensus_counts[mask].mean()
+    mean_score = report.scores[mask].mean()
+    print(f"  {cat}: mean consensus={mean_consensus:.2f}/3, "
+          f"mean score={mean_score:.4f}")
+</code></pre>
+<div class="code-caption">Listing 30.14: Running the three-method pipeline on a dataset with three populations (normal, instrument errors, genuine novelties). The consensus analysis shows whether methods agree on which anomalies matter most.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Anomaly Triage in a Protein Engineering Lab</div>
+<p>
+A protein engineering team uses directed evolution to produce enzyme variants with improved
+catalytic activity. Each round produces thousands of variants, most with activity similar to
+the parent enzyme. Anomalies fall into three categories: (1) inactive mutants from deleterious
+mutations (errors), (2) variants with modestly improved activity (expected improvements), and
+(3) variants with dramatically altered substrate specificity (genuine novelties). The team
+deployed a three-method anomaly pipeline on 50-dimensional activity profile vectors. In a
+retrospective analysis of 18 months of screening data, the pipeline's top-20 consensus anomalies
+included 8 of the 11 variants that had been independently identified as "transformative" by
+experienced enzymologists, and 3 additional variants that had been overlooked but proved valuable
+upon re-examination. The key was consensus: variants flagged by all three methods were far more
+likely to be genuinely novel (73% precision) than variants flagged by only one method (12%
+precision).
+</p>
+</div>
+
+<h2>4. Ground-Truth Validation</h2>
+
+<p>
+Evaluating anomaly detectors is fundamentally challenging because ground truth is almost never
+available in the quantities needed for standard supervised evaluation. In most scientific
+settings, we face one of three scenarios:
+</p>
+
+<p>
+<strong>No labels at all</strong>: the most common case. We can only evaluate using internal
+quality metrics (agreement between methods, stability under resampling) or by inspecting the
+top-ranked anomalies manually. Internal evaluation is necessary but insufficient; it cannot
+distinguish between a detector that finds genuinely interesting anomalies and one that
+consistently flags artifacts.
+</p>
+
+<p>
+<strong>Partial labels</strong>: some anomalies are known (from previous experiments, known failure
+modes, or expert annotation of a subset). We can compute precision and recall on the labeled
+subset, but we must be careful about selection bias: the known anomalies may not be
+representative of the anomalies we want to discover.
+</p>
+
+<p>
+<strong>Synthetic injection</strong>: we inject known anomalies into real data and evaluate
+detection. This is the most controlled approach but requires domain knowledge to create
+realistic synthetic anomalies. If the injected anomalies are too obvious, the evaluation
+is meaningless. If they are too subtle, even perfect detectors will miss them.
+</p>
+
+<pre><code class="language-python">from sklearn.metrics import (
+    roc_auc_score, average_precision_score,
+    precision_recall_curve
+)
+
+def evaluate_anomaly_detector(scores: np.ndarray,
+                              true_labels: np.ndarray,
+                              positive_label: str = 'anomaly') -> dict:
+    """Evaluate anomaly detection performance with multiple metrics.
+
+    Args:
+        scores: continuous anomaly scores (higher = more anomalous)
+        true_labels: array of string labels
+        positive_label: which label counts as a true anomaly
+    Returns:
+        dict of evaluation metrics
+    """
+    # Convert to binary: 1 = anomaly, 0 = normal
+    binary_labels = (true_labels != 'normal').astype(int)
+
+    # Core metrics
+    auroc = roc_auc_score(binary_labels, scores)
+    avg_precision = average_precision_score(binary_labels, scores)
+
+    # Precision at various recall levels
+    precision, recall, thresholds = precision_recall_curve(
+        binary_labels, scores
+    )
+
+    # Precision@k: precision in top-k ranked items
+    anomaly_rate = binary_labels.mean()
+    results = {
+        'auroc': auroc,
+        'avg_precision': avg_precision,
+        'anomaly_rate': anomaly_rate,
+    }
+
+    # P@k for various k values
+    for k in [10, 20, 50, 100]:
+        if k <= len(scores):
+            top_k = np.argsort(scores)[-k:]
+            p_at_k = binary_labels[top_k].mean()
+            results[f'precision@{k}'] = p_at_k
+
+    return results
+
+
+def stability_analysis(X: np.ndarray, pipeline_cls,
+                       n_bootstrap: int = 10, **kwargs) -> dict:
+    """Assess ranking stability via bootstrap resampling.
+
+    Stable detectors produce similar rankings across bootstrap samples.
+    Unstable detectors flag different anomalies each time.
+    """
+    n_samples = X.shape[0]
+    all_rankings = np.zeros((n_bootstrap, n_samples))
+    rng = np.random.default_rng(42)
+
+    for b in range(n_bootstrap):
+        # Bootstrap sample (with replacement)
+        indices = rng.choice(n_samples, size=n_samples, replace=True)
+        X_boot = X[indices]
+
+        pipeline = pipeline_cls(**kwargs)
+        report = pipeline.fit_score(X_boot)
+
+        # Map back to original indices
+        for rank, boot_idx in enumerate(report.rankings):
+            orig_idx = indices[boot_idx]
+            all_rankings[b, orig_idx] = rank
+
+    # Compute stability metrics
+    mean_rank = all_rankings.mean(axis=0)
+    rank_std = all_rankings.std(axis=0)
+
+    # Points with low mean rank AND low std are stably anomalous
+    return {
+        'mean_rank': mean_rank,
+        'rank_std': rank_std,
+        'stable_top_20': np.argsort(mean_rank)[:20],
+        'mean_top20_std': rank_std[np.argsort(mean_rank)[:20]].mean(),
+    }
+
+
+# Evaluate on our labeled dataset
+eval_results = evaluate_anomaly_detector(
+    report.scores, labels, positive_label='novel'
+)
+print("Evaluation Results:")
+for metric, value in eval_results.items():
+    print(f"  {metric}: {value:.4f}")
+
+# Evaluate per-method performance
+print("\nPer-method AUROC:")
+binary_labels = (labels != 'normal').astype(int)
+for name, norm_scores in report.per_method_scores.items():
+    method_auroc = roc_auc_score(binary_labels, norm_scores)
+    print(f"  {name}: {method_auroc:.4f}")
+ensemble_auroc = roc_auc_score(binary_labels, report.scores)
+print(f"  ensemble: {ensemble_auroc:.4f}")
+</code></pre>
+<div class="code-caption">Listing 30.15: Ground-truth validation with AUROC, average precision, precision@k metrics, and bootstrap stability analysis to assess both detection quality and ranking consistency.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Precision@k Matters More Than AUROC for Discovery</div>
+<p>
+In scientific anomaly detection, we rarely care about classifying every point correctly. What
+matters is whether the <em>top-ranked</em> anomalies are worth investigating. A detector with
+AUROC 0.95 but precision@20 of 0.30 ranks many false positives above true anomalies, wasting
+experimental resources on dead ends. A detector with AUROC 0.85 but precision@20 of 0.80
+delivers actionable results despite lower overall discrimination. Always report precision@k
+alongside AUROC, where $k$ matches the number of anomalies your lab or team can realistically
+investigate in a given cycle. This connects directly to the experimental design considerations
+in <a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>.
+</p>
+</div>
+
+<h2>5. Integration with the Discovery Workbench</h2>
+
+<p>
+The anomaly pipeline becomes most valuable when integrated into a larger scientific workflow.
+In the Discovery Workbench architecture from <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>,
+the anomaly pipeline is a <strong>discovery module</strong> that connects to data sources upstream
+and to investigation workflows downstream. The integration points are:
+</p>
+
+<ul>
+<li><strong>Data ingestion</strong>: the pipeline reads from the Workbench's data store (a feature matrix or embedding store populated by the representation learning modules of <a href="../module-26-representation-learning/index.html">Chapter 26</a>).</li>
+<li><strong>Drift monitoring</strong>: the pipeline includes a drift detector (Section 30.3) that fires alerts when the incoming data distribution shifts, triggering pipeline retraining or investigation.</li>
+<li><strong>Anomaly registry</strong>: detected anomalies are stored in a structured registry with their scores, consensus counts, and metadata, forming an audit trail for the <a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">provenance system</a> of Chapter 47.</li>
+<li><strong>Hypothesis generation</strong>: top anomalies are forwarded to the <a href="../../part-4-knowledge/module-39-hypothesis-generation/index.html">hypothesis generation module</a> (Chapter 39) for automated investigation.</li>
+</ul>
+
+<pre><code class="language-python">from dataclasses import dataclass
+from datetime import datetime
+import json
+
+@dataclass
+class AnomalyRecord:
+    """A single anomaly entry in the discovery registry."""
+    sample_id: str
+    anomaly_score: float
+    consensus_count: int
+    per_method_scores: dict
+    detection_timestamp: str
+    status: str = 'pending_review'  # pending_review | confirmed | dismissed
+    investigation_notes: str = ''
+    related_hypothesis_id: str = ''
+
+
+class AnomalyRegistry:
+    """Registry for tracking detected anomalies through investigation.
+
+    Integrates with the Discovery Workbench's provenance system.
+    """
+
+    def __init__(self):
+        self.records: dict[str, AnomalyRecord] = {}
+        self.run_metadata: list[dict] = []
+
+    def register_run(self, report: AnomalyReport,
+                     sample_ids: list[str],
+                     dataset_name: str) -> str:
+        """Register a pipeline run and its top anomalies."""
+        run_id = f"anomaly_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        self.run_metadata.append({
+            'run_id': run_id,
+            'dataset': dataset_name,
+            'timestamp': datetime.now().isoformat(),
+            'n_samples': report.metadata['n_samples'],
+            'n_flagged': report.metadata['n_flagged'],
+            'contamination': report.metadata['contamination'],
+        })
+
+        # Register each flagged anomaly
+        for idx in report.rankings[:report.metadata['n_flagged']]:
+            record = AnomalyRecord(
+                sample_id=sample_ids[idx],
+                anomaly_score=float(report.scores[idx]),
+                consensus_count=int(report.consensus_counts[idx]),
+                per_method_scores={
+                    name: float(scores[idx])
+                    for name, scores in report.per_method_scores.items()
+                },
+                detection_timestamp=datetime.now().isoformat(),
+            )
+            self.records[sample_ids[idx]] = record
+
+        return run_id
+
+    def update_status(self, sample_id: str, status: str,
+                      notes: str = ''):
+        """Update the investigation status of an anomaly."""
+        if sample_id in self.records:
+            self.records[sample_id].status = status
+            self.records[sample_id].investigation_notes = notes
+
+    def get_pending(self) -> list[AnomalyRecord]:
+        """Get all anomalies pending review, sorted by score."""
+        pending = [r for r in self.records.values()
+                   if r.status == 'pending_review']
+        return sorted(pending, key=lambda r: r.anomaly_score, reverse=True)
+
+    def summary_stats(self) -> dict:
+        """Summary statistics for the registry."""
+        statuses = [r.status for r in self.records.values()]
+        return {
+            'total': len(self.records),
+            'pending': statuses.count('pending_review'),
+            'confirmed': statuses.count('confirmed'),
+            'dismissed': statuses.count('dismissed'),
+            'confirmation_rate': (
+                statuses.count('confirmed') /
+                max(1, statuses.count('confirmed') + statuses.count('dismissed'))
+            ),
+        }
+
+    def export_json(self, filepath: str):
+        """Export registry to JSON for provenance tracking."""
+        data = {
+            'runs': self.run_metadata,
+            'records': {
+                sid: {
+                    'anomaly_score': r.anomaly_score,
+                    'consensus': r.consensus_count,
+                    'status': r.status,
+                    'notes': r.investigation_notes,
+                }
+                for sid, r in self.records.items()
+            }
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+
+
+# Usage example
+registry = AnomalyRegistry()
+sample_ids = [f"sample_{i:04d}" for i in range(len(X))]
+run_id = registry.register_run(report, sample_ids, "protein_activity_screen")
+
+# Simulate expert review
+pending = registry.get_pending()
+print(f"Anomalies pending review: {len(pending)}")
+print(f"Top anomaly: {pending[0].sample_id}, "
+      f"score={pending[0].anomaly_score:.4f}, "
+      f"consensus={pending[0].consensus_count}/3")
+
+# Expert reviews top anomalies
+for record in pending[:5]:
+    idx = int(record.sample_id.split('_')[1])
+    true_label = labels[idx]
+    if true_label == 'novel':
+        registry.update_status(record.sample_id, 'confirmed',
+                              'Novel pattern confirmed by domain expert')
+    elif true_label == 'error':
+        registry.update_status(record.sample_id, 'dismissed',
+                              'Instrument artifact')
+
+print(f"\nRegistry summary: {registry.summary_stats()}")
+</code></pre>
+<div class="code-caption">Listing 30.16: The AnomalyRegistry class for tracking detected anomalies through expert review, connecting anomaly detection to the Discovery Workbench's provenance system and hypothesis generation modules.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: PyOD's SUOD for Scalable Ensembles</div>
+<p>
+The pipeline above manually combines three detectors. For larger ensembles or bigger datasets,
+PyOD's <a href="https://pyod.readthedocs.io/en/latest/pyod.models.html#module-pyod.models.suod" target="_blank">SUOD</a>
+(Scalable Unsupervised Outlier Detection) automates the entire process: parallel execution of
+multiple detectors, automatic score normalization, and intelligent combination. It reduces the
+ensemble code from 100+ lines to about 10:
+</p>
+<pre><code class="language-python">from pyod.models.suod import SUOD
+from pyod.models.iforest import IForest
+from pyod.models.lof import LOF
+from pyod.models.auto_encoder import AutoEncoder
+
+# Define base detectors
+base_estimators = [
+    IForest(n_estimators=200, contamination=0.05),
+    LOF(n_neighbors=20, contamination=0.05),
+    AutoEncoder(hidden_neurons=[20, 64, 32, 16, 32, 64, 20],
+                epochs=100, contamination=0.05),
+]
+
+# SUOD handles parallelization, normalization, and combination
+ensemble = SUOD(base_estimators=base_estimators, n_jobs=-1,
+                combination='average', verbose=False)
+ensemble.fit(X)
+scores = ensemble.decision_function(X)
+labels_pred = ensemble.predict(X)
+print(f"SUOD flagged {labels_pred.sum()} anomalies")</code></pre>
+<p>
+SUOD also supports approximate methods (random projection, pseudo-supervised approximation)
+for datasets too large for exact computation.
+</p>
+</div>
+
+<h2>6. Putting It All Together: The Recipe</h2>
+
+<p>
+Here is the complete recipe for deploying an anomaly discovery pipeline in a scientific setting,
+from data preparation through investigation. Follow these steps in order; each builds on the
+previous.
+</p>
+
+<ol>
+<li><strong>Characterize your data</strong>: dimensionality, sample size, expected contamination rate, known anomaly types. This determines method selection and hyperparameters.</li>
+<li><strong>Preprocess</strong>: standardize features, handle missing values, apply domain-specific transformations (log-transform counts, normalize spectra). If dimensionality exceeds 100, apply PCA or use embeddings from a pretrained model (<a href="../module-26-representation-learning/index.html">Chapter 26</a>).</li>
+<li><strong>Run the ensemble</strong>: execute 3 to 5 detectors from different algorithmic families. Use rank normalization and average combination.</li>
+<li><strong>Assess consensus</strong>: count how many methods flag each anomaly. Prioritize high-consensus anomalies for investigation.</li>
+<li><strong>Validate stability</strong>: run bootstrap stability analysis. Anomalies that appear consistently across bootstrap samples are more trustworthy than those that appear sporadically.</li>
+<li><strong>Evaluate with available labels</strong>: if any labeled anomalies exist, compute precision@k to calibrate expectations. If not, use synthetic injection to establish a baseline.</li>
+<li><strong>Monitor for drift</strong>: deploy a drift detector on incoming data. When drift is detected, investigate before retraining (the drift may be the discovery).</li>
+<li><strong>Track through investigation</strong>: register anomalies, record expert reviews, and maintain the confirmation rate. A sustained low confirmation rate signals that the pipeline needs recalibration.</li>
+</ol>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: LLM-Guided Anomaly Interpretation</div>
+<p>
+The pipeline in this section ranks anomalies but leaves interpretation to human experts.
+A 2024 line of work closes this gap by using large language models to explain <em>why</em>
+detected anomalies are unusual. <strong>AnomalyLLM</strong> (Liu et al., 2024, "Large Language
+Models Can Be Good Anomaly Detectors," published at AAAI 2024) demonstrated that LLMs
+prompted with feature descriptions and anomaly scores can generate natural-language
+explanations of detected anomalies that domain experts rated as helpful in 78% of cases.
+Separately, the <strong>OmniAnomaly</strong> benchmark (Su et al., 2024) introduced a
+standardized evaluation suite spanning 12 domains with over 200,000 labeled time-series
+anomalies, providing the first large-scale cross-domain comparison of ensemble pipelines
+like the one built here. These developments point toward a near-future workflow where the
+anomaly pipeline not only ranks candidates but also drafts preliminary explanations,
+reducing the expert review bottleneck that dominates investigation time.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Pipeline That Found a Planet</div>
+<p>
+In 2020, a team at the University of Warwick ran a multi-method anomaly detection pipeline on
+Kepler and TESS light curves. Their ensemble (Isolation Forest + autoencoder + Gaussian mixture
+model) flagged a faint, irregular transit signal that had been missed by standard planet-finding
+algorithms because it fell below the detection threshold of each individual method. The consensus
+score, however, placed it in the top 0.1%. Follow-up observations confirmed it as a genuine
+exoplanet, TOI-700 e, a small rocky planet in the habitable zone. The discovery illustrates the
+central argument of this chapter: ensemble consensus can surface signals that are too weak for
+any single method but too consistent to be noise.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Three-Method Anomaly Detector on Real Tabular Data</h4>
+<p>
+Reproduce the ensemble pipeline from this section on a real benchmark dataset using only
+standard Python libraries. Estimated time: 30 to 45 minutes.
+</p>
+<ol>
+<li><strong>Get the data.</strong> Install <code>pyod</code> (<code>pip install pyod</code>) and load one of its built-in datasets: <code>from pyod.utils.data import generate_data; X_train, X_test, y_train, y_test = generate_data(n_train=800, n_test=200, n_features=15, contamination=0.05)</code>. This gives you labeled data for evaluation without needing external downloads.</li>
+<li><strong>Run three detectors independently.</strong> Fit an <code>IsolationForest</code> (from scikit-learn), an <code>LOF</code> (from scikit-learn with <code>novelty=False</code>), and a <code>pyod.models.auto_encoder.AutoEncoder</code> on <code>X_train</code>. Collect each detector's raw anomaly scores into a dictionary.</li>
+<li><strong>Rank-normalize and combine.</strong> For each detector's score array, compute ranks with <code>np.argsort(np.argsort(scores))</code>, divide by <code>n_samples - 1</code>, then average the three normalized arrays. Also count consensus: for each detector, find its top 5% and increment a per-sample counter.</li>
+<li><strong>Evaluate.</strong> Using <code>y_train</code> as ground truth, compute AUROC (<code>roc_auc_score</code>) for each individual detector and for the ensemble. Compute <code>precision@20</code> by checking how many of the top 20 ranked points are true anomalies. Verify that the ensemble AUROC meets or exceeds every individual detector.</li>
+<li><strong>Analyze consensus.</strong> Print the consensus count (0, 1, 2, or 3) for the top 20 anomalies. Compare the precision of 3/3 consensus anomalies versus 1/3 consensus anomalies. Record whether high-consensus points have higher true-positive rates.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Conceptual)</strong> Your anomaly pipeline's confirmation rate (fraction of flagged anomalies confirmed as genuine by domain experts) drops from 40% to 15% over six months. List three possible causes and, for each, describe how you would diagnose and fix the problem. Consider both data-side and model-side explanations.</li>
+<li><strong>(Coding)</strong> Extend the <code>AnomalyDiscoveryPipeline</code> to include a fourth detector: a One-Class SVM (from scikit-learn). Compare the three-method and four-method ensemble AUROC on three ODDS benchmark datasets. Does adding the fourth method improve or hurt performance? Under what conditions does adding more methods help?</li>
+<li><strong>(Analysis)</strong> Implement the bootstrap stability analysis function and apply it to the pipeline with 20 bootstrap samples. Compare the "stably top-20" anomalies (low mean rank, low rank standard deviation) to the "unstably top-20" (low mean rank, high rank standard deviation). Use the ground-truth labels to determine which group has higher precision. What does this tell you about how to prioritize anomalies for expert review?</li>
+</ol>
+</section>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+Anomaly detection tells us <em>what</em> is unusual, but not <em>why</em>.
+<a href="../module-31-causal-discovery/index.html">Chapter 31: Causal Discovery and Causal Inference</a>
+tackles the question of causation: given that we have found an unexpected pattern, can we identify
+the mechanism that produced it? Where anomaly detection flags the symptom, causal inference
+diagnoses the cause. Together, these two chapters form the core of data-driven scientific
+reasoning in Part III. The anomaly pipeline's output (ranked anomalies with metadata) feeds
+directly into causal analysis as the set of observations demanding explanation.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://pyod.readthedocs.io/" target="_blank">Zhao, Y., Nasrullah, Z., &amp; Li, Z. (2019). PyOD: A Python toolbox for scalable outlier detection. <em>JMLR</em>, 20(96), 1-7.</a>
+<p>The unified Python library for anomaly detection used throughout this chapter, providing 40+ algorithms with a consistent API.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2003.05484" target="_blank">Zhao, Y., Hu, X., Cheng, C., Wang, C., Wan, C., Wang, W., Yang, J., Bai, H., Li, Z., Xiao, C., Wang, Y., Qiao, Z., Sun, J., &amp; Akoglu, L. (2021). SUOD: Accelerating large-scale unsupervised heterogeneous outlier detection. <em>Proc. MLSys</em>.</a>
+<p>The scalable unsupervised outlier detection framework that automates ensemble anomaly detection at scale.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1145/3394486.3403062" target="_blank">Das, S., Islam, M. R., Jayakodi, N. K., &amp; Doppa, J. R. (2020). Active anomaly detection via ensembles. <em>Proc. ACM SIGKDD</em>.</a>
+<p>Active anomaly discovery with expert-in-the-loop feedback to iteratively improve detection performance.</p>
+</div>
+<div class="bib-card">
+<a href="https://scikit-learn.org/stable/modules/outlier_detection.html" target="_blank">scikit-learn documentation: Outlier and novelty detection.</a>
+<p>Official documentation for scikit-learn's anomaly detection modules, including implementation details for Isolation Forest, LOF, and One-Class SVM.</p>
+</div>
+<div class="bib-card">
+<a href="https://hdbscan.readthedocs.io/" target="_blank">McInnes, L. &amp; Healy, J. (2017). Accelerated hierarchical density-based clustering. <em>Proc. IEEE ICDMW</em>.</a>
+<p>The HDBSCAN implementation used for open-world class discovery in the pipeline's investigation workflow.</p>
+</div>
+<div class="bib-card">
+<a href="https://odds.cs.stonybrook.edu/" target="_blank">Rayana, S. (2016). ODDS Library. Stony Brook University.</a>
+<p>The Outlier Detection DataSets (ODDS) benchmark collection used for evaluating anomaly detection pipelines.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-30.3.html">&#8592; 30.3 Drift and Open-World Learning</a>
+<a href="index.html">Chapter 30</a>
+<a href="../module-31-causal-discovery/index.html">Chapter 31: Causal Discovery &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

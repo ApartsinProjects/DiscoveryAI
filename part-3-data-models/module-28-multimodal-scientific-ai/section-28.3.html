@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.3: Scientific Document AI. PaperQA2, vision-language models for figures, document layout understanding, and retrieval over scientific literature." name="description"/>
+<title>Section 28.3: Scientific Document AI | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Multimodal Scientific AI</a></div>
+<h1>28.3 Scientific Document AI</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"They asked me to read 10,000 papers and answer a question. I read them all, cited my sources, and still got accused of hallucinating. Fair enough, I was."</p>
+<cite>A RAG Pipeline Seeking Redemption</cite>
+</blockquote>
+
+<main class="content" id="main-content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+In <a href="section-28.2.html">Section 28.2</a> you worked with molecule-text and
+protein-text models that align structured scientific data with natural language. This
+section extends multimodal alignment to a different modality pair: <strong>scientific
+documents</strong> (PDFs with text, figures, tables, and equations) paired with natural
+language questions. Familiarity with retrieval-augmented generation (RAG) from
+<a href="../../part-4-knowledge/module-37-rag-discovery/index.html">Chapter 37</a> will
+provide additional context, though this section is self-contained. The
+<a href="../module-26-representation-learning/index.html">Chapter 26</a> discussion of
+dense retrieval provides the embedding search foundations.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Scientific papers are inherently multimodal: they contain prose, mathematical equations,
+data tables, charts, microscopy images, molecular structure diagrams, and citation
+networks. Traditional NLP systems process only the text, losing the information encoded
+in figures and tables. <strong>Scientific Document AI</strong> treats each paper as a multimodal
+object, extracting and indexing all modalities for retrieval and question answering.
+PaperQA2 (Lala et al., 2024) represents the state of the art: an agentic system that
+retrieves relevant papers, reads their full text, examines figures and tables, and
+synthesizes cited answers. This section covers the components needed to build such a
+system: document parsing, figure understanding, dense retrieval over heterogeneous
+content, and answer generation with source attribution.
+</p>
+</div>
+
+<h2>1. The Document Understanding Pipeline</h2>
+
+<p>
+A scientific PDF is not a flat text file. Extracting its content for AI processing
+requires a pipeline with several stages: layout analysis (identifying text blocks,
+figures, tables, equations), text extraction (OCR for scanned documents, direct
+extraction for digital PDFs), figure captioning (understanding what a chart or
+microscopy image shows), table parsing (converting visual tables to structured data),
+and equation recognition (converting rendered math to LaTeX or MathML).
+</p>
+
+<p data-agent="02">
+A document understanding pipeline is a sequence of machine learning and rule-based
+components that transforms a raw PDF (a stream of characters, vector graphics, and
+embedded images with no semantic markup) into structured, queryable content where every
+text paragraph, figure, table, and equation is individually typed, located, and ready for
+downstream embedding or generation. This pipeline matters because scientific PDFs encode
+over half their key findings in non-text elements (figures, tables, equations), and
+without explicit extraction those findings are invisible to language models. The core
+mechanism chains a layout detector (typically a vision transformer trained on document
+page images) that classifies rectangular regions by type, followed by modality-specific
+extractors (OCR for text, image cropping for figures, cell parsers for tables) that
+convert each region into a machine-readable representation. Use a full document
+understanding pipeline when your corpus contains scanned or figure-heavy documents; for
+born-digital, text-only papers, simpler PDF text extraction (such as PyMuPDF or
+pdfplumber) is sufficient and much faster.
+</p>
+
+<p>
+Modern document AI models handle many of these stages jointly. LayoutLMv3 (Huang et al.,
+2022) is a multimodal transformer that jointly processes text tokens and image patches
+from document pages, learning to classify regions as text, table, figure, or equation.
+Nougat (Blecher et al., 2023) takes a different approach: it treats the entire PDF page
+as an image and uses a vision encoder-decoder to output Markdown text, preserving
+equations and structure without explicit layout analysis.
+</p>
+
+<pre><code class="language-python">import fitz  # PyMuPDF
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class DocumentChunk:
+    """A chunk of content extracted from a scientific document.
+
+    Chunks can be text paragraphs, figure descriptions,
+    table contents, or equations.
+    """
+    content: str
+    chunk_type: str       # "text", "figure", "table", "equation"
+    page_number: int
+    source_file: str
+    section_title: str = ""
+    caption: str = ""     # for figures and tables
+    metadata: dict = field(default_factory=dict)
+
+
+def parse_scientific_pdf(pdf_path: str,
+                         chunk_size: int = 500) -> list[DocumentChunk]:
+    """Extract structured chunks from a scientific PDF.
+
+    Uses PyMuPDF for text extraction with page-level
+    layout awareness. Figures are identified by image blocks.
+
+    Parameters
+    ----------
+    pdf_path : str
+        Path to the PDF file.
+    chunk_size : int
+        Target number of characters per text chunk.
+    """
+    doc = fitz.open(pdf_path)
+    chunks = []
+
+    for page_num, page in enumerate(doc):
+        # Extract text blocks with position info
+        blocks = page.get_text("dict")["blocks"]
+
+        current_text = ""
+        for block in blocks:
+            if block["type"] == 0:  # text block
+                for line in block["lines"]:
+                    line_text = " ".join(
+                        span["text"] for span in line["spans"]
+                    )
+                    current_text += line_text + " "
+
+                    # Chunk when we reach target size
+                    if len(current_text) >= chunk_size:
+                        chunks.append(DocumentChunk(
+                            content=current_text.strip(),
+                            chunk_type="text",
+                            page_number=page_num + 1,
+                            source_file=str(pdf_path),
+                        ))
+                        current_text = ""
+
+            elif block["type"] == 1:  # image block
+                chunks.append(DocumentChunk(
+                    content=f"[Figure on page {page_num + 1}]",
+                    chunk_type="figure",
+                    page_number=page_num + 1,
+                    source_file=str(pdf_path),
+                    metadata={
+                        "width": block.get("width", 0),
+                        "height": block.get("height", 0),
+                    },
+                ))
+
+        # Flush remaining text
+        if current_text.strip():
+            chunks.append(DocumentChunk(
+                content=current_text.strip(),
+                chunk_type="text",
+                page_number=page_num + 1,
+                source_file=str(pdf_path),
+            ))
+
+    doc.close()
+    return chunks
+</code></pre>
+<div class="code-caption">Scientific PDF parsing with PyMuPDF. Text blocks are chunked at a target character count; image blocks are tagged as figures with dimension metadata. This basic parser handles digital PDFs; scanned documents require OCR preprocessing with Tesseract or a neural OCR model.</div>
+
+<h2>2. Vision-Language Models for Scientific Figures</h2>
+
+<p>
+Scientific figures encode critical information that text alone cannot capture: dose-response
+curves, phylogenetic trees, crystal structure visualizations, and experimental setup
+photographs. Understanding these figures requires vision-language models (VLMs) trained
+on scientific imagery.
+</p>
+
+<p>
+General-purpose VLMs like GPT-4V and Claude can interpret many scientific figure types,
+but specialized models perform better on domain-specific tasks. MatSci-NLP processes
+materials science charts. ChartQA answers questions about data visualizations. For our
+purposes, we use a VLM to generate text descriptions of figures, which are then indexed
+alongside the paper's text for retrieval.
+</p>
+
+<pre><code class="language-python">import torch
+from transformers import (
+    AutoProcessor, AutoModelForVision2Seq,
+)
+from PIL import Image
+
+
+class ScientificFigureCaptioner:
+    """Generate text descriptions of scientific figures.
+
+    Uses a vision-language model to produce detailed captions
+    that describe the figure's content, axes, trends, and
+    key findings for indexing and retrieval.
+    """
+
+    def __init__(self, model_name: str = "Salesforce/blip2-opt-2.7b"):
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.model = AutoModelForVision2Seq.from_pretrained(
+            model_name, torch_dtype=torch.float16,
+        )
+        self.model.eval()
+
+    def caption_figure(self, image_path: str,
+                       context: str = "") -> str:
+        """Generate a detailed caption for a scientific figure.
+
+        Parameters
+        ----------
+        image_path : str
+            Path to the figure image file.
+        context : str
+            Surrounding text from the paper (section title,
+            nearby paragraphs) to guide the captioning.
+        """
+        image = Image.open(image_path).convert("RGB")
+
+        prompt = (
+            "This is a figure from a scientific paper. "
+            "Describe what the figure shows, including axes, "
+            "data trends, and key findings."
+        )
+        if context:
+            prompt += f" Context from the paper: {context}"
+
+        inputs = self.processor(
+            images=image, text=prompt, return_tensors="pt"
+        ).to(self.model.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs, max_new_tokens=256,
+            )
+
+        caption = self.processor.decode(
+            output_ids[0], skip_special_tokens=True
+        )
+        return caption
+
+
+def enrich_chunks_with_figure_captions(
+    chunks: list[DocumentChunk],
+    captioner: ScientificFigureCaptioner,
+    figure_dir: str,
+) -> list[DocumentChunk]:
+    """Add AI-generated captions to figure chunks.
+
+    Replaces placeholder figure content with detailed
+    VLM-generated descriptions for better retrieval.
+    """
+    enriched = []
+    for chunk in chunks:
+        if chunk.chunk_type == "figure":
+            # Find the corresponding image file
+            img_path = f"{figure_dir}/page{chunk.page_number}_fig.png"
+            try:
+                caption = captioner.caption_figure(img_path)
+                chunk.content = caption
+                chunk.caption = caption
+            except FileNotFoundError:
+                pass  # keep placeholder
+        enriched.append(chunk)
+    return enriched
+</code></pre>
+<div class="code-caption">Scientific figure captioning using a vision-language model (BLIP-2). Generated captions replace placeholder "[Figure]" entries in the document index, making figure content searchable via text queries. Context from surrounding paragraphs improves caption relevance.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Finding the Right Chart</div>
+<p>
+A materials scientist asks: "Which paper reports the highest thermoelectric figure of
+merit for bismuth telluride at room temperature?" The answer is in a figure (a ZT vs.
+temperature plot) in one of 500 indexed papers. Without figure captioning, the text
+retriever finds papers mentioning "bismuth telluride" and "thermoelectric" but cannot
+identify which figure contains the specific ZT value. With VLM-generated captions
+("Figure 3 shows ZT as a function of temperature for Bi2Te3 samples, with peak ZT =
+1.86 at 300 K"), the retriever matches the question directly to the relevant figure
+and its source paper.
+</p>
+</div>
+
+<h2>3. PaperQA2: Agentic Question Answering Over Literature</h2>
+
+<p>
+PaperQA2 (Lala et al., 2024) is an agentic RAG system designed specifically for
+scientific literature. Unlike simple RAG pipelines that retrieve chunks and generate
+an answer, PaperQA2 operates as a multi-step agent that iteratively gathers evidence:
+it searches for papers, reads relevant sections, gathers supporting passages, scores
+their relevance, and synthesizes a cited answer. The system was shown to produce answers
+approaching the quality of human subject-matter experts on a benchmark of biomedical
+questions.
+</p>
+
+<p>
+The PaperQA2 architecture consists of several agent actions:
+</p>
+
+<ul>
+<li><strong>paper_search</strong>: Query a corpus (local PDFs, Semantic Scholar, PubMed) to find relevant papers.</li>
+<li><strong>gather_evidence</strong>: Read retrieved papers and extract passages relevant to the question.</li>
+<li><strong>gen_answer</strong>: Synthesize an answer from gathered evidence with inline citations.</li>
+</ul>
+
+<pre><code class="language-python"># PaperQA2 usage via the paper-qa package
+# pip install paper-qa
+
+from paperqa import Settings, ask
+from paperqa.settings import AgentSettings
+from pathlib import Path
+
+
+async def answer_research_question(
+    question: str,
+    paper_directory: str,
+    max_sources: int = 10,
+) -> dict:
+    """Answer a scientific question using PaperQA2.
+
+    Searches a local directory of PDFs, extracts evidence,
+    and generates a cited answer.
+
+    Parameters
+    ----------
+    question : str
+        The scientific question to answer.
+    paper_directory : str
+        Path to directory containing PDF papers.
+    max_sources : int
+        Maximum number of papers to consult.
+    """
+    settings = Settings(
+        agent=AgentSettings(
+            agent_type="fake",  # use "OpenAIFunctionsAgent" in prod
+            max_search_queries=3,
+        ),
+        answer=Settings.AnswerSettings(
+            evidence_k=max_sources,
+            answer_max_sources=5,
+        ),
+        paper_directory=paper_directory,
+    )
+
+    result = await ask(
+        question,
+        settings=settings,
+    )
+
+    return {
+        "answer": result.answer,
+        "references": [
+            {
+                "title": ref.title,
+                "authors": ref.authors,
+                "year": ref.year,
+                "key_passage": ref.text,
+                "relevance_score": ref.score,
+            }
+            for ref in result.references
+        ],
+        "confidence": result.confidence,
+    }
+
+
+# Usage example (requires asyncio event loop)
+# import asyncio
+# result = asyncio.run(answer_research_question(
+#     "What is the binding affinity of nirmatrelvir to SARS-CoV-2 Mpro?",
+#     paper_directory="./papers/covid_antivirals/",
+# ))
+# print(result["answer"])
+# for ref in result["references"]:
+#     print(f"  [{ref['year']}] {ref['title']}: {ref['key_passage'][:100]}...")
+</code></pre>
+<div class="code-caption">PaperQA2 question answering over a local PDF corpus. The agent searches the corpus, reads relevant sections from multiple papers, scores evidence passages by relevance, and generates a cited answer. The confidence score reflects how well-supported the answer is by the retrieved evidence.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Agent vs. Pipeline for Document QA</div>
+<p>
+A standard RAG pipeline (retrieve chunks, concatenate, generate answer) makes a single
+pass: it retrieves once and answers once. PaperQA2's agentic approach makes multiple
+passes: it searches, reads, re-searches based on what it found, gathers more evidence,
+and only then answers. This iterative process is critical for scientific questions where
+the answer depends on synthesizing information across multiple papers. A question like
+"How do the binding affinities of first-generation and second-generation EGFR inhibitors
+compare?" requires finding papers on both generations, extracting binding data from each,
+and comparing. No single retrieval step returns all needed information. The agentic loop,
+covered in depth in <a href="../../part-4-knowledge/module-40-research-agents/index.html">Chapter 40: Research Agents</a>,
+is what makes PaperQA2 competitive with human experts.
+</p>
+</div>
+
+<h2>4. Dense Retrieval for Heterogeneous Scientific Content</h2>
+
+<p>
+Scientific documents contain text, figures, tables, and equations. A retrieval system
+must handle all of these modalities. The approach is to embed every chunk (regardless
+of type) into a single dense vector space and perform nearest-neighbor search. Text
+chunks are embedded directly by a text encoder. Figure chunks use VLM-generated captions
+as a text proxy. Table chunks are serialized to text (Markdown or CSV format). Equation
+chunks use their LaTeX source.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of a public library where books, DVDs, vinyl records, and maps are all shelved
+separately. If a patron asks "What do we have about the history of the Silk Road?", the
+librarian must search four separate catalogs. A smarter library writes a short text
+summary card for every item (a paragraph for each book, a plot synopsis for each DVD, a
+tracklist description for each album, a caption for each map) and files all the cards in
+one unified card catalog sorted by topic. Now a single search finds relevant books,
+documentaries, music, and maps together. Dense retrieval over heterogeneous scientific
+content works the same way: each non-text element (figure, table, equation) is converted
+to a text description, embedded in the same vector space as the text chunks, and
+retrieved by one query. The conversion to text is the "summary card"; the shared
+embedding space is the "unified catalog."
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+from sentence_transformers import SentenceTransformer
+from typing import Optional
+
+
+class ScientificRetriever:
+    """Dense retrieval over heterogeneous scientific content.
+
+    Embeds text, figures (via captions), tables (via serialization),
+    and equations (via LaTeX) into a single vector space for
+    unified cross-modal search.
+    """
+
+    def __init__(self, model_name: str = "BAAI/bge-base-en-v1.5"):
+        self.encoder = SentenceTransformer(model_name)
+        self.chunks: list[DocumentChunk] = []
+        self.embeddings: Optional[np.ndarray] = None
+
+    def index_documents(self, chunks: list[DocumentChunk]) -> None:
+        """Build a dense index from document chunks.
+
+        Each chunk (text, figure, table, equation) is embedded
+        as text for unified retrieval.
+        """
+        self.chunks = chunks
+
+        # Convert all chunk types to text for embedding
+        texts = []
+        for chunk in chunks:
+            if chunk.chunk_type == "text":
+                texts.append(chunk.content)
+            elif chunk.chunk_type == "figure":
+                # Use VLM caption or original caption
+                texts.append(
+                    f"Figure: {chunk.caption or chunk.content}"
+                )
+            elif chunk.chunk_type == "table":
+                texts.append(f"Table: {chunk.content}")
+            elif chunk.chunk_type == "equation":
+                texts.append(f"Equation: {chunk.content}")
+            else:
+                texts.append(chunk.content)
+
+        self.embeddings = self.encoder.encode(
+            texts, show_progress_bar=True,
+            normalize_embeddings=True,
+        )
+
+    def search(self, query: str, top_k: int = 10,
+               chunk_type: Optional[str] = None) -> list[dict]:
+        """Retrieve chunks most relevant to a query.
+
+        Parameters
+        ----------
+        query : str
+            Natural language query.
+        top_k : int
+            Number of results to return.
+        chunk_type : str, optional
+            Filter results by type ("text", "figure", "table").
+        """
+        q_emb = self.encoder.encode(
+            [query], normalize_embeddings=True
+        )
+        scores = (q_emb @ self.embeddings.T).squeeze()
+
+        # Apply type filter if specified
+        if chunk_type:
+            mask = np.array([
+                c.chunk_type == chunk_type for c in self.chunks
+            ])
+            scores = np.where(mask, scores, -np.inf)
+
+        top_indices = np.argsort(-scores)[:top_k]
+
+        return [
+            {
+                "rank": rank + 1,
+                "score": float(scores[idx]),
+                "content": self.chunks[idx].content[:300],
+                "type": self.chunks[idx].chunk_type,
+                "page": self.chunks[idx].page_number,
+                "source": self.chunks[idx].source_file,
+            }
+            for rank, idx in enumerate(top_indices)
+        ]
+</code></pre>
+<div class="code-caption">Dense retrieval over heterogeneous scientific content using sentence-transformers. All chunk types (text, figures, tables, equations) are embedded as text, enabling unified cross-modal search. The optional type filter restricts results to specific modalities when the query targets a particular content type.</div>
+
+<h2>5. Hallucination Detection and Source Attribution</h2>
+
+<p>
+Scientific question answering has a unique challenge: hallucinated answers can propagate
+false claims into the research record. A model that confidently states "compound X has
+IC50 = 3.2 nM against target Y" when no source supports this claim is dangerous.
+PaperQA2 addresses this with <strong>source attribution</strong>: every statement in the
+generated answer must be traceable to a specific passage in a specific paper, and the
+system assigns a confidence score reflecting how well the evidence supports the claim.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misunderstanding is that retrieval-augmented generation cannot hallucinate
+because it grounds answers in real documents. In practice, RAG systems hallucinate in
+at least three ways: the model may fabricate details not present in any retrieved
+passage, it may incorrectly combine facts from different passages (conflation), or it
+may cite a real passage that does not actually support the stated claim (misattribution).
+Retrieval reduces hallucination relative to pure generation, but it does not eliminate
+it; explicit claim verification (as shown below) remains necessary.
+</p>
+</div>
+
+<pre><code class="language-python">from dataclasses import dataclass
+import re
+
+
+@dataclass
+class CitedClaim:
+    """A claim extracted from a generated answer with its source."""
+    claim_text: str
+    source_passage: str
+    source_paper: str
+    source_page: int
+    support_score: float  # 0-1, how well the passage supports the claim
+
+
+def extract_and_verify_claims(
+    answer: str,
+    evidence_passages: list[dict],
+    verifier_model,
+) -> list[CitedClaim]:
+    """Extract claims from an answer and verify source support.
+
+    Parameters
+    ----------
+    answer : str
+        Generated answer with inline citations like [1], [2].
+    evidence_passages : list[dict]
+        Retrieved passages with paper metadata.
+    verifier_model : callable
+        NLI model that scores (premise, hypothesis) pairs.
+        Returns probability that premise entails hypothesis.
+    """
+    # Split answer into individual claims (sentences)
+    sentences = re.split(r'(?<=[.!?])\s+', answer)
+
+    verified_claims = []
+    for sentence in sentences:
+        # Extract citation markers [N]
+        citations = re.findall(r'\[(\d+)\]', sentence)
+        clean_claim = re.sub(r'\[\d+\]', '', sentence).strip()
+
+        if not clean_claim or not citations:
+            continue
+
+        # Verify each cited source supports the claim
+        best_score = 0.0
+        best_source = None
+        for cite_num in citations:
+            idx = int(cite_num) - 1
+            if idx < len(evidence_passages):
+                passage = evidence_passages[idx]
+                # NLI verification: does the passage entail the claim?
+                score = verifier_model(
+                    premise=passage["text"],
+                    hypothesis=clean_claim,
+                )
+                if score > best_score:
+                    best_score = score
+                    best_source = passage
+
+        if best_source:
+            verified_claims.append(CitedClaim(
+                claim_text=clean_claim,
+                source_passage=best_source["text"][:200],
+                source_paper=best_source.get("title", "Unknown"),
+                source_page=best_source.get("page", 0),
+                support_score=best_score,
+            ))
+
+    return verified_claims
+
+
+def flag_unsupported_claims(
+    claims: list[CitedClaim],
+    threshold: float = 0.5,
+) -> list[CitedClaim]:
+    """Flag claims with insufficient source support.
+
+    Returns claims where the best supporting evidence
+    falls below the entailment threshold.
+    """
+    return [c for c in claims if c.support_score < threshold]
+</code></pre>
+<div class="code-caption">Claim extraction and source verification for scientific answers. Each sentence is matched to its cited evidence passages, and an NLI (natural language inference) model scores how well the evidence supports the claim. Claims below the support threshold are flagged as potentially hallucinated.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Verified Scientific QA With Structured Evidence</div>
+<p>
+PaperQA2 achieved 85.2% accuracy on the LitQA2 benchmark, outperforming human
+PhD-level respondents. Building on this, VERITAS (Li et al., 2024) introduced a
+fine-grained scientific claim verification framework that decomposes generated answers
+into atomic claims and checks each against structured evidence (tables, figures, and
+equations), not just text passages. VERITAS shows that roughly 40% of hallucinations in
+scientific QA involve numerical values (dosages, binding constants, p-values) drawn from
+tables or figures, and that text-only NLI verification misses these because the source
+data is in a non-textual modality. Concurrently, ScholarQABench (Agarwal et al., 2025)
+provides a multi-paper QA benchmark requiring synthesis across 10+ sources per question,
+revealing that even state-of-the-art systems drop to ~50% accuracy when answers demand
+cross-paper numerical comparison. These results highlight the need for modality-aware
+verification that goes beyond textual entailment to include table cell matching, chart
+value extraction, and equation consistency checks.
+</p>
+</div>
+
+<h2>6. Building a Document Retrieval Pipeline</h2>
+
+<p>
+Combining the components above, we can build a complete pipeline that ingests scientific
+PDFs, extracts and indexes all modalities, and answers questions with cited sources.
+This pipeline forms the document understanding layer of the multimodal research assistant
+built in <a href="section-28.4.html">Section 28.4</a>.
+</p>
+
+<pre><code class="language-python">from pathlib import Path
+import json
+
+
+class ScientificDocumentPipeline:
+    """End-to-end pipeline for scientific document understanding.
+
+    Combines PDF parsing, figure captioning, dense retrieval,
+    and answer generation with source attribution.
+    """
+
+    def __init__(self, paper_dir: str,
+                 embedding_model: str = "BAAI/bge-base-en-v1.5"):
+        self.paper_dir = Path(paper_dir)
+        self.retriever = ScientificRetriever(embedding_model)
+        self.all_chunks: list[DocumentChunk] = []
+        self._indexed = False
+
+    def ingest_papers(self, chunk_size: int = 500) -> int:
+        """Parse all PDFs in the paper directory.
+
+        Returns the total number of chunks extracted.
+        """
+        pdf_files = list(self.paper_dir.glob("*.pdf"))
+        print(f"Found {len(pdf_files)} PDF files")
+
+        for pdf_path in pdf_files:
+            chunks = parse_scientific_pdf(
+                str(pdf_path), chunk_size=chunk_size
+            )
+            self.all_chunks.extend(chunks)
+
+        print(f"Extracted {len(self.all_chunks)} chunks "
+              f"({sum(1 for c in self.all_chunks if c.chunk_type == 'text')} text, "
+              f"{sum(1 for c in self.all_chunks if c.chunk_type == 'figure')} figures)")
+        return len(self.all_chunks)
+
+    def build_index(self) -> None:
+        """Build the dense retrieval index over all chunks."""
+        self.retriever.index_documents(self.all_chunks)
+        self._indexed = True
+        print(f"Indexed {len(self.all_chunks)} chunks")
+
+    def query(self, question: str, top_k: int = 10,
+              chunk_type: str = None) -> list[dict]:
+        """Search the indexed documents.
+
+        Parameters
+        ----------
+        question : str
+            Natural language query.
+        top_k : int
+            Number of results.
+        chunk_type : str, optional
+            Filter by "text", "figure", or "table".
+        """
+        if not self._indexed:
+            raise RuntimeError("Call build_index() before querying")
+
+        return self.retriever.search(question, top_k, chunk_type)
+
+    def answer(self, question: str,
+               max_sources: int = 5) -> dict:
+        """Generate a cited answer from the document corpus.
+
+        Retrieves evidence, synthesizes answer, and provides
+        source attribution for each claim.
+        """
+        evidence = self.query(question, top_k=max_sources * 2)
+
+        # Format evidence for answer generation
+        context = "\n\n".join(
+            f"[{i+1}] (p.{e['page']}, {Path(e['source']).stem}): "
+            f"{e['content']}"
+            for i, e in enumerate(evidence[:max_sources])
+        )
+
+        return {
+            "question": question,
+            "evidence": evidence[:max_sources],
+            "context_for_llm": context,
+            "num_sources": len(evidence[:max_sources]),
+        }
+
+
+# Usage
+# pipeline = ScientificDocumentPipeline("./papers/kinase_inhibitors/")
+# pipeline.ingest_papers()
+# pipeline.build_index()
+#
+# results = pipeline.query(
+#     "What is the selectivity profile of lapatinib?",
+#     top_k=5,
+# )
+# for r in results:
+#     print(f"  [{r['type']}] p.{r['page']} score={r['score']:.3f}")
+#     print(f"    {r['content'][:100]}...")
+</code></pre>
+<div class="code-caption">A complete scientific document pipeline from PDF ingestion through dense retrieval. The pipeline handles text, figures, and tables uniformly, building a single index for cross-modal scientific document search. The answer method prepares evidence context for LLM-based answer generation.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PaperQA2 for Full-Stack Document QA</div>
+<p>
+The from-scratch pipeline above is approximately 250 lines. PaperQA2 provides
+production-grade equivalents for all components (PDF parsing, chunking, dense retrieval,
+agentic search, answer generation, citation verification) in a single package:
+</p>
+<pre><code class="language-python"># Full PaperQA2 pipeline (replaces ~250 lines with ~10)
+from paperqa import Settings, ask
+
+result = await ask(
+    "What is the binding affinity of erlotinib to EGFR?",
+    settings=Settings(paper_directory="./papers/"),
+)
+
+print(result.answer)          # cited answer
+print(result.confidence)      # 0-1 confidence score
+for ref in result.references:
+    print(f"  {ref.title}: {ref.text[:100]}...")
+</code></pre>
+<p>
+PaperQA2 handles PDF parsing (including figures and tables), hybrid retrieval
+(sparse + dense), iterative evidence gathering, answer synthesis with citations,
+and confidence scoring internally. Line count reduction: approximately 25x.
+Use the from-scratch approach when you need custom indexing strategies, domain-specific
+figure understanding, or integration with non-standard document formats.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Paper That Cited Itself</div>
+<p>
+When testing PaperQA2 on a corpus that includes the PaperQA2 paper itself, the system
+will sometimes cite its own paper to answer questions about its own architecture. This
+is technically correct (the best kind of correct) but creates an amusing circularity:
+the system's answer about how it works is sourced from the paper describing how it
+works. More practically, self-citation bias in document QA systems is a known issue.
+If your corpus overrepresents a particular research group, the QA system will
+overrepresent that group's claims in its answers.
+</p>
+</div>
+
+<h2>7. Evaluation: Answer Quality and Attribution Fidelity</h2>
+
+<p>
+Evaluating a scientific document QA system requires two orthogonal measurements:
+<strong>answer correctness</strong> (does the answer match the ground truth?) and
+<strong>attribution fidelity</strong> (do the cited sources actually support the claims?).
+A system can produce a correct answer with wrong citations (lucky guess), or a
+well-cited answer that is factually wrong (the source was misinterpreted).
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+
+
+@dataclass
+class DocumentQAMetrics:
+    """Evaluation metrics for scientific document QA systems.
+
+    Measures both answer quality and source attribution.
+    """
+
+    @staticmethod
+    def answer_accuracy(predictions: list[str],
+                        ground_truths: list[str],
+                        exact_match: bool = False) -> float:
+        """Fraction of answers that match the ground truth.
+
+        Uses exact string match or fuzzy substring match.
+        """
+        correct = 0
+        for pred, truth in zip(predictions, ground_truths):
+            if exact_match:
+                if pred.strip().lower() == truth.strip().lower():
+                    correct += 1
+            else:
+                # Fuzzy: truth appears as substring in prediction
+                if truth.strip().lower() in pred.strip().lower():
+                    correct += 1
+        return correct / len(predictions) if predictions else 0.0
+
+    @staticmethod
+    def citation_precision(cited_passages: list[list[str]],
+                           relevant_passages: list[list[str]]) -> float:
+        """Fraction of cited passages that are actually relevant.
+
+        High precision means the system does not cite irrelevant sources.
+        """
+        total_cited = 0
+        relevant_cited = 0
+        for cited, relevant in zip(cited_passages, relevant_passages):
+            for c in cited:
+                total_cited += 1
+                if any(r in c or c in r for r in relevant):
+                    relevant_cited += 1
+        return relevant_cited / total_cited if total_cited else 0.0
+
+    @staticmethod
+    def citation_recall(cited_passages: list[list[str]],
+                        relevant_passages: list[list[str]]) -> float:
+        """Fraction of relevant passages that are actually cited.
+
+        High recall means the system does not miss important sources.
+        """
+        total_relevant = 0
+        recalled = 0
+        for cited, relevant in zip(cited_passages, relevant_passages):
+            for r in relevant:
+                total_relevant += 1
+                if any(r in c or c in r for c in cited):
+                    recalled += 1
+        return recalled / total_relevant if total_relevant else 0.0
+</code></pre>
+<div class="code-caption">Evaluation metrics for scientific document QA measuring both answer accuracy and citation quality (precision and recall). Citation precision catches systems that pad answers with irrelevant sources; citation recall catches systems that miss important evidence.</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Scientific QA System</h4>
+<p>
+Build a working document QA pipeline over open-access papers in under an hour.
+(1) Download 5 open-access PDFs from arXiv on a single topic (for example, search
+"graph neural networks for drug discovery" and grab the top 5 results as PDFs into a
+folder called <code>papers/</code>).
+(2) Install dependencies: <code>pip install pymupdf sentence-transformers numpy</code>.
+Copy the <code>DocumentChunk</code>, <code>parse_scientific_pdf</code>, and
+<code>ScientificRetriever</code> classes from this section into a file called
+<code>mini_qa.py</code>.
+(3) Write a short driver script that calls <code>parse_scientific_pdf</code> on each PDF,
+collects all chunks, indexes them with <code>ScientificRetriever</code>, and exposes a
+<code>search(query)</code> function.
+(4) Write 5 questions whose answers you can verify by reading the papers (for example,
+"What dataset did the authors use for molecular property prediction?"). Run each query,
+inspect the top-3 retrieved chunks, and manually judge whether the correct passage
+appears.
+(5) Compute precision@3 (fraction of top-3 results that are relevant) and recall@3
+(fraction of questions where the correct passage appears in the top 3). Experiment with
+chunk sizes of 300, 500, and 800 characters and compare how retrieval quality changes.
+</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual.</strong> Explain why PaperQA2's agentic approach (iterative search, gather,
+re-search) produces better answers than single-pass RAG for scientific questions. Give a
+specific example of a question that requires multiple retrieval rounds and explain what
+each round contributes to the final answer.</li>
+
+<li><strong>Coding.</strong> Build a minimal scientific document pipeline using the
+<code>ScientificDocumentPipeline</code> class above. Index 5 to 10 open-access papers from
+arXiv (download PDFs manually). Implement a simple evaluation: write 10 questions whose
+answers you know, query the pipeline, and measure answer accuracy and retrieval
+precision@5. Compare results with and without figure captioning enabled.</li>
+
+<li><strong>Analysis.</strong> The hallucination detection approach in this section uses NLI
+(natural language inference) to verify that cited passages entail the generated claims.
+What are the limitations of NLI for scientific claim verification? Consider: (a) claims
+involving numerical comparisons, (b) claims that require multi-hop reasoning across
+passages, (c) claims about statistical significance. For each limitation, propose an
+alternative verification strategy.</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-28.2.html">&larr; 28.2 Molecule-Text and Protein-Text Models</a>
+<span class="nav-separator">|</span>
+<a href="index.html">Chapter 28</a>
+<span class="nav-separator">|</span>
+<a href="section-28.4.html">28.4 Building a Multimodal Research Assistant &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

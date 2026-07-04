@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.3: Treatment Effect Estimation. ATE, ATT, CATE with inverse propensity weighting, double machine learning, meta-learners, and E-value sensitivity analysis." name="description"/>
+<title>Section 31.3: Treatment Effect Estimation | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: Causal Discovery and Causal Inference</a></div>
+<h1>31.3 Treatment Effect Estimation</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"My point estimate was beautiful. Then the sensitivity analysis showed it would vanish if just one unmeasured confounder existed with a risk ratio of 1.3. I have not slept well since."</p>
+<cite>An E-value That Delivered Bad News</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+In <a href="section-31.1.html">Section 31.1</a>, we learned the structural causal model
+formalism, the do-operator, and the backdoor criterion for identification. In
+<a href="section-31.2.html">Section 31.2</a>, we discovered how to learn causal graphs from
+data. Now we turn to the quantitative question: given a causal graph and observational data,
+how large is the causal effect? You should be comfortable with the backdoor adjustment formula,
+potential outcomes, and the ignorability assumption. Familiarity with logistic regression and
+random forests from <a href="../../part-1-foundations/module-05-data-models-simulation/index.html">Chapter 5</a>
+will help with the estimation methods.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Treatment effect estimation bridges the gap between causal identification (can we compute the
+effect?) and statistical estimation (what is the effect, and how precisely do we know it?).
+This section covers three layers of increasing richness: the <strong>average treatment effect
+(ATE)</strong>, which summarizes the population-level impact; the <strong>average treatment
+effect on the treated (ATT)</strong>, which focuses on those who actually received treatment;
+and the <strong>conditional average treatment effect (CATE)</strong>, which reveals how the
+effect varies across subpopulations. Modern semiparametric methods (double machine learning,
+meta-learners) let us use flexible ML models for nuisance estimation while preserving valid
+confidence intervals for the causal parameter. E-value sensitivity analysis then quantifies
+how robust our conclusions are to unmeasured confounding.
+</p>
+</div>
+
+<h2>1. The Estimands: ATE, ATT, CATE</h2>
+
+<p>
+Using the potential outcomes notation from <a href="section-31.1.html">Section 31.1</a>, we
+define three fundamental treatment effect estimands for a binary treatment $T \in \{0, 1\}$:
+</p>
+
+<p>
+The <strong>Average Treatment Effect (ATE)</strong> is the expected difference in potential
+outcomes across the entire population:
+</p>
+
+$$\text{ATE} = E[Y(1) - Y(0)] = E[Y(1)] - E[Y(0)]$$
+
+<p>
+The <strong>Average Treatment Effect on the Treated (ATT)</strong> restricts the comparison to
+units that actually received treatment:
+</p>
+
+$$\text{ATT} = E[Y(1) - Y(0) \mid T = 1] = E[Y(1) \mid T = 1] - E[Y(0) \mid T = 1]$$
+
+<p>
+The ATT is often the policy-relevant quantity: it answers "how much did the treatment help
+those who received it?" The second term, $E[Y(0) \mid T = 1]$, is the expected outcome the
+treated group <em>would have had</em> under control, which is counterfactual and must be
+estimated.
+</p>
+
+<p>
+The <strong>Conditional Average Treatment Effect (CATE)</strong> captures treatment effect
+heterogeneity by conditioning on covariates:
+</p>
+
+$$\tau(x) = E[Y(1) - Y(0) \mid X = x]$$
+
+<p>
+CATE is a function, not a number. It tells us which subpopulations benefit most (or are
+harmed) by the treatment. In personalized medicine, CATE estimation drives treatment
+recommendations: give the drug to patients with $\tau(x) > 0$ and withhold it from those
+with $\tau(x) < 0$. CATE estimation is the most challenging task because it requires
+modeling a function over the covariate space, not estimating a single scalar.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Right Estimand Depends on the Question</div>
+<p>
+Choosing between ATE, ATT, and CATE is not a statistical decision; it is a scientific one.
+ATE answers: "if we treated everyone, what would the average benefit be?" ATT answers: "did
+the treatment help those who received it?" CATE answers: "who benefits most?" A drug with
+ATE = 0 might still have $\tau(x) > 0$ for a subpopulation and $\tau(x) < 0$ for another,
+meaning it helps some patients and harms others. Reporting only the ATE would hide this
+heterogeneity. Conversely, a policy maker deciding whether to universally deploy a
+fertilizer needs the ATE, not the CATE. The estimand must match the scientific question
+before any estimation begins.
+</p>
+</div>
+
+<h2>2. Inverse Propensity Weighting</h2>
+
+<p>
+The simplest approach to ATE estimation is the <strong>Horvitz-Thompson estimator</strong>,
+also called <strong>inverse propensity weighting (IPW)</strong>. The key idea: in
+observational data, treatment assignment is non-random, so naive comparisons of treated and
+control groups are biased. IPW corrects this by reweighting each observation by the inverse
+of its probability of receiving the treatment it actually received.
+</p>
+
+<p>
+The <strong>propensity score</strong> is the probability of receiving treatment given
+covariates:
+</p>
+
+$$e(x) = P(T = 1 \mid X = x)$$
+
+<p data-agent="02">
+A propensity score is a single number between 0 and 1 that summarizes how likely a unit was to receive treatment based on all of its observed characteristics. It matters because it reduces a potentially high-dimensional covariate adjustment problem to a one-dimensional balancing problem: instead of matching on every covariate individually, you only need to balance on this scalar. The mechanism is straightforward: fit a classification model (logistic regression, gradient boosting, or any probabilistic classifier) to predict treatment assignment from covariates, then use the predicted probabilities as the propensity scores. Use propensity scores when you have many covariates and matching on all of them simultaneously is impractical; use direct regression adjustment instead when you have few covariates and want to model the outcome directly, or use doubly robust methods (Section 3 below) when you want protection against misspecification in either model.
+</p>
+
+<p>
+The IPW estimator for the ATE is:
+</p>
+
+$$\hat{\tau}_{\text{IPW}} = \frac{1}{n} \sum_{i=1}^{n} \left[ \frac{T_i Y_i}{e(X_i)} - \frac{(1 - T_i) Y_i}{1 - e(X_i)} \right]$$
+
+<p>
+The intuition: a treated unit with propensity score $e(x) = 0.9$ was very likely to be treated
+anyway, so it gets weight $1/0.9 \approx 1.1$; it does not teach us much about what would
+happen if we treated a randomly chosen unit. A treated unit with $e(x) = 0.2$ was unlikely to
+be treated, so it gets weight $1/0.2 = 5$; it is more "informative" about the treatment
+effect because it resembles the control population.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that IPW (or any method that adjusts for observed covariates) fully eliminates confounding bias. It does not. IPW corrects for <em>measured</em> confounders only. If an unmeasured variable influences both treatment assignment and the outcome, the reweighted estimate remains biased regardless of how accurately you model the propensity score. Adjusting for observed covariates is necessary but never sufficient to guarantee a causal interpretation; that guarantee requires the untestable assumption that no unmeasured confounders exist (the ignorability assumption), which is why sensitivity analysis (Section 6) is essential.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+
+np.random.seed(42)
+n = 5_000
+
+# Simulate observational data with confounding
+X1 = np.random.normal(0, 1, n)  # Age (standardized)
+X2 = np.random.normal(0, 1, n)  # Severity (standardized)
+
+# Treatment assignment depends on confounders
+propensity_true = 1 / (1 + np.exp(-(0.5 * X1 + 0.8 * X2)))
+T = np.random.binomial(1, propensity_true)
+
+# Outcome with heterogeneous treatment effect
+Y = 2 * T + 0.5 * X1 - 0.3 * X2 + 0.4 * T * X1 + np.random.normal(0, 1, n)
+
+data = pd.DataFrame({"X1": X1, "X2": X2, "T": T, "Y": Y})
+
+# Naive estimate (biased)
+naive = data[data.T == 1]["Y"].mean() - data[data.T == 0]["Y"].mean()
+print(f"Naive ATE: {naive:.3f}")  # Biased upward
+
+# IPW estimate
+lr = LogisticRegression()
+lr.fit(data[["X1", "X2"]], data["T"])
+e_hat = lr.predict_proba(data[["X1", "X2"]])[:, 1]
+
+# Clip propensity scores to avoid extreme weights
+e_hat = np.clip(e_hat, 0.05, 0.95)
+
+ipw_ate = np.mean(T * Y / e_hat - (1 - T) * Y / (1 - e_hat))
+print(f"IPW ATE: {ipw_ate:.3f}")
+
+# True ATE: E[2 + 0.4*X1] = 2 + 0.4*E[X1] = 2 + 0 = 2.0
+print(f"True ATE: 2.000")</code></pre>
+<div class="code-caption">Listing 31.12: Inverse propensity weighting for ATE estimation. Propensity scores estimated by logistic regression reweight observations to correct for confounding. Clipping extreme propensity scores (below 0.05 or above 0.95) stabilizes the estimator at the cost of mild bias.</div>
+
+<p>
+IPW has a well-known weakness: when propensity scores are close to 0 or 1, the weights
+become extreme, inflating variance. This is called <strong>positivity violation</strong>
+or <strong>practical non-overlap</strong>. Clipping propensity scores (as in the code above)
+is the simplest remedy, but it introduces bias. A more principled solution is the
+<strong>doubly robust estimator</strong>, which combines propensity weighting with outcome
+regression.
+</p>
+
+<h2>3. Doubly Robust Estimation</h2>
+
+<p>
+The <strong>augmented inverse propensity weighted (AIPW)</strong> estimator, also called the
+doubly robust estimator, combines outcome regression $\hat{\mu}(t, x) = \hat{E}[Y \mid T = t, X = x]$
+with propensity weighting:
+</p>
+
+$$\hat{\tau}_{\text{AIPW}} = \frac{1}{n} \sum_{i=1}^{n} \left[ \hat{\mu}(1, X_i) - \hat{\mu}(0, X_i) + \frac{T_i (Y_i - \hat{\mu}(1, X_i))}{e(X_i)} - \frac{(1 - T_i)(Y_i - \hat{\mu}(0, X_i))}{1 - e(X_i)} \right]$$
+
+<p>
+The "doubly robust" property: the estimator is consistent if <em>either</em> the propensity
+score model $e(x)$ or the outcome model $\hat{\mu}(t, x)$ is correctly specified. You get
+two chances to get it right, not one. If both models are correct, AIPW achieves the
+semiparametric efficiency bound (the smallest possible variance among regular estimators).
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of double robustness like navigating to a friend's house using both a GPS and written directions. If the GPS has accurate maps but a weak signal (the propensity model is right, the outcome model is wrong), you still arrive. If the GPS signal drops entirely but the written directions are correct (the outcome model is right, the propensity model is wrong), you also arrive. You only get lost if both the GPS and the written directions are simultaneously wrong. The AIPW estimator works the same way: the propensity model corrects the residual errors of the outcome model, and vice versa, so you need both to fail for the estimate to be biased. This is not just a convenience; it is a structural property of how the two correction terms cancel each other's mistakes in the formula above.
+</p>
+</div>
+
+<pre><code class="language-python">from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
+
+# Outcome models: E[Y | T=t, X]
+mu1_model = GradientBoostingRegressor(n_estimators=100, max_depth=3)
+mu0_model = GradientBoostingRegressor(n_estimators=100, max_depth=3)
+
+treated = data[data.T == 1]
+control = data[data.T == 0]
+
+mu1_model.fit(treated[["X1", "X2"]], treated["Y"])
+mu0_model.fit(control[["X1", "X2"]], control["Y"])
+
+mu1_hat = mu1_model.predict(data[["X1", "X2"]])
+mu0_hat = mu0_model.predict(data[["X1", "X2"]])
+
+# Propensity model
+ps_model = GradientBoostingClassifier(n_estimators=100, max_depth=3)
+ps_model.fit(data[["X1", "X2"]], data["T"])
+e_hat_gb = np.clip(ps_model.predict_proba(data[["X1", "X2"]])[:, 1], 0.05, 0.95)
+
+# AIPW estimator
+aipw_scores = (
+    (mu1_hat - mu0_hat)
+    + T * (Y - mu1_hat) / e_hat_gb
+    - (1 - T) * (Y - mu0_hat) / (1 - e_hat_gb)
+)
+aipw_ate = aipw_scores.mean()
+aipw_se = aipw_scores.std() / np.sqrt(n)
+
+print(f"AIPW ATE: {aipw_ate:.3f} (SE: {aipw_se:.3f})")
+print(f"95% CI: [{aipw_ate - 1.96*aipw_se:.3f}, {aipw_ate + 1.96*aipw_se:.3f}]")
+print(f"True ATE: 2.000")</code></pre>
+<div class="code-caption">Listing 31.13: The doubly robust (AIPW) estimator combining gradient boosting for both outcome and propensity models. The estimator is consistent if either model is correctly specified, and achieves the semiparametric efficiency bound when both are correct.</div>
+
+<h2>4. Double Machine Learning</h2>
+
+<p>
+<strong>Double Machine Learning (DML)</strong>, introduced by Chernozhukov et al. (2018),
+provides a rigorous framework for using arbitrary ML models (random forests, neural networks,
+gradient boosting) for nuisance estimation while preserving $\sqrt{n}$-consistent, asymptotically
+normal inference on the causal parameter. The key innovations are:
+</p>
+
+<ol>
+<li><strong>Neyman orthogonality</strong>: construct a moment condition for the causal parameter that is locally insensitive to errors in the nuisance estimates. This allows the nuisance models to converge at slower-than-$\sqrt{n}$ rates (as ML models typically do) without contaminating the causal estimate.</li>
+<li><strong>Cross-fitting</strong>: split the data into $K$ folds. For each fold, estimate nuisance parameters on the other $K - 1$ folds and compute the causal estimate on the held-out fold. This avoids overfitting bias from using the same data for nuisance estimation and causal inference.</li>
+</ol>
+
+<p>
+The partially linear model $Y = \theta T + g(X) + U$, $T = m(X) + V$ illustrates the DML
+recipe. The causal parameter $\theta$ is the treatment effect. The functions $g(X) = E[Y \mid X]$
+and $m(X) = E[T \mid X]$ are nuisance parameters estimated by ML. The DML estimator:
+</p>
+
+<ol>
+<li>Residualize $Y$ against $X$: compute $\tilde{Y} = Y - \hat{g}(X)$.</li>
+<li>Residualize $T$ against $X$: compute $\tilde{T} = T - \hat{m}(X)$.</li>
+<li>Regress $\tilde{Y}$ on $\tilde{T}$: $\hat{\theta} = (\tilde{T}^\top \tilde{T})^{-1} \tilde{T}^\top \tilde{Y}$.</li>
+</ol>
+
+<p>
+The residualization "partials out" the confounders, isolating the variation in $T$ that is
+not explained by $X$, which is the variation that is as-good-as-random under the ignorability
+assumption. This is the Frisch-Waugh-Lovell theorem generalized to nonparametric nuisance
+estimation.
+</p>
+
+<pre><code class="language-python">from econml.dml import LinearDML
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+
+# Double ML with EconML
+dml = LinearDML(
+    model_y=RandomForestRegressor(n_estimators=200, max_depth=5, min_samples_leaf=10),
+    model_t=RandomForestClassifier(n_estimators=200, max_depth=5, min_samples_leaf=10),
+    cv=5,  # 5-fold cross-fitting
+    random_state=42,
+)
+
+X_covariates = data[["X1", "X2"]].values
+T_treatment = data["T"].values
+Y_outcome = data["Y"].values
+
+dml.fit(Y_outcome, T_treatment, X=X_covariates)
+
+# ATE with confidence interval
+ate = dml.ate()
+ate_interval = dml.ate_interval(alpha=0.05)
+print(f"DML ATE: {ate:.3f}")
+print(f"95% CI: [{ate_interval[0]:.3f}, {ate_interval[1]:.3f}]")
+print(f"True ATE: 2.000")
+
+# CATE: treatment effect as a function of covariates
+# Predict CATE for specific covariate values
+test_points = np.array([[0, 0], [1, 0], [-1, 0], [0, 1]])
+cate_predictions = dml.effect(test_points)
+cate_intervals = dml.effect_interval(test_points, alpha=0.05)
+
+print("\nCate predictions:")
+for i, (x, tau, ci) in enumerate(zip(test_points, cate_predictions, zip(*cate_intervals))):
+    print(f"  X={x}: CATE={tau:.3f}, 95% CI=[{ci[0]:.3f}, {ci[1]:.3f}]")</code></pre>
+<div class="code-caption">Listing 31.14: Double Machine Learning with EconML. Random forests handle the nonlinear nuisance estimation; 5-fold cross-fitting prevents overfitting bias; and the Neyman-orthogonal moment condition ensures valid confidence intervals despite the ML nuisance models.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Heterogeneous Drug Response in Clinical Data</div>
+<p>
+A pharmaceutical company studies whether a new anti-inflammatory drug reduces joint pain scores.
+Observational data from electronic health records show that older patients and those with higher
+baseline inflammation are more likely to receive the drug (confounding by indication). The
+company runs DML with gradient boosting for both nuisance models, using age, baseline
+inflammation, BMI, and comorbidity count as covariates. The overall ATE is 1.2 points on a
+10-point pain scale ($p < 0.001$). But the CATE analysis reveals dramatic heterogeneity: patients
+with high baseline inflammation ($> 2$ SD above mean) show CATE = 3.1 points, while patients with
+low baseline inflammation show CATE = 0.3 points (not significant). This heterogeneity, invisible
+in the ATE, directly informs personalized treatment guidelines. The analysis connects to the
+<a href="../../part-6-scientific-domains/module-48-biology-medicine/index.html">biology and
+medicine</a> applications in Chapter 48.
+</p>
+</div>
+
+<h2>5. Meta-Learners for CATE</h2>
+
+<p>
+Meta-learners are a family of strategies for estimating CATE by combining base ML models in
+specific ways. The three most common meta-learners are:
+</p>
+
+<p>
+<strong>T-learner</strong>: fit separate outcome models for treated ($\hat{\mu}_1(x)$) and
+control ($\hat{\mu}_0(x)$) groups. The CATE estimate is $\hat{\tau}(x) = \hat{\mu}_1(x) - \hat{\mu}_0(x)$.
+Simple but can suffer from regularization bias when the treatment and control groups have
+different sample sizes or covariate distributions.
+</p>
+
+<p>
+<strong>S-learner</strong>: fit a single outcome model $\hat{\mu}(t, x)$ that includes
+treatment as a feature. The CATE estimate is $\hat{\tau}(x) = \hat{\mu}(1, x) - \hat{\mu}(0, x)$.
+Can underestimate heterogeneity because regularization may shrink the treatment effect toward
+zero if it is small relative to the main effects.
+</p>
+
+<p>
+<strong>X-learner</strong> (Kunzel et al., 2019): a two-stage procedure that is especially
+effective when the treated and control groups are imbalanced. Stage 1: fit T-learner models.
+Stage 2: impute individual treatment effects by applying each group's model to the other
+group's data. Stage 3: combine the imputed effects using a propensity-score-weighted average.
+</p>
+
+<pre><code class="language-python">from econml.metalearners import TLearner, SLearner, XLearner
+from sklearn.ensemble import GradientBoostingRegressor
+
+# T-Learner
+t_learner = TLearner(
+    models=GradientBoostingRegressor(n_estimators=200, max_depth=4)
+)
+t_learner.fit(Y_outcome, T_treatment, X=X_covariates)
+
+# S-Learner
+s_learner = SLearner(
+    overall_model=GradientBoostingRegressor(n_estimators=200, max_depth=4)
+)
+s_learner.fit(Y_outcome, T_treatment, X=X_covariates)
+
+# X-Learner
+x_learner = XLearner(
+    models=GradientBoostingRegressor(n_estimators=200, max_depth=4),
+    propensity_model=LogisticRegression(),
+)
+x_learner.fit(Y_outcome, T_treatment, X=X_covariates)
+
+# Compare CATE estimates at test points
+print("CATE comparison at X1=1, X2=0:")
+test_x = np.array([[1.0, 0.0]])
+print(f"  T-learner: {t_learner.effect(test_x)[0]:.3f}")
+print(f"  S-learner: {s_learner.effect(test_x)[0]:.3f}")
+print(f"  X-learner: {x_learner.effect(test_x)[0]:.3f}")
+print(f"  True CATE: {2 + 0.4 * 1.0:.3f}")  # tau(x) = 2 + 0.4*X1
+
+# Population-level CATE distribution
+cate_t = t_learner.effect(X_covariates)
+cate_s = s_learner.effect(X_covariates)
+cate_x = x_learner.effect(X_covariates)
+
+print(f"\nPopulation CATE statistics:")
+print(f"  T-learner: mean={cate_t.mean():.3f}, std={cate_t.std():.3f}")
+print(f"  S-learner: mean={cate_s.mean():.3f}, std={cate_s.std():.3f}")
+print(f"  X-learner: mean={cate_x.mean():.3f}, std={cate_x.std():.3f}")</code></pre>
+<div class="code-caption">Listing 31.15: Comparing T-learner, S-learner, and X-learner for CATE estimation. All three use gradient boosting as the base model but combine predictions differently. The true CATE is $\tau(x) = 2 + 0.4 X_1$, so CATE should increase with $X_1$.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: EconML's Meta-Learner Zoo</div>
+<p>
+EconML provides T-learner, S-learner, X-learner, doubly robust learner, causal forests
+(Athey and Wager, 2019), and the DRLearner, all with a unified <code>fit/effect/effect_interval</code>
+API. The library handles cross-fitting, propensity estimation, and confidence interval
+construction internally. What would require implementing the full X-learner two-stage
+procedure from scratch (separate model fits, counterfactual imputation, propensity-weighted
+combination) reduces to three lines of code. EconML also integrates with DoWhy for the
+identification step, creating a seamless model-identify-estimate-refute pipeline.
+</p>
+</div>
+
+<h2>6. Sensitivity Analysis with E-Values</h2>
+
+<p>
+Every observational causal analysis rests on the assumption that all confounders are measured
+(ignorability). This assumption is untestable: we can never rule out the existence of an
+unmeasured confounder that biases our estimate. <strong>Sensitivity analysis</strong>
+quantifies how <em>strong</em> such an unmeasured confounder would need to be to explain
+away the observed effect.
+</p>
+
+<p>
+The <strong>E-value</strong> (VanderWeele and Ding, 2017) provides an intuitive measure of
+robustness. For an observed risk ratio $\text{RR}$, the E-value is:
+</p>
+
+$$E\text{-value} = \text{RR} + \sqrt{\text{RR} \times (\text{RR} - 1)}$$
+
+<p>
+The E-value represents the minimum strength of association (on the risk ratio scale) that an
+unmeasured confounder would need to have with <em>both</em> the treatment and the outcome,
+<em>above and beyond</em> the measured covariates, to fully explain away the observed
+treatment-outcome association. A large E-value means the estimate is robust: only a very
+strong unmeasured confounder could overturn the conclusion. A small E-value (close to 1)
+means even a weak unmeasured confounder could explain the finding.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def compute_e_value(risk_ratio: float, ci_bound: float = None) -> dict:
+    """Compute the E-value for an observed risk ratio.
+
+    Parameters
+    ----------
+    risk_ratio : float
+        Observed risk ratio (must be >= 1; if < 1, invert it).
+    ci_bound : float, optional
+        The confidence interval bound closest to 1.0.
+
+    Returns
+    -------
+    dict with E-value for point estimate and CI bound.
+    """
+    if risk_ratio < 1:
+        risk_ratio = 1 / risk_ratio  # Work with RR >= 1
+
+    e_point = risk_ratio + np.sqrt(risk_ratio * (risk_ratio - 1))
+
+    result = {"e_value_point": e_point}
+
+    if ci_bound is not None:
+        if ci_bound < 1:
+            ci_bound = 1 / ci_bound
+        if ci_bound <= 1.0:
+            result["e_value_ci"] = 1.0  # CI crosses null
+        else:
+            result["e_value_ci"] = ci_bound + np.sqrt(ci_bound * (ci_bound - 1))
+
+    return result
+
+# Example: drug reduces mortality with RR = 0.6, 95% CI [0.45, 0.80]
+result = compute_e_value(risk_ratio=0.6, ci_bound=0.80)
+print(f"E-value for point estimate (RR=0.6): {result['e_value_point']:.2f}")
+print(f"E-value for CI bound (RR=0.80):      {result['e_value_ci']:.2f}")
+print()
+print("Interpretation: an unmeasured confounder would need to be associated")
+print(f"with both treatment and outcome by a factor of {result['e_value_point']:.1f}")
+print("(beyond measured covariates) to explain away the point estimate.")
+print(f"A factor of {result['e_value_ci']:.1f} would move the CI to include the null.")</code></pre>
+<div class="code-caption">Listing 31.16: Computing E-values for sensitivity analysis. A drug with RR = 0.6 requires an unmeasured confounder with substantial association strength to explain away the finding. The E-value for the confidence interval bound is always smaller and represents the minimum confounding needed to make the result non-significant.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Sensitivity Analysis Is Not Optional</div>
+<p>
+Reporting a causal effect without sensitivity analysis is like reporting a measurement without
+an uncertainty estimate: the number is meaningless without context about its reliability.
+The E-value provides that context by translating the abstract worry "what if there is
+unmeasured confounding?" into a concrete quantitative statement: "the result would be
+overturned only if an unmeasured confounder existed that was associated with both treatment
+and outcome by a risk ratio of at least $X$." Researchers and reviewers can then judge
+whether such a confounder is plausible in their domain. For drug safety studies, regulatory
+agencies increasingly require sensitivity analysis alongside point estimates.
+</p>
+</div>
+
+<h2>7. DoWhy Refutation Tests</h2>
+
+<p>
+DoWhy implements a battery of <strong>refutation tests</strong> that stress-test causal
+estimates by checking whether the estimate behaves as expected under controlled
+perturbations. These are not tests of statistical significance; they are tests of
+<em>causal model specification</em>. The main refutation methods are:
+</p>
+
+<ul>
+<li><strong>Placebo treatment</strong>: replace the real treatment with a random variable. If the causal model is correct, the estimated effect should be approximately zero.</li>
+<li><strong>Random common cause</strong>: add a random variable as an additional confounder. If the original adjustment set was sufficient, the estimate should not change substantially.</li>
+<li><strong>Data subset</strong>: re-estimate on a random subset of the data. The estimate should remain stable (within sampling variability).</li>
+<li><strong>Unobserved common cause</strong>: simulate the effect of an unmeasured confounder with specified strength. Quantifies how sensitive the estimate is to omitted variable bias.</li>
+</ul>
+
+<pre><code class="language-python">import dowhy
+from dowhy import CausalModel
+
+# Set up the DoWhy model
+df = pd.DataFrame({"X1": X1, "X2": X2, "T": T, "Y": Y})
+
+model = CausalModel(
+    data=df,
+    treatment="T",
+    outcome="Y",
+    common_causes=["X1", "X2"],
+)
+
+identified = model.identify_effect()
+estimate = model.estimate_effect(
+    identified,
+    method_name="backdoor.econml.dml.DML",
+    method_params={
+        "init_params": {
+            "model_y": GradientBoostingRegressor(n_estimators=100),
+            "model_t": GradientBoostingClassifier(n_estimators=100),
+            "cv": 3,
+        },
+        "fit_params": {},
+    },
+)
+print(f"Estimated ATE: {estimate.value:.3f}")
+
+# Refutation 1: Placebo treatment
+refute_placebo = model.refute_estimate(
+    identified, estimate,
+    method_name="placebo_treatment_refuter",
+    placebo_type="permute",
+    num_simulations=100,
+)
+print(f"\nPlacebo refutation:")
+print(f"  Estimated effect with placebo: {refute_placebo.new_effect:.3f}")
+print(f"  p-value: {refute_placebo.refutation_result['p_value']:.4f}")
+
+# Refutation 2: Random common cause
+refute_random = model.refute_estimate(
+    identified, estimate,
+    method_name="random_common_cause",
+    num_simulations=100,
+)
+print(f"\nRandom common cause refutation:")
+print(f"  Estimated effect with random confounder: {refute_random.new_effect:.3f}")
+
+# Refutation 3: Data subset
+refute_subset = model.refute_estimate(
+    identified, estimate,
+    method_name="data_subset_refuter",
+    subset_fraction=0.8,
+    num_simulations=100,
+)
+print(f"\nSubset refutation:")
+print(f"  Estimated effect on 80% subset: {refute_subset.new_effect:.3f}")</code></pre>
+<div class="code-caption">Listing 31.17: DoWhy refutation tests stress-testing a causal estimate. The placebo test should yield an effect near zero (confirming the treatment matters). The random common cause test should show a stable estimate (confirming the adjustment set is sufficient). The subset test should show consistency across data subsamples.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Causal Inference with Foundation Models and Automatic Debiasing</div>
+<p>
+Recent work pushes treatment effect estimation beyond the methods covered here. Chernozhukov et al. (2024) introduced <em>Automatic Debiased Machine Learning</em> (AutoDML), which automates the construction of Neyman-orthogonal moment conditions for a broad class of causal parameters, removing the need for analysts to hand-derive the debiasing correction for each new estimand. Separately, Shi et al. (2024) demonstrated that large language model embeddings of unstructured clinical notes can serve as high-dimensional proxies for unmeasured confounders, substantially reducing residual bias in observational studies where structured covariates alone are insufficient. Their CausalBERT framework fine-tunes a pretrained transformer to jointly predict treatment and outcome, achieving tighter CATE intervals than traditional covariate-based approaches on electronic health record benchmarks. These directions suggest that the next generation of causal estimation tools will combine flexible debiasing theory with representation learning from unstructured data sources.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Unreasonable Effectiveness of Doubly Robust Estimation</div>
+<p>
+In a 2021 simulation study, Naimi et al. compared 23 causal estimators across 3,600 data-generating
+processes. The doubly robust estimators (AIPW and TMLE) were the only ones that maintained low bias
+across nearly all settings, even when one of the two nuisance models was badly misspecified. The
+IPW estimator was unbiased when the propensity model was correct but catastrophically biased
+otherwise. The outcome regression estimator showed the opposite pattern. The doubly robust estimator
+was, in the authors' words, "never the worst and often the best." If you must pick one estimator for
+a paper, pick AIPW.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: End-to-End Treatment Effect Estimation on Simulated Data</h4>
+<p>
+Build a complete causal estimation pipeline from scratch using only NumPy, scikit-learn, and EconML.
+</p>
+<ol>
+<li><strong>Simulate a confounded dataset.</strong> Generate 5,000 observations with two covariates ($X_1$, $X_2$), a binary treatment assigned via a logistic model that depends on both covariates (creating confounding), and an outcome $Y = 3T + X_1 - 0.5 X_2 + T \cdot X_1 + \varepsilon$. Record the true ATE (3.0) and true CATE function $\tau(x) = 3 + X_1$.</li>
+<li><strong>Estimate propensity scores and run IPW.</strong> Fit a logistic regression to predict $T$ from $(X_1, X_2)$. Clip scores to $[0.05, 0.95]$. Compute the IPW estimate. Compare it to the naive difference in group means and note the bias correction.</li>
+<li><strong>Run the AIPW estimator.</strong> Fit two gradient boosting regressors (one for treated outcomes, one for control outcomes) and combine them with the propensity scores in the AIPW formula. Compute the 95% confidence interval using the influence-function standard error.</li>
+<li><strong>Estimate heterogeneous effects with DML.</strong> Use <code>econml.dml.LinearDML</code> with random forest nuisance models and 5-fold cross-fitting. Plot the estimated CATE against $X_1$ and overlay the true CATE line $\tau(x) = 3 + X_1$. Verify that the slope is recovered.</li>
+<li><strong>Compute E-values.</strong> Convert your ATE estimate and its confidence interval to the risk-ratio scale (using the formula $\text{RR} \approx \exp(\hat{\tau} / \text{SD}(Y_0))$), then compute E-values for both the point estimate and the confidence interval bound. Interpret: how strong would an unmeasured confounder need to be to nullify your finding?</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> A researcher estimates the effect of a new teaching method on student test scores using observational data from 50 schools. The estimated ATE is 5 points (95% CI: [2, 8]). The E-value for the confidence interval bound is 1.8. A colleague points out that parental education (unmeasured) is likely associated with both the school's adoption of the method (RR = 1.5) and student performance (RR = 2.0). Should the researcher be worried? Explain using the E-value framework.
+</li>
+<li>
+<strong>(Coding)</strong> Simulate a dataset where the treatment effect is truly heterogeneous: $\tau(x) = 2 + 3 \sin(X_1) - X_2^2$. Compare the CATE estimates from T-learner, X-learner, and DML (with a flexible model) at 100 test points. Compute the RMSE of each estimator against the true CATE. Which estimator captures the nonlinear heterogeneity best? Try varying the sample size from 1,000 to 50,000.
+</li>
+<li>
+<strong>(Analysis)</strong> Using the LaLonde (1986) experimental dataset (available in the <code>causalml</code> package), estimate the effect of a job training program on earnings. First compute the experimental benchmark (randomized estimate). Then drop the experimental control group, substitute a non-experimental comparison group (the CPS data), and estimate the effect using IPW, AIPW, and DML. How close does each observational estimator come to the experimental benchmark? Run all three DoWhy refutation tests and discuss which estimator passes the refutation checks most convincingly.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have the full toolkit: structural causal models for encoding assumptions
+(<a href="section-31.1.html">Section 31.1</a>), discovery algorithms for learning causal
+structure (<a href="section-31.2.html">Section 31.2</a>), and estimation methods for
+quantifying effects (this section). In <a href="section-31.4.html">Section 31.4: Building a
+Causal Analysis Pipeline</a>, we assemble these components into a complete, end-to-end
+pipeline: from raw observational data through causal discovery, heterogeneous treatment
+effect estimation, and rigorous refutation testing, integrated into the Discovery Workbench.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-31.2.html">&#8592; 31.2 Causal Discovery Algorithms</a>
+<a href="index.html">Chapter 31</a>
+<a href="section-31.4.html">31.4 Building a Causal Analysis Pipeline &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

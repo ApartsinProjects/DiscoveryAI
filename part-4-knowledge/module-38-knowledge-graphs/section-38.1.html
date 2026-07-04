@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 38.1: Link Prediction and Graph Embeddings. TransE, RotatE, ComplEx scoring functions, negative sampling, MRR and Hits@k evaluation for scientific knowledge graphs." name="description"/>
+<title>Section 38.1: Link Prediction and Graph Embeddings | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 38: Knowledge Graph Discovery</a></div>
+<h1>38.1 Link Prediction and Graph Embeddings</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"You say 'aspirin inhibits COX-2' and I say $\mathbf{h} + \mathbf{r} \approx \mathbf{t}$. We are saying the same thing, but I can do it 47 million times per second."</p>
+<cite>A TransE Model That Took Geometry Literally</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the embedding space concepts from <a href="../../part-3-data-models/module-26-representation-learning/index.html">Chapter 26: Representation Learning</a>, particularly the idea that geometric relationships in learned vector spaces can encode semantic meaning. You should be comfortable with complex numbers (magnitude, phase, conjugate), dot products, and the L1/L2 norms. The knowledge representation foundations from <a href="../../part-1-foundations/module-03-knowledge-representation/index.html">Chapter 3</a> provide the conceptual grounding for why we represent knowledge as triples.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A knowledge graph is a collection of (head, relation, tail) triples: (Aspirin, inhibits, COX-2), (TP53, activates, Apoptosis), (Graphene, exhibits, High_Conductivity). Link prediction asks: given a partially observed graph, which unobserved triples are likely true? This is the core question for scientific discovery, because every missing edge is a potential hypothesis. The approach is to embed entities and relations into a continuous vector space where a simple geometric test (a translation, a rotation, a dot product) scores how plausible any given triple is. We train these embeddings on known triples and then rank all possible missing triples by their scores. The top-ranked missing links become discovery candidates.
+</p>
+</div>
+
+<h2>1. The Link Prediction Problem</h2>
+
+<p>
+Let $\mathcal{E}$ be a set of entities and $\mathcal{R}$ a set of relation types. A knowledge graph $\mathcal{G} \subset \mathcal{E} \times \mathcal{R} \times \mathcal{E}$ is a set of observed triples $(h, r, t)$ where $h$ is the head entity, $r$ is the relation, and $t$ is the tail entity. The link prediction task is: given a query $(h, r, ?)$ or $(?, r, t)$, rank all candidate entities by the likelihood that the completed triple is true.
+</p>
+
+<p data-agent="02">
+Link prediction is, precisely, a ranking problem over the full entity vocabulary: given an incomplete triple with one slot missing, a model assigns a plausibility score to every possible entity that could fill that slot, then sorts the candidates from most to least likely. It matters because scientific knowledge graphs are always dramatically incomplete (curated databases capture a small fraction of real biological or chemical interactions), so systematically ranking the missing edges surfaces testable hypotheses at scale. The mechanism is to learn a low-dimensional vector for each entity and each relation type, then define a geometric scoring function (such as a vector addition, rotation, or dot product) that returns high values for entity combinations consistent with observed patterns and low values otherwise. Link prediction is the right tool when you have a structured graph of typed relationships and want to prioritize which unobserved relationships to investigate experimentally; for unstructured text or single-relation networks, retrieval models or simple graph algorithms (such as label propagation) are more appropriate alternatives.
+</p>
+
+<p>
+In scientific knowledge graphs, the entities are biological molecules, genes, diseases, chemical compounds, materials, or physical phenomena. The relations encode scientific interactions: <em>causes</em>, <em>inhibits</em>, <em>activates</em>, <em>binds_to</em>, <em>treats</em>, <em>upregulates</em>, <em>is_substrate_of</em>. A biomedical knowledge graph might contain triples like:
+</p>
+
+<ul>
+<li>(Metformin, treats, Type_2_Diabetes)</li>
+<li>(BRCA1, associated_with, Breast_Cancer)</li>
+<li>(Ibuprofen, inhibits, COX-1)</li>
+<li>(TNF-alpha, activates, NF-kB)</li>
+<li>(Penicillin, binds_to, PBP2)</li>
+</ul>
+
+<p>
+The key insight is that these graphs are always incomplete. DrugBank contains roughly 15,000 drug-target interactions, but the true number of pharmacologically relevant interactions is estimated to be orders of magnitude larger. Every curated database represents a lower bound on the true set of relations. Link prediction aims to fill in the gaps.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Incompleteness as Opportunity</div>
+<p>
+The Open World Assumption distinguishes knowledge graphs from relational databases. In a database, if a row is absent, the fact is false (Closed World Assumption). In a knowledge graph, an absent triple simply means we do not know yet. This distinction is what makes link prediction meaningful for discovery: an absent edge between Drug X and Disease Y is not evidence against the relationship; it is an unstudied hypothesis. The embedding model's job is to estimate which unstudied hypotheses are most likely to be true, based on patterns in the observed graph.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that a high link prediction score means the predicted relationship is probably true in reality. It does not. A high score means the predicted triple is structurally consistent with the patterns in the observed graph; it tells you nothing about whether the underlying biology or chemistry actually holds. Link prediction identifies statistically plausible hypotheses, not confirmed facts, and every top-ranked prediction still requires experimental validation before it can be treated as established knowledge.
+</p>
+</div>
+
+<h2>2. TransE: Relations as Translations</h2>
+
+<p>
+The simplest and most influential knowledge graph embedding model is <strong>TransE</strong> (Bordes et al., 2013). The idea is elegant: if (h, r, t) is a true triple, then the embedding of the head entity plus the embedding of the relation should be close to the embedding of the tail entity. In vector notation:
+</p>
+
+$$\mathbf{h} + \mathbf{r} \approx \mathbf{t}$$
+
+<p>
+The scoring function measures how well this translation property holds:
+</p>
+
+$$f_{\text{TransE}}(h, r, t) = -\|\mathbf{h} + \mathbf{r} - \mathbf{t}\|_{p}$$
+
+<p>
+where $\|\cdot\|_p$ is the L1 or L2 norm. Higher scores (closer to zero) indicate more plausible triples. For a true triple like (Aspirin, inhibits, COX-2), training pushes $\mathbf{h}_{\text{aspirin}} + \mathbf{r}_{\text{inhibits}}$ toward $\mathbf{t}_{\text{COX-2}}$. After training, we can query $(?, \text{inhibits}, \text{COX-2})$ by computing $\mathbf{t}_{\text{COX-2}} - \mathbf{r}_{\text{inhibits}}$ and finding the nearest entity embeddings, discovering other potential COX-2 inhibitors.
+</p>
+
+<p>
+TransE has a fundamental limitation: it cannot model symmetric relations. If (Drug_A, interacts_with, Drug_B) is true, TransE requires $\mathbf{h}_A + \mathbf{r} \approx \mathbf{t}_B$ and $\mathbf{h}_B + \mathbf{r} \approx \mathbf{t}_A$. This forces $\mathbf{h}_A \approx \mathbf{t}_A$ and $\mathbf{h}_B \approx \mathbf{t}_B$, collapsing the embeddings of interacting entities. It also struggles with one-to-many relations (one gene activating multiple pathways), because the translation from one head must land near multiple distinct tails.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TransE(nn.Module):
+    """TransE: knowledge graph embeddings via translation."""
+
+    def __init__(self, num_entities, num_relations, embedding_dim=128):
+        super().__init__()
+        self.entity_embeddings = nn.Embedding(num_entities, embedding_dim)
+        self.relation_embeddings = nn.Embedding(num_relations, embedding_dim)
+
+        # Initialize with uniform distribution (Bordes et al., 2013)
+        nn.init.uniform_(self.entity_embeddings.weight, -6.0/embedding_dim**0.5,
+                         6.0/embedding_dim**0.5)
+        nn.init.uniform_(self.relation_embeddings.weight, -6.0/embedding_dim**0.5,
+                         6.0/embedding_dim**0.5)
+        # Normalize relation embeddings to unit length
+        with torch.no_grad():
+            self.relation_embeddings.weight.data = F.normalize(
+                self.relation_embeddings.weight.data, p=2, dim=1
+            )
+
+    def score(self, head_ids, relation_ids, tail_ids):
+        """Score triples: higher (less negative) = more plausible."""
+        h = self.entity_embeddings(head_ids)
+        r = self.relation_embeddings(relation_ids)
+        t = self.entity_embeddings(tail_ids)
+        # Negative L1 distance: h + r should be close to t
+        return -torch.norm(h + r - t, p=1, dim=-1)
+
+    def forward(self, pos_triples, neg_triples, margin=1.0):
+        """Margin-based ranking loss: push positive above negative."""
+        pos_scores = self.score(
+            pos_triples[:, 0], pos_triples[:, 1], pos_triples[:, 2]
+        )
+        neg_scores = self.score(
+            neg_triples[:, 0], neg_triples[:, 1], neg_triples[:, 2]
+        )
+        # Margin loss: want pos_score > neg_score + margin
+        loss = F.relu(margin - pos_scores + neg_scores).mean()
+        return loss
+
+
+# Example: a small biomedical knowledge graph
+entities = ["Aspirin", "Ibuprofen", "COX-1", "COX-2",
+            "Inflammation", "Pain", "Metformin", "AMPK"]
+relations = ["inhibits", "treats", "activates", "binds_to"]
+
+model = TransE(
+    num_entities=len(entities),
+    num_relations=len(relations),
+    embedding_dim=64
+)
+
+# Positive triples: (head_id, relation_id, tail_id)
+pos = torch.tensor([
+    [0, 0, 3],  # Aspirin inhibits COX-2
+    [1, 0, 2],  # Ibuprofen inhibits COX-1
+    [0, 1, 4],  # Aspirin treats Inflammation
+    [6, 2, 7],  # Metformin activates AMPK
+])
+
+# Negative triples: corrupt tail entity
+neg = torch.tensor([
+    [0, 0, 7],  # Aspirin inhibits AMPK (false)
+    [1, 0, 5],  # Ibuprofen inhibits Pain (false)
+    [0, 1, 7],  # Aspirin treats AMPK (false)
+    [6, 2, 2],  # Metformin activates COX-1 (false)
+])
+
+loss = model(pos, neg, margin=1.0)
+print(f"TransE margin loss: {loss.item():.4f}")
+</code></pre>
+<div class="code-caption">Listing 38.1: TransE implementation with margin-based ranking loss. Each positive triple is contrasted against a corrupted negative triple. After training, the scoring function ranks candidate triples by geometric plausibility in the embedding space.</div>
+
+<h2>3. RotatE: Relations as Rotations in Complex Space</h2>
+
+<p>
+<strong>RotatE</strong> (Sun et al., 2019) addresses TransE's limitations by modeling relations as element-wise rotations in complex vector space. Each entity is embedded as a complex vector $\mathbf{h}, \mathbf{t} \in \mathbb{C}^d$, and each relation is a complex vector $\mathbf{r} \in \mathbb{C}^d$ with unit modulus: $|r_i| = 1$ for each component. The scoring function is:
+</p>
+
+$$f_{\text{RotatE}}(h, r, t) = -\|\mathbf{h} \circ \mathbf{r} - \mathbf{t}\|$$
+
+<p>
+where $\circ$ denotes element-wise (Hadamard) product. Since each $r_i = e^{i\theta_i}$ is a point on the unit circle, multiplying by $r_i$ rotates $h_i$ by angle $\theta_i$ in the complex plane. This seemingly small change has profound consequences for expressiveness:
+</p>
+
+<ul>
+<li><strong>Symmetric relations</strong> (interacts_with): set $\theta_i = 0$ or $\pi$, so $r_i = \pm 1$ and rotation is its own inverse.</li>
+<li><strong>Antisymmetric relations</strong> (inhibits): use arbitrary $\theta_i \neq 0, \pi$, so the forward and reverse rotations differ.</li>
+<li><strong>Inversion</strong>: if $r_1$ is the rotation for "inhibits" and $r_2$ for "is_inhibited_by", then $r_2 = \bar{r}_1$ (complex conjugate, i.e., reverse rotation).</li>
+<li><strong>Composition</strong>: if "A causes B" and "B causes C" imply "A causes C", the rotation for the composed relation is the product of individual rotations: $r_{\text{causes}} \circ r_{\text{causes}} = r_{\text{causes}}^2$.</li>
+</ul>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of RotatE like a combination lock with 128 independent dials. Each entity is described by the position of all 128 dials, and each relation type is a specific set of turns (one per dial). To check whether "Aspirin inhibits COX-2," you start at Aspirin's dial positions, apply the "inhibits" turns, and see whether you land close to COX-2's dial positions. Symmetric relations (like "interacts_with") correspond to turns that are either zero or a full half-turn, so applying them twice returns you to where you started. Antisymmetric relations use intermediate turn amounts, so applying and then reversing them does not cancel out. The key mechanism that makes this more powerful than TransE's simple shift: each of the 128 dials turns independently, giving the model a combinatorial space of possible relation signatures rather than a single direction.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Why Rotation Beats Translation</div>
+<p>
+TransE encodes each relation as a single direction in vector space. This means two different relations that share the same head and tail must point the same direction, creating conflicts when the graph has multiple relation types between the same entity pairs. RotatE encodes each relation as a rotation angle per dimension, giving it $d$ independent degrees of freedom. A 128-dimensional RotatE model can represent $2^{128}$ distinct relation patterns, because each dimension independently rotates by a different angle. This combinatorial expressiveness is why RotatE consistently outperforms TransE on benchmarks with complex relational patterns.
+</p>
+</div>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import numpy as np
+
+class RotatE(nn.Module):
+    """RotatE: relations as rotations in complex embedding space."""
+
+    def __init__(self, num_entities, num_relations, embedding_dim=128):
+        super().__init__()
+        # Entity embeddings: complex, stored as 2*dim reals
+        self.entity_re = nn.Embedding(num_entities, embedding_dim)
+        self.entity_im = nn.Embedding(num_entities, embedding_dim)
+
+        # Relation embeddings: phase angles (constrained to unit modulus)
+        self.relation_phase = nn.Embedding(num_relations, embedding_dim)
+
+        self.embedding_dim = embedding_dim
+        self.gamma = nn.Parameter(torch.tensor(12.0))  # margin
+
+        # Xavier initialization
+        nn.init.xavier_uniform_(self.entity_re.weight)
+        nn.init.xavier_uniform_(self.entity_im.weight)
+        nn.init.uniform_(self.relation_phase.weight,
+                         -np.pi, np.pi)
+
+    def score(self, head_ids, relation_ids, tail_ids):
+        """Score = gamma - ||h * r - t|| in complex space."""
+        # Head entity as complex vector
+        h_re = self.entity_re(head_ids)
+        h_im = self.entity_im(head_ids)
+
+        # Relation as unit-modulus complex: r = cos(phase) + i*sin(phase)
+        phase = self.relation_phase(relation_ids)
+        r_re = torch.cos(phase)
+        r_im = torch.sin(phase)
+
+        # Tail entity as complex vector
+        t_re = self.entity_re(tail_ids)
+        t_im = self.entity_im(tail_ids)
+
+        # Complex multiplication: (h_re + i*h_im)(r_re + i*r_im)
+        hr_re = h_re * r_re - h_im * r_im
+        hr_im = h_re * r_im + h_im * r_re
+
+        # Distance in complex space
+        diff_re = hr_re - t_re
+        diff_im = hr_im - t_im
+        distance = torch.sqrt(diff_re**2 + diff_im**2 + 1e-12).sum(dim=-1)
+
+        return self.gamma - distance
+
+    def forward(self, pos_triples, neg_triples):
+        """Self-adversarial negative sampling loss (Sun et al., 2019)."""
+        pos_scores = self.score(
+            pos_triples[:, 0], pos_triples[:, 1], pos_triples[:, 2]
+        )
+        neg_scores = self.score(
+            neg_triples[:, 0], neg_triples[:, 1], neg_triples[:, 2]
+        )
+
+        # Negative log-sigmoid loss
+        pos_loss = -F.logsigmoid(pos_scores).mean()
+        neg_loss = -F.logsigmoid(-neg_scores).mean()
+        return (pos_loss + neg_loss) / 2
+
+
+# RotatE on the same biomedical graph
+model = RotatE(num_entities=8, num_relations=4, embedding_dim=64)
+
+pos = torch.tensor([[0, 0, 3], [1, 0, 2], [0, 1, 4], [6, 2, 7]])
+neg = torch.tensor([[0, 0, 7], [1, 0, 5], [0, 1, 7], [6, 2, 2]])
+
+loss = model(pos, neg)
+print(f"RotatE loss: {loss.item():.4f}")
+
+# After training: predict missing links
+with torch.no_grad():
+    # Query: (Metformin, treats, ?) -- score all tail candidates
+    head = torch.tensor([6])  # Metformin
+    rel = torch.tensor([1])   # treats
+    scores = []
+    for tail_id in range(8):
+        s = model.score(head, rel, torch.tensor([tail_id]))
+        scores.append((entities[tail_id], s.item()))
+
+    scores.sort(key=lambda x: -x[1])
+    print("\nMetformin treats ?  (ranked predictions):")
+    for entity, score in scores:
+        print(f"  {entity:20s} score={score:.3f}")
+</code></pre>
+<div class="code-caption">Listing 38.2: RotatE implementation with complex-valued entity embeddings and phase-angle relation embeddings. The query at the end demonstrates link prediction: scoring all possible tail entities for "Metformin treats ?" and ranking by plausibility.</div>
+
+<h2>4. ComplEx: Asymmetry Through Complex Dot Products</h2>
+
+<p>
+<strong>ComplEx</strong> (Trouillon et al., 2016) takes a different approach to handling asymmetric relations. Instead of geometric operations (translation or rotation), ComplEx uses a bilinear scoring function with complex-valued embeddings. The scoring function computes the real part of the Hermitian dot product:
+</p>
+
+$$f_{\text{ComplEx}}(h, r, t) = \text{Re}\left(\sum_{i=1}^{d} r_i \cdot h_i \cdot \bar{t}_i\right)$$
+
+<p>
+where $\bar{t}_i$ is the complex conjugate of $t_i$. Expanding into real and imaginary parts:
+</p>
+
+$$f_{\text{ComplEx}} = \sum_{i=1}^{d} \left( r_i^{(\text{re})} h_i^{(\text{re})} t_i^{(\text{re})} + r_i^{(\text{re})} h_i^{(\text{im})} t_i^{(\text{im})} + r_i^{(\text{im})} h_i^{(\text{re})} t_i^{(\text{im})} - r_i^{(\text{im})} h_i^{(\text{im})} t_i^{(\text{re})} \right)$$
+
+<p>
+The crucial property is that $f(h, r, t) \neq f(t, r, h)$ in general, because the conjugation breaks symmetry. For the triple (TNF-alpha, activates, NF-kB), the score differs from (NF-kB, activates, TNF-alpha), correctly modeling the directionality of biological activation. If the relation happens to be symmetric, ComplEx can learn real-valued relation embeddings (zero imaginary part), which makes the conjugation a no-op and the scoring function symmetric.
+</p>
+
+<pre><code class="language-python">class ComplEx(nn.Module):
+    """ComplEx: complex-valued bilinear model for link prediction."""
+
+    def __init__(self, num_entities, num_relations, embedding_dim=128):
+        super().__init__()
+        # Each embedding has real and imaginary parts
+        self.ent_re = nn.Embedding(num_entities, embedding_dim)
+        self.ent_im = nn.Embedding(num_entities, embedding_dim)
+        self.rel_re = nn.Embedding(num_relations, embedding_dim)
+        self.rel_im = nn.Embedding(num_relations, embedding_dim)
+
+        for emb in [self.ent_re, self.ent_im,
+                    self.rel_re, self.rel_im]:
+            nn.init.xavier_uniform_(emb.weight)
+
+    def score(self, head_ids, relation_ids, tail_ids):
+        """Hermitian dot product scoring function."""
+        h_re = self.ent_re(head_ids)
+        h_im = self.ent_im(head_ids)
+        r_re = self.rel_re(relation_ids)
+        r_im = self.rel_im(relation_ids)
+        t_re = self.ent_re(tail_ids)
+        t_im = self.ent_im(tail_ids)
+
+        # Re(r * h * conj(t)) expanded:
+        score = (
+            (r_re * h_re * t_re).sum(dim=-1)    # re*re*re
+            + (r_re * h_im * t_im).sum(dim=-1)  # re*im*im
+            + (r_im * h_re * t_im).sum(dim=-1)  # im*re*im
+            - (r_im * h_im * t_re).sum(dim=-1)  # -im*im*re
+        )
+        return score
+
+    def forward(self, pos_triples, neg_triples):
+        """Binary cross-entropy loss."""
+        pos_scores = self.score(
+            pos_triples[:, 0], pos_triples[:, 1], pos_triples[:, 2]
+        )
+        neg_scores = self.score(
+            neg_triples[:, 0], neg_triples[:, 1], neg_triples[:, 2]
+        )
+
+        pos_loss = F.binary_cross_entropy_with_logits(
+            pos_scores, torch.ones_like(pos_scores)
+        )
+        neg_loss = F.binary_cross_entropy_with_logits(
+            neg_scores, torch.zeros_like(neg_scores)
+        )
+        return (pos_loss + neg_loss) / 2
+
+
+# Verify asymmetry: score(h,r,t) != score(t,r,h)
+model = ComplEx(num_entities=8, num_relations=4, embedding_dim=64)
+with torch.no_grad():
+    forward_score = model.score(
+        torch.tensor([3]), torch.tensor([2]), torch.tensor([4])
+    )  # TNF-alpha activates NF-kB
+    reverse_score = model.score(
+        torch.tensor([4]), torch.tensor([2]), torch.tensor([3])
+    )  # NF-kB activates TNF-alpha
+    print(f"Forward score: {forward_score.item():.4f}")
+    print(f"Reverse score: {reverse_score.item():.4f}")
+    print(f"Asymmetric: {forward_score.item() != reverse_score.item()}")
+</code></pre>
+<div class="code-caption">Listing 38.3: ComplEx scoring function with the Hermitian dot product. The verification at the end confirms that ComplEx naturally produces different scores for (h, r, t) versus (t, r, h), correctly modeling directional scientific relations like "activates."</div>
+
+<h2>5. Negative Sampling Strategies</h2>
+
+<p>
+All three models learn by contrasting positive (observed) triples against negative (corrupted) triples. The quality of negative samples directly determines the quality of learned embeddings. The standard approach is <strong>uniform corruption</strong>: for each positive triple $(h, r, t)$, generate a negative by replacing either the head or tail with a random entity:
+</p>
+
+$$(h', r, t) \quad \text{where } h' \sim \text{Uniform}(\mathcal{E})$$
+$$(h, r, t') \quad \text{where } t' \sim \text{Uniform}(\mathcal{E})$$
+
+<p>
+Uniform sampling has a well-known problem: most random corruptions produce trivially false triples. Replacing "COX-2" with "Graphene" in (Aspirin, inhibits, COX-2) creates an obviously wrong triple that provides little training signal. The model easily scores it low without learning anything about the fine structure of drug-target interactions.
+</p>
+
+<p>
+<strong>Self-adversarial negative sampling</strong> (Sun et al., 2019) addresses this by sampling negatives proportional to their current model scores:
+</p>
+
+$$p(h'_j, r, t) = \frac{\exp \alpha \cdot f(h'_j, r, t)}{\sum_i \exp \alpha \cdot f(h'_i, r, t)}$$
+
+<p>
+where $\alpha$ is a temperature parameter. This generates harder negatives as training progresses: early in training, the model cannot distinguish any negatives, so sampling is approximately uniform; later, the model preferentially samples negatives it currently finds plausible, which are exactly the ones it needs to learn to reject. In our drug example, self-adversarial sampling would preferentially corrupt (Aspirin, inhibits, COX-2) with other enzyme targets (COX-1, Lipoxygenase) rather than unrelated entities (Graphene, Type_2_Diabetes).
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Type-Constrained Negative Sampling for Drug Discovery</div>
+<p>
+A pharmaceutical knowledge graph has entity types (Drug, Gene, Disease, Pathway) and relation type constraints (inhibits connects Drug to Gene, treats connects Drug to Disease). When generating negatives for (Ibuprofen, treats, Headache), unconstrained sampling might produce (Ibuprofen, treats, COX-1), which violates the type constraint (COX-1 is a Gene, not a Disease) and is trivially identifiable as false. Type-constrained sampling restricts corruption to entities of the correct type: (Ibuprofen, treats, Alzheimer's) or (Ibuprofen, treats, Malaria). These are plausible but (presumably) false, forcing the model to learn meaningful distinctions within each entity type. In practice, type-constrained sampling improves MRR by 5 to 15 percentage points on typed biomedical knowledge graphs.
+</p>
+</div>
+
+<h2>6. Evaluation: MRR and Hits@k</h2>
+
+<p>
+Link prediction models are evaluated using ranking metrics. For each test triple $(h, r, t)$, we corrupt either the head or tail with every entity in $\mathcal{E}$, score all candidates, and rank them. The true entity's rank determines the metric values.
+</p>
+
+<p>
+<strong>Mean Reciprocal Rank (MRR)</strong> is the average of the reciprocal ranks across all test triples:
+</p>
+
+$$\text{MRR} = \frac{1}{|\mathcal{T}_{\text{test}}|} \sum_{(h,r,t) \in \mathcal{T}_{\text{test}}} \frac{1}{\text{rank}(t \mid h, r)}$$
+
+<p>
+MRR ranges from 0 to 1, with 1 meaning the correct entity is always ranked first. It penalizes low ranks heavily: rank 1 contributes 1.0, rank 2 contributes 0.5, rank 10 contributes 0.1, and rank 100 contributes only 0.01.
+</p>
+
+<p>
+<strong>Hits@k</strong> measures the proportion of test triples where the correct entity appears in the top $k$ predictions:
+</p>
+
+$$\text{Hits@}k = \frac{1}{|\mathcal{T}_{\text{test}}|} \sum_{(h,r,t) \in \mathcal{T}_{\text{test}}} \mathbb{1}[\text{rank}(t \mid h, r) \leq k]$$
+
+<p>
+Standard reporting uses Hits@1, Hits@3, and Hits@10. For discovery applications, Hits@10 and Hits@50 are often more relevant: a researcher reviewing the top 50 predicted drug-disease associations is practical, while requiring rank-1 accuracy is unrealistic given the inherent ambiguity of biological systems.
+</p>
+
+<p>
+A subtle but important detail is the <strong>filtered setting</strong> (Bordes et al., 2013). When ranking candidate tails for $(h, r, ?)$, some candidates may be other true triples in the training or validation set. For example, when evaluating (Aspirin, treats, ?), both "Headache" and "Inflammation" might be correct. The filtered setting removes all known true triples (except the test triple itself) from the ranking, so a model is not penalized for ranking another correct answer above the test answer. All modern benchmarks report filtered metrics.
+</p>
+
+<pre><code class="language-python">import torch
+import numpy as np
+from collections import defaultdict
+
+def evaluate_link_prediction(model, test_triples, all_triples,
+                              num_entities, batch_size=256):
+    """
+    Evaluate a KG embedding model with filtered MRR and Hits@k.
+
+    Args:
+        model: KG embedding model with a .score(h, r, t) method
+        test_triples: tensor of (h, r, t) triples to evaluate
+        all_triples: set of all known true triples (for filtering)
+        num_entities: total number of entities
+        batch_size: evaluation batch size
+    """
+    model.eval()
+    ranks = []
+    hits_at = {1: 0, 3: 0, 10: 0}
+
+    # Convert all_triples to a set for O(1) lookup
+    true_set = set(
+        (h.item(), r.item(), t.item()) for h, r, t in all_triples
+    )
+
+    with torch.no_grad():
+        for i in range(0, len(test_triples), batch_size):
+            batch = test_triples[i:i + batch_size]
+
+            for triple in batch:
+                h, r, t = triple[0], triple[1], triple[2]
+
+                # Score all possible tails: (h, r, e) for all e
+                heads = h.expand(num_entities)
+                rels = r.expand(num_entities)
+                tails = torch.arange(num_entities)
+
+                scores = model.score(heads, rels, tails)
+
+                # Filtered setting: mask out other true triples
+                for e in range(num_entities):
+                    if e != t.item() and (h.item(), r.item(), e) in true_set:
+                        scores[e] = float('-inf')
+
+                # Rank of the correct tail
+                rank = (scores >= scores[t.item()]).sum().item()
+                ranks.append(rank)
+
+                for k in hits_at:
+                    if rank <= k:
+                        hits_at[k] += 1
+
+    n = len(ranks)
+    mrr = np.mean([1.0 / r for r in ranks])
+    results = {
+        "MRR": mrr,
+        "Hits@1": hits_at[1] / n,
+        "Hits@3": hits_at[3] / n,
+        "Hits@10": hits_at[10] / n,
+        "Mean Rank": np.mean(ranks),
+    }
+
+    print("Link Prediction Results (Filtered):")
+    for metric, value in results.items():
+        print(f"  {metric:12s}: {value:.4f}")
+
+    return results
+
+
+# Example evaluation on our toy graph
+model = TransE(num_entities=8, num_relations=4, embedding_dim=64)
+test = torch.tensor([[0, 0, 3], [6, 2, 7]])
+all_known = torch.tensor([
+    [0, 0, 3], [1, 0, 2], [0, 1, 4], [6, 2, 7]
+])
+
+results = evaluate_link_prediction(
+    model, test, all_known, num_entities=8
+)
+</code></pre>
+<div class="code-caption">Listing 38.4: Filtered MRR and Hits@k evaluation for link prediction models. The filtered setting removes known true triples from the ranking, ensuring models are not penalized for correctly predicting other valid answers.</div>
+
+<h2>7. Comparing Embedding Models on Scientific Relations</h2>
+
+<p>
+The choice between TransE, RotatE, and ComplEx depends on the relational patterns in your scientific domain. The table below summarizes their theoretical capabilities:
+</p>
+
+<figure class="table-figure">
+<table>
+<thead>
+<tr><th>Pattern</th><th>Example</th><th>TransE</th><th>RotatE</th><th>ComplEx</th></tr>
+</thead>
+<tbody>
+<tr><td>Symmetric</td><td>interacts_with</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Antisymmetric</td><td>inhibits</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Inversion</td><td>inhibits / inhibited_by</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Composition</td><td>causes + causes = causes</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+<tr><td>1-to-N</td><td>gene activates many pathways</td><td>No</td><td>Yes</td><td>Yes</td></tr>
+</tbody>
+</table>
+<figcaption>Table 38.1: Relational pattern support across embedding models. RotatE handles all common patterns in biomedical knowledge graphs. TransE struggles with symmetric and 1-to-N patterns. ComplEx cannot model composition.</figcaption>
+</figure>
+
+<p>
+In practice, RotatE and ComplEx achieve similar MRR on most benchmarks (both around 0.33 to 0.34 on the standard FB15k-237 dataset), while TransE lags by 3 to 5 points. For scientific knowledge graphs with rich relational structure (biomedical graphs typically have 20 to 50 relation types with mixed symmetry patterns), RotatE is the recommended default. Its rotation-based geometry is also more interpretable: examining the learned phase angles reveals which dimensions the model uses to distinguish different relation types.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PyKEEN for KG Embeddings</div>
+<p>
+The <code>PyKEEN</code> library provides 35+ embedding models, standardized training pipelines, and automatic evaluation. What took us 100+ lines to implement above collapses to about 15 lines:
+</p>
+<pre><code class="language-python">from pykeen.pipeline import pipeline
+
+result = pipeline(
+    model="RotatE",
+    dataset="FB15k237",          # or your custom TriplesFactory
+    training_kwargs=dict(
+        num_epochs=100,
+        batch_size=256,
+    ),
+    model_kwargs=dict(
+        embedding_dim=256,
+    ),
+    negative_sampler="basic",
+    negative_sampler_kwargs=dict(
+        num_negs_per_pos=64,
+    ),
+    evaluation_kwargs=dict(
+        batch_size=128,
+    ),
+)
+
+# Automatic MRR, Hits@k, Mean Rank reporting
+print(result.metric_results.to_df())
+
+# Save and reload the trained model
+result.save_to_directory("rotate_biomedical")
+</code></pre>
+<p>
+PyKEEN handles negative sampling strategies, learning rate scheduling, early stopping, filtered evaluation, and result serialization. This reduces roughly 200 lines of custom implementation to a single <code>pipeline()</code> call. Use PyKEEN for production training; use the from-scratch implementations in this section for understanding the geometry.
+</p>
+</div>
+
+<h2>8. Scientific Relation Types and Their Geometric Signatures</h2>
+
+<p>
+Scientific knowledge graphs use domain-specific relation types that carry important structural properties. Understanding these properties guides model selection and hyperparameter tuning.
+</p>
+
+<p>
+<strong>Causal relations</strong> (causes, induces, leads_to) are antisymmetric and compositional: if A causes B and B causes C, then A (indirectly) causes C. RotatE handles both properties. In embedding space, causal chains correspond to successive rotations, and the composed rotation should approximate the direct rotation from A to C.
+</p>
+
+<p>
+<strong>Inhibitory relations</strong> (inhibits, suppresses, downregulates) are antisymmetric and typically inverse to activation relations. If "inhibits" is encoded as rotation by angle $\theta$, "activates" should approximate rotation by $-\theta$. RotatE learns this inversion pattern naturally.
+</p>
+
+<p>
+<strong>Binding relations</strong> (binds_to, interacts_with) are often symmetric: if protein A binds protein B, then protein B binds protein A. TransE collapses symmetric pairs, making it a poor choice for protein interaction networks. RotatE and ComplEx both handle symmetry correctly.
+</p>
+
+<p>
+<strong>Hierarchical relations</strong> (is_a, part_of, subclass_of) define taxonomic structure. TransE models these well as a single translation direction (from specific to general), but struggles when entities belong to multiple hierarchies. RotatE uses different phase angles for different aspects of the hierarchy.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+A major 2024 advance is <strong>ULTRA</strong> (Galkin et al., "Towards Foundation Models for Knowledge Graph Reasoning," AAAI 2024), which learns a single set of transferable graph structure parameters that generalize across entirely different knowledge graphs without any retraining or fine-tuning on the target graph. ULTRA achieves this by conditioning its scoring function on relational structure (the graph of relations itself) rather than on entity identities, enabling zero-shot link prediction on unseen KGs. On 57 diverse benchmarks, a single pretrained ULTRA checkpoint matches or exceeds graph-specific models trained from scratch. For scientific applications, this is especially significant: a researcher working with a small, newly constructed KG (say, 5,000 triples about a niche materials domain) can run competitive link prediction immediately, without the hundreds of thousands of triples typically needed for effective embedding training. The follow-up work ULTRA-KG (2024) extends this to inductive settings where both entities and relation types are unseen at training time.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Train and Query a Drug Repurposing KG</h4>
+<p>
+Build a small drug repurposing knowledge graph and run link prediction to surface candidate drug-disease associations. This project uses only PyKEEN and standard Python libraries.
+</p>
+<p>
+<strong>Step 1.</strong> Install PyKEEN: <code>pip install pykeen</code>. Then load the built-in Hetionet dataset, a real biomedical knowledge graph with drugs, genes, diseases, and 24 relation types: <code>from pykeen.datasets import Hetionet; dataset = Hetionet()</code>. Print <code>dataset.summary_str()</code> to inspect entity and relation counts.
+</p>
+<p>
+<strong>Step 2.</strong> Train a RotatE model using the PyKEEN pipeline: <code>from pykeen.pipeline import pipeline; result = pipeline(model="RotatE", dataset=dataset, training_kwargs=dict(num_epochs=50, batch_size=256), model_kwargs=dict(embedding_dim=128))</code>. Training on CPU takes roughly 10 to 20 minutes for 50 epochs.
+</p>
+<p>
+<strong>Step 3.</strong> Evaluate the trained model by printing <code>result.metric_results.to_df()</code>. Record the filtered MRR and Hits@10 values. Compare against a TransE baseline by rerunning with <code>model="TransE"</code>.
+</p>
+<p>
+<strong>Step 4.</strong> Use the trained model to predict new links. Pick a disease entity (for example, "Alzheimer Disease") and score all drugs for the "treats" relation: <code>from pykeen.models.predict import get_tail_prediction_df; preds = get_tail_prediction_df(result.model, "Alzheimer Disease", "treats", triples_factory=result.training)</code>. Inspect the top 20 predictions.
+</p>
+<p>
+<strong>Step 5.</strong> Cross-reference your top 5 predictions against PubMed or ClinicalTrials.gov. For each predicted drug-disease pair, search whether any published study or registered trial has investigated the association. Count how many of your top 5 correspond to at least one real study. This hit rate gives you a concrete sense of how well the embedding model surfaces plausible hypotheses from graph structure alone.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Consider a materials science knowledge graph with relations: "has_property", "is_composed_of", "is_alloy_of", "synthesized_by". Classify each relation as symmetric, antisymmetric, or neither. For each, explain whether TransE, RotatE, or ComplEx would be most appropriate and why.
+</li>
+<li>
+<strong>(Coding)</strong> Extend the TransE implementation in Listing 38.1 to support self-adversarial negative sampling. Train both uniform and self-adversarial variants on the Nations dataset (available in PyKEEN) for 200 epochs. Compare MRR and Hits@10 and explain the difference.
+</li>
+<li>
+<strong>(Analysis)</strong> The filtered evaluation setting (Listing 38.4) removes known true triples from the ranking. Implement both raw (unfiltered) and filtered evaluation. Run both on a trained RotatE model on FB15k-237. How much does filtering affect MRR? What does the difference tell you about the dataset's structure?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+The embedding models in this section treat each entity as an independent vector, ignoring the rich neighborhood structure of the graph. In <a href="section-38.2.html">Section 38.2: GNNs for Knowledge Completion</a>, we introduce graph neural networks that compute entity representations by aggregating information from neighboring nodes. This message-passing approach naturally incorporates multi-hop context: the embedding of a drug reflects not just the drug itself but also its known targets, the pathways those targets participate in, and the diseases those pathways are associated with. The result is richer representations that capture the full relational context of each entity.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 38 Index</a>
+<a href="index.html">Chapter 38</a>
+<a href="section-38.2.html">38.2 GNNs for Knowledge Completion &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

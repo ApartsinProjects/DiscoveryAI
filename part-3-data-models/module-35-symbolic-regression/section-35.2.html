@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.2: Genetic Programming and Neural Guidance. Tournament selection, subtree crossover, point mutation, neural-guided symbolic regression with transformers, reinforcement learning for expression construction, and PySR's multi-population algorithm." name="description"/>
+<title>Section 35.2: Genetic Programming and Neural Guidance | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Symbolic Regression and Equation Discovery</a></div>
+<h1>35.2 Genetic Programming and Neural Guidance</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"My parents were $\sin(x)$ and $x^2$. Through crossover I became $\sin(x^2)$. Through mutation I became $\cos(x^2)$. Through selection I became extinct."</p>
+<cite>An Expression Tree Reflecting on Its Lineage</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds directly on the expression-tree representations and fitness functions from
+<a href="section-35.1.html">Section 35.1</a>. Familiarity with the
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">search framework</a>
+from Chapter 1 (especially heuristic search and population-based methods) will clarify the
+evolutionary operators. The neural-guidance discussion references transformer architectures from
+<a href="../module-27-foundation-models/index.html">Chapter 27: Scientific Foundation Models</a>
+and reinforcement learning concepts; prior exposure is helpful but the key ideas are introduced
+here.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Section 35.1 established expression trees as the search space and fitness functions as the
+evaluation criterion. This section fills in the search operators: how do we move through the
+space of expressions to find good ones? Classical genetic programming (GP) uses biologically
+inspired operators (crossover, mutation, selection) to evolve populations of expression trees.
+These operators are simple, general, and surprisingly effective, but they are also blind: they
+know nothing about mathematical structure. Neural-guided approaches use trained neural networks
+to propose promising expressions or steer the search toward fruitful regions of the space.
+The state of the art, exemplified by PySR, combines both: evolutionary search provides the
+exploration backbone while learned heuristics accelerate convergence.
+</p>
+</div>
+
+<h2>1. The Genetic Programming Loop</h2>
+
+<p>
+Genetic programming (Koza, 1992) treats program synthesis as an evolutionary optimization
+problem. A population of candidate expression trees undergoes repeated cycles of evaluation,
+selection, and reproduction. Over generations, selection pressure drives the population toward
+higher-fitness individuals while crossover and mutation introduce variation that prevents
+premature convergence to local optima.
+</p>
+
+<p data-agent="02">
+Genetic programming is, precisely, an optimization algorithm that searches over the space of computer programs (here, mathematical expressions represented as trees) by maintaining a population of candidate solutions and iteratively improving them through biologically inspired operators: selection favors fit individuals, crossover recombines parts of two parents into offspring, and mutation introduces random local changes. It matters because it can discover the <em>structure</em> of an equation (which variables, which operators, how they compose) without requiring a predefined model family, unlike linear regression or neural network fitting where the functional form is fixed in advance. Use GP when you suspect the underlying relationship has a compact symbolic form but you do not know what that form is; prefer parametric regression (linear, polynomial, neural) when you already know the model structure and only need to fit coefficients, since parametric methods are faster and more statistically efficient in that setting.
+</p>
+
+<p>
+The standard GP loop has five phases per generation:
+</p>
+
+<ol>
+<li><strong>Initialization.</strong> Generate a random population of $P$ expression trees, typically using either the "full" method (all branches have the same depth) or the "grow" method (branches can terminate at different depths). The "ramped half-and-half" method alternates between full and grow at varying depths to produce a diverse initial population.</li>
+<li><strong>Evaluation.</strong> Compute the fitness (e.g., MSE plus complexity penalty) of each individual on the training data.</li>
+<li><strong>Selection.</strong> Choose parents for the next generation based on fitness, using tournament selection, fitness-proportionate selection, or lexicographic selection.</li>
+<li><strong>Variation.</strong> Apply crossover (exchange subtrees between parents) and mutation (randomly modify subtrees) to produce offspring.</li>
+<li><strong>Replacement.</strong> Form the next generation from offspring, possibly retaining the best individual from the previous generation (elitism).</li>
+</ol>
+
+<pre><code class="language-python">import numpy as np
+import copy
+from typing import Optional
+
+# Use the Node class from Section 35.1 (Listing 35.1)
+
+BINARY_OPS = ['+', '-', '*', '/']
+UNARY_OPS = ['sin', 'cos']
+ALL_OPS = BINARY_OPS + UNARY_OPS
+
+def random_tree(max_depth: int, variables: list[str],
+                const_range: tuple = (-5.0, 5.0),
+                p_terminal: float = 0.3) -> 'Node':
+    """Generate a random expression tree using the 'grow' method.
+
+    At each internal position, randomly choose an operator.
+    Terminate with a leaf (variable or constant) with probability p_terminal
+    or when max_depth is reached.
+    """
+    if max_depth <= 0 or (max_depth > 1 and np.random.random() < p_terminal):
+        # Leaf node: variable or constant
+        if np.random.random() < 0.6:
+            name = np.random.choice(variables)
+            return Node(name, 0, [])
+        else:
+            val = np.random.uniform(*const_range)
+            return Node(f'{val:.3f}', 0, [], value=val)
+
+    op = np.random.choice(ALL_OPS)
+    if op in BINARY_OPS:
+        left = random_tree(max_depth - 1, variables, const_range, p_terminal)
+        right = random_tree(max_depth - 1, variables, const_range, p_terminal)
+        return Node(op, 2, [left, right])
+    else:
+        child = random_tree(max_depth - 1, variables, const_range, p_terminal)
+        return Node(op, 1, [child])
+
+
+def collect_nodes(tree: 'Node') -> list[tuple['Node', Optional['Node'], int]]:
+    """Collect all (node, parent, child_index) triples in the tree."""
+    result = [(tree, None, -1)]
+    stack = [(tree, None, -1)]
+    while stack:
+        node, parent, idx = stack.pop()
+        for i, child in enumerate(node.children):
+            result.append((child, node, i))
+            stack.append((child, node, i))
+    return result
+
+
+def subtree_crossover(parent1: 'Node', parent2: 'Node') -> 'Node':
+    """Create offspring by replacing a random subtree of parent1
+    with a random subtree from parent2."""
+    offspring = copy.deepcopy(parent1)
+    donor = copy.deepcopy(parent2)
+
+    # Collect all nodes in both trees
+    offspring_nodes = collect_nodes(offspring)
+    donor_nodes = collect_nodes(donor)
+
+    # Pick a random crossover point in the offspring (skip root for safety)
+    if len(offspring_nodes) < 2:
+        return offspring
+    _, o_parent, o_idx = offspring_nodes[np.random.randint(1, len(offspring_nodes))]
+
+    # Pick a random subtree from the donor
+    d_node, _, _ = donor_nodes[np.random.randint(len(donor_nodes))]
+
+    # Swap the subtree
+    o_parent.children[o_idx] = d_node
+    return offspring
+
+
+def point_mutation(tree: 'Node', variables: list[str],
+                   p_mutate: float = 0.1) -> 'Node':
+    """Mutate individual nodes with probability p_mutate.
+
+    Operators are replaced with operators of the same arity.
+    Variables are replaced with other variables or constants.
+    """
+    tree = copy.deepcopy(tree)
+    nodes = collect_nodes(tree)
+
+    for node, parent, idx in nodes:
+        if np.random.random() > p_mutate:
+            continue
+        if node.arity == 2:
+            node.op = np.random.choice(BINARY_OPS)
+        elif node.arity == 1:
+            node.op = np.random.choice(UNARY_OPS)
+        else:
+            # Leaf: replace with a different variable or constant
+            if np.random.random() < 0.6:
+                node.op = np.random.choice(variables)
+                node.value = None
+            else:
+                node.value = np.random.uniform(-5, 5)
+                node.op = f'{node.value:.3f}'
+
+    return tree
+
+
+def hoist_mutation(tree: 'Node') -> 'Node':
+    """Replace tree with one of its own subtrees (reduces complexity)."""
+    nodes = collect_nodes(tree)
+    # Pick a random internal node's child as the new root
+    internal = [(n, p, i) for n, p, i in nodes if n.arity > 0 and p is not None]
+    if not internal:
+        return copy.deepcopy(tree)
+    chosen, _, _ = internal[np.random.randint(len(internal))]
+    return copy.deepcopy(chosen)
+</code></pre>
+<div class="code-caption">Listing 35.6: Core GP operators: random tree generation (grow method), subtree crossover, point mutation, and hoist mutation. Hoist mutation is the primary bloat-control mechanism, replacing a tree with one of its subtrees to reduce complexity without requiring an explicit penalty term.</div>
+
+<h2>2. Tournament Selection</h2>
+
+<p>
+Tournament selection is the most widely used selection method in GP because it is simple, has
+tunable selection pressure, and does not require global fitness sorting. To select one parent,
+draw $k$ individuals uniformly at random from the population, then choose the individual with
+the best fitness. The parameter $k$ (the tournament size) controls selection pressure: $k = 2$
+gives gentle pressure (slightly favoring better individuals), while $k = 7$ or higher gives
+aggressive pressure (strongly favoring the best).
+</p>
+
+<p>
+A subtlety: tournament selection based on fitness alone can eliminate diversity too quickly,
+causing the population to converge to a single expression that is then unable to escape its
+local optimum. <strong>Lexicographic tournament selection</strong> addresses this by first
+comparing on fitness and then, among individuals with similar fitness (within a tolerance
+$\epsilon$), preferring the simpler one. This naturally maintains a Pareto front without
+requiring an explicit multi-objective framework.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that subtree crossover between two high-fitness parents will typically produce a high-fitness offspring, analogous to how breeding in nature combines beneficial traits. In reality, subtree crossover is largely a <em>random macro-mutation</em>: it replaces an arbitrary subtree in one expression with an arbitrary subtree from another, with no guarantee that the swapped pieces are semantically compatible or serve analogous roles in their respective expressions. Crossover between $\sin(x) + 2$ and $x^2 \cdot \exp(y)$ might produce $\sin(x^2 \cdot \exp(y)) + 2$, which is typically worse than either parent. GP works not because crossover is smart, but because selection discards the many bad offspring and retains the rare good ones.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+
+def tournament_select(population: list[dict], tournament_size: int = 5,
+                      epsilon: float = 0.01) -> dict:
+    """Lexicographic tournament selection.
+
+    Among tournament participants, pick the one with best fitness.
+    Among those within epsilon of the best, prefer the simplest.
+    """
+    # Draw tournament participants
+    indices = np.random.choice(len(population), size=tournament_size, replace=False)
+    participants = [population[i] for i in indices]
+
+    # Find best fitness in tournament
+    best_fitness = min(p['fitness'] for p in participants)
+
+    # Among near-best, prefer simplest
+    near_best = [p for p in participants
+                 if p['fitness'] <= best_fitness * (1 + epsilon)]
+    winner = min(near_best, key=lambda p: p['complexity'])
+
+    return winner
+
+
+def run_gp(X: np.ndarray, y: np.ndarray, variables: list[str],
+           pop_size: int = 500, generations: int = 50,
+           tournament_size: int = 5, p_crossover: float = 0.7,
+           max_depth: int = 6, elite_size: int = 5) -> list[dict]:
+    """Run a complete GP loop and return the Pareto front.
+
+    Returns a list of dicts with keys: 'tree', 'fitness', 'complexity', 'mse'.
+    """
+    # Initialize population
+    population = []
+    for _ in range(pop_size):
+        tree = random_tree(max_depth=max_depth, variables=variables)
+        population.append({'tree': tree})
+
+    best_ever = None
+    data = {v: X[:, i] for i, v in enumerate(variables)}
+
+    for gen in range(generations):
+        # Evaluate fitness
+        for ind in population:
+            try:
+                pred = ind['tree'].evaluate(data)
+                mse = np.mean((pred - y) ** 2)
+                if not np.isfinite(mse):
+                    mse = 1e10
+            except Exception:
+                mse = 1e10
+            complexity = ind['tree'].count_nodes()
+            ind['mse'] = mse
+            ind['complexity'] = complexity
+            ind['fitness'] = mse  # pure fitness; Pareto handles complexity
+
+        # Track best
+        gen_best = min(population, key=lambda p: p['mse'])
+        if best_ever is None or gen_best['mse'] < best_ever['mse']:
+            best_ever = gen_best
+        if gen % 10 == 0:
+            print(f"Gen {gen:3d} | Best MSE: {gen_best['mse']:.6f} "
+                  f"| Nodes: {gen_best['complexity']} "
+                  f"| {gen_best['tree'].to_string()[:60]}")
+
+        # Elitism: carry forward top individuals
+        sorted_pop = sorted(population, key=lambda p: p['fitness'])
+        new_population = [{'tree': copy.deepcopy(ind['tree'])}
+                          for ind in sorted_pop[:elite_size]]
+
+        # Breed offspring
+        while len(new_population) < pop_size:
+            if np.random.random() < p_crossover:
+                p1 = tournament_select(population, tournament_size)
+                p2 = tournament_select(population, tournament_size)
+                child_tree = subtree_crossover(p1['tree'], p2['tree'])
+            else:
+                parent = tournament_select(population, tournament_size)
+                # Choose mutation type
+                r = np.random.random()
+                if r < 0.6:
+                    child_tree = point_mutation(parent['tree'], variables)
+                elif r < 0.8:
+                    child_tree = hoist_mutation(parent['tree'])
+                else:
+                    child_tree = random_tree(max_depth, variables)
+
+            # Depth limit: reject trees that are too deep
+            if child_tree.count_nodes() <= 50:
+                new_population.append({'tree': child_tree})
+
+        population = new_population
+
+    # Compute final Pareto front
+    for ind in population:
+        try:
+            pred = ind['tree'].evaluate(data)
+            ind['mse'] = float(np.mean((pred - y) ** 2))
+            if not np.isfinite(ind['mse']):
+                ind['mse'] = 1e10
+        except Exception:
+            ind['mse'] = 1e10
+        ind['complexity'] = ind['tree'].count_nodes()
+        ind['expr'] = ind['tree'].to_string()
+
+    return pareto_front([{'expr': ind['expr'], 'mse': ind['mse'],
+                          'complexity': ind['complexity']}
+                        for ind in population if ind['mse'] < 1e9])
+</code></pre>
+<div class="code-caption">Listing 35.7: A complete genetic programming loop with tournament selection, crossover, three mutation types (point, hoist, random subtree), elitism, and depth limiting. The function returns the Pareto front of accuracy vs. complexity.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Selection Pressure Is the Critical Hyperparameter</div>
+<p>
+Population size, generation count, and crossover probability all matter, but selection pressure
+(controlled by tournament size and elitism count) has the largest effect on GP performance.
+Too-low pressure (tournament size 2, no elitism) produces random drift; the population
+explores broadly but never converges. Too-high pressure (tournament size 20, large elite)
+produces premature convergence; the population locks onto the first decent expression and
+never discovers alternatives. The sweet spot (tournament size 5 to 7, elite fraction 1% to 2%)
+allows exploitation of good solutions while maintaining enough diversity for crossover to
+produce novel combinations. PySR solves this balance structurally by running multiple
+independent populations that periodically exchange their best individuals, a strategy called
+island migration.
+</p>
+</div>
+
+<h2>3. Neural-Guided Symbolic Regression</h2>
+
+<p>
+Classical GP treats expression search as a purely evolutionary process: no mathematical
+knowledge guides the operators. A crossover between $\sin(x)$ and $\exp(y)$ is as likely as a
+crossover between $x^2$ and $x^3$, even though the latter is far more likely to be useful if
+the true expression is a polynomial. Neural-guided symbolic regression uses trained neural
+networks to inject mathematical knowledge into the search, either by directly generating
+candidate expressions or by steering evolutionary operators toward promising regions.
+</p>
+
+<p>
+Three architectures have emerged as dominant paradigms, each representing a different way to
+combine neural networks with symbolic search.
+</p>
+
+<h3>3.1 Transformer-Based Expression Generation</h3>
+
+<p>
+The most direct approach treats symbolic regression as a sequence-to-sequence translation
+problem. A transformer encoder processes the input dataset (a set of $(x, y)$ pairs), and a
+transformer decoder generates an expression token by token in prefix notation. Kamienny et al.
+(2022) trained such a model on millions of synthetic equation-dataset pairs, producing a system
+that can generate candidate expressions in a single forward pass, without any evolutionary
+search.
+</p>
+
+<p>
+The key insight is that the encoder must handle a <em>set</em> of data points (the order of
+$(x_i, y_i)$ pairs should not matter), while the decoder must produce a <em>sequence</em> of
+expression tokens. The encoder uses a set-transformer architecture (Lee et al., 2019) that is
+permutation-invariant over data points, while the decoder is a standard autoregressive
+transformer with causal masking.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+# Pseudocode for transformer-based symbolic regression
+# (Full implementation requires PyTorch; this shows the architecture)
+
+class SymbolicTransformer:
+    """End-to-end symbolic regression with a transformer.
+
+    Architecture:
+      1. Encoder: Set-Transformer over (x, y) pairs
+         - Input: N data points, each a (d+1)-dimensional vector [x_1,...,x_d, y]
+         - Permutation-invariant via induced set attention (ISAB)
+         - Output: fixed-size latent representation z
+
+      2. Decoder: Autoregressive transformer
+         - Input: z (from encoder) + previously generated tokens
+         - Output: probability distribution over next token
+         - Vocabulary: operators (+, -, *, /, sin, cos, exp, log, sqrt)
+                       variables (x_1, ..., x_d)
+                       constants (discretized or placeholder)
+         - Generates expression in prefix notation: + * x1 x1 1.0 => x1^2 + 1
+    """
+
+    def encode_dataset(self, X, y):
+        """Encode a dataset of (x, y) pairs into a latent vector.
+
+        Uses Induced Set Attention Blocks (ISAB) for permutation invariance.
+        The encoder sees the DATA, not any symbolic representation.
+        """
+        # Stack inputs and outputs: each point is [x_1, ..., x_d, y]
+        data_points = np.column_stack([X, y])
+        # ... Set-Transformer encoder produces latent z
+        return "latent_z"  # placeholder
+
+    def decode_expression(self, z, max_tokens=50):
+        """Autoregressively generate expression tokens.
+
+        At each step:
+          1. Feed z and all previously generated tokens to the decoder
+          2. Sample the next token from the output distribution
+          3. Stop when <EOS> is generated or max_tokens is reached
+
+        Temperature controls exploration vs. exploitation:
+          - Low temperature (0.1): greedy, picks highest-probability tokens
+          - High temperature (1.0): diverse, explores alternative expressions
+        """
+        tokens = []
+        for _ in range(max_tokens):
+            # next_token = decoder(z, tokens)
+            # tokens.append(next_token)
+            # if next_token == '<EOS>': break
+            pass
+        return tokens
+
+    def beam_search(self, z, beam_width=10):
+        """Generate multiple candidate expressions via beam search.
+
+        Maintains beam_width partial expressions at each step,
+        expanding each by its top-k next tokens, then pruning to
+        the beam_width most probable sequences.
+
+        Returns beam_width complete expressions ranked by probability.
+        """
+        pass
+
+# Training procedure (conceptual):
+# 1. Generate millions of random symbolic expressions
+# 2. For each expression, sample N data points to create a dataset
+# 3. Train the transformer to predict the expression from the dataset
+# 4. At inference, encode the real dataset and decode candidate expressions
+</code></pre>
+<div class="code-caption">Listing 35.8: Architecture of a transformer-based symbolic regression model. The set-transformer encoder handles variable-size datasets with permutation invariance; the autoregressive decoder generates expressions in prefix notation. Training requires millions of synthetic equation-dataset pairs.</div>
+
+<p>
+The transformer approach has a remarkable property: at inference time, it requires only a single
+forward pass through the network (or a beam search with a few passes) rather than the thousands
+of evaluations needed by evolutionary search. On the SRBench benchmark (La Cava et al., 2021),
+transformer models match or exceed GP on problems with clean data and known functional forms.
+However, they struggle with noisy data and out-of-distribution expressions (functions unlike
+anything seen during training), where evolutionary methods remain more robust.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: NeSymReS in Action</div>
+<p>
+NeSymReS (Biggio et al., 2021) demonstrates the scaling advantage of neural-guided SR. Given a
+dataset with 10 input variables, classical GP requires populations of 10,000+ and 100+ generations
+(millions of expression evaluations). NeSymReS encodes the dataset in one pass and generates
+100 candidate expressions via beam search in under 2 seconds on a GPU. It then refines the best
+candidates by optimizing their numerical constants with BFGS (a quasi-Newton optimizer from
+scipy). On the Feynman symbolic regression benchmark (120 equations from the Feynman Lectures on
+Physics), NeSymReS recovers the exact equation for 82 of 120 problems, compared to 65 for
+standard GP. The key limitation: NeSymReS requires a pretrained model (training takes ~48 GPU
+hours on synthetic data), while GP works out of the box.
+</p>
+</div>
+
+<h3>3.2 Reinforcement Learning for Expression Construction</h3>
+
+<p>
+An alternative to supervised training on synthetic data is to frame expression construction as
+a sequential decision-making problem. At each step, an agent chooses the next token in a prefix-
+notation expression. The reward is the negative of the expression's fitness (MSE plus complexity
+penalty) when the expression is complete. The agent learns a policy that maximizes expected reward,
+effectively learning which operator sequences tend to produce good fits.
+</p>
+
+<p>
+Petersen et al. (2021) introduced Deep Symbolic Regression (DSR) using this framework. The agent
+is an RNN that maintains a hidden state summarizing the partial expression built so far. At each
+step, it outputs a distribution over the token vocabulary, samples a token, and appends it to
+the expression. When the expression is syntactically complete (the tree has no unfilled slots),
+the agent receives a reward based on how well the expression fits the data.
+</p>
+
+<p>
+The critical innovation in DSR is the <strong>risk-seeking policy gradient</strong>. Standard
+policy gradient methods (REINFORCE) optimize the expected reward. But in symbolic regression,
+we do not care about average performance across sampled expressions; we care about the
+<em>best single expression found</em>. DSR uses a quantile-based objective that focuses the
+gradient on the top $\epsilon$-fraction of sampled expressions, concentrating learning on
+the rare high-reward trajectories:
+</p>
+
+$$\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \nabla_\theta \log \pi_\theta(\tau) \cdot R(\tau) \cdot \mathbf{1}[R(\tau) \geq R_{1-\epsilon}] \right]$$
+
+<p>
+where $R_{1-\epsilon}$ is the $(1-\epsilon)$-quantile of rewards in the current batch and
+$\mathbf{1}[\cdot]$ is the indicator function. Only trajectories (expressions) with reward above
+this threshold contribute to the gradient update, which dramatically improves convergence for
+the rare-reward structure of symbolic regression.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the risk-seeking policy gradient as a talent-show judge who only remembers the best acts. Imagine a cooking competition where 1,000 contestants each prepare a dish. A standard judge would average all the scores, conclude that the typical dish was mediocre, and give broad feedback like "use more salt." The risk-seeking judge ignores the bottom 950 dishes entirely and studies only the top 50, asking: what did these winners do differently? The feedback becomes specific and actionable: "the winners all used a citrus glaze on the protein." In the same way, the risk-seeking gradient ignores the vast majority of poorly fitting expressions and concentrates the learning signal on the rare few that achieved high reward, extracting the structural patterns (operator choices, variable combinations) that made those expressions successful.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+
+def risk_seeking_policy_gradient(
+    log_probs: np.ndarray,   # log probability of each sampled expression
+    rewards: np.ndarray,     # reward (negative fitness) of each expression
+    epsilon: float = 0.05    # top fraction to focus on
+) -> np.ndarray:
+    """Compute the risk-seeking policy gradient for symbolic regression.
+
+    Instead of optimizing expected reward (standard REINFORCE), focus the
+    gradient on the top epsilon-fraction of sampled expressions.
+
+    Args:
+        log_probs: shape (batch_size,), log pi(expression_i)
+        rewards: shape (batch_size,), reward for each expression
+        epsilon: fraction of top-performing expressions to learn from
+
+    Returns:
+        gradient: weighted log-prob gradient for the policy update
+    """
+    # Find the (1-epsilon) quantile of rewards
+    quantile_threshold = np.quantile(rewards, 1 - epsilon)
+
+    # Mask: only include expressions above the threshold
+    mask = rewards >= quantile_threshold
+
+    # Advantage: how much better than the threshold
+    advantages = (rewards - quantile_threshold) * mask
+
+    # Normalize advantages for stable gradients
+    if advantages.sum() > 0:
+        advantages = advantages / (advantages.std() + 1e-8)
+
+    # Policy gradient: high-reward expressions get positive gradient
+    gradient = log_probs * advantages
+
+    n_selected = mask.sum()
+    print(f"Risk-seeking: {n_selected}/{len(rewards)} expressions "
+          f"above quantile {quantile_threshold:.4f}")
+
+    return gradient
+
+
+# Example: batch of 1000 sampled expressions
+np.random.seed(42)
+n_batch = 1000
+fake_log_probs = np.random.normal(-5, 2, n_batch)  # typical log probs
+fake_rewards = np.random.exponential(0.1, n_batch)  # most are bad
+
+# Inject a few good expressions (realistic: rare high-reward events)
+fake_rewards[42] = 5.0   # excellent fit
+fake_rewards[137] = 4.2  # very good fit
+fake_rewards[500] = 3.8  # good fit
+
+grad = risk_seeking_policy_gradient(fake_log_probs, fake_rewards, epsilon=0.05)
+# Risk-seeking: 50/1000 expressions above quantile 0.2750
+</code></pre>
+<div class="code-caption">Listing 35.9: The risk-seeking policy gradient from Deep Symbolic Regression. By focusing the gradient update on only the top 5% of sampled expressions, the agent learns from rare successes rather than averaging over the predominantly poor samples that dominate standard REINFORCE.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Why Risk-Seeking Beats Risk-Neutral for Symbolic Search</div>
+<p>
+In symbolic regression, the reward distribution is extremely skewed: 99% of randomly generated
+expressions have terrible fitness, and the difference between a "good" expression and the
+"correct" expression is often all or nothing ($\sin(x)$ vs. $\sin(x) + 1$ can differ by a
+constant that is easily fixed, but $\sin(x)$ vs. $x^2$ represents a qualitatively different
+structure). Standard REINFORCE averages over all samples, so the gradient is dominated by the
+vast majority of poor expressions and pushes the policy toward "average" behavior. Risk-seeking
+gradients ignore the poor majority entirely and concentrate learning on the exceptional cases,
+which is exactly the right inductive bias for a search problem where we need to find one
+correct answer, not perform well on average.
+</p>
+</div>
+
+<h2>4. PySR: Multi-Population Evolutionary Search</h2>
+
+<p>
+PySR (Cranmer, 2023) represents the current state of the art for practical symbolic regression.
+It combines classical GP with several innovations that address the weaknesses of both pure
+evolutionary and pure neural approaches. Understanding PySR's architecture is important because
+it is the primary tool we use in <a href="section-35.3.html">Section 35.3</a>.
+</p>
+
+<p>
+PySR's key design decisions:
+</p>
+
+<ol>
+<li><strong>Multi-population island model.</strong> Instead of one large population, PySR runs $M$ independent populations (typically 20 to 40) that evolve in parallel. Periodically, the best individual from one population migrates to another. This maintains diversity (each island can explore a different region of expression space) while allowing good solutions to spread across the ensemble. It is the evolutionary analog of ensemble methods in machine learning.</li>
+
+<li><strong>Adaptive complexity weighting.</strong> Rather than a fixed parsimony coefficient, PySR uses a temperature-based scheme that periodically increases complexity penalties (cooling) and decreases them (heating). During hot phases, complex expressions are tolerated, allowing the search to explore elaborate structures. During cold phases, complexity is heavily penalized, pruning away bloat and favoring simple expressions. This annealing schedule prevents the search from getting stuck in either regime.</li>
+
+<li><strong>Constant optimization.</strong> After each generation, PySR optimizes the numerical constants in each expression using BFGS (a quasi-Newton method from scipy.optimize). This is critical: GP is good at discovering the <em>structure</em> of an expression ($a \cdot x^2 + b$) but poor at finding precise constant values ($0.5 \cdot x^2 + 1.0$). By separating structure search (GP) from constant fitting (BFGS), PySR gets the best of both approaches.</li>
+
+<li><strong>Julia backend.</strong> PySR's core engine is written in Julia (SymbolicRegression.jl), which provides near-C performance for expression evaluation. The Python wrapper handles I/O and visualization. This architecture means PySR runs 10 to 100x faster than pure-Python GP implementations like gplearn.</li>
+</ol>
+
+<pre><code class="language-python">from pysr import PySRRegressor
+import numpy as np
+
+# PySR configuration for a physics problem
+model = PySRRegressor(
+    # Search configuration
+    niterations=100,           # number of evolutionary cycles
+    populations=30,            # number of independent island populations
+    population_size=50,        # individuals per population
+    ncycles_per_iteration=300, # inner cycles per iteration (Julia-side)
+
+    # Operator vocabulary
+    binary_operators=["+", "-", "*", "/", "^"],
+    unary_operators=["sin", "cos", "exp", "log", "sqrt", "abs"],
+
+    # Complexity control
+    maxsize=30,                # maximum expression tree size (nodes)
+    maxdepth=8,                # maximum tree depth
+    parsimony=0.0032,          # adaptive complexity penalty base
+    adaptive_parsimony_scaling=1000.0,  # temperature for adaptive penalty
+
+    # Constant optimization
+    optimizer_algorithm="BFGS",     # quasi-Newton for constant fitting
+    optimizer_nrestarts=3,          # random restarts for constant optimization
+    optimize_probability=0.14,      # fraction of individuals that get constant opt
+
+    # Batching and performance
+    batching=True,             # subsample data per evaluation (faster)
+    batch_size=50,             # subsample size
+
+    # Output
+    equation_file="hall_of_fame.csv",  # save Pareto front to CSV
+    progress=True,
+    verbosity=1,
+    random_state=42,
+)
+
+# Example: recover the ideal gas law PV = nRT
+# Variables: P (pressure), V (volume), n (moles), T (temperature)
+# Target: PV/nT should be approximately R = 8.314
+np.random.seed(42)
+n_points = 200
+P = np.random.uniform(1e4, 1e6, n_points)     # Pa
+V = np.random.uniform(0.001, 0.1, n_points)    # m^3
+n_mol = np.random.uniform(0.1, 10.0, n_points) # mol
+T = np.random.uniform(200, 500, n_points)       # K
+R = 8.314  # J/(mol*K)
+
+# Target: P = nRT/V (rearranged ideal gas law)
+y = n_mol * R * T / V + np.random.normal(0, 100, n_points)  # noisy pressure
+
+X = np.column_stack([V, n_mol, T])
+
+model.fit(X, y, variable_names=["V", "n", "T"])
+
+# Display the Pareto front of discovered equations
+print("\nPareto front (complexity vs. loss):")
+print(model)
+# Typical output (exact results vary by run):
+# Complexity | Loss       | Equation
+# 1          | 3.24e+10   | 336820.0
+# 3          | 1.82e+08   | (T * 164.85)
+# 5          | 2.41e+06   | ((n * T) * 85.43)
+# 7          | 9847.2     | ((n * T) / V) * 8.317
+# 9          | 9841.6     | ((n * (T + 0.182)) / V) * 8.314
+</code></pre>
+<div class="code-caption">Listing 35.10: PySR configuration and execution for recovering the ideal gas law from noisy data. The Pareto front shows a clear knee at complexity 7, where the expression <code>((n * T) / V) * 8.317</code> achieves a dramatic accuracy improvement, identifying the correct functional form $P = nRT/V$ with the gas constant $R \approx 8.317$.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PySR vs. Manual GP</div>
+<p>
+The complete GP implementation in Listings 35.6 and 35.7 spans approximately 150 lines and lacks
+constant optimization, multi-population search, adaptive parsimony, and Julia-speed evaluation.
+PySR provides all of this in the configuration shown in Listing 35.10 (approximately 20 lines).
+On the SRBench benchmark, PySR achieves the highest median accuracy across 122 datasets,
+outperforming gplearn, DSR, AI Feynman, and transformer-based methods. The practical rule of
+thumb: use PySR as the default tool for any symbolic regression task; fall back to custom GP
+implementations only when you need operators or constraints that PySR does not support.
+</p>
+</div>
+
+<h2>5. Scaling Challenges and Hybrid Approaches</h2>
+
+<p>
+All symbolic regression methods face a fundamental scaling wall: the number of possible
+expressions grows super-exponentially with the number of input variables. For $d$ input variables,
+$k$ operators, and expressions of size $n$, the number of distinct trees scales roughly as
+$(2k + d)^n$. With $d = 20$ variables and $n = 15$ nodes, this exceeds $10^{20}$.
+</p>
+
+<p>
+Several strategies address this scaling challenge. <strong>Feature selection</strong> reduces $d$
+before symbolic regression begins, using mutual information or gradient-based importance from
+<a href="../module-25-exploratory-discovery/index.html">Chapter 25</a>. <strong>Modular
+decomposition</strong> (used in AI Feynman) searches for separability ($f(x,y) = g(x) + h(y)$
+or $f(x,y) = g(x) \cdot h(y)$) and solves the subproblems independently. <strong>Hybrid
+neural-evolutionary</strong> approaches use a neural network as a warm-start for the evolutionary
+search: the transformer generates an initial population of plausible expressions, then GP refines
+them through crossover and mutation.
+</p>
+
+<p>
+The most promising recent direction combines large language models with symbolic regression.
+LLMs can propose candidate functional forms based on natural-language descriptions of the
+problem domain ("this data describes a damped oscillator"), which are then refined by PySR.
+This connects symbolic regression to the <a href="../../part-4-knowledge/module-39-hypothesis-generation/index.html">hypothesis
+generation</a> systems of Chapter 39 and the <a href="../../part-7-autonomous-discovery/module-53-ai-scientists/index.html">AI
+scientist</a> architectures of Chapter 53, where LLMs serve as the creative hypothesis engine
+and symbolic regression provides the rigorous mathematical verification.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Foundation Models for Symbolic Regression</div>
+<p>
+As of 2025, several groups are training large transformer models specifically for symbolic
+regression at scale. The SNIP model (Meidani et al., 2024) trains a transformer on 200 million
+synthetic equations and achieves state-of-the-art performance on SRBench without any
+evolutionary search at inference time. LaSR (Gao et al., 2024) integrates an LLM-based
+hypothesis proposer with PySR's evolutionary backbone: the LLM suggests functional forms in
+natural language ("try a power law with an exponential cutoff"), PySR translates these into
+expression trees and evolves them, and the best results are fed back to the LLM for the next
+round. More recently, SR-GPT (Wang et al., 2025) frames symbolic regression as a code-generation
+task: a fine-tuned large language model generates Python functions that compute candidate
+expressions, evaluates them against data, and iteratively refines the code through
+self-debugging, achieving new state-of-the-art recovery rates on the Feynman benchmark by
+leveraging the LLM's ability to reason about mathematical structure in natural language rather
+than operating purely at the token level. The convergence of foundation models and symbolic
+regression is one of the most active frontiers in AI-driven scientific discovery.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Evolve and Compare Symbolic Regressors on a Known Law</h4>
+<p>
+Build a mini benchmark that compares hand-rolled GP against PySR on a known physical law,
+so you can see both the search dynamics and the accuracy gap.
+</p>
+<ol>
+<li><strong>Generate the dataset.</strong> Using NumPy, create 300 data points for the
+Kepler third law: $T^2 = \frac{4\pi^2}{GM} r^3$. Sample orbital radius $r$ uniformly
+from 1 to 30 (AU), set $GM = 4\pi^2$ (so $T^2 = r^3$ in natural units), and add
+Gaussian noise with $\sigma = 0.5$ to the target $T$.</li>
+<li><strong>Run the manual GP.</strong> Using the <code>run_gp</code> function from
+Listing 35.7, evolve a population of 500 for 80 generations with tournament size 5.
+Record the best expression and its MSE at generations 10, 20, 40, and 80. Plot MSE
+vs. generation to visualize convergence.</li>
+<li><strong>Run PySR.</strong> Configure PySR as in Listing 35.10 with
+<code>binary_operators=["+", "-", "*", "/", "^"]</code> and
+<code>unary_operators=["sqrt"]</code>, 40 iterations, and 20 populations.
+Print the Pareto front and check whether $T = r^{1.5}$ (or equivalently
+$T^2 = r^3$) appears.</li>
+<li><strong>Compare.</strong> Tabulate the best expression, MSE, and node count from
+each method. Note whether the manual GP found the correct functional form or a
+polynomial approximation, and how many more evaluations it required compared to
+PySR.</li>
+<li><strong>Ablate constant optimization.</strong> Re-run PySR with
+<code>optimize_probability=0.0</code> (disabling BFGS constant fitting). Compare the
+resulting Pareto front to the default run and observe how much accuracy degrades
+when constants are not optimized separately from structure.</li>
+</ol>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Unreasonable Effectiveness of $x^2$</div>
+<p>
+A recurring observation in symbolic regression competitions is that an embarrassingly large
+fraction of benchmark problems are best fit by low-degree polynomials. SRBench (La Cava et al.,
+2021) found that a simple polynomial regressor (degree 3 or 4) matched or beat most symbolic
+regression methods on over 40% of the 122 benchmark datasets. This does not mean symbolic
+regression is useless; it means that many benchmark datasets lack the nonlinear, transcendental
+structure that symbolic regression is specifically designed to find. The real value of symbolic
+regression emerges on physics problems where the true relationship involves $\sin$, $\exp$,
+$\sqrt{\cdot}$, or dimensional products that polynomials cannot capture compactly.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Compare and contrast three approaches to symbolic regression:
+(a) genetic programming, (b) transformer-based generation, and (c) reinforcement learning.
+For each, identify: the search strategy, the training signal, the main computational bottleneck,
+and the failure mode. Which approach would you choose for (i) a physics problem with 3 variables
+and known dimensions, and (ii) a biology problem with 50 features and no dimensional information?
+</li>
+<li>
+<strong>(Coding)</strong> Implement a simple "island model" by running the <code>run_gp</code>
+function from Listing 35.7 with 4 independent populations of 200 individuals each. Every 10
+generations, migrate the best individual from each population to the next (circular topology).
+Compare the final Pareto front to a single population of 800 individuals. Does the island model
+find better or more diverse solutions?
+</li>
+<li>
+<strong>(Analysis)</strong> Using PySR (Listing 35.10), fit the dataset generated by
+$y = 3.0 \cdot \sin(2\pi x_1) + x_2^2$ with 500 data points and Gaussian noise
+$\sigma \in \{0.01, 0.1, 1.0, 5.0\}$. For each noise level, report the complexity of the
+best expression on the Pareto front and whether the correct functional form is recovered.
+At what noise level does symbolic regression begin to fail?
+</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-35.1.html">&larr; 35.1 Equation Discovery from Data</a>
+<a href="index.html">Chapter 35 Home</a>
+<a href="section-35.3.html">35.3 Building an Equation Discovery Pipeline &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

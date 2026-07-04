@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 4.2: Reasoning in Language Models. Chain-of-thought, scratchpad, tool use, AlphaGeometry, and reasoning failures." name="description"/>
+<title>Section 4.2: Reasoning in Language Models | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 4: Reasoning For Discovery</a></div>
+<h1>4.2 Reasoning in Language Models</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I can solve your math problem, but only if you ask me to think step by step. Otherwise I just guess. Please do not ask why."</p>
+<cite>A Foundation Model Pretending to Be a Scientist</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Large language models have transformed what "reasoning" means in AI systems. They do not use resolution or structure mapping internally; instead, they approximate reasoning through next-token prediction over sequences that resemble reasoning traces. This approximation is sometimes remarkably effective and sometimes spectacularly wrong. Understanding when and why LLMs reason well (or poorly) is essential for building discovery systems that use them. This section maps the techniques (chain-of-thought, scratchpads, tool use, reasoning models), examines a landmark case study (AlphaGeometry), and catalogs the systematic failure modes you must design around.</p>
+</div>
+
+<h2>1. The Surprising Emergence of Reasoning</h2>
+
+<p>In the previous section, we defined five forms of reasoning and gave each a clean computational realization. Language models take a radically different approach. A transformer trained on next-token prediction does not contain a resolution engine or a structure mapping algorithm. Yet when prompted appropriately, models like Claude, GPT-4, and Gemini can solve syllogisms, identify analogies, propose abductive explanations, and even prove mathematical theorems. How?</p>
+
+<p>The working hypothesis, supported by mechanistic interpretability research, is that transformers learn to simulate reasoning processes during pretraining. When the training corpus contains mathematical proofs, the model learns patterns like "if the premises include $P \rightarrow Q$ and $P$, the text usually continues with $Q$." This is not deduction in the logical sense (the model does not verify soundness), but it is a useful statistical approximation that works correctly on a wide range of inputs.</p>
+
+<p>The critical insight for discovery AI practitioners: LLM reasoning is a <em>capability</em> that must be elicited, tested, and bounded, not a <em>guarantee</em> that can be assumed. The techniques in this section are the elicitation tools; the failure modes at the end are the boundaries.</p>
+
+<h2>2. Chain-of-Thought Prompting</h2>
+
+<p>Chain-of-thought (CoT) prompting, introduced by Wei et al. (2022), is the simplest and most impactful technique for improving LLM reasoning. The idea is to ask the model to produce intermediate steps before the final answer, rather than jumping directly to the conclusion.</p>
+
+<p data-agent="02">Precisely, chain-of-thought prompting is a technique where you structure a model's input (via instructions or few-shot examples) so that the output includes explicit intermediate reasoning steps before the final answer. It matters because it converts problems that exceed a transformer's fixed computational depth into a sequence of individually tractable sub-problems, each benefiting from the full context of prior steps. The mechanism is autoregressive amplification: each generated reasoning token becomes part of the input context for subsequent tokens, effectively giving the model an unbounded working memory proportional to the length of its output. Use CoT when a task requires multiple dependent reasoning steps (multi-hop questions, arithmetic, logical deduction); prefer direct prompting for single-step classification, sentiment analysis, or tasks where latency and token cost outweigh accuracy gains.</p>
+
+<p>Why does this work? Consider the computation graph. Without CoT, the model must compress a multi-step reasoning chain into a single forward pass (a fixed number of transformer layers). With CoT, each intermediate step becomes part of the input context for subsequent steps, effectively giving the model a variable-length "working memory" through its own output tokens. The model can attend to its previously generated reasoning steps when producing the next one.</p>
+
+<p>The mathematical framing: for a question $Q$ with answer $A$ and reasoning chain $R = (r_1, r_2, \ldots, r_k)$:</p>
+
+$$
+P(A \mid Q) = \sum_R P(A \mid R, Q) \cdot P(R \mid Q)
+$$
+
+<p>Direct prompting asks for $P(A \mid Q)$ in one shot. CoT prompting samples $R$ first, then computes $P(A \mid R, Q)$, which is often a much easier conditional distribution because the reasoning chain $R$ has already done the hard work.</p>
+
+<pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()
+
+def reason_with_cot(question: str, domain: str = "science") -> dict:
+    """Elicit chain-of-thought reasoning from Claude.
+
+    Returns both the reasoning chain and final answer,
+    separated for downstream processing.
+    """
+    system_prompt = f"""You are a {domain} reasoning assistant.
+When given a question, think through it step by step.
+Structure your response as:
+
+REASONING:
+[numbered steps of your reasoning]
+
+ANSWER:
+[your final answer]
+
+CONFIDENCE:
+[high/medium/low with brief justification]"""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        system=system_prompt,
+        messages=[{"role": "user", "content": question}]
+    )
+
+    text = response.content[0].text
+
+    # Parse structured output
+    parts = {}
+    for section in ["REASONING", "ANSWER", "CONFIDENCE"]:
+        start = text.find(f"{section}:")
+        if start != -1:
+            # Find next section or end
+            next_sections = [
+                text.find(f"{s}:", start + len(section))
+                for s in ["REASONING", "ANSWER", "CONFIDENCE"]
+                if text.find(f"{s}:", start + len(section)) != -1
+            ]
+            end = min(next_sections) if next_sections else len(text)
+            parts[section.lower()] = text[start + len(section) + 1:end].strip()
+
+    return parts
+
+# Example: scientific reasoning question
+result = reason_with_cot(
+    "A sealed container holds gas at 300K and 1 atm. "
+    "The temperature is doubled to 600K. "
+    "What happens to the pressure, and why?"
+)
+print("Reasoning:", result.get("reasoning", "")[:200], "...")
+print("Answer:", result.get("answer", ""))
+print("Confidence:", result.get("confidence", ""))</code></pre>
+<div class="code-caption">Listing 4.5: Chain-of-thought prompting with structured output parsing. The system prompt instructs the model to separate reasoning steps from the final answer, enabling downstream systems to inspect the reasoning chain for validity.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>Chain-of-thought prompting does not make the model "smarter." It changes the computational graph by converting internal (fixed-depth) computation into external (variable-length) computation. The model's per-step accuracy remains roughly constant, but multi-step problems become tractable because each step can attend to all previous steps. This is why CoT helps most on problems requiring many reasoning steps (multi-digit arithmetic, multi-hop logic) and helps least on problems requiring a single insight (creative leaps, perceptual judgments). For discovery AI, this means CoT is excellent for systematic hypothesis evaluation but less useful for the abductive leap that generates the hypothesis in the first place.</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A widespread misconception is that chain-of-thought prompting teaches the model new reasoning abilities or "unlocks" latent intelligence. In reality, CoT does not add any capability the model lacks; it restructures the computation so that multi-step problems are decomposed into single steps the model can already handle. If the model cannot perform a single reasoning step correctly (for example, applying a rule it never encountered during training), no amount of chain-of-thought scaffolding will fix that gap. CoT amplifies existing per-step competence across longer chains; it does not create competence from scratch.</p>
+</div>
+
+<h2>3. Scratchpad and Extended Thinking</h2>
+
+<p>The scratchpad technique, introduced by Nye et al. (2021), takes chain-of-thought further. Instead of merely asking the model to "think step by step," we provide an explicit workspace where the model can perform intermediate computations, store partial results, and revise its approach.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of extended thinking like a chef's prep kitchen versus a live cooking show. In the live show (standard prompting), the chef must plate each ingredient the moment it comes out, with no chance to taste, adjust, or start over. In the prep kitchen (extended thinking), the chef can try a sauce, realize it needs more acid, discard a failed reduction, and rework the dish before it ever reaches the dining room. The thinking tokens are the prep kitchen: a private workspace where the model can explore dead ends, catch its own mistakes, and revise its approach before committing to a final answer. The diner (the user) only sees the polished plate, but the quality depends on the freedom to experiment behind the scenes.</p>
+</div>
+
+<p>Modern reasoning models formalize this through <strong>extended thinking</strong>: the model generates a potentially long internal reasoning trace (the "thinking" tokens) before producing the visible response. Claude's extended thinking, OpenAI's o1 and o3 models, and DeepSeek-R1 all implement variants of this approach. The key difference from basic CoT is that the model may backtrack, consider alternatives, and self-correct within the thinking trace.</p>
+
+<pre><code class="language-python">def reason_with_extended_thinking(question: str) -> dict:
+    """Use Claude's extended thinking for complex reasoning.
+
+    Extended thinking allocates additional compute at inference
+    time, allowing the model to explore and self-correct.
+    """
+    client = anthropic.Anthropic()
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=16000,
+        temperature=1,  # Required for extended thinking
+        thinking={
+            "type": "enabled",
+            "budget_tokens": 10000  # Up to 10k tokens for reasoning
+        },
+        messages=[{
+            "role": "user",
+            "content": question
+        }]
+    )
+
+    result = {"thinking": "", "answer": ""}
+    for block in response.content:
+        if block.type == "thinking":
+            result["thinking"] = block.thinking
+        elif block.type == "text":
+            result["answer"] = block.text
+
+    return result
+
+# Example: a multi-step scientific reasoning problem
+result = reason_with_extended_thinking(
+    "A researcher observes that a protein's enzymatic activity "
+    "increases when the temperature rises from 25C to 37C, "
+    "but drops sharply at 42C. Meanwhile, circular dichroism "
+    "spectroscopy shows no change in secondary structure at 37C "
+    "but significant changes at 42C. What can we conclude about "
+    "the relationship between structure and function, and what "
+    "experiment would confirm it?"
+)
+print(f"Thinking tokens used: ~{len(result['thinking'].split())}")
+print(f"Answer preview: {result['answer'][:300]}...")</code></pre>
+<div class="code-caption">Listing 4.6: Extended thinking for complex scientific reasoning. The model allocates up to 10,000 tokens for internal deliberation, enabling multi-step analysis of experimental observations with self-correction.</div>
+
+<h2>4. Tool-Augmented Reasoning</h2>
+
+<p>Pure language model reasoning hits hard limits: arithmetic errors on large numbers, inability to access current data, hallucinated facts. Tool-augmented reasoning addresses these limits by letting the model delegate specific subtasks to external tools: calculators, databases, code interpreters, search engines.</p>
+
+<p>The architecture, which we explore in depth in <a href="../../part-2-software-engineering/module-12-mcp-servers/index.html">Chapter 12: Building MCP Servers</a>, follows a simple pattern: the model decides <em>when</em> to use a tool and <em>what</em> to ask; the tool provides a reliable answer; the model incorporates the answer into its reasoning chain.</p>
+
+<pre><code class="language-python">import json
+
+tools = [
+    {
+        "name": "calculate",
+        "description": "Evaluate a mathematical expression. "
+                       "Use for any arithmetic, algebra, or calculus.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "Math expression, e.g. '2**10 * 3.14'"
+                }
+            },
+            "required": ["expression"]
+        }
+    },
+    {
+        "name": "lookup_constant",
+        "description": "Look up a physical or chemical constant.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Constant name, e.g. 'speed_of_light'"
+                }
+            },
+            "required": ["name"]
+        }
+    }
+]
+
+CONSTANTS = {
+    "speed_of_light": {"value": 2.998e8, "unit": "m/s"},
+    "boltzmann": {"value": 1.381e-23, "unit": "J/K"},
+    "avogadro": {"value": 6.022e23, "unit": "mol^-1"},
+    "planck": {"value": 6.626e-34, "unit": "J*s"},
+    "gas_constant": {"value": 8.314, "unit": "J/(mol*K)"},
+}
+
+def handle_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Execute a tool call and return the result."""
+    if tool_name == "calculate":
+        try:
+            # Safe eval for math expressions
+            result = eval(tool_input["expression"], {"__builtins__": {}},
+                         {"abs": abs, "round": round, "min": min, "max": max})
+            return json.dumps({"result": result})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+    elif tool_name == "lookup_constant":
+        name = tool_input["name"].lower().replace(" ", "_")
+        if name in CONSTANTS:
+            return json.dumps(CONSTANTS[name])
+        return json.dumps({"error": f"Unknown constant: {name}"})
+    return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+def reason_with_tools(question: str) -> str:
+    """Reasoning loop with tool use for scientific calculations."""
+    client = anthropic.Anthropic()
+    messages = [{"role": "user", "content": question}]
+
+    while True:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+
+        # Collect all content blocks
+        tool_results = []
+        final_text = ""
+
+        for block in response.content:
+            if block.type == "text":
+                final_text += block.text
+            elif block.type == "tool_use":
+                result = handle_tool_call(block.name, block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result
+                })
+
+        if response.stop_reason == "end_turn":
+            return final_text
+
+        # Feed tool results back for continued reasoning
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+# Example: requires both constant lookup and calculation
+answer = reason_with_tools(
+    "What is the de Broglie wavelength of an electron "
+    "moving at 1% of the speed of light? "
+    "Show your work using the formula lambda = h / (m * v)."
+)
+print(answer)</code></pre>
+<div class="code-caption">Listing 4.7: Tool-augmented reasoning loop. The model identifies when it needs a physical constant or a calculation, delegates to the appropriate tool, and incorporates the result into its reasoning chain. This pattern eliminates arithmetic errors and hallucinated constants.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: AlphaGeometry as a Reasoning Architecture</div>
+<p>AlphaGeometry (Trinh et al., 2024) demonstrates the most sophisticated integration of neural and symbolic reasoning to date. It solves olympiad-level geometry problems by combining two systems:</p>
+<ul>
+<li><strong>A neural language model</strong> trained on synthetic geometry proofs. This model proposes auxiliary constructions ("add point $E$ as the midpoint of $AC$") that unlock proof paths the symbolic engine cannot find on its own.</li>
+<li><strong>A symbolic deduction engine</strong> (DD+AR: Deductive Database with Algebraic Reasoning) that applies geometry rules (angle chasing, congruence, similarity) deterministically and exhaustively.</li>
+</ul>
+<p>The architecture loops: the symbolic engine attempts a proof, gets stuck, asks the neural model for a construction, adds it to the diagram, and retries. This loop solved 25 out of 30 olympiad geometry problems, approaching the performance of gold-medalist humans.</p>
+<p>For discovery AI, AlphaGeometry is a template: use neural models for the creative, abductive step (proposing constructions, hypotheses) and symbolic systems for the deductive, verification step (checking consequences, proving theorems). Neither alone is sufficient. The integration pattern recurs in <a href="../../part-3-data-models/module-35-symbolic-regression/index.html">Chapter 35: Symbolic Regression</a> and <a href="../../part-7-autonomous-discovery/module-53-ai-scientists/index.html">Chapter 53: AI Scientists</a>.</p>
+</div>
+
+<h2>5. Reasoning Models: Scaling Test-Time Compute</h2>
+
+<p>The 2024-2025 generation of "reasoning models" represents a paradigm shift: instead of making models larger (scaling training compute), these systems make models <em>think longer</em> (scaling test-time compute). The key idea is reinforcement learning on reasoning traces: the model learns not just to produce correct answers but to produce effective reasoning chains that lead to correct answers.</p>
+
+<p>The landscape includes OpenAI's o1 and o3 series, DeepSeek-R1, and Claude's extended thinking mode. These models share several architectural principles:</p>
+
+<ol>
+<li><strong>Internal chain-of-thought</strong>: the model generates a potentially long reasoning trace before the final answer</li>
+<li><strong>Backtracking and self-correction</strong>: the trace may explore dead ends, recognize errors, and try alternative approaches</li>
+<li><strong>Compute-accuracy tradeoff</strong>: more thinking tokens generally yield better answers, with diminishing returns</li>
+<li><strong>Verification loops</strong>: the model checks its own intermediate results, catching errors that a single-pass model would propagate</li>
+</ol>
+
+<p>For discovery AI, reasoning models offer a new design dimension. Instead of choosing a larger model for harder problems, we can choose a <em>longer thinking budget</em>. This is particularly valuable for scientific reasoning, where problems vary enormously in difficulty but the types of reasoning steps are relatively consistent.</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier</div>
+<p>The theoretical foundations of test-time compute scaling are still being established. Snell et al. (2024) show that optimal compute allocation depends on problem difficulty: easy problems benefit more from parallel sampling (generate multiple answers and vote), while hard problems benefit more from sequential deepening (think longer on a single chain). Brown et al. (2024) demonstrate that verifier models can guide test-time search, effectively turning reasoning into a tree search problem, connecting back to the search frameworks of <a href="../module-01-discovery-as-search/index.html">Chapter 1</a>. More recently, DeepSeek-R1 (Guo et al., 2025) showed that pure reinforcement learning on reasoning traces, without any supervised fine-tuning on human-written chains, can produce strong reasoning behavior; the model learns to generate long, self-correcting chains of thought entirely from outcome-based reward signals. This result suggests that reasoning may emerge as an optimal strategy under RL pressure rather than requiring explicit imitation of human reasoning patterns, with significant implications for training future discovery-oriented models.</p>
+</div>
+
+<h2>6. Systematic Reasoning Failures</h2>
+
+<p>LLM reasoning, however impressive, exhibits systematic failure modes that discovery AI practitioners must understand and design around. These are not random errors; they are predictable consequences of how language models process information.</p>
+
+<h3>6.1 Compositional Fragility</h3>
+
+<p>LLMs handle individual reasoning steps well but degrade as the number of required steps increases. A model that correctly solves 95% of single-step inferences will solve only $0.95^{10} \approx 60\%$ of 10-step chains correctly (assuming independent errors). In practice, errors compound worse than independently because early errors corrupt the context for subsequent steps.</p>
+
+<h3>6.2 Sensitivity to Irrelevant Information</h3>
+
+<p>Adding irrelevant details to a problem statement can dramatically change model performance. The classic demonstration: "John has 5 apples. He gives 2 to Mary. He then takes a bus to school. How many apples does John have?" Models sometimes incorporate the bus detail into their arithmetic. For discovery AI, this means that noisy or tangential data in the prompt can derail reasoning about the core scientific question.</p>
+
+<h3>6.3 Reversal Curse and Directional Failures</h3>
+
+<p>Models trained on "A is B" do not automatically know "B is A." Berglund et al. (2023) demonstrated that models trained on "The mother of X is Y" could not answer "Who is Y's child?" This asymmetry matters for scientific reasoning because many relationships are bidirectional (if gene A regulates gene B, then gene B is regulated by gene A), and a model's inability to reverse its training patterns creates blind spots.</p>
+
+<h3>6.4 Faithful vs. Unfaithful Chain-of-Thought</h3>
+
+<p>Perhaps the most dangerous failure mode: the reasoning chain can be wrong while the answer is right (the model "knows" the answer from pattern matching and generates a post-hoc justification), or the chain can be right while the answer is wrong (the model follows correct logic but makes an arithmetic or factual error in the final step). Turpin et al. (2023) showed that CoT explanations are frequently unfaithful to the model's actual computation, meaning you cannot trust the reasoning trace as a reliable explanation of the model's conclusion.</p>
+
+<pre><code class="language-python">def diagnose_reasoning(
+    question: str,
+    expected_answer: str,
+    n_samples: int = 5
+) -> dict:
+    """Diagnose reasoning reliability by sampling multiple chains.
+
+    If the model gives different answers across samples, the
+    reasoning is fragile. If chains differ but answers agree,
+    the model may be pattern-matching rather than reasoning.
+    """
+    client = anthropic.Anthropic()
+    samples = []
+
+    for i in range(n_samples):
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            temperature=1.0,  # Increase diversity
+            messages=[{
+                "role": "user",
+                "content": f"Think step by step:\n{question}"
+            }]
+        )
+        samples.append(response.content[0].text)
+
+    # Extract final answers (last line heuristic)
+    answers = [s.strip().split("\n")[-1] for s in samples]
+    unique_answers = set(answers)
+
+    diagnosis = {
+        "question": question,
+        "n_samples": n_samples,
+        "unique_answers": len(unique_answers),
+        "answers": answers,
+        "consensus": len(unique_answers) == 1,
+        "agreement_rate": max(
+            answers.count(a) for a in unique_answers
+        ) / n_samples,
+    }
+
+    # Check if consensus matches expected
+    if diagnosis["consensus"]:
+        diagnosis["correct"] = expected_answer.lower() in answers[0].lower()
+    else:
+        diagnosis["correct"] = any(
+            expected_answer.lower() in a.lower() for a in answers
+        )
+
+    return diagnosis
+
+# Example: test a tricky reasoning problem
+result = diagnose_reasoning(
+    question=(
+        "A researcher measures the boiling point of a liquid at "
+        "sea level (100.0C) and at 2000m altitude. "
+        "At altitude, will the boiling point be higher, lower, "
+        "or the same? Why?"
+    ),
+    expected_answer="lower",
+    n_samples=5
+)
+print(f"Consensus: {result['consensus']}")
+print(f"Agreement rate: {result['agreement_rate']:.0%}")
+print(f"Correct: {result['correct']}")</code></pre>
+<div class="code-caption">Listing 4.8: Reasoning reliability diagnosis via multi-sample consistency. By sampling multiple reasoning chains with temperature > 0, we detect fragile reasoning (inconsistent answers) and potential pattern matching (consistent answers with inconsistent reasoning). This diagnostic is essential before trusting LLM reasoning in scientific pipelines.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>The implication for discovery AI is clear: never trust a single LLM reasoning chain in a scientific context. Design systems that (1) sample multiple reasoning paths, (2) verify intermediate steps with symbolic or computational tools, (3) separate the creative/abductive role (where LLMs excel) from the verification/deductive role (where symbolic systems are more reliable), and (4) maintain explicit confidence estimates. The reasoning pipeline in <a href="section-4.4.html">Section 4.4</a> embodies all four principles.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>The "unfaithful chain-of-thought" phenomenon creates an unsettling parallel with human cognition. Psychologists have long known that humans frequently confabulate explanations for their decisions (Nisbett &amp; Wilson, 1977). When asked why they chose a particular product, people generate plausible-sounding reasons that have nothing to do with the actual cause (which might be shelf position or packaging color). LLMs appear to have learned this very human skill of fluent rationalization. Whether this is a feature or a bug depends on whether you are building a reasoning engine or a persuasion engine.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Reasoning Frameworks</div>
+<p>For production reasoning pipelines, several frameworks handle the scaffolding shown above. <a href="https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking" target="_blank">Claude's extended thinking API</a> provides native test-time compute scaling in two lines of code. <a href="https://github.com/langchain-ai/langchain" target="_blank">LangChain</a> and <a href="https://github.com/run-llama/llama_index" target="_blank">LlamaIndex</a> offer tool-use abstractions that handle the tool-call loop automatically. <a href="https://github.com/anthropics/anthropic-cookbook" target="_blank">The Anthropic Cookbook</a> provides production-tested patterns for structured reasoning with Claude. These frameworks reduce the reasoning loop from ~50 lines to ~5, handling retries, token management, and output parsing internally.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Measure CoT Reliability on Science Questions</h4>
+<p>Build a small reasoning reliability benchmark using only Python and an LLM API key. This project takes about 30 minutes and produces a quantitative view of when chain-of-thought helps and when it fails.</p>
+<ol>
+<li><strong>Curate five questions</strong> spanning a range of reasoning depths: one single-step factual recall question (e.g., "What is the chemical formula of water?"), one two-step inference, one requiring three or more chained steps (e.g., a stoichiometry problem), one requiring numerical computation, and one requiring an abductive/creative leap. Record the ground-truth answer for each.</li>
+<li><strong>Write a script</strong> that sends each question to an LLM twice: once with a direct prompt ("Answer concisely:") and once with a CoT prompt ("Think step by step, then give your final answer:"). Use <code>temperature=0</code> for reproducibility. Store both responses.</li>
+<li><strong>Add multi-sample consistency</strong>: for the CoT condition, resend each question five times at <code>temperature=1.0</code>. Extract the final answer from each sample (take the last line or parse after "ANSWER:"). Compute the agreement rate (fraction of samples giving the same answer).</li>
+<li><strong>Score and tabulate</strong>: for each question, record (a) whether the direct prompt was correct, (b) whether the CoT prompt was correct, (c) the multi-sample agreement rate, and (d) the number of reasoning steps in the CoT trace. Print a table using Python's built-in <code>print</code> formatting or the <code>csv</code> module.</li>
+<li><strong>Analyze the pattern</strong>: plot agreement rate versus reasoning depth (number of steps) using <code>matplotlib</code>. You should observe that agreement drops as step count rises, confirming the compositional fragility discussed in Section 6.1. Write two sentences summarizing what you found.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual:</strong> Explain why chain-of-thought prompting helps more on arithmetic problems than on sentiment analysis. Frame your answer in terms of the number of reasoning steps and the role of working memory.</li>
+
+<li><strong>Coding:</strong> Implement a "self-consistency" scorer: run the same question through a model 10 times with temperature=1.0, extract the final answer from each, and return the majority vote along with a confidence score (fraction of samples agreeing). Test it on three science questions of varying difficulty.</li>
+
+<li><strong>Analysis:</strong> The AlphaGeometry architecture loops between a neural proposer and a symbolic verifier. Design a similar two-system architecture for a different scientific domain (e.g., chemistry reaction prediction, biological pathway analysis). Specify what the neural system proposes, what the symbolic system verifies, and what the loop termination condition is.</li>
+</ol>
+</section>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>We have seen how language models approximate reasoning and where they fail. <a href="section-4.3.html">Section 4.3: Causal Reasoning and the Do-Calculus</a> develops the most scientifically important reasoning form in full mathematical detail: causal reasoning. Where LLMs tell us "X and Y tend to appear together," causal reasoning tells us whether changing X will change Y, the question that every scientific experiment is designed to answer.</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-grid">
+
+<div class="bib-category">
+<h3>Foundational Papers</h3>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2201.11903" target="_blank">Wei, J. et al. (2022). Chain-of-thought prompting elicits reasoning in large language models.</a>
+<p>The paper that launched chain-of-thought prompting. Showed that adding "Let's think step by step" or providing few-shot examples with reasoning traces dramatically improves performance on arithmetic, commonsense, and symbolic reasoning benchmarks.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2112.00114" target="_blank">Nye, M. et al. (2021). Show your work: Scratchpads for intermediate computation with language models.</a>
+<p>Introduced the scratchpad technique: training models to produce intermediate computation steps in an explicit workspace. Precursor to modern extended thinking approaches.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2401.08500" target="_blank">Trinh, T.H. et al. (2024). Solving olympiad geometry without human demonstrations.</a>
+<p>AlphaGeometry: a neuro-symbolic system that solves olympiad geometry by combining a neural language model (for proposing auxiliary constructions) with a symbolic deduction engine. Achieved near-gold-medalist performance.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2203.11171" target="_blank">Wang, X. et al. (2022). Self-consistency improves chain of thought reasoning in language models.</a>
+<p>Introduced self-consistency decoding: sample multiple reasoning chains and take the majority-vote answer. A simple, effective method for improving reasoning reliability.</p>
+</div>
+
+</div>
+
+<div class="bib-category">
+<h3>Reasoning Failures</h3>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2309.12288" target="_blank">Berglund, L. et al. (2023). The Reversal Curse: LLMs trained on "A is B" fail to learn "B is A."</a>
+<p>Demonstrates a fundamental asymmetry in LLM knowledge: training on directional statements does not yield bidirectional understanding. Important implications for scientific knowledge retrieval.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2305.04388" target="_blank">Turpin, M. et al. (2023). Language models don't always say what they think.</a>
+<p>Shows that chain-of-thought explanations are frequently unfaithful to the model's actual reasoning process. Biasing features in the input can change the answer without changing the explanation.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2407.01687" target="_blank">Snell, C. et al. (2024). Scaling LLM test-time compute optimally can be more effective than scaling model parameters.</a>
+<p>Analyzes the tradeoff between training-time and test-time compute scaling, showing that optimal allocation depends on problem difficulty. Foundational for reasoning model design.</p>
+</div>
+
+</div>
+
+<div class="bib-category">
+<h3>Tools &amp; References</h3>
+
+<div class="bib-card">
+<a href="https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking" target="_blank">Anthropic. Extended Thinking Documentation.</a>
+<p>API reference for Claude's extended thinking feature, including budget allocation, streaming, and integration patterns.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2210.03629" target="_blank">Yao, S. et al. (2023). ReAct: Synergizing reasoning and acting in language models.</a>
+<p>Interleaves reasoning traces with tool-use actions, enabling models to reason about when and how to use external tools. Foundational pattern for tool-augmented reasoning.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2212.10403" target="_blank">Huang, J. &amp; Chang, K.C. (2023). Towards Reasoning in Large Language Models: A Survey.</a>
+<p>Comprehensive survey covering deductive, inductive, abductive, mathematical, and commonsense reasoning in LLMs. Useful reference for the full taxonomy of reasoning capabilities and benchmarks.</p>
+</div>
+
+</div>
+
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-4.1.html">&#8592; 4.1 Forms of Reasoning</a>
+<a href="index.html">Chapter 4</a>
+<a class="next" href="section-4.3.html">4.3 Causal Reasoning and the Do-Calculus &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</body>
+</html>

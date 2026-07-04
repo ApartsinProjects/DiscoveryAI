@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.3: Verification and Repair. Test suites as executable contracts, property-based testing with Hypothesis, schema validation with Pydantic, and the repair loop." name="description"/>
+<title>Section 9.3: Verification and Repair | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Vibe Coding As Specification, Steering, Verification, And Repair</a></div>
+<h1>9.3 Verification and Repair</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I generated 200 random inputs and the function handled all of them correctly. Then input 201 revealed it had been silently truncating negative numbers the whole time."</p>
+<cite>A Property-Based Test With a Grudge</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the vibe coding loop from <a href="section-9.2.html">Section 9.2</a>
+and the specification gap framework from <a href="section-9.1.html">Section 9.1</a>. You
+should be comfortable writing pytest test cases and using Python type annotations.
+Familiarity with the concept of invariants from
+<a href="../../part-1-foundations/module-04-reasoning-for-discovery/index.html">Chapter 4: Reasoning for Discovery</a>
+will help with the property-based testing material.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Verification is the "observe" phase of the vibe coding loop, and repair is what happens
+when observation reveals problems. This section builds a layered verification stack:
+example-based tests (pytest) catch specific bugs, property-based tests (Hypothesis)
+catch classes of bugs, schema validators (Pydantic) catch structural violations, and
+static analysis (mypy, ruff) catches issues without running the code at all. Each layer
+catches bugs that the layers below it miss, and together they form an executable
+contract that turns the vague aspiration of "make it work" into a precise, automatable
+definition of correctness. The repair half of this section shows how to feed
+verification failures back to the model effectively, closing the loop from
+Section 9.2.
+</p>
+</div>
+
+<h2>1. The Verification Stack</h2>
+
+<p>
+A single layer of verification is never sufficient. Example-based tests only check
+the specific inputs you thought of. Property-based tests only check the properties
+you defined. Type checkers only catch type errors, not logic errors. Each tool has
+blind spots that the others compensate for. The verification stack arranges these
+tools in a deliberate order, from fastest and cheapest to slowest and most thorough.
+</p>
+
+<p data-agent="02">
+A verification stack is a fixed sequence of automated checking tools, ordered by speed
+and cost, that runs against every version of the generated code. It matters because no
+single tool can catch all categories of defect: a linter sees style violations but not
+logic errors, while a test suite sees logic errors but not type mismatches. The
+mechanism is straightforward: each layer runs independently, produces a pass/fail
+verdict with structured details, and the results are aggregated into one report before
+any repair begins. Use a verification stack whenever you are iterating on AI-generated
+code (the vibe coding loop); for a one-off script you will never modify again, running
+pytest alone may suffice, but for anything that will evolve across multiple
+generate/repair cycles, the full stack pays for itself within two or three iterations
+by catching errors that would otherwise cascade.
+</p>
+
+<p>
+<strong>Layer 1: Static analysis</strong> (mypy, pyright, ruff) runs in seconds, requires
+no test inputs, and catches type mismatches, unused imports, unreachable code, and
+style violations. Static analysis is the cheapest verification layer because it
+requires no test infrastructure and provides immediate feedback. In the vibe coding
+loop, static analysis runs first: if the generated code has type errors, there is no
+point running the test suite.
+</p>
+
+<p>
+<strong>Layer 2: Unit tests</strong> (pytest) run in seconds to minutes and verify
+specific input-output pairs. Each test encodes one behavioral decision from the
+specification. Unit tests are the backbone of the executable contract because they
+are easy to write, easy to understand, and produce clear pass/fail signals that
+the model can act on.
+</p>
+
+<p>
+<strong>Layer 3: Property-based tests</strong> (Hypothesis) run in seconds to minutes
+and verify invariants across randomly generated inputs. Property tests are more
+powerful than unit tests because they explore the input space automatically, finding
+edge cases the developer never considered. They are also harder to write because they
+require the developer to articulate general properties rather than specific examples.
+</p>
+
+<p>
+<strong>Layer 4: Integration and end-to-end tests</strong> (Playwright, httpx) run in
+seconds to minutes and verify that components work together. End-to-end tests are
+the most expensive layer but also the most realistic: they test the system as a user
+would experience it. We use Playwright for browser-based testing in
+<a href="section-9.4.html">Section 9.4</a>.
+</p>
+
+<pre><code class="language-python">import subprocess
+import json
+from dataclasses import dataclass
+
+@dataclass
+class VerificationResult:
+    """Result from one layer of the verification stack."""
+    layer: str
+    passed: bool
+    details: str
+    duration_seconds: float
+
+def run_verification_stack(
+    source_file: str,
+    test_file: str,
+) -> list[VerificationResult]:
+    """
+    Run the full verification stack against generated code.
+
+    Layers run in order; each layer runs regardless of whether
+    previous layers passed (to collect all issues at once).
+    """
+    results = []
+    import time
+
+    # Layer 1: Static analysis with ruff (linting)
+    t0 = time.time()
+    ruff_result = subprocess.run(
+        ["ruff", "check", source_file, "--output-format=json"],
+        capture_output=True, text=True,
+    )
+    results.append(VerificationResult(
+        layer="ruff",
+        passed=ruff_result.returncode == 0,
+        details=ruff_result.stdout[:500],
+        duration_seconds=time.time() - t0,
+    ))
+
+    # Layer 2: Type checking with mypy
+    t0 = time.time()
+    mypy_result = subprocess.run(
+        ["mypy", source_file, "--ignore-missing-imports"],
+        capture_output=True, text=True,
+    )
+    results.append(VerificationResult(
+        layer="mypy",
+        passed=mypy_result.returncode == 0,
+        details=mypy_result.stdout[:500],
+        duration_seconds=time.time() - t0,
+    ))
+
+    # Layer 3: pytest (unit + property-based tests)
+    t0 = time.time()
+    pytest_result = subprocess.run(
+        ["pytest", test_file, "-v", "--tb=short"],
+        capture_output=True, text=True,
+    )
+    results.append(VerificationResult(
+        layer="pytest",
+        passed=pytest_result.returncode == 0,
+        details=pytest_result.stdout[-1000:],  # last 1000 chars for failures
+        duration_seconds=time.time() - t0,
+    ))
+
+    return results
+
+def format_for_repair(results: list[VerificationResult]) -> str:
+    """
+    Format verification results as a repair prompt for the model.
+
+    Only includes failing layers, with actionable details.
+    """
+    failures = [r for r in results if not r.passed]
+    if not failures:
+        return "All verification layers passed."
+
+    lines = ["The following verification layers failed:\n"]
+    for f in failures:
+        lines.append(f"## {f.layer} (failed in {f.duration_seconds:.1f}s)")
+        lines.append(f.details)
+        lines.append("")
+
+    lines.append("Please fix all issues. Do not change the test file.")
+    return "\n".join(lines)
+</code></pre>
+<div class="code-caption">The verification stack runner. Each layer produces a structured result; <code>format_for_repair</code> transforms failures into a repair prompt suitable for feeding back into the vibe coding loop.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Verification Stack Is a Filter, Not a Checkpoint</div>
+<p>
+Run all layers even if an early layer fails. Collecting all failures at once gives the
+model a complete picture of what is wrong, enabling it to fix multiple issues in a single
+repair iteration rather than playing whack-a-mole across iterations. This principle
+(parallelize verification, serialize repair) directly improves the convergence rate
+from Section 9.2 by maximizing the information content of each steering message.
+</p>
+</div>
+
+<h2>2. Property-Based Testing with Hypothesis</h2>
+
+<p>
+Example-based tests verify that specific inputs produce specific outputs. Property-based
+tests verify that <em>all</em> inputs (within a defined domain) satisfy a general property.
+The distinction is profound: an example test says "for input [3, 1, 2], the output is
+[1, 2, 3]"; a property test says "for any list of integers, the output is a sorted
+permutation of the input." The property test subsumes infinitely many example tests.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of property-based testing like a building inspector versus a homeowner. A homeowner
+(example-based testing) checks that the kitchen faucet works, the bedroom light switch
+flips, and the front door locks. An inspector (property-based testing) checks that
+<em>every</em> faucet delivers water within a pressure range, <em>every</em> switch
+controls the correct circuit, and <em>every</em> door meets fire-code clearance. The
+inspector does not enumerate each fixture individually; instead, she states a rule ("all
+outlets must be grounded") and then walks through the house testing outlets she
+encounters, including ones the homeowner forgot existed. Similarly, Hypothesis states a
+property ("the output is always sorted") and then generates inputs the developer never
+considered, including the empty list, the single-element list, and the list with all
+identical values.
+</p>
+</div>
+
+<p>
+Hypothesis is the standard property-based testing library for Python. It works by
+generating random inputs according to <em>strategies</em> (descriptions of valid input
+domains), running the function under test, and checking that the specified property
+holds. When Hypothesis finds a failing input, it automatically <em>shrinks</em> it to
+the smallest example that still triggers the failure, making the bug report maximally
+informative.
+</p>
+
+<pre><code class="language-python">from hypothesis import given, settings, assume
+from hypothesis import strategies as st
+
+# --- The function under test (generated by AI) ---
+def merge_sorted(a: list[int], b: list[int]) -> list[int]:
+    """Merge two sorted lists into one sorted list."""
+    result = []
+    i = j = 0
+    while i < len(a) and j < len(b):
+        if a[i] <= b[j]:
+            result.append(a[i])
+            i += 1
+        else:
+            result.append(b[j])
+            j += 1
+    result.extend(a[i:])
+    result.extend(b[j:])
+    return result
+
+# --- Property-based tests ---
+
+@given(
+    a=st.lists(st.integers(min_value=-1000, max_value=1000)),
+    b=st.lists(st.integers(min_value=-1000, max_value=1000)),
+)
+def test_merge_preserves_elements(a: list[int], b: list[int]):
+    """Property: merging preserves all elements (no drops, no duplicates)."""
+    a_sorted = sorted(a)
+    b_sorted = sorted(b)
+    merged = merge_sorted(a_sorted, b_sorted)
+    assert sorted(merged) == sorted(a_sorted + b_sorted)
+
+@given(
+    a=st.lists(st.integers(min_value=-1000, max_value=1000)),
+    b=st.lists(st.integers(min_value=-1000, max_value=1000)),
+)
+def test_merge_output_is_sorted(a: list[int], b: list[int]):
+    """Property: output is always sorted."""
+    a_sorted = sorted(a)
+    b_sorted = sorted(b)
+    merged = merge_sorted(a_sorted, b_sorted)
+    for i in range(len(merged) - 1):
+        assert merged[i] <= merged[i + 1], (
+            f"Output not sorted at index {i}: {merged[i]} > {merged[i+1]}"
+        )
+
+@given(
+    a=st.lists(st.integers(min_value=-1000, max_value=1000)),
+    b=st.lists(st.integers(min_value=-1000, max_value=1000)),
+)
+def test_merge_length_is_sum(a: list[int], b: list[int]):
+    """Property: output length equals sum of input lengths."""
+    a_sorted = sorted(a)
+    b_sorted = sorted(b)
+    merged = merge_sorted(a_sorted, b_sorted)
+    assert len(merged) == len(a_sorted) + len(b_sorted)
+</code></pre>
+<div class="code-caption">Three property-based tests for a merge function. Each test defines a universal property (element preservation, sorted output, length conservation) that Hypothesis verifies across hundreds of randomly generated inputs.</div>
+
+<p>
+The three properties above form a <em>complete characterization</em> of the merge
+function: any function that preserves elements, produces sorted output, and preserves
+total length is a correct merge. This is more powerful than any finite set of example
+tests because it covers the entire input domain.
+</p>
+
+<p>
+In the vibe coding loop, property-based tests serve a special role: they catch bugs
+that arise from the implicit assumptions component of the specification gap (Section
+9.1). The developer may not think to test what happens when both input lists are empty,
+or when they contain duplicate values, or when one list is much longer than the other.
+Hypothesis generates all of these cases automatically.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Hypothesis Finds a Floating-Point Bug</div>
+<p>
+A researcher asks Claude Code to implement a function that normalizes a vector to unit
+length. The example tests all pass (they use small integer vectors like [3, 4] and
+[1, 0, 0]). But a Hypothesis property test discovers that the function crashes on the
+zero vector [0, 0, 0] (division by zero) and returns incorrect results for very large
+vectors (floating-point overflow in the norm calculation). Neither edge case appeared
+in the hand-written tests. The property test that caught these issues is remarkably
+simple:
+</p>
+<pre><code class="language-python">import numpy as np
+from hypothesis import given
+from hypothesis import strategies as st
+from hypothesis.extra.numpy import arrays
+
+@given(
+    v=arrays(
+        dtype=np.float64,
+        shape=st.integers(min_value=1, max_value=100),
+        elements=st.floats(
+            min_value=-1e308, max_value=1e308,
+            allow_nan=False, allow_infinity=False,
+        ),
+    )
+)
+def test_normalize_unit_length(v):
+    """Property: normalized vector has unit length (or input is zero)."""
+    norm = np.linalg.norm(v)
+    if norm == 0:
+        # Zero vector: function should return zero vector or raise
+        try:
+            result = normalize(v)
+            assert np.allclose(result, 0.0)
+        except ValueError:
+            pass  # raising is also acceptable
+    else:
+        result = normalize(v)
+        result_norm = np.linalg.norm(result)
+        assert abs(result_norm - 1.0) < 1e-6, (
+            f"Expected unit norm, got {result_norm}"
+        )
+</code></pre>
+<div class="code-caption">A property test for vector normalization using Hypothesis's NumPy integration. The strategy generates arrays of arbitrary dimension with arbitrary float values, covering edge cases no human would enumerate.</div>
+</div>
+
+<h2>3. Schema Validation with Pydantic</h2>
+
+<p>
+While tests verify behavior, schema validation verifies <em>structure</em>. In vibe coding
+for data-intensive applications (which most scientific applications are), the most
+common bugs are structural: a function returns a dictionary with the wrong keys, a
+nested field has the wrong type, or a numeric value falls outside its valid range.
+Pydantic catches all of these automatically.
+</p>
+
+<p>
+The key insight is that Pydantic models serve as both documentation and enforcement.
+A Pydantic model is simultaneously a type annotation (readable by mypy), a runtime
+validator (catches invalid data at execution time), a serialization schema (converts
+to and from JSON), and a documentation artifact (generates JSON Schema). Writing
+the model once provides all four functions.
+</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field, field_validator
+from typing import Optional
+from datetime import datetime
+
+class ExperimentResult(BaseModel):
+    """
+    Schema contract for a single experiment result.
+
+    This model serves as the executable contract between the data
+    ingestion pipeline (AI-generated) and the analysis pipeline
+    (human-written). Any violation raises ValidationError with
+    a precise error message that can be fed back to the model.
+    """
+    experiment_id: str = Field(
+        pattern=r"^EXP-\d{6}$",
+        description="Experiment ID in format EXP-NNNNNN",
+    )
+    timestamp: datetime = Field(
+        description="When the measurement was taken (UTC)",
+    )
+    measurement: float = Field(
+        ge=-273.15,  # absolute zero in Celsius
+        le=10000.0,
+        description="Temperature measurement in Celsius",
+    )
+    uncertainty: float = Field(
+        gt=0.0,
+        description="Measurement uncertainty (must be positive)",
+    )
+    instrument: str = Field(
+        min_length=1,
+        max_length=100,
+        description="Instrument identifier",
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        max_length=1000,
+        description="Optional free-text notes",
+    )
+
+    @field_validator("measurement")
+    @classmethod
+    def measurement_precision(cls, v: float) -> float:
+        """Measurements should not have more than 4 decimal places."""
+        if round(v, 4) != v:
+            raise ValueError(
+                f"Measurement {v} has excessive precision; "
+                f"round to 4 decimal places"
+            )
+        return v
+
+# Valid: passes all constraints
+valid = ExperimentResult(
+    experiment_id="EXP-000042",
+    timestamp="2025-06-15T10:30:00Z",
+    measurement=23.5,
+    uncertainty=0.1,
+    instrument="Thermocouple-A7",
+)
+print(valid.model_dump_json(indent=2))
+
+# Invalid: multiple violations caught at once
+try:
+    invalid = ExperimentResult(
+        experiment_id="EXP42",         # wrong format
+        timestamp="2025-06-15",
+        measurement=-300.0,            # below absolute zero
+        uncertainty=-0.1,              # negative uncertainty
+        instrument="",                 # too short
+    )
+except Exception as e:
+    print(f"Validation errors:\n{e}")
+    # Pydantic reports ALL violations, not just the first one
+</code></pre>
+<div class="code-caption">Pydantic model as executable schema contract. The model encodes domain constraints (temperature bounds, ID format, positive uncertainty) that would require dozens of lines of manual assertion code.</div>
+
+<p>
+In the vibe coding loop, Pydantic models serve as the interface contract between
+components. When you ask the model to generate a data ingestion function, you provide
+the Pydantic model as part of the specification: "The function must return a list of
+<code>ExperimentResult</code> objects." If the generated function returns data that
+violates the schema, Pydantic's error message is detailed enough to serve directly
+as steering feedback. This technique extends naturally to
+<a href="../module-12-mcp-servers/index.html">MCP server development</a> (Chapter 12),
+where Pydantic models define the tool input/output schemas.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Hypothesis + Pydantic Integration</div>
+<p>
+Hypothesis can generate test data directly from Pydantic models using the
+<code>hypothesis-pydantic</code> plugin (or the built-in <code>from_type</code> strategy
+with Pydantic v2). This eliminates the need to write custom strategies for complex
+data structures. Instead of manually defining strategies for each field, you write one
+line: <code>st.from_type(ExperimentResult)</code>. Hypothesis reads the Pydantic
+constraints (min/max values, string patterns, field validators) and generates valid
+instances automatically. This reduces property test setup from roughly 20 lines of
+strategy code to a single line. The combination of Hypothesis and Pydantic is
+particularly powerful for scientific data pipelines, where data schemas are complex
+and edge cases are numerous.
+</p>
+</div>
+
+<h2>4. The Repair Loop: Feeding Failures Back</h2>
+
+<p>
+Verification without repair is diagnosis without treatment. The repair loop takes
+verification failures, formats them as actionable feedback, and feeds them back to
+the model. The quality of this formatting directly affects repair efficiency (the
+$\alpha_t$ parameter from Section 9.2).
+</p>
+
+<p>
+Three principles govern effective repair feedback:
+</p>
+
+<p>
+<strong>Principle 1: Show the full failure context.</strong> Do not paraphrase error
+messages. Include the complete stack trace, the failing assertion, the actual versus
+expected values, and the test name. The model needs the raw data, not your interpretation
+of it.
+</p>
+
+<p>
+<strong>Principle 2: Separate structural failures from behavioral failures.</strong>
+A type error ("expected int, got str") requires a different repair strategy than a
+logic error ("expected 42, got 41"). Presenting them separately helps the model
+prioritize. Fix structural issues first (they often cause cascading behavioral failures),
+then address behavioral issues.
+</p>
+
+<p>
+<strong>Principle 3: Constrain the repair scope.</strong> Tell the model which files it
+may modify and which it must not. "Fix the implementation in <code>pipeline.py</code>.
+Do not modify <code>test_pipeline.py</code>." This prevents the model from "fixing" a
+test failure by weakening the test, which is a common failure mode when the repair
+prompt is unconstrained.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that "all tests pass" means the code is correct. Passing tests
+only means the code satisfies the properties you remembered to check; it says nothing
+about properties you omitted. If your test suite contains only example-based tests with
+hand-picked inputs, entire categories of bugs (boundary conditions, empty inputs,
+concurrent access, overflow) can hide in the untested input space. This is why the
+verification stack uses multiple layers with different coverage strategies: each layer
+probes a region of the defect space that the others leave dark.
+</p>
+</div>
+
+<pre><code class="language-python">from dataclasses import dataclass
+
+@dataclass
+class RepairPrompt:
+    """Structured repair prompt for the vibe coding loop."""
+    original_spec: str
+    source_file: str
+    test_file: str
+    failures: list[VerificationResult]
+
+    def render(self) -> str:
+        """Render the repair prompt as a string for the model."""
+        sections = []
+
+        # Remind the model of the original specification
+        sections.append("## Original Specification")
+        sections.append(self.original_spec)
+        sections.append("")
+
+        # Separate structural and behavioral failures
+        structural = [f for f in self.failures if f.layer in ("ruff", "mypy")]
+        behavioral = [f for f in self.failures if f.layer in ("pytest",)]
+
+        if structural:
+            sections.append("## Structural Issues (fix these first)")
+            for f in structural:
+                sections.append(f"### {f.layer}")
+                sections.append(f.details)
+                sections.append("")
+
+        if behavioral:
+            sections.append("## Behavioral Issues")
+            for f in behavioral:
+                sections.append(f"### {f.layer}")
+                sections.append(f.details)
+                sections.append("")
+
+        # Constrain the repair scope
+        sections.append("## Constraints")
+        sections.append(f"- Only modify `{self.source_file}`")
+        sections.append(f"- Do NOT modify `{self.test_file}`")
+        sections.append("- Do NOT weaken any test assertions")
+        sections.append("- All existing passing tests must continue to pass")
+
+        return "\n".join(sections)
+</code></pre>
+<div class="code-caption">Structured repair prompt. The three principles (full context, failure separation, scope constraint) are encoded directly in the prompt structure.</div>
+
+<p>
+The scope constraint ("do not modify the test file") deserves emphasis. Without it,
+the model frequently "repairs" a bug by changing the test's expected value to match
+the buggy output. This is formally correct (all tests pass) but semantically wrong
+(the specification has been weakened). In the
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">search framework</a>,
+weakening tests is equivalent to expanding the solution space $S^*$ rather than
+navigating to a better point within it. It feels like progress (the pass rate goes up)
+but represents regression.
+</p>
+
+<h2>5. Putting It Together: The Automated Verification Pipeline</h2>
+
+<p>
+The following class combines all verification layers into a single automated pipeline
+that can be invoked from the command line or integrated into a CI/CD workflow. This
+pipeline is the workhorse of the "observe" phase in the vibe coding loop.
+</p>
+
+<pre><code class="language-python">import subprocess
+import time
+import json
+from pathlib import Path
+from dataclasses import dataclass, field
+
+@dataclass
+class VerificationPipeline:
+    """
+    Automated verification pipeline for vibe-coded projects.
+
+    Runs all verification layers in sequence, collects results,
+    and generates a repair prompt if any layer fails.
+    """
+    source_files: list[str]
+    test_files: list[str]
+    results: list[VerificationResult] = field(default_factory=list)
+
+    def run_layer(
+        self, name: str, cmd: list[str],
+    ) -> VerificationResult:
+        """Run a single verification layer and capture the result."""
+        t0 = time.time()
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        elapsed = time.time() - t0
+        return VerificationResult(
+            layer=name,
+            passed=proc.returncode == 0,
+            details=(proc.stdout + proc.stderr)[-1500:],
+            duration_seconds=elapsed,
+        )
+
+    def run_all(self) -> list[VerificationResult]:
+        """Run the full verification stack."""
+        self.results = []
+
+        # Layer 1: Linting
+        self.results.append(self.run_layer(
+            "ruff", ["ruff", "check"] + self.source_files,
+        ))
+
+        # Layer 2: Type checking
+        self.results.append(self.run_layer(
+            "mypy", ["mypy", "--ignore-missing-imports"] + self.source_files,
+        ))
+
+        # Layer 3: Tests (unit + property-based)
+        self.results.append(self.run_layer(
+            "pytest",
+            ["pytest"] + self.test_files + ["-v", "--tb=short", "-x"],
+        ))
+
+        return self.results
+
+    @property
+    def all_passed(self) -> bool:
+        return all(r.passed for r in self.results)
+
+    def summary(self) -> str:
+        """One-line summary for logging."""
+        total = len(self.results)
+        passed = sum(1 for r in self.results if r.passed)
+        elapsed = sum(r.duration_seconds for r in self.results)
+        return f"{passed}/{total} layers passed in {elapsed:.1f}s"
+
+
+# Usage in the vibe coding loop
+pipeline = VerificationPipeline(
+    source_files=["src/pipeline.py"],
+    test_files=["tests/test_pipeline.py"],
+)
+results = pipeline.run_all()
+print(pipeline.summary())
+
+if not pipeline.all_passed:
+    repair = RepairPrompt(
+        original_spec="...",  # from Section 9.1
+        source_file="src/pipeline.py",
+        test_file="tests/test_pipeline.py",
+        failures=[r for r in results if not r.passed],
+    )
+    print(repair.render())
+</code></pre>
+<div class="code-caption">The complete verification pipeline. Runs linting, type checking, and tests in sequence, then generates a structured repair prompt from any failures. This pipeline integrates directly into the vibe coding loop from Section 9.2.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+A 2024-2025 research direction called "verification-guided generation" integrates
+the verification stack directly into the generation process rather than running it as
+a post-hoc check. AlphaCodium (Ridnik et al., 2024) alternates between generation and
+testing in a structured flow, achieving state-of-the-art results on competitive
+programming benchmarks. More recently, CodeMonkeys (Ehrlich et al., 2025) scales
+verification-guided repair to entire repositories: the system decomposes repository-level
+tasks into per-file sub-problems, generates candidate edits for each file, and then runs
+the project's own test suite as the verification oracle, iterating repairs until the
+tests pass. On the SWE-bench Verified benchmark, CodeMonkeys resolved 57.4% of
+real-world GitHub issues, demonstrating that the verification-and-repair loop taught
+in this section extends well beyond single-function exercises to production codebases
+with hundreds of interacting files. The implication for vibe coders is practical: tools
+that integrate verification into generation (such as Claude Code's internal test-running
+loop) will converge faster than tools that treat generation and verification as
+separate steps.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Hypothesis Shrinking Superpower</div>
+<p>
+When Hypothesis finds a failing test case, it does not just report the input that
+caused the failure. It <em>shrinks</em> the input to the smallest example that still
+triggers the bug. If your function fails on a list of 47 elements, Hypothesis will
+try shorter lists, smaller numbers, and simpler structures until it finds the minimal
+reproducer. A bug report that says "fails on [0]" is vastly more debuggable than one
+that says "fails on [847, -3, 0, 291, ...]". This shrinking behavior is especially
+valuable in the vibe coding repair loop because the minimal reproducer gives the model
+the clearest possible signal about the root cause.
+</p>
+</div>
+
+<h2>6. Repair Anti-Patterns</h2>
+
+<p>
+Not all repairs move the session toward convergence. Three anti-patterns are common
+enough to warrant explicit warnings.
+</p>
+
+<p>
+<strong>Test weakening</strong> occurs when the model changes the test to match the
+buggy output rather than fixing the code. Guard against this by making the test file
+read-only or by including a "do not modify tests" constraint in every repair prompt.
+</p>
+
+<p>
+<strong>Overfitting to failures</strong> occurs when the model adds special-case logic
+to pass specific failing tests without addressing the underlying bug. The result is
+code that passes the current test suite but fails on any new input. Property-based
+tests are the primary defense: they generate new inputs on every run, making overfitting
+impossible.
+</p>
+
+<p>
+<strong>Regression cascades</strong> occur when fixing one test breaks several others,
+triggering a chain of fixes and breaks that never stabilizes. This is the "oscillating
+pass rate" pathology from Section 9.2. The root cause is usually tight coupling between
+components. The fix is to decompose the function into smaller, independently testable
+units and repair each unit separately.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Verification Stack for a CSV Parser</h4>
+<p>
+This mini-project walks you through constructing and running a complete verification
+stack for a small but realistic function. You need Python 3.10+, pytest, hypothesis,
+pydantic, ruff, and mypy (all installable via <code>pip install pytest hypothesis
+pydantic ruff mypy</code>).
+</p>
+<ol>
+<li>Create a file <code>csv_parser.py</code> with a function
+<code>parse_csv(text: str) -> list[dict[str, str]]</code> that splits a CSV string
+(with a header row) into a list of dictionaries. Write it yourself or ask an AI to
+generate it.</li>
+<li>Create a Pydantic model <code>CsvRow</code> with fields <code>name: str</code>
+(min_length=1), <code>age: int</code> (ge=0, le=150), and
+<code>email: str</code> (pattern for a basic email format). Write a wrapper function
+that parses the CSV, then validates each row against the model.</li>
+<li>In <code>test_csv_parser.py</code>, write two example-based tests (one for a
+normal three-row CSV, one for an empty CSV), plus one Hypothesis property test: given
+a list of valid <code>CsvRow</code> objects, serialize them to CSV text, parse them
+back, and assert the round-trip preserves all values.</li>
+<li>Run the full stack in order: <code>ruff check csv_parser.py</code>, then
+<code>mypy csv_parser.py</code>, then <code>pytest test_csv_parser.py -v</code>.
+Record which layers pass and which fail.</li>
+<li>For each failure, write a one-sentence diagnosis, fix the code (not the tests),
+and re-run the stack until all layers pass. Count how many repair iterations you
+needed.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> For each layer of the verification stack (static analysis,
+unit tests, property tests, end-to-end tests), give one example of a bug it would
+catch that the layers below it would miss. Then give one example of a bug that no
+layer in the stack would catch.
+</li>
+<li>
+<strong>(Coding)</strong> Write a Hypothesis property test for a function
+<code>parse_csv_row(row: str) -> list[str]</code> that parses a single line of CSV.
+Your property tests should verify: (1) round-trip consistency (formatting the parsed
+result back to CSV produces the original input), (2) the number of fields is
+consistent for all rows of the same structure, and (3) quoted fields preserve commas
+and newlines. Use <code>st.text()</code> and <code>st.lists()</code> to generate test
+inputs.
+</li>
+<li>
+<strong>(Analysis)</strong> Implement the <code>VerificationPipeline</code> and run it
+against a small Python project (your own or a tutorial project). Record the pass/fail
+results for each layer. Which layer catches the most issues? How many of the issues
+caught by static analysis would also be caught by the test suite?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+With the verification and repair machinery in place, <a href="section-9.4.html">Section 9.4: Building Through Conversation</a>
+puts everything together in a complete, end-to-end recipe. We will build a scientific
+data explorer web application from scratch, starting with failing tests, generating
+code through iterative conversation, verifying with the full stack, and repairing
+until all contracts pass. The recipe demonstrates the entire vibe coding methodology
+on a realistic project.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-9.2.html">&larr; 9.2 The Vibe Coding Loop</a>
+<a href="index.html">Chapter 9</a>
+<a href="section-9.4.html">9.4 Building Through Conversation &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

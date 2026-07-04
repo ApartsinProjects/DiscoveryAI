@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 14.2: AI-Assisted Architecture Generation. Using LLMs to generate candidate architectures from requirements, visualize them with Mermaid and Structurizr, and select the Pareto-optimal design." name="description"/>
+<title>Section 14.2: AI-Assisted Architecture Generation | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 14: Discovery of Architectures</a></div>
+<h1>14.2 AI-Assisted Architecture Generation</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I asked the model for three candidate architectures and it gave me twelve, each with a compelling argument for why the other eleven were wrong."</p>
+<cite>An LLM That Took 'Explore the Design Space' Literally</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+In <a href="section-14.1.html">Section 14.1</a> we established the vocabulary of
+architectural styles, quality attributes, and component graphs. Now we bring in AI.
+You should be comfortable with structured LLM output from
+<a href="../module-10-prompting-to-programming/index.html">Chapter 10: Prompting to Programming</a>
+and the context engineering strategies from
+<a href="../module-11-context-engineering/index.html">Chapter 11</a>. We will use
+Pydantic for schema enforcement and NetworkX for graph analysis, both introduced
+in the previous section.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Human architects draw on experience, pattern catalogs, and intuition to propose
+candidate architectures. An LLM draws on a training corpus that includes thousands
+of architecture descriptions, design documents, and technical blog posts. The key
+insight is not that the LLM replaces the architect, but that it can rapidly generate
+a <em>diverse set</em> of candidates that a human might not consider. The architect's
+role shifts from "design the architecture" to "evaluate, compare, and select from
+generated candidates." This section builds the generation pipeline: from requirements
+to structured architecture candidates, from candidates to Mermaid diagrams, and from
+diagrams to Pareto-optimal selection.
+</p>
+</div>
+
+<h2>1. Structured Architecture Schemas</h2>
+
+<p>
+Before asking an LLM to generate architectures, we need a schema that constrains its
+output to valid, parseable structures. Without a schema, the LLM might produce
+free-form prose describing an architecture, which is useful for brainstorming but
+impossible to evaluate computationally. With a Pydantic schema, every generated
+architecture arrives as a typed Python object that can be directly converted into the
+NetworkX graph from <a href="section-14.1.html">Section 14.1</a>.
+</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field
+from enum import Enum
+
+
+class ArchStyle(str, Enum):
+    LAYERED = "layered"
+    MICROSERVICES = "microservices"
+    EVENT_DRIVEN = "event_driven"
+    HEXAGONAL = "hexagonal"
+    HYBRID = "hybrid"
+
+
+class ComponentSpec(BaseModel):
+    """Specification for a single architectural component."""
+    name: str = Field(description="Unique component identifier")
+    component_type: str = Field(description="One of: service, database, "
+                                "message_broker, api_gateway, ui, adapter, core")
+    responsibilities: list[str] = Field(
+        description="What this component does, 2-5 items"
+    )
+    technology: str = Field(description="Suggested technology, e.g. 'FastAPI'")
+
+
+class ConnectionSpec(BaseModel):
+    """Specification for a connection between two components."""
+    source: str = Field(description="Name of the source component")
+    target: str = Field(description="Name of the target component")
+    connector_type: str = Field(
+        description="One of: sync_call, async_message, shared_data, dependency"
+    )
+    protocol: str = Field(default="", description="Protocol if applicable")
+
+
+class ArchitectureCandidate(BaseModel):
+    """A complete candidate architecture generated by an LLM."""
+    name: str = Field(description="Short descriptive name for this architecture")
+    style: ArchStyle = Field(description="Primary architectural style")
+    rationale: str = Field(
+        description="Why this architecture fits the given requirements"
+    )
+    components: list[ComponentSpec] = Field(
+        description="All components in this architecture"
+    )
+    connections: list[ConnectionSpec] = Field(
+        description="All connections between components"
+    )
+    tradeoffs: dict[str, str] = Field(
+        description="Quality attribute tradeoffs: attribute name to explanation"
+    )
+
+
+class ArchitectureProposal(BaseModel):
+    """Container for multiple candidate architectures."""
+    system_name: str
+    candidates: list[ArchitectureCandidate] = Field(
+        min_length=2, max_length=5,
+        description="2-5 candidate architectures to compare"
+    )</code></pre>
+<div class="code-caption">Listing 14.5: Pydantic schemas for structured architecture generation. The ArchitectureProposal model constrains the LLM to produce 2 to 5 well-formed candidates, each with typed components, connections, and explicit tradeoff annotations.</div>
+
+<p>
+The schema serves three purposes. First, it acts as a <em>prompt contract</em>:
+the LLM knows exactly what structure to produce, reducing hallucinated or incomplete
+output (recall the structured output techniques from
+<a href="../module-10-prompting-to-programming/index.html">Chapter 10</a>). Second,
+it enables <em>automated validation</em>: Pydantic rejects candidates with missing
+fields, invalid types, or connections referencing nonexistent components. Third, it
+creates a <em>bridge to computation</em>: each validated candidate can be converted
+to a NetworkX graph for metric computation.
+</p>
+
+<h2>2. The Generation Prompt</h2>
+
+<p>
+The prompt for architecture generation must convey three things: the requirements to
+satisfy, the quality attributes that matter, and the structural constraints of the
+output schema. We use a system prompt that establishes the architect persona and a
+user prompt that delivers the specific requirements.
+</p>
+
+<pre><code class="language-python">import json
+from anthropic import Anthropic
+
+# Initialize the client
+client = Anthropic()
+
+ARCHITECT_SYSTEM_PROMPT = """You are a senior software architect with expertise in
+distributed systems, domain-driven design, and scientific computing platforms.
+
+Given a set of requirements and quality attribute priorities, generate multiple
+candidate architectures that represent genuinely different tradeoff choices.
+Each candidate should:
+
+1. Use a different primary architectural style (or a meaningfully different hybrid).
+2. Include concrete component and connection specifications.
+3. Explain the tradeoffs it makes: what it optimizes for and what it sacrifices.
+4. Suggest specific technologies for each component.
+
+Generate architectures that a real engineering team would seriously consider,
+not strawman alternatives designed to make one option look better."""
+
+
+def generate_architecture_candidates(
+    requirements: list[str],
+    quality_priorities: dict[str, float],
+    num_candidates: int = 3,
+) -> ArchitectureProposal:
+    """Generate candidate architectures from requirements using an LLM.
+
+    Args:
+        requirements: List of validated requirement strings.
+        quality_priorities: Mapping of quality attribute names to
+            importance weights (0.0 to 1.0).
+        num_candidates: Number of candidates to generate (2-5).
+
+    Returns:
+        An ArchitectureProposal containing the generated candidates.
+    """
+    # Format requirements and priorities for the prompt
+    req_text = "\n".join(f"- {r}" for r in requirements)
+    priority_text = "\n".join(
+        f"- {attr}: {weight:.1f} importance"
+        for attr, weight in sorted(
+            quality_priorities.items(), key=lambda x: -x[1]
+        )
+    )
+
+    user_prompt = f"""Generate {num_candidates} candidate architectures for the
+following system.
+
+## Requirements
+{req_text}
+
+## Quality Attribute Priorities (higher = more important)
+{priority_text}
+
+Generate exactly {num_candidates} candidates, each using a different architectural
+style. For each candidate, specify all components with their types and
+responsibilities, all connections with their types and protocols, and the
+tradeoffs this architecture makes.
+
+Return your response as a JSON object matching the ArchitectureProposal schema."""
+
+    # Call the LLM with structured output
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        system=ARCHITECT_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    # Parse the response into our Pydantic model
+    response_text = message.content[0].text
+
+    # Extract JSON from the response (handle markdown code blocks)
+    if "```json" in response_text:
+        json_str = response_text.split("```json")[1].split("```")[0]
+    elif "```" in response_text:
+        json_str = response_text.split("```")[1].split("```")[0]
+    else:
+        json_str = response_text
+
+    proposal = ArchitectureProposal.model_validate_json(json_str)
+    return proposal</code></pre>
+<div class="code-caption">Listing 14.6: Generating candidate architectures from requirements using the Anthropic API with structured output parsing. The system prompt establishes the architect persona; the user prompt delivers requirements and quality priorities.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Diversity by Design</div>
+<p>
+The prompt explicitly asks for "genuinely different tradeoff choices" and
+"a different primary architectural style." Without this instruction, LLMs tend
+to generate minor variations of the same architecture, which defeats the purpose
+of design-space exploration. The requirement for different styles forces the model
+to explore distinct regions of the architecture space, producing candidates that
+differ structurally rather than superficially. This mirrors the diversity
+requirement in evolutionary search algorithms (covered in
+<a href="../../part-5-simulation-optimization/module-45-optimization/index.html">Chapter 45</a>):
+a population of similar candidates converges prematurely, while a diverse
+population explores more of the fitness landscape.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that the LLM-generated architecture is the final design, ready for implementation as produced. It is not. The generated candidates are <em>starting points</em> for human evaluation, not finished blueprints. An LLM cannot verify that its proposed component boundaries align with team structures, that its technology choices match the organization's operational expertise, or that its connection protocols satisfy real latency constraints. Every generated candidate requires expert review, refinement, and validation against the actual deployment environment before it becomes an implementable architecture.
+</p>
+</div>
+
+<h2>3. From Candidates to Component Graphs</h2>
+
+<p>
+Each generated <code>ArchitectureCandidate</code> must be converted to the NetworkX
+graph representation from Section 14.1 so we can compute quality metrics. The
+conversion bridges the LLM's structured output with our computational analysis
+pipeline.
+</p>
+
+<pre><code class="language-python">def candidate_to_graph(candidate: ArchitectureCandidate) -> nx.DiGraph:
+    """Convert a Pydantic ArchitectureCandidate to a NetworkX graph.
+
+    Maps string type names from the LLM output to the enum types
+    used by our analysis functions.
+    """
+    type_map = {
+        "service": ComponentType.SERVICE,
+        "database": ComponentType.DATABASE,
+        "message_broker": ComponentType.MESSAGE_BROKER,
+        "api_gateway": ComponentType.API_GATEWAY,
+        "ui": ComponentType.UI,
+        "adapter": ComponentType.ADAPTER,
+        "core": ComponentType.CORE,
+    }
+    connector_map = {
+        "sync_call": ConnectorType.SYNC_CALL,
+        "async_message": ConnectorType.ASYNC_MESSAGE,
+        "shared_data": ConnectorType.SHARED_DATA,
+        "dependency": ConnectorType.DEPENDENCY,
+    }
+
+    components = []
+    for spec in candidate.components:
+        comp_type = type_map.get(spec.component_type, ComponentType.SERVICE)
+        components.append(Component(
+            name=spec.name,
+            component_type=comp_type,
+            responsibilities=spec.responsibilities,
+            technology=spec.technology,
+        ))
+
+    connections = []
+    # Collect valid component names for validation
+    valid_names = {c.name for c in components}
+    for conn in candidate.connections:
+        if conn.source in valid_names and conn.target in valid_names:
+            conn_type = connector_map.get(
+                conn.connector_type, ConnectorType.SYNC_CALL
+            )
+            connections.append((
+                conn.source, conn.target,
+                Connector(
+                    connector_type=conn_type,
+                    protocol=conn.protocol or None,
+                    async_capable=conn_type == ConnectorType.ASYNC_MESSAGE,
+                )
+            ))
+
+    return create_architecture_graph(components, connections)</code></pre>
+<div class="code-caption">Listing 14.7: Converting LLM-generated architecture candidates to NetworkX graphs. String-based type names from the LLM output are mapped to typed enums, and invalid connections (referencing nonexistent components) are silently filtered.</div>
+
+<h2>4. Visualizing Architectures with Mermaid</h2>
+
+<p>
+A component graph is precise but hard to read as raw data. Visualization makes
+architectural structures legible to human reviewers. Mermaid is a text-based
+diagramming tool that renders directly in Markdown, GitHub, and many documentation
+platforms. We generate Mermaid diagram code from our architecture graphs.
+</p>
+
+<pre><code class="language-python">def graph_to_mermaid(
+    G: nx.DiGraph, title: str = "Architecture"
+) -> str:
+    """Generate a Mermaid flowchart from an architecture graph.
+
+    Produces a top-down flowchart where node shapes reflect
+    component types and edge labels show connector types.
+    """
+    lines = [f"graph TD"]
+    lines.append(f"    %% {title}")
+
+    # Map component types to Mermaid node shapes
+    shape_map = {
+        ComponentType.UI: ('["', '"]'),           # stadium shape
+        ComponentType.SERVICE: ('("', '")'),      # rounded
+        ComponentType.DATABASE: ('[("', '")]'),   # cylinder
+        ComponentType.MESSAGE_BROKER: ('{{"', '"}}'), # hexagon
+        ComponentType.API_GATEWAY: ('["', '"]'),  # stadium
+        ComponentType.ADAPTER: ('["', '"]'),      # stadium
+        ComponentType.CORE: ('(["', '"])'),        # subroutine
+    }
+
+    # Define nodes
+    for node_name, data in G.nodes(data=True):
+        comp = data.get("component")
+        if comp:
+            left, right = shape_map.get(
+                comp.component_type, ('["', '"]')
+            )
+            # Sanitize name for Mermaid (replace spaces)
+            safe_id = node_name.replace(" ", "_").replace("-", "_")
+            lines.append(f"    {safe_id}{left}{node_name}{right}")
+
+    # Define edges
+    edge_labels = {
+        ConnectorType.SYNC_CALL: "sync",
+        ConnectorType.ASYNC_MESSAGE: "async",
+        ConnectorType.SHARED_DATA: "data",
+        ConnectorType.DEPENDENCY: "depends",
+    }
+    for source, target, data in G.edges(data=True):
+        conn = data.get("connector")
+        safe_source = source.replace(" ", "_").replace("-", "_")
+        safe_target = target.replace(" ", "_").replace("-", "_")
+        if conn:
+            label = edge_labels.get(conn.connector_type, "")
+            protocol = f" ({conn.protocol})" if conn.protocol else ""
+            arrow = "-.->|" if conn.async_capable else "-->|"
+            lines.append(
+                f"    {safe_source} {arrow}{label}{protocol}| {safe_target}"
+            )
+        else:
+            lines.append(f"    {safe_source} --> {safe_target}")
+
+    return "\n".join(lines)
+
+
+# Example: generate Mermaid for the layered architecture
+mermaid_code = graph_to_mermaid(layered_graph, "Layered Lab Platform")
+print(mermaid_code)
+# Output:
+# graph TD
+#     %% Layered Lab Platform
+#     web_dashboard["web_dashboard"]
+#     api_layer("api_layer")
+#     analysis_engine("analysis_engine")
+#     data_ingestion("data_ingestion")
+#     main_db[("main_db")]
+#     web_dashboard -->|sync (HTTPS)| api_layer
+#     api_layer -->|sync (gRPC)| analysis_engine
+#     api_layer -->|sync (gRPC)| data_ingestion
+#     analysis_engine -->|data| main_db
+#     data_ingestion -->|data| main_db</code></pre>
+<div class="code-caption">Listing 14.8: Generating Mermaid diagram code from an architecture graph. Component types map to different node shapes (cylinders for databases, hexagons for brokers), and connector types determine arrow styles (dashed for async, solid for sync).</div>
+
+<p>
+The Mermaid output can be rendered in any Mermaid-compatible environment. For the
+Discovery Workbench, we embed Mermaid diagrams directly in the architecture report,
+giving stakeholders a visual overview alongside the quantitative metrics.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Structurizr DSL</div>
+<p>
+Our hand-built Mermaid generator takes about 50 lines. The
+<a href="https://structurizr.com/dsl" target="_blank">Structurizr DSL</a>
+provides a richer alternative in roughly the same line count, with built-in
+support for the C4 model's four levels of abstraction (System Context, Container,
+Component, Code). A Structurizr workspace definition generates multiple diagram
+types from a single source, including deployment diagrams, dynamic diagrams, and
+filtered views. The <code>structurizr-python</code> library
+(<code>pip install structurizr</code>) offers a Python API for building workspaces
+programmatically, which integrates cleanly with our LLM generation pipeline. The
+tradeoff: Structurizr requires a server or CLI for rendering, while Mermaid renders
+client-side in the browser.
+</p>
+</div>
+
+<h2>5. Multi-Objective Evaluation and Pareto Frontier</h2>
+
+<p>
+With multiple candidates scored on multiple quality attributes, we need a principled
+way to identify the best options. The Pareto frontier, introduced conceptually in
+<a href="section-14.1.html">Section 14.1</a>, identifies the set of non-dominated
+candidates: those where no attribute can be improved without degrading another.
+</p>
+
+<p data-agent="02">
+A Pareto frontier is the subset of candidates that no other candidate strictly outperforms on every measured quality attribute simultaneously. It matters because it reduces a multi-dimensional comparison (where "best" has no single answer) to a small set of genuinely competitive options, each representing a distinct tradeoff that stakeholders can reason about. The mechanism works by pairwise dominance checking: candidate A dominates candidate B if A scores at least as well as B on every attribute and strictly better on at least one; any candidate not dominated by any other lands on the frontier. Use a Pareto frontier instead of a single weighted score when stakeholders have not yet agreed on relative attribute importance, or when you want to preserve optionality rather than collapsing the decision to a single recommendation prematurely.
+</p>
+
+<p>
+The algorithm is straightforward. For $n$ candidates scored on $k$ attributes, the
+brute-force approach compares every pair of candidates, yielding $O(n^2 k)$ time
+complexity. For our use case (typically 3 to 10 candidates, 4 to 8 attributes),
+this is instantaneous.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the Pareto frontier like shopping for an apartment. Each listing has a price and a commute time, and you want both to be low. Some apartments are strictly worse than others: apartment X costs more <em>and</em> has a longer commute than apartment Y, so X is "dominated" and you can eliminate it. The apartments you cannot eliminate this way form your shortlist: each one is cheaper than some rivals but farther from work, or closer to work but pricier. That shortlist is the Pareto frontier. No amount of math can pick among them for you, because the final choice depends on how much you personally value money versus commute time. The frontier's job is to throw away the clearly inferior options so the decision maker only compares the genuinely competitive ones.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+
+
+def compute_pareto_frontier(
+    candidates: list[dict],
+    metrics: list[dict[str, float]],
+    maximize: bool = True,
+) -> list[int]:
+    """Find the Pareto frontier among scored candidates.
+
+    Args:
+        candidates: List of candidate metadata (for reference).
+        metrics: List of metric dictionaries, one per candidate.
+            All values should be on the same scale (e.g., 0 to 1).
+        maximize: If True, higher metric values are better.
+
+    Returns:
+        Indices of candidates on the Pareto frontier.
+    """
+    # Convert metrics to a numpy array for vectorized comparison
+    keys = sorted(metrics[0].keys())
+    scores = np.array([[m[k] for k in keys] for m in metrics])
+
+    n = len(scores)
+    is_dominated = [False] * n
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if maximize:
+                # j dominates i if j >= i on all and j > i on at least one
+                at_least_as_good = np.all(scores[j] >= scores[i])
+                strictly_better = np.any(scores[j] > scores[i])
+            else:
+                at_least_as_good = np.all(scores[j] <= scores[i])
+                strictly_better = np.any(scores[j] < scores[i])
+
+            if at_least_as_good and strictly_better:
+                is_dominated[i] = True
+                break
+
+    frontier = [i for i in range(n) if not is_dominated[i]]
+    return frontier
+
+
+# Apply to our four architectural styles
+style_names = list(styles.keys())
+style_metrics = [compute_architecture_metrics(g) for g in styles.values()]
+
+frontier_indices = compute_pareto_frontier(
+    style_names, style_metrics, maximize=True
+)
+
+print("Pareto frontier:")
+for idx in frontier_indices:
+    print(f"  {style_names[idx]}: {style_metrics[idx]}")
+
+# Output:
+# Pareto frontier:
+#   Microservices: {'maintainability': 0.839, 'performance': 0.725, ...}
+#   Hexagonal: {'maintainability': 0.833, 'performance': 0.875, ...}</code></pre>
+<div class="code-caption">Listing 14.9: Computing the Pareto frontier over candidate architectures. The brute-force pairwise dominance check runs in O(n^2 k) time. For the lab data platform, Microservices and Hexagonal are non-dominated; Layered and Event-Driven are dominated.</div>
+
+<p>
+The Pareto frontier reveals that, for our lab data platform, the Layered and
+Event-Driven architectures are dominated: the Hexagonal style matches or exceeds
+them on every quality attribute. The Microservices and Hexagonal styles remain on the
+frontier because they trade performance against deployability. Microservices achieve
+higher deployability (each service deploys independently), while the Hexagonal style
+achieves higher performance (fewer network hops). Neither dominates the other.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Presenting the Pareto Frontier to Stakeholders</div>
+<p>
+The Pareto frontier transforms an architectural decision from "which architecture
+is best?" (an unanswerable question) to "which tradeoff do we prefer?" (a
+stakeholder decision). For the lab data platform, you present two options:
+(A) Microservices, optimizing for independent deployability so the instrument
+team and the analysis team can release independently, at the cost of some network
+latency; or (B) Hexagonal, optimizing for performance and testability with a
+clean domain core, at the cost of requiring coordinated deployments. The decision
+depends on organizational factors (team structure, release cadence, operational
+maturity) that no metric can capture. The architect's job is to make the tradeoff
+explicit and let the team choose with full information.
+</p>
+</div>
+
+<h2>6. Weighted Selection from the Frontier</h2>
+
+<p>
+When stakeholders do express preferences as weights, we can select the frontier
+candidate closest to their ideal point. The ideal point is the vector of best
+possible scores across all attributes; no real architecture achieves it, but we can
+find the frontier candidate that minimizes distance to it.
+</p>
+
+<pre><code class="language-python">def select_from_frontier(
+    frontier_indices: list[int],
+    metrics: list[dict[str, float]],
+    weights: dict[str, float],
+) -> int:
+    """Select the best candidate from the Pareto frontier using weighted
+    distance to the ideal point.
+
+    Args:
+        frontier_indices: Indices of frontier candidates.
+        metrics: All candidate metrics.
+        weights: Stakeholder preference weights per attribute.
+
+    Returns:
+        Index of the selected candidate.
+    """
+    keys = sorted(metrics[0].keys())
+
+    # Ideal point: best score for each attribute across ALL candidates
+    all_scores = np.array([[m[k] for k in keys] for m in metrics])
+    ideal = np.max(all_scores, axis=0)
+
+    # Weight vector (aligned with keys)
+    w = np.array([weights.get(k, 1.0) for k in keys])
+    w = w / w.sum()  # normalize
+
+    # Find frontier candidate closest to ideal (weighted Euclidean)
+    best_idx = None
+    best_dist = float("inf")
+    for idx in frontier_indices:
+        scores = np.array([metrics[idx][k] for k in keys])
+        dist = np.sqrt(np.sum(w * (ideal - scores) ** 2))
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+
+    return best_idx
+
+
+# Stakeholder weights: scalability and deployability matter most
+stakeholder_weights = {
+    "maintainability": 0.2,
+    "performance": 0.2,
+    "scalability": 0.35,
+    "deployability": 0.25,
+}
+
+selected = select_from_frontier(
+    frontier_indices, style_metrics, stakeholder_weights
+)
+print(f"Selected: {style_names[selected]}")
+# Output: Selected: Microservices</code></pre>
+<div class="code-caption">Listing 14.10: Selecting the Pareto-optimal candidate closest to stakeholder preferences using weighted Euclidean distance to the ideal point. With scalability weighted highest, the Microservices architecture wins.</div>
+
+<p>
+The weighted selection confirms the intuition: when stakeholders prioritize
+scalability and deployability, microservices emerge as the recommended architecture.
+Change the weights to favor performance and maintainability, and the hexagonal style
+wins instead. This sensitivity analysis is itself valuable: it shows stakeholders
+exactly how robust their choice is to changes in priorities.
+</p>
+
+<h2>7. The Complete Generation Pipeline</h2>
+
+<p>
+Putting it all together, the architecture generation pipeline follows five steps:
+</p>
+
+<ol>
+<li><strong>Input</strong>: Validated requirements from <a href="../module-13-requirements-discovery/index.html">Chapter 13</a> and stakeholder quality-attribute weights.</li>
+<li><strong>Generate</strong>: Use the LLM to produce 3 to 5 candidate architectures as structured <code>ArchitectureProposal</code> objects.</li>
+<li><strong>Convert</strong>: Transform each candidate into a NetworkX graph and compute quality metrics.</li>
+<li><strong>Analyze</strong>: Compute the Pareto frontier and select the optimal candidate using stakeholder weights.</li>
+<li><strong>Visualize</strong>: Generate Mermaid diagrams and metric comparison tables for stakeholder review.</li>
+</ol>
+
+<pre><code class="language-python">def run_architecture_discovery(
+    requirements: list[str],
+    quality_weights: dict[str, float],
+    num_candidates: int = 3,
+) -> dict:
+    """Run the full architecture discovery pipeline.
+
+    Returns a dictionary containing all candidates, their metrics,
+    the Pareto frontier, the selected candidate, and Mermaid diagrams.
+    """
+    # Step 1: Generate candidates via LLM
+    proposal = generate_architecture_candidates(
+        requirements, quality_weights, num_candidates
+    )
+
+    # Step 2: Convert to graphs and compute metrics
+    graphs = []
+    all_metrics = []
+    mermaid_diagrams = []
+
+    for candidate in proposal.candidates:
+        graph = candidate_to_graph(candidate)
+        metrics = compute_architecture_metrics(graph)
+        mermaid = graph_to_mermaid(graph, candidate.name)
+
+        graphs.append(graph)
+        all_metrics.append(metrics)
+        mermaid_diagrams.append(mermaid)
+
+    # Step 3: Compute Pareto frontier
+    candidate_names = [c.name for c in proposal.candidates]
+    frontier = compute_pareto_frontier(
+        candidate_names, all_metrics, maximize=True
+    )
+
+    # Step 4: Select best from frontier
+    selected_idx = select_from_frontier(
+        frontier, all_metrics, quality_weights
+    )
+
+    return {
+        "system_name": proposal.system_name,
+        "candidates": [
+            {
+                "name": c.name,
+                "style": c.style.value,
+                "rationale": c.rationale,
+                "tradeoffs": c.tradeoffs,
+                "metrics": all_metrics[i],
+                "mermaid": mermaid_diagrams[i],
+                "on_frontier": i in frontier,
+            }
+            for i, c in enumerate(proposal.candidates)
+        ],
+        "frontier_indices": frontier,
+        "selected_index": selected_idx,
+        "selected_name": candidate_names[selected_idx],
+    }</code></pre>
+<div class="code-caption">Listing 14.11: The complete architecture discovery pipeline: generate candidates via LLM, convert to graphs, compute metrics, find the Pareto frontier, and select the optimal candidate. This function becomes a core component of the Discovery Workbench.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: LLM-Driven Architecture Optimization</div>
+<p>
+Our pipeline generates candidates in a single LLM call, which limits diversity
+to what the model produces in one pass. The <em>ChatModeler</em> system
+(Chen et al., "ChatModeler: A Human-Machine Co-Creation Approach to Software
+Architecture Design with LLMs," IEEE Transactions on Software Engineering, 2024)
+demonstrates an iterative human-LLM collaboration loop where the model proposes
+architectural modifications, the human evaluates them against quality scenarios,
+and the model refines its proposals across multiple rounds. This iterative
+approach consistently produces higher-quality architectures than single-pass
+generation, because each round narrows the design space based on concrete
+feedback rather than relying on the model's initial guess. Beyond iterative
+refinement, recent work on <em>evolutionary architecture search</em> (2024, 2025)
+uses LLMs as mutation and crossover operators in a genetic algorithm, where each
+generation receives the current Pareto frontier and quality metrics, then proposes
+new candidates that attempt to improve on specific tradeoffs. The key open
+challenge is defining meaningful mutation operators for architectural structures:
+swapping a synchronous connector for an asynchronous one is a small mutation;
+splitting a monolithic service into three microservices is a large one.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Architecture by Committee</div>
+<p>
+There is an old joke that a camel is a horse designed by committee. In
+architecture discovery, the committee is the Pareto frontier: every member
+represents a legitimate tradeoff, and the final design is a negotiation among
+competing concerns. The difference is that our committee members come with
+quantitative metrics, so the negotiation is informed by data rather than
+politics. The fitness function does not eliminate disagreement, but it does
+make the disagreement <em>precise</em>.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Compare Three Architectures for a URL Shortener</h4>
+<p>
+Build a miniature version of the architecture discovery pipeline using only Python standard libraries and NetworkX.
+</p>
+<ol>
+<li><strong>Define three candidates by hand.</strong> Create three <code>nx.DiGraph</code> objects representing a URL shortener: (a) a monolith with a single service node connected to a database, (b) a two-service split with a redirect service and an analytics service sharing a database, and (c) an event-driven design where the redirect service publishes click events to a broker consumed by an analytics service with its own database.</li>
+<li><strong>Compute two metrics for each graph.</strong> Use <code>nx.density(G)</code> as a proxy for coupling (lower is better) and <code>len(G.nodes)</code> as a proxy for deployability (more nodes means more independent deployable units). Normalize both to a 0-to-1 scale.</li>
+<li><strong>Implement dominance checking.</strong> Write a function that takes the three score pairs and returns which candidates are on the Pareto frontier. Verify that the monolith (low coupling, low deployability) and the event-driven design (higher coupling, higher deployability) are both non-dominated, while the two-service split may be dominated.</li>
+<li><strong>Visualize the frontier.</strong> Use <code>matplotlib</code> to scatter-plot the three candidates with coupling on the x-axis and deployability on the y-axis. Draw a line connecting the non-dominated points to show the frontier.</li>
+<li><strong>Run a sensitivity sweep.</strong> Vary a weight parameter from 0.0 (all weight on coupling) to 1.0 (all weight on deployability) in increments of 0.1, and for each value compute which frontier candidate the weighted distance selects. Print a table showing the weight and the selected architecture at each step.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual:</strong> Explain why generating architectures with a single
+LLM call might produce less diverse candidates than generating them with multiple
+independent calls (one per style). What prompt engineering techniques from
+<a href="../module-10-prompting-to-programming/index.html">Chapter 10</a> could
+improve diversity within a single call?
+</li>
+<li>
+<strong>Coding:</strong> Extend the <code>graph_to_mermaid</code> function to
+generate Structurizr DSL instead of Mermaid. The Structurizr DSL uses a
+<code>workspace</code> block containing <code>model</code> (defining people,
+software systems, containers, and components) and <code>views</code> (defining
+which diagrams to render). Generate a Container diagram for any architecture graph.
+</li>
+<li>
+<strong>Analysis:</strong> Run the <code>run_architecture_discovery</code> pipeline
+three times with the same requirements but different quality weights. How stable is
+the Pareto frontier across runs? How sensitive is the selected candidate to the
+weights? Document your findings as a sensitivity analysis table.
+</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-14.1.html">&larr; 14.1 Architectural Styles and Quality Attributes</a>
+<a class="index" href="index.html">Chapter 14</a>
+<a class="next" href="section-14.3.html">14.3 Building Architecture Decision Records &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

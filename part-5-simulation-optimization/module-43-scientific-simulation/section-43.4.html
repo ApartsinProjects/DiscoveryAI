@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 43.4: Building a Calibrated Simulator. End-to-end recipe for a stochastic biochemical simulator calibrated with ABC-SMC and counterfactual interventions." name="description"/>
+<title>Section 43.4: Building a Calibrated Simulator | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation &amp; Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 43: Scientific Simulation</a></div>
+<h1>43.4 Building a Calibrated Simulator</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I calibrated my model, then asked it what would happen if I doubled the degradation rate. It told me. Then I checked in the lab. It was right. That was the moment I stopped calling it a toy."</p>
+<cite>A Posterior Distribution That Earned Its Keep</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>This section assembles every component from the chapter into a single, end-to-end pipeline. We build a stochastic simulator of a gene regulatory toggle switch, calibrate it against synthetic experimental data using ABC-SMC, validate the calibration, and then use the calibrated model to run counterfactual experiments that test mechanistic hypotheses. The toggle switch is a two-gene system that exhibits bistability: cells commit to one of two stable expression states, and stochastic noise can flip them between states. Understanding the parameters that control this switching behavior is a core question in synthetic biology. By the end of this section, you will have a complete, reusable template for simulation-based discovery that integrates with the Discovery Workbench.</p>
+</div>
+
+<h2>1. The Biological System: A Genetic Toggle Switch</h2>
+
+<p>The genetic toggle switch, first constructed synthetically by Gardner et al. (2000), consists of two genes that mutually repress each other. Gene A produces protein A, which represses gene B. Gene B produces protein B, which represses gene A. This mutual inhibition creates two stable steady states: high A / low B, or low A / high B. Stochastic fluctuations in molecule counts can cause the system to switch between states, a phenomenon with implications for cell fate decisions, antibiotic resistance, and developmental biology.</p>
+
+<p>The reaction network has six reactions:</p>
+
+$$
+\begin{align}
+R_1: &\quad \emptyset \xrightarrow{\alpha_A / (1 + B^n)} A \quad &\text{(production of A, repressed by B)} \\
+R_2: &\quad A \xrightarrow{\delta_A} \emptyset \quad &\text{(degradation of A)} \\
+R_3: &\quad \emptyset \xrightarrow{\alpha_B / (1 + A^n)} B \quad &\text{(production of B, repressed by A)} \\
+R_4: &\quad B \xrightarrow{\delta_B} \emptyset \quad &\text{(degradation of B)} \\
+\end{align}
+$$
+
+<p>The Hill coefficient $n$ controls the cooperativity of repression: higher $n$ produces sharper switches and more stable bistability. The production rates $\alpha_A, \alpha_B$ and degradation rates $\delta_A, \delta_B$ are the parameters we will calibrate.</p>
+
+<h2>2. Implementing the Toggle Switch Simulator</h2>
+
+<pre><code class="language-python">import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class ToggleSwitchParams:
+    """Parameters for the genetic toggle switch model."""
+    alpha_a: float = 50.0   # max production rate of A
+    alpha_b: float = 50.0   # max production rate of B
+    delta_a: float = 1.0    # degradation rate of A
+    delta_b: float = 1.0    # degradation rate of B
+    n: float = 2.0          # Hill coefficient (cooperativity)
+
+
+def toggle_switch_gillespie(params, t_max=100.0, seed=42):
+    """Simulate the genetic toggle switch using the Gillespie algorithm.
+
+    State: [A, B] (molecule counts of the two proteins)
+
+    Args:
+        params: ToggleSwitchParams or dict with parameter values
+        t_max: simulation duration
+        seed: random seed
+
+    Returns:
+        dict with 'times' and 'states' arrays
+    """
+    if isinstance(params, dict):
+        p = ToggleSwitchParams(**params)
+    else:
+        p = params
+
+    rng = np.random.default_rng(seed)
+
+    # Initial state: start near one steady state
+    x = np.array([0.0, 0.0])  # [A, B]
+    t = 0.0
+
+    times = [t]
+    states = [x.copy()]
+
+    while t < t_max:
+        A, B = x[0], x[1]
+
+        # Propensities with Hill-function repression
+        a1 = p.alpha_a / (1.0 + B**p.n)    # production of A
+        a2 = p.delta_a * A                  # degradation of A
+        a3 = p.alpha_b / (1.0 + A**p.n)    # production of B
+        a4 = p.delta_b * B                  # degradation of B
+
+        propensities = np.array([a1, a2, a3, a4])
+        a0 = propensities.sum()
+
+        if a0 == 0:
+            break
+
+        # Time to next event
+        tau = rng.exponential(1.0 / a0)
+        t += tau
+        if t > t_max:
+            break
+
+        # Which reaction fires?
+        j = rng.choice(4, p=propensities / a0)
+
+        # Stoichiometry: [dA, dB]
+        stoich = np.array([
+            [1, 0],    # R1: produce A
+            [-1, 0],   # R2: degrade A
+            [0, 1],    # R3: produce B
+            [0, -1],   # R4: degrade B
+        ])
+
+        x += stoich[j]
+        x = np.maximum(x, 0)
+
+        times.append(t)
+        states.append(x.copy())
+
+    return {"times": np.array(times), "states": np.array(states)}
+
+
+# Run a single trajectory
+params = ToggleSwitchParams(alpha_a=50, alpha_b=50, delta_a=1, delta_b=1, n=2)
+result = toggle_switch_gillespie(params, t_max=200.0, seed=42)
+print(f"Toggle switch: {len(result['times'])} events over "
+      f"{result['times'][-1]:.1f} time units")
+print(f"Final state: A={result['states'][-1, 0]:.0f}, "
+      f"B={result['states'][-1, 1]:.0f}")</code></pre>
+<div class="code-caption">Gillespie simulation of the genetic toggle switch. The Hill-function propensities create nonlinear feedback: when protein B is abundant, production of A is suppressed, and vice versa. The system settles into one of two metastable states (high A / low B or high B / low A) with stochastic transitions between them.</div>
+
+<h2>3. Generating Synthetic Experimental Data</h2>
+
+<p>In a real discovery workflow, you would have experimental measurements (e.g., fluorescence time series from a single-cell microscopy experiment). For this recipe, we generate synthetic "experimental" data from the simulator with known ground-truth parameters, then calibrate against it. This lets us verify that the calibration recovers the true values before applying the pipeline to real data.</p>
+
+<pre><code class="language-python">def generate_observed_data(
+    true_params, n_cells=20, t_max=200.0,
+    measurement_times=None, noise_std=5.0, seed=42,
+):
+    """Generate synthetic experimental data from the toggle switch model.
+
+    Simulates n_cells independent cells, samples at measurement_times,
+    and adds Gaussian measurement noise.
+
+    Args:
+        true_params: ToggleSwitchParams with ground-truth values
+        n_cells: number of independent cell trajectories
+        t_max: simulation duration
+        measurement_times: array of time points to sample
+        noise_std: standard deviation of measurement noise
+        seed: random seed
+
+    Returns:
+        observed: dict with measurement_times, cell_data, and summaries
+    """
+    rng = np.random.default_rng(seed)
+
+    if measurement_times is None:
+        measurement_times = np.linspace(10, t_max, 20)
+
+    all_measurements = []
+
+    for i in range(n_cells):
+        cell_seed = rng.integers(0, 2**31)
+        result = toggle_switch_gillespie(true_params, t_max=t_max, seed=cell_seed)
+
+        # Interpolate to measurement times
+        A_measured = np.interp(
+            measurement_times, result["times"], result["states"][:, 0]
+        )
+        B_measured = np.interp(
+            measurement_times, result["times"], result["states"][:, 1]
+        )
+
+        # Add measurement noise
+        A_noisy = A_measured + rng.normal(0, noise_std, len(measurement_times))
+        B_noisy = B_measured + rng.normal(0, noise_std, len(measurement_times))
+
+        all_measurements.append(np.column_stack([A_noisy, B_noisy]))
+
+    cell_data = np.array(all_measurements)  # (n_cells, n_times, 2)
+
+    return {
+        "measurement_times": measurement_times,
+        "cell_data": cell_data,
+        "n_cells": n_cells,
+    }
+
+
+# Ground truth parameters
+true_params = ToggleSwitchParams(
+    alpha_a=40.0, alpha_b=45.0, delta_a=0.8, delta_b=1.2, n=2.5
+)
+
+observed = generate_observed_data(true_params, n_cells=20, seed=42)
+print(f"Generated data: {observed['n_cells']} cells, "
+      f"{len(observed['measurement_times'])} time points each")</code></pre>
+<div class="code-caption">Generating synthetic experimental data for calibration validation. Twenty independent cell trajectories are simulated with the true parameters, sampled at discrete time points (mimicking microscopy snapshots), and corrupted with Gaussian noise. This dataset plays the role of real experimental observations in the calibration pipeline.</div>
+
+<h2>4. Designing Summary Statistics for the Toggle Switch</h2>
+
+<p>The toggle switch has distinctive statistical signatures that good summary statistics must capture: bimodal distributions (cells in the high-A or high-B state), anti-correlation between A and B, and specific steady-state levels.</p>
+
+<pre><code class="language-python">def toggle_switch_summaries(sim_result, measurement_times=None):
+    """Compute summary statistics for toggle switch calibration.
+
+    Extracts features that capture the bistable dynamics:
+    - Mean and variance of each protein across cells/time
+    - Bimodality coefficient (distinguishes unimodal from bimodal)
+    - Cross-correlation between A and B
+    - Fraction of time spent in each state
+
+    Args:
+        sim_result: dict with 'times' and 'states' from the simulator
+        measurement_times: optional array of time points to evaluate
+
+    Returns:
+        1D numpy array of summary statistics
+    """
+    times = sim_result["times"]
+    states = sim_result["states"]
+    A = states[:, 0]
+    B = states[:, 1]
+
+    # Use the second half of the trajectory (after transient)
+    midpoint = len(times) // 2
+    A_ss = A[midpoint:]
+    B_ss = B[midpoint:]
+
+    summaries = []
+
+    # Moments for each protein
+    for series, name in [(A_ss, "A"), (B_ss, "B")]:
+        summaries.append(np.mean(series))
+        summaries.append(np.std(series))
+        summaries.append(np.median(series))
+
+        # Bimodality coefficient: (skewness^2 + 1) / kurtosis
+        # Values > 5/9 suggest bimodality
+        if np.std(series) > 0:
+            from scipy.stats import skew, kurtosis
+            s = skew(series)
+            k = kurtosis(series, fisher=False)  # excess=False -> Pearson
+            bimod = (s**2 + 1) / k if k > 0 else 0
+            summaries.append(bimod)
+        else:
+            summaries.append(0.0)
+
+    # Cross-correlation
+    if np.std(A_ss) > 0 and np.std(B_ss) > 0:
+        min_len = min(len(A_ss), len(B_ss))
+        corr = np.corrcoef(A_ss[:min_len], B_ss[:min_len])[0, 1]
+        summaries.append(corr if np.isfinite(corr) else 0.0)
+    else:
+        summaries.append(0.0)
+
+    # Fraction of time in high-A state (A > B)
+    min_len = min(len(A_ss), len(B_ss))
+    frac_high_a = np.mean(A_ss[:min_len] > B_ss[:min_len])
+    summaries.append(frac_high_a)
+
+    # Mean switching frequency (state changes per unit time)
+    if min_len > 1:
+        state_labels = (A_ss[:min_len] > B_ss[:min_len]).astype(int)
+        switches = np.sum(np.abs(np.diff(state_labels)))
+        dt = times[-1] - times[midpoint] if times[-1] > times[midpoint] else 1.0
+        summaries.append(switches / dt)
+    else:
+        summaries.append(0.0)
+
+    return np.array(summaries)
+
+
+def observed_data_summaries(observed):
+    """Compute summary statistics from the observed multi-cell data.
+
+    Aggregates across cells to produce population-level summaries
+    that match the single-trajectory summaries from the simulator.
+    """
+    cell_data = observed["cell_data"]  # (n_cells, n_times, 2)
+
+    # Average across cells, then compute summaries
+    mean_trajectory = cell_data.mean(axis=0)  # (n_times, 2)
+
+    # Use second half
+    mid = len(mean_trajectory) // 2
+    A_ss = mean_trajectory[mid:, 0]
+    B_ss = mean_trajectory[mid:, 1]
+
+    summaries = []
+
+    for series in [A_ss, B_ss]:
+        summaries.append(np.mean(series))
+        summaries.append(np.std(series))
+        summaries.append(np.median(series))
+        # Bimodality from cell-level distribution at the last time point
+        if np.std(series) > 0:
+            from scipy.stats import skew, kurtosis
+            s = skew(series)
+            k = kurtosis(series, fisher=False)
+            summaries.append((s**2 + 1) / k if k > 0 else 0)
+        else:
+            summaries.append(0.0)
+
+    if np.std(A_ss) > 0 and np.std(B_ss) > 0:
+        summaries.append(np.corrcoef(A_ss, B_ss)[0, 1])
+    else:
+        summaries.append(0.0)
+
+    summaries.append(np.mean(A_ss > B_ss))
+
+    # Switching frequency from individual cells
+    switch_rates = []
+    for cell in cell_data:
+        mid_c = len(cell) // 2
+        labels = (cell[mid_c:, 0] > cell[mid_c:, 1]).astype(int)
+        switch_rates.append(np.sum(np.abs(np.diff(labels))))
+    summaries.append(np.mean(switch_rates))
+
+    return np.array(summaries)
+
+
+obs_summaries = observed_data_summaries(observed)
+print(f"Observed summary statistics ({len(obs_summaries)} dimensions):")
+print(obs_summaries.round(3))</code></pre>
+<div class="code-caption">Summary statistics for the toggle switch, designed to capture bistability. The bimodality coefficient detects the two-state distribution. The A-B cross-correlation captures mutual repression. The switching frequency measures how often cells flip between states. These statistics are sensitive to all five model parameters.</div>
+
+<h2>5. Running ABC-SMC Calibration</h2>
+
+<p>With the simulator, the observed data, and the summary statistics defined, we can now run ABC-SMC calibration. We use pyABC for its adaptive epsilon scheduling and efficient implementation.</p>
+
+<p data-agent="02">ABC-SMC (Approximate Bayesian Computation with Sequential Monte Carlo) is a likelihood-free inference algorithm that estimates the posterior distribution over model parameters when the likelihood function is too complex to evaluate directly, as is the case for stochastic simulators. It matters because most interesting simulators (including Gillespie models) produce stochastic outputs whose probability cannot be written in closed form, making standard Bayesian methods like MCMC inapplicable. The mechanism works by proposing candidate parameters from a prior, simulating data from each candidate, comparing simulated summary statistics to the observed ones via a distance threshold (epsilon), and iteratively tightening that threshold across successive populations so that the surviving particles converge toward the true posterior. Use ABC-SMC when your simulator is a black box with no tractable likelihood; if your model does have a closed-form likelihood, standard MCMC (e.g., Hamiltonian Monte Carlo via Stan or PyMC) will be more sample-efficient.</p>
+
+<pre><code class="language-python">import pyabc
+from pyabc import ABCSMC, RV, Distribution, MedianEpsilon
+
+
+def run_toggle_switch_calibration(
+    observed, n_populations=8, population_size=300, seed=42,
+):
+    """Calibrate the toggle switch model using pyABC's ABC-SMC.
+
+    Args:
+        observed: dict from generate_observed_data
+        n_populations: number of SMC generations
+        population_size: particles per generation
+        seed: random seed
+
+    Returns:
+        history: pyABC History object
+        posterior_samples: DataFrame of accepted parameters
+    """
+    obs_summ = observed_data_summaries(observed)
+
+    # Prior distributions (broad, covering plausible biological ranges)
+    prior = Distribution(
+        alpha_a=RV("uniform", 10, 90),    # 10 to 100
+        alpha_b=RV("uniform", 10, 90),    # 10 to 100
+        delta_a=RV("uniform", 0.1, 2.9),  # 0.1 to 3.0
+        delta_b=RV("uniform", 0.1, 2.9),  # 0.1 to 3.0
+        n=RV("uniform", 1.0, 4.0),        # 1.0 to 5.0
+    )
+
+    def model(params_dict):
+        """Run the simulator and return summary statistics as a dict."""
+        p = ToggleSwitchParams(**params_dict)
+        result = toggle_switch_gillespie(p, t_max=200.0, seed=seed)
+        summaries = toggle_switch_summaries(result)
+        return {f"s{i}": float(v) for i, v in enumerate(summaries)}
+
+    # Convert observed summaries to matching dict format
+    obs_dict = {f"s{i}": float(v) for i, v in enumerate(obs_summ)}
+
+    # Distance and epsilon
+    distance = pyabc.PNormDistance(p=2)
+    epsilon = MedianEpsilon(initial_epsilon=100.0)
+
+    abc = ABCSMC(
+        models=model,
+        parameter_priors=prior,
+        distance_function=distance,
+        population_size=population_size,
+        eps=epsilon,
+    )
+
+    import tempfile, os
+    db_path = os.path.join(tempfile.gettempdir(), "toggle_calibration.db")
+    abc.new(f"sqlite:///{db_path}", obs_dict)
+
+    history = abc.run(
+        minimum_epsilon=1.0,
+        max_nr_populations=n_populations,
+    )
+
+    # Extract posterior samples from the final generation
+    df, w = history.get_distribution()
+    print("\nPosterior summary:")
+    print(df.describe().round(3))
+    print(f"\nTrue values: alpha_a=40, alpha_b=45, delta_a=0.8, "
+          f"delta_b=1.2, n=2.5")
+
+    return history, df
+
+
+# Run calibration (this takes several minutes)
+# history, posterior = run_toggle_switch_calibration(observed)</code></pre>
+<div class="code-caption">Full ABC-SMC calibration of the toggle switch using pyABC. The prior covers broad biological ranges. MedianEpsilon adapts the tolerance at each generation based on the distance distribution of accepted particles. The posterior DataFrame shows the inferred parameter distributions, which should concentrate around the true values used to generate the synthetic data.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Calibration Reveals Parameter Identifiability</div>
+<p>If the posterior is tight for some parameters but wide for others, the wide parameters are poorly identifiable from the available data. This is scientifically informative: it tells you which aspects of the mechanism the data constrain and which remain uncertain. For the toggle switch, the Hill coefficient $n$ is typically well-identified (it controls the sharpness of switching, which is directly observable), while $\alpha_A$ and $\delta_A$ may be confounded (only their ratio $\alpha_A / \delta_A$ determines the steady-state level). Discovering such confounding through calibration guides the design of follow-up experiments, connecting to the automated experiment design of <a href="../module-46-experiment-design/index.html">Chapter 46</a>.</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A common misconception is that a well-calibrated simulator has accurately recovered every individual parameter. In reality, calibration constrains the joint posterior, not each parameter independently. Two parameters may be individually uncertain yet tightly constrained as a ratio or product (as with $\alpha_A$ and $\delta_A$ above, where only the ratio $\alpha_A / \delta_A$ is identifiable from steady-state data). A wide marginal posterior for a single parameter does not mean the calibration failed; it means the data do not contain enough information to pin down that parameter in isolation, which is itself a valuable scientific finding.</p>
+</div>
+
+<h2>6. Counterfactual Interventions</h2>
+
+<p>A calibrated simulator is not just a fitted model; it is an experimental platform. You can ask "What if?" questions that are impossible, expensive, or unethical to answer in the lab. These counterfactual interventions are the primary scientific payoff of calibration.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of a counterfactual experiment like adjusting a recipe after you have already calibrated your oven. You bake a cake at 350 degrees and it comes out right, confirming your oven's temperature is accurate (calibration). Now you ask: "What would happen if I raised it to 400 degrees?" You do not need to bake again to predict the outcome, because you trust the calibrated oven's behavior across temperatures. Similarly, once you have calibrated the simulator's parameters against real data, you can change one parameter (the "oven dial") and trust the prediction, because the rest of the model's machinery (the "oven physics") has been validated. The key requirement is the same: your calibration must cover the regime you are extrapolating into, just as an oven calibrated only at 350 degrees tells you little about its behavior at 600.</p>
+</div>
+
+<p>For the toggle switch, mechanistically interesting counterfactuals include:</p>
+
+<ul>
+<li><strong>What if we doubled the degradation rate of protein A?</strong> (Mimics adding a protease.)</li>
+<li><strong>What if we reduced the Hill coefficient?</strong> (Mimics weakening cooperative binding.)</li>
+<li><strong>What if we broke the symmetry by increasing production of B?</strong> (Mimics an environmental signal.)</li>
+</ul>
+
+<pre><code class="language-python">def counterfactual_experiment(
+    posterior_samples, intervention_fn, n_posterior_draws=50,
+    n_replicates=10, t_max=200.0, seed=42,
+):
+    """Run a counterfactual experiment using the calibrated posterior.
+
+    For each posterior sample, applies the intervention and simulates,
+    then compares to the unperturbed simulation.
+
+    Args:
+        posterior_samples: DataFrame with columns for each parameter
+        intervention_fn: callable(params_dict) -> modified params_dict
+        n_posterior_draws: number of posterior samples to use
+        n_replicates: simulations per posterior sample
+        t_max: simulation duration
+        seed: random seed
+
+    Returns:
+        baseline_summaries: summary stats without intervention
+        intervention_summaries: summary stats with intervention
+    """
+    rng = np.random.default_rng(seed)
+
+    # Sample from the posterior
+    if len(posterior_samples) > n_posterior_draws:
+        indices = rng.choice(
+            len(posterior_samples), n_posterior_draws, replace=False
+        )
+        samples = posterior_samples.iloc[indices]
+    else:
+        samples = posterior_samples
+
+    baseline_results = []
+    intervention_results = []
+
+    for _, row in samples.iterrows():
+        params_dict = row.to_dict()
+
+        for rep in range(n_replicates):
+            run_seed = rng.integers(0, 2**31)
+
+            # Baseline (no intervention)
+            p_base = ToggleSwitchParams(**params_dict)
+            result_base = toggle_switch_gillespie(
+                p_base, t_max=t_max, seed=run_seed
+            )
+            baseline_results.append(
+                toggle_switch_summaries(result_base)
+            )
+
+            # Intervention
+            modified_dict = intervention_fn(params_dict.copy())
+            p_mod = ToggleSwitchParams(**modified_dict)
+            result_mod = toggle_switch_gillespie(
+                p_mod, t_max=t_max, seed=run_seed
+            )
+            intervention_results.append(
+                toggle_switch_summaries(result_mod)
+            )
+
+    return np.array(baseline_results), np.array(intervention_results)
+
+
+def analyze_counterfactual(baseline, intervention, stat_names=None):
+    """Compare baseline and intervention summary statistics.
+
+    Computes effect sizes and credible intervals for each statistic.
+    """
+    if stat_names is None:
+        stat_names = [f"stat_{i}" for i in range(baseline.shape[1])]
+
+    print(f"{'Statistic':<25} {'Baseline':>10} {'Intervention':>12} "
+          f"{'Effect':>10} {'95% CI':>20}")
+    print("-" * 80)
+
+    for j, name in enumerate(stat_names):
+        base_mean = np.mean(baseline[:, j])
+        int_mean = np.mean(intervention[:, j])
+        effect = int_mean - base_mean
+
+        # Bootstrap 95% CI for the effect
+        effects = intervention[:, j] - baseline[:, j]
+        ci_lo = np.percentile(effects, 2.5)
+        ci_hi = np.percentile(effects, 97.5)
+
+        print(f"{name:<25} {base_mean:>10.2f} {int_mean:>12.2f} "
+              f"{effect:>+10.2f} [{ci_lo:>+8.2f}, {ci_hi:>+8.2f}]")
+
+
+# Example: What happens if we double the degradation of protein A?
+def double_delta_a(params):
+    params["delta_a"] *= 2.0
+    return params
+
+# Example: What happens if we reduce the Hill coefficient?
+def reduce_cooperativity(params):
+    params["n"] = max(1.0, params["n"] - 1.0)
+    return params
+
+stat_names = [
+    "mean_A", "std_A", "median_A", "bimod_A",
+    "mean_B", "std_B", "median_B", "bimod_B",
+    "corr_AB", "frac_high_A", "switch_freq",
+]
+
+# In practice, after calibration:
+# baseline, intervened = counterfactual_experiment(
+#     posterior, double_delta_a, n_posterior_draws=50, n_replicates=10
+# )
+# analyze_counterfactual(baseline, intervened, stat_names)</code></pre>
+<div class="code-caption">Counterfactual experiment framework. Each intervention modifies the parameters of the calibrated model, and the difference in outcomes (with uncertainty propagated from the posterior) quantifies the intervention's effect. Using the same random seeds for baseline and intervention ensures that differences reflect the intervention, not stochastic noise.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Predicting the Effect of a Drug on Gene Regulation</div>
+<p>A pharmaceutical company wants to know whether a candidate drug that increases the degradation rate of protein A will break the bistable switch and force cells into the high-B state. Running the counterfactual experiment above with the drug's estimated effect on $\delta_A$ answers this question without synthesizing a single molecule. If the posterior-predictive analysis shows that the bimodality coefficient drops below the bistability threshold for most posterior samples, the drug is predicted to work. If the confidence interval spans the threshold, more data (or a better-calibrated model) is needed before proceeding to synthesis. This in silico screening saves months of lab work and focuses experimental resources on the most promising candidates.</p>
+</div>
+
+<h2>7. The Complete Pipeline</h2>
+
+<p>Let us assemble the entire workflow into a single, reusable pipeline class that integrates with the Discovery Workbench architecture from <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from typing import Callable, Optional
+import json
+
+
+@dataclass
+class CalibratedSimulatorPipeline:
+    """End-to-end pipeline for simulation-based discovery.
+
+    Stages:
+    1. Define the simulator and summary statistics
+    2. Calibrate against observed data using ABC-SMC
+    3. Validate the calibration (posterior predictive check)
+    4. Run counterfactual experiments
+    5. Report results with full provenance
+    """
+
+    simulator_fn: Callable
+    summary_fn: Callable
+    param_names: list
+    prior_ranges: dict
+    observed_data: Optional[dict] = None
+    posterior_samples: Optional[np.ndarray] = None
+    calibration_history: Optional[object] = None
+    provenance: dict = field(default_factory=dict)
+
+    def set_observed_data(self, data):
+        """Register the observed experimental data."""
+        self.observed_data = data
+        self.provenance["data_registered"] = True
+        self.provenance["n_observations"] = (
+            data.get("n_cells", "unknown")
+        )
+
+    def calibrate(self, n_populations=8, population_size=300, seed=42):
+        """Run ABC-SMC calibration."""
+        if self.observed_data is None:
+            raise ValueError("Call set_observed_data() first")
+
+        obs_summaries = self.summary_fn(self.observed_data)
+
+        # ABC-SMC calibration (using the manual implementation for clarity)
+        from scipy.stats import uniform
+
+        def prior_sampler(rng):
+            params = []
+            for name in self.param_names:
+                lo, hi = self.prior_ranges[name]
+                params.append(rng.uniform(lo, hi))
+            return np.array(params)
+
+        def prior_pdf(theta):
+            for j, name in enumerate(self.param_names):
+                lo, hi = self.prior_ranges[name]
+                if theta[j] < lo or theta[j] > hi:
+                    return 0.0
+            pdf = 1.0
+            for j, name in enumerate(self.param_names):
+                lo, hi = self.prior_ranges[name]
+                pdf *= 1.0 / (hi - lo)
+            return pdf
+
+        def sim_wrapper(theta, seed=42):
+            params_dict = dict(zip(self.param_names, theta))
+            return self.simulator_fn(params_dict, seed=seed)
+
+        def summary_wrapper(sim_data):
+            return self.summary_fn(sim_data)
+
+        # Use decreasing epsilon schedule
+        epsilons = np.geomspace(100, 2, n_populations)
+
+        from scipy.spatial.distance import euclidean
+
+        particles, weights, populations = abc_smc(
+            simulator_fn=sim_wrapper,
+            summary_fn=summary_wrapper,
+            observed_summaries=obs_summaries,
+            prior_sampler=prior_sampler,
+            prior_pdf=prior_pdf,
+            epsilons=epsilons,
+            n_particles=population_size,
+            seed=seed,
+        )
+
+        self.posterior_samples = particles
+        self.provenance["calibration"] = {
+            "method": "ABC-SMC",
+            "n_populations": n_populations,
+            "population_size": population_size,
+            "final_epsilon": float(epsilons[-1]),
+            "seed": seed,
+        }
+
+        return particles, weights
+
+    def validate(self, n_checks=100, seed=42):
+        """Run posterior predictive check."""
+        if self.posterior_samples is None:
+            raise ValueError("Call calibrate() first")
+
+        obs_summaries = self.summary_fn(self.observed_data)
+        rng = np.random.default_rng(seed)
+        distances = []
+
+        indices = rng.choice(
+            len(self.posterior_samples), min(n_checks, len(self.posterior_samples)),
+            replace=False,
+        )
+
+        for idx in indices:
+            theta = self.posterior_samples[idx]
+            params_dict = dict(zip(self.param_names, theta))
+            sim_data = self.simulator_fn(
+                params_dict, seed=rng.integers(0, 2**31)
+            )
+            sim_summ = self.summary_fn(sim_data)
+            from scipy.spatial.distance import euclidean
+            distances.append(euclidean(sim_summ, obs_summaries))
+
+        distances = np.array(distances)
+        self.provenance["validation"] = {
+            "median_distance": float(np.median(distances)),
+            "p95_distance": float(np.percentile(distances, 95)),
+        }
+
+        print(f"Posterior predictive check: "
+              f"median distance = {np.median(distances):.3f}, "
+              f"p95 = {np.percentile(distances, 95):.3f}")
+
+        return distances
+
+    def counterfactual(self, intervention_fn, intervention_name="",
+                       n_draws=50, n_replicates=5, seed=42):
+        """Run a counterfactual experiment."""
+        if self.posterior_samples is None:
+            raise ValueError("Call calibrate() first")
+
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(
+            len(self.posterior_samples), min(n_draws, len(self.posterior_samples)),
+            replace=False,
+        )
+
+        effects = []
+        for idx in indices:
+            theta = self.posterior_samples[idx]
+            params_dict = dict(zip(self.param_names, theta))
+
+            for _ in range(n_replicates):
+                run_seed = rng.integers(0, 2**31)
+
+                # Baseline
+                base_data = self.simulator_fn(params_dict, seed=run_seed)
+                base_summ = self.summary_fn(base_data)
+
+                # Intervention
+                mod_dict = intervention_fn(params_dict.copy())
+                mod_data = self.simulator_fn(mod_dict, seed=run_seed)
+                mod_summ = self.summary_fn(mod_data)
+
+                effects.append(mod_summ - base_summ)
+
+        effects = np.array(effects)
+        self.provenance.setdefault("counterfactuals", []).append({
+            "name": intervention_name,
+            "n_draws": n_draws,
+            "n_replicates": n_replicates,
+            "mean_effect": effects.mean(axis=0).tolist(),
+        })
+
+        return effects
+
+    def save_provenance(self, path):
+        """Save full provenance record to JSON."""
+        with open(path, "w") as f:
+            json.dump(self.provenance, f, indent=2, default=str)
+        print(f"Provenance saved to {path}")
+
+
+# Assemble the pipeline
+pipeline = CalibratedSimulatorPipeline(
+    simulator_fn=lambda params, seed=42: toggle_switch_gillespie(
+        ToggleSwitchParams(**params), t_max=200.0, seed=seed
+    ),
+    summary_fn=toggle_switch_summaries,
+    param_names=["alpha_a", "alpha_b", "delta_a", "delta_b", "n"],
+    prior_ranges={
+        "alpha_a": (10, 100),
+        "alpha_b": (10, 100),
+        "delta_a": (0.1, 3.0),
+        "delta_b": (0.1, 3.0),
+        "n": (1.0, 5.0),
+    },
+)
+
+# The full workflow:
+# pipeline.set_observed_data(observed)
+# particles, weights = pipeline.calibrate(n_populations=8)
+# distances = pipeline.validate()
+# effects = pipeline.counterfactual(double_delta_a, "double_delta_a")
+# pipeline.save_provenance("toggle_switch_provenance.json")</code></pre>
+<div class="code-caption">The complete calibrated simulator pipeline. The CalibratedSimulatorPipeline class encapsulates the entire workflow: data registration, ABC-SMC calibration, posterior predictive validation, counterfactual experiments, and provenance recording. Each stage updates the provenance record, creating a complete audit trail that links scientific conclusions to their computational evidence.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: pyABC Handles the Heavy Lifting</div>
+<p>The manual pipeline above illustrates the architecture, but for production use, replace the <code>calibrate()</code> method's internals with pyABC (as shown earlier in this section). pyABC provides adaptive epsilon scheduling, parallel execution across cores or machines via Redis, built-in model selection for comparing alternative mechanisms, and SQLite-backed history objects for storing and querying calibration results. The pipeline class becomes a thin wrapper around pyABC, adding provenance tracking and counterfactual experiment support. This reduces the calibration code from roughly 100 lines to about 30, while gaining robustness, parallelism, and diagnostics.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Neural simulation-based inference (SBI) methods are rapidly replacing traditional ABC for calibrating complex simulators. The <em>sbi</em> Python library (Tejero-Cantero et al., JMLR 2020, with major updates through 2024) implements neural posterior estimation (NPE), neural likelihood estimation (NLE), and neural ratio estimation (NRE), which train neural density estimators on simulated data to amortize inference. Once trained, these networks produce posterior samples in milliseconds rather than requiring thousands of new simulations per inference query. Dax et al. (2023, "Neural Importance Sampling for Rapid and Reliable Gravitational-Wave Inference," Physical Review Letters) demonstrated that neural SBI achieves calibrated posteriors for gravitational wave parameter estimation over 1000 times faster than traditional samplers, while matching their accuracy. For the toggle switch pipeline in this section, replacing ABC-SMC with NPE from the <code>sbi</code> package would enable real-time posterior updates as new experimental data arrives, making interactive calibration-and-counterfactual loops feasible during a single lab session.</p>
+</div>
+
+<h2>8. Integrating with the Discovery Workbench</h2>
+
+<p>The calibrated simulator pipeline plugs into the Discovery Workbench as a component that accepts hypotheses (as parameter values or intervention specifications) and returns predictions with uncertainty estimates. This integration enables automated hypothesis testing loops where the Workbench generates candidate mechanisms, the simulator tests them, and the results guide the next round of hypothesis generation.</p>
+
+<pre><code class="language-python">from discovery_workbench import Component, register
+
+
+@register("calibrated_simulator")
+class CalibratedSimulatorComponent(Component):
+    """Discovery Workbench component for calibrated simulation.
+
+    Exposes three actions:
+    - predict: simulate from the posterior and return predictions
+    - intervene: run a counterfactual experiment
+    - compare_models: use ABC model selection to rank mechanisms
+    """
+
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+
+    def predict(self, n_samples=100, seed=42):
+        """Generate posterior predictive samples."""
+        rng = np.random.default_rng(seed)
+        predictions = []
+
+        for _ in range(n_samples):
+            idx = rng.choice(len(self.pipeline.posterior_samples))
+            theta = self.pipeline.posterior_samples[idx]
+            params = dict(zip(self.pipeline.param_names, theta))
+            result = self.pipeline.simulator_fn(
+                params, seed=rng.integers(0, 2**31)
+            )
+            predictions.append(result)
+
+        return predictions
+
+    def intervene(self, intervention_fn, name=""):
+        """Run a counterfactual and return effect with uncertainty."""
+        effects = self.pipeline.counterfactual(
+            intervention_fn, intervention_name=name
+        )
+        return {
+            "mean_effect": effects.mean(axis=0).tolist(),
+            "std_effect": effects.std(axis=0).tolist(),
+            "ci_lower": np.percentile(effects, 2.5, axis=0).tolist(),
+            "ci_upper": np.percentile(effects, 97.5, axis=0).tolist(),
+            "intervention_name": name,
+        }
+
+    def provenance(self):
+        return self.pipeline.provenance</code></pre>
+<div class="code-caption">Wrapping the calibrated simulator as a Discovery Workbench component. The predict method generates posterior predictive samples for forecasting. The intervene method runs counterfactual experiments and returns effect sizes with credible intervals. The provenance method exposes the full computational audit trail.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Automated Mechanism Discovery with the Calibrated Simulator</div>
+<p>A synthetic biology team wants to understand why their engineered toggle switch fails to maintain bistability in certain growth conditions. They integrate the calibrated simulator into a Discovery Workbench pipeline that: (1) generates candidate hypotheses about which parameter changes could explain the loss of bistability (using the hypothesis generation tools from <a href="../../part-4-knowledge/module-39-hypothesis-generation/index.html">Chapter 39</a>); (2) tests each hypothesis by running the corresponding counterfactual experiment; (3) ranks hypotheses by their posterior predictive fit to the failure-condition data; and (4) suggests the most informative follow-up experiment to distinguish between surviving hypotheses (using the experiment design tools from <a href="../module-46-experiment-design/index.html">Chapter 46</a>). The entire loop runs autonomously, producing a ranked list of mechanistic explanations with quantified uncertainty.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Calibrate and Interrogate a Toggle Switch</h4>
+<p>Build a minimal calibrated simulator on your laptop using only NumPy and SciPy (no pyABC required). (1) Copy the <code>ToggleSwitchParams</code>, <code>toggle_switch_gillespie</code>, <code>toggle_switch_summaries</code>, and <code>generate_observed_data</code> functions from this section into a Python script. Generate synthetic observed data with the true parameters shown above. (2) Implement a simple rejection ABC: sample 10,000 parameter vectors uniformly from the prior ranges, simulate each, compute summary statistics, and keep the 100 samples whose Euclidean distance to the observed summaries is smallest. (3) Plot histograms of the accepted values for each of the five parameters and overlay the true values as vertical lines. Verify that the posterior concentrates near the ground truth for $n$ but remains broad for $\alpha_A$ individually. (4) Pick one counterfactual intervention (e.g., doubling $\delta_A$) and re-simulate from each of your 100 accepted parameter sets. Compare the distribution of the switching frequency statistic before and after the intervention. (5) Compute the fraction of posterior samples for which the intervention eliminates bistability (bimodality coefficient drops below 5/9). This fraction is your posterior probability that the intervention breaks the switch, a directly actionable prediction.</p>
+</div>
+
+<h2>9. Summary</h2>
+
+<p>This section demonstrated the complete arc of simulation-based scientific discovery. We built a stochastic simulator of a biologically relevant system (the genetic toggle switch), generated synthetic experimental data, designed summary statistics that capture the system's distinctive bistable dynamics, calibrated the simulator against the data using ABC-SMC, validated the calibration with posterior predictive checks, and used the calibrated model for counterfactual experiments that test mechanistic hypotheses. The pipeline class encapsulates this workflow with full provenance tracking, and the Discovery Workbench integration makes it available as a component in automated discovery loops. The same template applies to any stochastic simulator: swap the reaction network, the summary statistics, and the prior, and the calibration machinery transfers unchanged.</p>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>The simulators in this chapter encode explicit mechanistic knowledge: every reaction, every rate constant is specified by the modeler. <a href="../module-44-world-models/index.html">Chapter 44: World Models for Discovery</a> takes the complementary approach: learning the simulator itself from data. Neural world models ingest observations and learn to predict future states, bypassing the need for explicit mechanism specification. The calibration techniques from this chapter (especially ABC-SMC and posterior predictive checks) serve as evaluation baselines for learned world models, and the counterfactual intervention framework transfers directly to neural simulators that support interventional queries.</p>
+</section>
+
+</main>
+
+<footer>
+<p>&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+<p class="edition-note">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+</footer>
+</body>
+</html>

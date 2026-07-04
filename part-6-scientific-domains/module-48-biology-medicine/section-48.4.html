@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 48.4: Clinical AI. Cox proportional hazards, survival analysis, risk prediction from electronic health records, clinical trial design, biomarker discovery, and evaluation metrics." name="description"/>
+<title>Section 48.4: Clinical AI | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Discovery in Scientific Domains</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 48: Discovery AI For Biology And Medicine</a></div>
+<h1>48.4 Clinical AI</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The patient is censored at month 18. Not in the Orwellian sense; they simply moved to another city and stopped answering our calls."</p>
+<cite>A Cox Model Explaining Its Terminology</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Clinical AI operates at the boundary between computational prediction and human
+health. Unlike protein folding or virtual screening, clinical models must contend
+with incomplete data, ethical constraints, regulatory requirements, and the
+irreducible uncertainty of human biology. The foundational tool is survival analysis,
+which models time-to-event outcomes (death, disease recurrence, treatment response)
+in the presence of censoring: patients who leave a study, have not yet experienced
+the event, or die from unrelated causes. This section builds from the classic Cox
+proportional hazards model through modern deep survival models, then addresses
+clinical trial design and biomarker discovery.
+</p>
+</div>
+
+<h2>1. Survival Analysis Fundamentals</h2>
+
+<p>
+Survival analysis models the time $T$ until an event of interest occurs (death,
+relapse, treatment failure). The key challenge is <strong>censoring</strong>: for
+some patients, we observe only that the event has not occurred by a certain time,
+not the actual event time. Right-censoring is the most common type: a patient who
+is alive at the end of the study contributes the information "survived at least
+this long" but not the actual survival time.
+</p>
+
+<p data-agent="02">
+Survival analysis is a family of statistical methods designed specifically for
+time-to-event data where some observations are incomplete (censored). It matters
+because standard regression treats "patient alive at study end" and "patient lost
+to follow-up at month 6" as identical missing values, discarding the partial
+information each carries about how long the patient survived. The core mechanism
+is a likelihood function that factors each patient's contribution into two cases:
+observed events contribute the probability of failing at the exact observed time,
+while censored observations contribute only the probability of surviving up to
+their last known time point. Use survival analysis whenever the outcome is "time
+until something happens" and some subjects have not yet experienced that event;
+use standard classification instead when the outcome is a binary label observed
+for every subject at a fixed time horizon (e.g., "readmitted within 30 days,
+yes or no").
+</p>
+
+<p>
+Three equivalent functions describe the survival distribution:
+</p>
+
+<p>
+The <strong>survival function</strong> $S(t) = P(T > t)$ gives the probability of
+surviving beyond time $t$. The <strong>hazard function</strong>
+$h(t) = \lim_{\Delta t \to 0} \frac{P(t \leq T < t + \Delta t \mid T \geq t)}{\Delta t}$
+gives the instantaneous rate of the event at time $t$, conditional on survival to
+that point. The <strong>cumulative hazard</strong>
+$H(t) = \int_0^t h(u)\, du$ connects to the survival function via
+$S(t) = \exp(-H(t))$.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the hazard function like a dripping faucet with variable water pressure.
+The survival function tracks how full the bucket still is (the fraction of patients
+who have not yet experienced the event). The hazard function is the drip rate at
+each moment: how fast the bucket is losing water right now, given how much remains.
+A constant drip rate (constant hazard) means the faucet does not care how long it
+has been dripping; this is the exponential survival model. The Cox model says that
+each patient has their own faucet whose drip rate is the baseline rate multiplied
+by a patient-specific factor (determined by age, biomarkers, treatment). Crucially,
+the proportional hazards assumption means every patient's drip rate speeds up and
+slows down at the same times; only the multiplier differs. When that assumption
+breaks (e.g., a drug works well early but wears off), the faucets no longer move
+in lockstep, and you need a model like DeepHit that allows each patient's drip
+pattern to have its own shape over time.
+</p>
+</div>
+
+<h3>1.1 The Kaplan-Meier Estimator</h3>
+
+<p>
+The Kaplan-Meier estimator is the nonparametric maximum likelihood estimate of the
+survival function. At each observed event time $t_j$ with $d_j$ events and $n_j$
+individuals at risk:
+</p>
+
+$$\hat{S}(t) = \prod_{t_j \leq t} \left(1 - \frac{d_j}{n_j}\right)$$
+
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+from lifelines import KaplanMeierFitter, CoxPHFitter
+from lifelines.statistics import logrank_test
+
+def kaplan_meier_analysis(
+    durations: np.ndarray,
+    events: np.ndarray,
+    groups: np.ndarray = None,
+    group_labels: list[str] = None,
+) -> dict:
+    """Kaplan-Meier survival analysis with optional group comparison.
+
+    Args:
+        durations: time-to-event or time-to-censoring for each patient
+        events: 1 if event observed, 0 if censored
+        groups: optional group assignments for stratified analysis
+        group_labels: names for the groups
+
+    Returns: fitted KM models and log-rank test results
+    """
+    results = {}
+
+    if groups is None:
+        # Single-group analysis
+        kmf = KaplanMeierFitter()
+        kmf.fit(durations, event_observed=events)
+        results["median_survival"] = kmf.median_survival_time_
+        results["survival_at_12m"] = float(kmf.predict(12.0))
+        results["survival_at_24m"] = float(kmf.predict(24.0))
+        results["model"] = kmf
+    else:
+        # Stratified analysis with log-rank test
+        unique_groups = np.unique(groups)
+        models = {}
+        for g in unique_groups:
+            mask = groups == g
+            label = group_labels[int(g)] if group_labels else str(g)
+            kmf = KaplanMeierFitter()
+            kmf.fit(durations[mask], event_observed=events[mask], label=label)
+            models[label] = kmf
+
+        results["models"] = models
+
+        # Log-rank test between groups
+        if len(unique_groups) == 2:
+            mask1 = groups == unique_groups[0]
+            mask2 = groups == unique_groups[1]
+            lr = logrank_test(
+                durations[mask1], durations[mask2],
+                events[mask1], events[mask2],
+            )
+            results["logrank_p"] = lr.p_value
+            results["logrank_statistic"] = lr.test_statistic
+
+    return results</code></pre>
+<div class="code-caption">Listing 48.20: Kaplan-Meier survival analysis with the lifelines library. The log-rank test compares survival curves between groups (e.g., treatment vs. control), testing the null hypothesis that the survival functions are identical.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+Censoring is not missing data; it is a form of partial information. A censored
+observation tells you that the patient survived at least until the censoring time.
+Ignoring censored observations (analyzing only patients who experienced the event)
+introduces severe bias, because patients with longer survival times are more
+likely to be censored by end-of-study. Every survival model must properly handle
+censoring; standard regression and classification models cannot.
+</p>
+</div>
+
+<h2>2. Cox Proportional Hazards</h2>
+
+<p>
+The Cox proportional hazards model is the workhorse of clinical survival analysis.
+It models the hazard for patient $i$ as a function of covariates
+$\mathbf{x}_i$ (age, biomarkers, treatment, genomic features):
+</p>
+
+$$h(t \mid \mathbf{x}_i) = h_0(t) \cdot \exp(\boldsymbol{\beta}^T \mathbf{x}_i)$$
+
+<p>
+where $h_0(t)$ is the <strong>baseline hazard</strong> (a nonparametric function of
+time shared by all patients) and $\boldsymbol{\beta}$ are the regression coefficients.
+The model is "semi-parametric": the covariate effects $\boldsymbol{\beta}$ are
+parametric, but the baseline hazard $h_0(t)$ is left unspecified.
+</p>
+
+<p>
+The proportional hazards assumption means that the hazard ratio between any two
+patients is constant over time:
+</p>
+
+$$\frac{h(t \mid \mathbf{x}_i)}{h(t \mid \mathbf{x}_j)} = \exp\bigl(\boldsymbol{\beta}^T (\mathbf{x}_i - \mathbf{x}_j)\bigr)$$
+
+<p>
+This ratio does not depend on $t$ or $h_0(t)$, which is why the baseline hazard
+cancels in the partial likelihood used for estimation.
+</p>
+
+<h3>2.1 The Partial Likelihood</h3>
+
+<p>
+Cox's key insight: the coefficients $\boldsymbol{\beta}$ can be estimated without
+specifying $h_0(t)$, using the <strong>partial likelihood</strong>. At each event
+time $t_j$ where patient $j$ experiences the event, the probability that it was
+patient $j$ (rather than any other at-risk patient) is:
+</p>
+
+$$L_j(\boldsymbol{\beta}) = \frac{\exp(\boldsymbol{\beta}^T \mathbf{x}_j)}{\sum_{k \in \mathcal{R}(t_j)} \exp(\boldsymbol{\beta}^T \mathbf{x}_k)}$$
+
+<p>
+where $\mathcal{R}(t_j)$ is the risk set (all patients still under observation at
+time $t_j$). The full partial likelihood is the product over all event times:
+</p>
+
+$$L(\boldsymbol{\beta}) = \prod_{j: \delta_j = 1} \frac{\exp(\boldsymbol{\beta}^T \mathbf{x}_j)}{\sum_{k \in \mathcal{R}(t_j)} \exp(\boldsymbol{\beta}^T \mathbf{x}_k)}$$
+
+<p>
+where $\delta_j = 1$ indicates an observed event (not censored). Maximizing this
+partial likelihood yields the coefficient estimates $\hat{\boldsymbol{\beta}}$.
+</p>
+
+<pre><code class="language-python">import pandas as pd
+import numpy as np
+from lifelines import CoxPHFitter
+
+def fit_cox_model(
+    df: pd.DataFrame,
+    duration_col: str = "time",
+    event_col: str = "event",
+    covariate_cols: list[str] = None,
+    penalizer: float = 0.01,
+) -> dict:
+    """Fit a Cox proportional hazards model.
+
+    Args:
+        df: DataFrame with duration, event, and covariate columns
+        duration_col: column with time-to-event values
+        event_col: column with event indicators (1=event, 0=censored)
+        covariate_cols: list of covariate column names
+        penalizer: L2 regularization strength (prevents overfitting
+            with many covariates)
+
+    Returns: fitted model with coefficients, hazard ratios, and metrics
+    """
+    if covariate_cols is not None:
+        cols = [duration_col, event_col] + covariate_cols
+        df_model = df[cols].copy()
+    else:
+        df_model = df.copy()
+
+    # Fit Cox model
+    cph = CoxPHFitter(penalizer=penalizer)
+    cph.fit(df_model, duration_col=duration_col, event_col=event_col)
+
+    # Extract results
+    summary = cph.summary
+    results = {
+        "concordance_index": cph.concordance_index_,
+        "log_likelihood": cph.log_likelihood_,
+        "aic": cph.AIC_partial_,
+        "coefficients": {},
+    }
+
+    for covariate in summary.index:
+        results["coefficients"][covariate] = {
+            "coef": float(summary.loc[covariate, "coef"]),
+            "hazard_ratio": float(summary.loc[covariate, "exp(coef)"]),
+            "p_value": float(summary.loc[covariate, "p"]),
+            "ci_lower": float(summary.loc[covariate, "exp(coef) lower 95%"]),
+            "ci_upper": float(summary.loc[covariate, "exp(coef) upper 95%"]),
+        }
+
+    return results
+
+
+def check_proportional_hazards(cph: CoxPHFitter, df: pd.DataFrame) -> dict:
+    """Test the proportional hazards assumption.
+
+    Uses Schoenfeld residuals to test whether covariate effects
+    are constant over time. A significant p-value indicates
+    violation of the PH assumption for that covariate.
+    """
+    ph_test = cph.check_assumptions(df, p_value_threshold=0.05, show_plots=False)
+    return ph_test</code></pre>
+<div class="code-caption">Listing 48.21: Cox proportional hazards model with lifelines. The concordance index measures discriminative ability (0.5 = random, 1.0 = perfect ranking). Hazard ratios above 1.0 indicate increased risk; below 1.0 indicate decreased risk (protective effect).</div>
+
+<h3>2.2 The Concordance Index</h3>
+
+<p>
+The concordance index (C-index) is the standard metric for evaluating survival
+model discrimination. It measures the probability that, for a random pair of
+patients where one experienced the event earlier, the model assigns a higher
+risk score to the patient with the earlier event:
+</p>
+
+$$C = P(\hat{r}_i > \hat{r}_j \mid T_i < T_j, \delta_i = 1)$$
+
+<p>
+where $\hat{r}_i$ is the predicted risk score and $T_i$ is the observed time. A
+C-index of 0.5 indicates random prediction; 0.7 to 0.8 is typical for clinical
+models; above 0.8 is considered excellent.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A high concordance index does not mean the model's predicted probabilities are
+accurate. The C-index measures only <strong>discrimination</strong> (can the model
+rank patients correctly?) and says nothing about <strong>calibration</strong>
+(are the predicted survival probabilities close to the true probabilities?). A
+model can achieve a C-index of 0.85 while systematically overestimating or
+underestimating survival by 20%. Always pair the C-index with calibration
+assessment, such as the Brier score or calibration plots that compare predicted
+versus observed survival at specific time horizons.
+</p>
+</div>
+
+<pre><code class="language-python">from lifelines.utils import concordance_index
+
+def evaluate_survival_model(
+    predicted_risk: np.ndarray,
+    durations: np.ndarray,
+    events: np.ndarray,
+    time_horizons: list[float] = None,
+) -> dict:
+    """Evaluate a survival prediction model.
+
+    Metrics:
+    - Concordance index (discrimination)
+    - Time-dependent AUC at specific horizons
+    - Brier score (calibration + discrimination)
+    """
+    # Overall concordance index
+    c_index = concordance_index(durations, -predicted_risk, events)
+
+    results = {"concordance_index": c_index}
+
+    # Time-dependent evaluation at specific horizons
+    if time_horizons is not None:
+        from sksurv.metrics import cumulative_dynamic_auc, brier_score
+        import numpy as np
+
+        # Convert to structured array for scikit-survival
+        y = np.array(
+            [(bool(e), t) for e, t in zip(events, durations)],
+            dtype=[("event", bool), ("time", float)],
+        )
+
+        for horizon in time_horizons:
+            try:
+                auc, mean_auc = cumulative_dynamic_auc(
+                    y, y, predicted_risk, [horizon]
+                )
+                results[f"auc_at_{horizon}m"] = float(mean_auc)
+            except Exception:
+                pass
+
+    return results</code></pre>
+<div class="code-caption">Listing 48.22: Evaluating survival model discrimination with concordance index and time-dependent AUC. The concordance index measures overall ranking ability, while time-dependent AUC evaluates prediction quality at specific clinical time horizons (e.g., 12-month or 24-month survival prediction).</div>
+
+<h2>3. Deep Survival Models</h2>
+
+<p>
+The Cox model assumes a linear log-hazard: $\log h(t | \mathbf{x}) = \log h_0(t) + \boldsymbol{\beta}^T \mathbf{x}$.
+Deep survival models relax this to learn nonlinear risk functions while
+preserving proper handling of censoring:
+</p>
+
+<p>
+<strong>DeepSurv</strong> replaces the linear predictor with a neural network:
+$h(t | \mathbf{x}) = h_0(t) \cdot \exp(f_\theta(\mathbf{x}))$. The loss function
+is the negative log partial likelihood, identical to the Cox model but with
+$f_\theta(\mathbf{x})$ in place of $\boldsymbol{\beta}^T \mathbf{x}$.
+</p>
+
+<p>
+<strong>DeepHit</strong> models the full survival distribution without the
+proportional hazards assumption. It divides time into discrete intervals and
+predicts the probability of the event in each interval:
+$P(T = t_k | \mathbf{x}) = f_\theta(\mathbf{x})_k$. The loss combines a
+log-likelihood term with a ranking loss that encourages concordance.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class DeepSurv(nn.Module):
+    """DeepSurv: neural network Cox proportional hazards model.
+
+    Replaces the linear predictor in Cox PH with a deep network
+    while preserving the partial likelihood loss and proper
+    handling of censoring.
+    """
+
+    def __init__(self, input_dim: int, hidden_dims: list[int] = None, dropout: float = 0.3):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [256, 128, 64]
+
+        layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, h_dim),
+                nn.BatchNorm1d(h_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ])
+            prev_dim = h_dim
+        layers.append(nn.Linear(prev_dim, 1))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute log-risk score for each patient."""
+        return self.network(x).squeeze(-1)
+
+
+def cox_partial_likelihood_loss(
+    log_risk: torch.Tensor,
+    durations: torch.Tensor,
+    events: torch.Tensor,
+) -> torch.Tensor:
+    """Negative log partial likelihood for Cox PH models.
+
+    Properly handles censoring: only patients with observed
+    events contribute to the numerator; all at-risk patients
+    contribute to the denominator.
+    """
+    # Sort by duration (descending for cumulative sum trick)
+    sorted_indices = torch.argsort(durations, descending=True)
+    log_risk = log_risk[sorted_indices]
+    events = events[sorted_indices]
+
+    # Log-sum-exp over risk set (cumulative sum in sorted order)
+    log_cumsum_risk = torch.logcumsumexp(log_risk, dim=0)
+
+    # Partial likelihood: sum over events only
+    event_mask = events.bool()
+    partial_ll = log_risk[event_mask] - log_cumsum_risk[event_mask]
+
+    return -partial_ll.mean()
+
+
+def train_deepsurv(
+    model: DeepSurv,
+    X_train: np.ndarray,
+    durations_train: np.ndarray,
+    events_train: np.ndarray,
+    X_val: np.ndarray,
+    durations_val: np.ndarray,
+    events_val: np.ndarray,
+    n_epochs: int = 200,
+    lr: float = 1e-3,
+    batch_size: int = 256,
+) -> dict:
+    """Train DeepSurv with early stopping on validation C-index."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=10, factor=0.5
+    )
+
+    X_t = torch.tensor(X_train, dtype=torch.float32)
+    dur_t = torch.tensor(durations_train, dtype=torch.float32)
+    evt_t = torch.tensor(events_train, dtype=torch.float32)
+
+    best_c_index = 0.0
+    best_state = None
+
+    for epoch in range(n_epochs):
+        model.train()
+        # Mini-batch training
+        indices = torch.randperm(len(X_t))
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for start in range(0, len(X_t), batch_size):
+            batch_idx = indices[start:start + batch_size]
+            log_risk = model(X_t[batch_idx])
+            loss = cox_partial_likelihood_loss(
+                log_risk, dur_t[batch_idx], evt_t[batch_idx]
+            )
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        # Validation
+        model.eval()
+        with torch.no_grad():
+            val_risk = model(torch.tensor(X_val, dtype=torch.float32)).numpy()
+        c_idx = concordance_index(durations_val, -val_risk, events_val)
+        scheduler.step(-c_idx)
+
+        if c_idx > best_c_index:
+            best_c_index = c_idx
+            best_state = model.state_dict().copy()
+
+    model.load_state_dict(best_state)
+    return {"best_c_index": best_c_index}</code></pre>
+<div class="code-caption">Listing 48.23: DeepSurv implementation with Cox partial likelihood loss. The loss function uses the log-cumsum-exp trick for numerical stability and correctly handles censoring: only observed events contribute to the loss, while censored patients contribute to the risk set denominators.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: lifelines and scikit-survival</div>
+<p>
+For standard survival analysis without implementing custom models, lifelines
+provides a complete toolkit in a few lines:
+</p>
+<pre><code class="language-python">from lifelines import CoxPHFitter, WeibullAFTFitter
+
+# Cox model in 3 lines
+cph = CoxPHFitter(penalizer=0.01)
+cph.fit(df, duration_col="time", event_col="event")
+cph.print_summary()  # Coefficients, HRs, p-values, C-index
+
+# Predict survival curves for new patients
+survival_curves = cph.predict_survival_function(new_patients)
+median_survival = cph.predict_median(new_patients)
+</code></pre>
+<p>
+For more advanced needs (time-dependent AUC, integrated Brier score, random
+survival forests), scikit-survival extends the scikit-learn API to survival data,
+reducing hundreds of lines of custom evaluation code to standard sklearn-style
+fit/predict/score calls.
+</p>
+</div>
+
+<h2>4. Risk Prediction from Electronic Health Records</h2>
+
+<p>
+Electronic health records (EHRs) contain longitudinal patient data: diagnoses,
+medications, lab results, procedures, and clinical notes. AI risk models use this
+data to predict clinical outcomes: 30-day readmission, disease progression,
+adverse drug events, or mortality. The challenge is that EHR data is
+<strong>temporal</strong> (events occur over time), <strong>irregular</strong>
+(measurements are not equally spaced), and <strong>heterogeneous</strong>
+(mixing categorical codes, continuous lab values, and free text).
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+Health-LLM (Google Research, 2024) and MOTOR (Steinberg et al., NeurIPS 2023)
+represent a shift toward foundation models for clinical prediction. MOTOR
+pre-trains a transformer on 55 million patient timelines using a novel
+"Multi-Objective Temporal Outcome Regression" objective, learning to predict
+lab values, diagnoses, and procedures simultaneously across time. On downstream
+tasks (30-day readmission, in-hospital mortality, long-term survival), MOTOR
+matches or exceeds task-specific models while requiring as few as 1% of the
+labeled examples for fine-tuning. This pre-train-then-fine-tune paradigm
+parallels the success of language model pre-training: the model learns temporal
+clinical dynamics from unlabeled EHR sequences and transfers that knowledge to
+specific prediction tasks, reducing the labeled data bottleneck that has
+historically limited clinical AI deployment.
+</p>
+</div>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class TemporalEHRModel(nn.Module):
+    """Transformer-based risk prediction from EHR event sequences.
+
+    Processes a patient's medical history as a sequence of
+    (event_code, timestamp, value) tuples using a temporal
+    transformer with time-aware positional encoding.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,        # Number of unique medical codes
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 3,
+        max_events: int = 512,
+        n_outcomes: int = 1,
+    ):
+        super().__init__()
+
+        self.code_embedding = nn.Embedding(vocab_size, d_model)
+        self.value_projection = nn.Linear(1, d_model)
+        self.time_projection = nn.Linear(1, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * 4,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_layers
+        )
+
+        self.output_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model // 2, n_outcomes),
+        )
+
+    def forward(
+        self,
+        event_codes: torch.Tensor,    # (batch, seq_len) int
+        event_times: torch.Tensor,    # (batch, seq_len) float (days)
+        event_values: torch.Tensor,   # (batch, seq_len) float
+        mask: torch.Tensor = None,    # (batch, seq_len) bool
+    ) -> torch.Tensor:
+        """Predict risk score from patient event history."""
+        # Embed event codes
+        code_emb = self.code_embedding(event_codes)
+
+        # Project continuous values and timestamps
+        time_emb = self.time_projection(event_times.unsqueeze(-1))
+        value_emb = self.value_projection(event_values.unsqueeze(-1))
+
+        # Combine embeddings
+        x = code_emb + time_emb + value_emb
+
+        # Apply transformer with causal masking
+        if mask is not None:
+            x = self.transformer(x, src_key_padding_mask=~mask)
+        else:
+            x = self.transformer(x)
+
+        # Pool over sequence and predict
+        if mask is not None:
+            x = (x * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True)
+        else:
+            x = x.mean(dim=1)
+
+        return self.output_head(x).squeeze(-1)</code></pre>
+<div class="code-caption">Listing 48.24: Transformer-based risk prediction from EHR event sequences. Medical codes, timestamps, and lab values are embedded and combined, then processed by a temporal transformer. The model handles irregular time intervals through learned time embeddings rather than fixed positional encodings.</div>
+
+<h2>5. Clinical Trial Design</h2>
+
+<p>
+Clinical trials are the most expensive experiments in science: a Phase III oncology
+trial costs $50 million to $200 million and takes 3 to 5 years. AI contributes to
+trial design in three ways:
+</p>
+
+<h3>5.1 Patient Stratification</h3>
+
+<p>
+Many drugs work well for a subset of patients and poorly for the rest. Biomarker-guided
+stratification identifies the responsive subpopulation before the trial begins,
+increasing the probability of detecting a treatment effect. The Cox model provides
+the mathematical framework: interaction terms between treatment assignment and
+biomarker values reveal differential treatment effects.
+</p>
+
+<h3>5.2 Adaptive Trial Design</h3>
+
+<p>
+Adaptive trials modify enrollment criteria, dosing, or even the primary endpoint
+during the trial based on interim results. Bayesian adaptive designs use posterior
+probability of treatment effect to make decisions:
+</p>
+
+$$P(\text{treatment effective} \mid \text{interim data}) > \theta_{\text{futility}}$$
+
+<p>
+If the posterior probability drops below a futility threshold, the trial stops early,
+saving resources. If it exceeds an efficacy threshold, the trial may conclude early
+with a positive result. The Bayesian methods from
+<a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32</a>
+provide the mathematical foundation, and the experiment design framework from
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>
+formalizes the sequential decision-making.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy import stats
+
+def simulate_adaptive_trial(
+    n_max: int = 500,
+    interim_analyses: list[int] = None,
+    true_hazard_ratio: float = 0.75,
+    futility_threshold: float = 0.10,
+    efficacy_threshold: float = 0.99,
+    n_simulations: int = 10000,
+) -> dict:
+    """Simulate a Bayesian adaptive clinical trial.
+
+    Uses a Beta-Binomial model for simplicity (in practice,
+    survival endpoints use more complex models).
+
+    Args:
+        n_max: maximum enrollment
+        interim_analyses: patient counts at which to evaluate
+        true_hazard_ratio: true treatment effect (< 1 = beneficial)
+        futility_threshold: stop if P(effective) < this
+        efficacy_threshold: stop if P(effective) > this
+        n_simulations: number of trial simulations
+    """
+    if interim_analyses is None:
+        interim_analyses = [100, 200, 300, 400]
+
+    # Convert HR to response probability difference
+    p_control = 0.30  # Baseline response rate
+    p_treatment = 1 - (1 - p_control) ** true_hazard_ratio
+
+    results = {
+        "stopped_early_futility": 0,
+        "stopped_early_efficacy": 0,
+        "completed": 0,
+        "true_positive": 0,
+        "average_enrollment": 0,
+    }
+
+    for _ in range(n_simulations):
+        # Simulate patient outcomes
+        treatment_responses = np.random.binomial(1, p_treatment, n_max)
+        control_responses = np.random.binomial(1, p_control, n_max)
+
+        stopped = False
+        for n_interim in interim_analyses:
+            n_per_arm = n_interim // 2
+
+            # Observed responses
+            r_t = treatment_responses[:n_per_arm].sum()
+            r_c = control_responses[:n_per_arm].sum()
+
+            # Bayesian posterior: Beta(1 + successes, 1 + failures)
+            # P(treatment > control)
+            n_mc = 10000
+            post_t = stats.beta.rvs(1 + r_t, 1 + n_per_arm - r_t, size=n_mc)
+            post_c = stats.beta.rvs(1 + r_c, 1 + n_per_arm - r_c, size=n_mc)
+            p_effective = (post_t > post_c).mean()
+
+            if p_effective < futility_threshold:
+                results["stopped_early_futility"] += 1
+                results["average_enrollment"] += n_interim
+                stopped = True
+                break
+            elif p_effective > efficacy_threshold:
+                results["stopped_early_efficacy"] += 1
+                results["true_positive"] += 1
+                results["average_enrollment"] += n_interim
+                stopped = True
+                break
+
+        if not stopped:
+            results["completed"] += 1
+            results["average_enrollment"] += n_max
+
+    # Normalize
+    results["average_enrollment"] /= n_simulations
+    for key in ["stopped_early_futility", "stopped_early_efficacy",
+                "completed", "true_positive"]:
+        results[key] /= n_simulations
+
+    return results</code></pre>
+<div class="code-caption">Listing 48.25: Simulating a Bayesian adaptive clinical trial with interim futility and efficacy analyses. The trial stops early if the posterior probability of treatment effectiveness crosses either threshold, reducing average enrollment while maintaining statistical validity.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: I-SPY 2 Adaptive Platform Trial</div>
+<p>
+The I-SPY 2 breast cancer trial is a landmark adaptive platform trial that has
+been running since 2010. It uses Bayesian adaptive randomization to test multiple
+experimental drugs simultaneously against a common control arm. Drugs that show
+early promise receive more patients (adaptive randomization); drugs that appear
+ineffective are dropped (futility analysis). The trial uses biomarker-guided
+stratification, assigning patients to treatment arms based on hormone receptor
+status, HER2 status, and MammaPrint genomic score. As of 2025, I-SPY 2 has
+evaluated over 20 experimental arms and graduated 7 drugs to Phase III trials,
+with an average time-to-decision of 2 to 3 years compared to 5 to 7 years in
+traditional designs.
+</p>
+</div>
+
+<h2>6. Biomarker Discovery</h2>
+
+<p>
+Biomarkers are measurable indicators of biological processes: genes whose
+expression level predicts drug response, proteins whose blood concentration
+indicates disease progression, or imaging features that predict treatment outcome.
+AI accelerates biomarker discovery by learning which features, among thousands of
+candidates, are most predictive of clinical outcomes.
+</p>
+
+<p>
+The survival model framework provides a natural approach: fit a regularized Cox
+model with all candidate biomarkers as covariates, and the features that receive
+nonzero coefficients are biomarker candidates. L1 (lasso) regularization performs
+feature selection automatically:
+</p>
+
+<pre><code class="language-python">from lifelines import CoxPHFitter
+
+def discover_biomarkers(
+    df: pd.DataFrame,
+    duration_col: str = "time",
+    event_col: str = "event",
+    candidate_cols: list[str] = None,
+    l1_ratio: float = 0.5,
+    penalizer: float = 0.1,
+    significance_threshold: float = 0.05,
+) -> list[dict]:
+    """Discover prognostic biomarkers using regularized Cox regression.
+
+    Uses elastic net regularization (L1 + L2) to select a sparse
+    set of biomarkers from many candidates. L1 drives most
+    coefficients to zero; surviving features are biomarker candidates.
+    """
+    if candidate_cols is None:
+        exclude = {duration_col, event_col}
+        candidate_cols = [c for c in df.columns if c not in exclude]
+
+    cols = [duration_col, event_col] + candidate_cols
+
+    cph = CoxPHFitter(
+        penalizer=penalizer,
+        l1_ratio=l1_ratio,
+    )
+    cph.fit(df[cols], duration_col=duration_col, event_col=event_col)
+
+    # Extract significant biomarkers
+    summary = cph.summary
+    biomarkers = []
+    for feature in summary.index:
+        coef = float(summary.loc[feature, "coef"])
+        hr = float(summary.loc[feature, "exp(coef)"])
+        p = float(summary.loc[feature, "p"])
+
+        if abs(coef) > 1e-6:  # Non-zero after L1 regularization
+            biomarkers.append({
+                "feature": feature,
+                "coefficient": coef,
+                "hazard_ratio": hr,
+                "p_value": p,
+                "significant": p < significance_threshold,
+                "direction": "risk" if hr > 1 else "protective",
+            })
+
+    return sorted(biomarkers, key=lambda x: abs(x["coefficient"]), reverse=True)</code></pre>
+<div class="code-caption">Listing 48.26: Biomarker discovery using regularized Cox regression. L1 regularization automatically selects a sparse set of prognostic features from thousands of candidates. Features with hazard ratios above 1.0 indicate increased risk; below 1.0 indicate protective effects.</div>
+
+<div class="callout connection">
+<div class="callout-title">Connection: Clinical AI and Causal Inference</div>
+<p>
+Biomarker discovery illustrates the tension between prediction and causation
+explored in <a href="../../part-3-data-models/module-31-causal-discovery/index.html">Chapter 31</a>.
+A gene expression level that predicts survival is a <em>prognostic</em> biomarker,
+but it is not necessarily a drug target. A gene that causes disease progression
+(identified through Mendelian randomization or experimental perturbation) is a
+<em>causal</em> biomarker and a valid target. The causal inference methods from
+Chapter 31, particularly instrumental variable analysis and mediation analysis,
+distinguish these cases. The single-cell perturbation models from
+<a href="section-48.3.html">Section 48.3</a> provide experimental evidence of
+causality at the cellular level.
+</p>
+</div>
+
+<h2>7. Discovery Workbench Integration</h2>
+
+<p>
+The Discovery Workbench gains a <code>ClinicalAnalyzer</code> component that
+provides survival analysis, biomarker discovery, and trial simulation capabilities.
+The component accepts clinical datasets in standard formats, fits survival models
+with automatic assumption checking, and logs all results for provenance tracking.
+</p>
+
+<pre><code class="language-python">from discovery_workbench import Analyzer, ExperimentRegistry
+
+class ClinicalAnalyzer(Analyzer):
+    """Clinical analysis pipeline for the Discovery Workbench."""
+
+    def survival_analysis(
+        self,
+        df: pd.DataFrame,
+        covariates: list[str],
+        duration_col: str = "time",
+        event_col: str = "event",
+    ) -> dict:
+        """Full survival analysis with model selection and validation."""
+        run_id = self.registry.start_run(pipeline="clinical_analysis")
+
+        # Fit Cox model
+        cox_results = fit_cox_model(df, duration_col, event_col, covariates)
+
+        # Check proportional hazards assumption
+        cph = CoxPHFitter(penalizer=0.01)
+        cph.fit(df[[duration_col, event_col] + covariates],
+                duration_col=duration_col, event_col=event_col)
+
+        # Biomarker discovery
+        biomarkers = discover_biomarkers(df, duration_col, event_col, covariates)
+
+        self.registry.log_stage(run_id, "survival", {
+            "c_index": cox_results["concordance_index"],
+            "n_biomarkers": len([b for b in biomarkers if b["significant"]]),
+        })
+        self.registry.end_run(run_id)
+
+        return {
+            "cox_model": cox_results,
+            "biomarkers": biomarkers,
+        }</code></pre>
+<div class="code-caption">Listing 48.27: Discovery Workbench clinical analyzer integrating survival analysis with biomarker discovery and provenance tracking.</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Survival Analysis on the GBSG2 Dataset</h4>
+<p>
+Build a complete survival analysis pipeline using the German Breast Cancer Study
+Group (GBSG2) dataset, which is bundled with scikit-survival and requires no
+download.
+(1) Install dependencies: <code>pip install lifelines scikit-survival matplotlib</code>.
+(2) Load the dataset and inspect it:
+<code>from sksurv.datasets import load_gbsg2; X, y = load_gbsg2()</code>.
+Convert the structured array <code>y</code> into separate <code>duration</code>
+and <code>event</code> arrays, and one-hot encode categorical covariates with
+<code>pd.get_dummies</code>.
+(3) Plot Kaplan-Meier curves stratified by hormone therapy
+(<code>horTh</code> column) using <code>lifelines.KaplanMeierFitter</code>, and
+run a log-rank test to check whether the survival difference is statistically
+significant.
+(4) Fit a Cox proportional hazards model on all covariates, print the summary
+to identify which features have significant hazard ratios, and verify the
+proportional hazards assumption with <code>cph.check_assumptions()</code>.
+(5) Split the data 70/30, fit the Cox model on the training set, and evaluate
+the concordance index on the held-out test set. Compare this C-index against a
+random survival forest from
+<code>sksurv.ensemble.RandomSurvivalForest</code> to see whether nonlinear
+modeling improves discrimination on this dataset.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+With the individual tools covered (drug discovery, protein design, single-cell
+genomics, clinical AI), <a href="section-48.5.html">Section 48.5: Building a
+Protein Design Pipeline</a> integrates them into a complete end-to-end recipe that
+chains RFDiffusion, ProteinMPNN, ESMFold, and docking into a working protein
+design workflow.
+</p>
+</section>
+
+</main>
+
+<footer>
+<nav class="section-nav">
+<a href="section-48.3.html">&larr; Section 48.3</a>
+<a href="section-48.5.html">Section 48.5 &rarr;</a>
+</nav>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

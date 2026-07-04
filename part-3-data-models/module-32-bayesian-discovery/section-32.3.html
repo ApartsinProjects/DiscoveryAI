@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.3: Model Comparison and Decision Making. WAIC, LOO-CV, Bayes factors, calibration checking, and value of information for scientific experiment design." name="description"/>
+<title>Section 32.3: Model Comparison and Decision Making | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Bayesian Discovery and Uncertainty</a></div>
+<h1>32.3 Model Comparison and Decision Making</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"Two hypotheses entered. One had a better ELPD. The other had a better story. The committee funded the story."</p>
+<cite>A LOO-CV Estimate That Lost to a PowerPoint</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section requires the Bayesian modeling framework from
+<a href="section-32.1.html">Section 32.1</a> and the posterior inference methods from
+<a href="section-32.2.html">Section 32.2</a>. You should be comfortable with the
+concept of a posterior distribution and know how to obtain one through MCMC or VI.
+Familiarity with information theory (KL divergence, entropy) from
+<a href="../../appendices/appendix-a/index.html">Appendix A</a> will help with the
+WAIC derivation. The connection to
+<a href="../module-31-causal-discovery/index.html">causal inference</a> (Chapter 31)
+enriches the model comparison discussion, as causal and statistical models often
+compete as alternative explanations for the same data.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Scientific discovery is fundamentally about choosing between explanations. Is the
+relationship linear or quadratic? Does this drug work, or is the effect just noise?
+Are two populations drawn from the same distribution or different ones? The Bayesian
+framework provides three complementary tools for these questions: information criteria
+(WAIC) that estimate out-of-sample predictive accuracy, leave-one-out cross-validation
+(LOO-CV) that does the same with better finite-sample properties, and Bayes factors
+that directly compare the marginal evidence for competing hypotheses. Beyond model
+comparison, this section covers calibration (does the model's stated uncertainty match
+reality?) and value of information (which experiment should we run next?). Together,
+these tools turn Bayesian inference from a parameter-estimation method into a complete
+decision-making framework for scientific discovery.
+</p>
+</div>
+
+<h2>1. The Widely Applicable Information Criterion (WAIC)</h2>
+
+<p>
+We want to choose the model that will make the best predictions on future data drawn
+from the same process. The <strong>expected log pointwise predictive density</strong>
+(ELPD) measures exactly this:
+</p>
+
+<p data-agent="02">
+WAIC is a scoring rule that estimates how well a Bayesian model will predict new, unseen
+observations, using only the posterior samples you already have. It matters because
+choosing between models based on how well they fit the training data is misleading; a
+complex model can memorize noise and perform terribly on fresh data, so WAIC corrects
+for this by subtracting a data-driven penalty that grows with effective model complexity.
+The mechanism is straightforward: average each observation's likelihood across all
+posterior draws to get a raw fit score, then subtract the variance of that log-likelihood
+across draws (observations whose likelihood swings wildly across parameter values signal
+overfitting, so they incur a larger penalty). Use WAIC when you need a quick, posterior-sample-based
+estimate of predictive performance and your model is reasonably well-specified; prefer
+LOO-CV (Section 2) when you need per-observation diagnostics or suspect influential
+outliers, and prefer Bayes factors (Section 3) when the scientific question is about
+which hypothesis is true rather than which model predicts best.
+</p>
+
+$$\text{ELPD} = \sum_{i=1}^{n} \int p_{\text{true}}(\tilde{y}_i) \log p(\tilde{y}_i \mid D) \, d\tilde{y}_i$$
+
+<p>
+We cannot compute ELPD directly because we do not know the true data-generating
+distribution $p_{\text{true}}$. WAIC (Watanabe, 2010) estimates ELPD from the
+posterior predictive distribution:
+</p>
+
+$$\widehat{\text{ELPD}}_{\text{WAIC}} = \sum_{i=1}^{n} \log \hat{p}(y_i \mid D) - \sum_{i=1}^{n} V_i$$
+
+<p>
+The first term is the log pointwise predictive density (lppd), where
+$\hat{p}(y_i \mid D) = \frac{1}{S} \sum_{s=1}^{S} p(y_i \mid \theta^{(s)})$
+averages the likelihood of each observation over posterior samples. The second term
+$V_i = \text{Var}_{s}[\log p(y_i \mid \theta^{(s)})]$ is a bias correction that
+penalizes model complexity: observations that are highly sensitive to the particular
+parameter values (high variance across posterior samples) contribute more to the
+penalty. This penalty is the Bayesian analogue of the parameter count in AIC.
+</p>
+
+<p>
+WAIC is computed entirely from posterior samples, making it straightforward to
+calculate after any MCMC or VI run. Higher WAIC (less negative ELPD) means better
+expected out-of-sample prediction.
+</p>
+
+<h2>2. LOO-CV with Pareto Smoothed Importance Sampling</h2>
+
+<p>
+Leave-one-out cross-validation (LOO-CV) is the gold standard for estimating
+out-of-sample prediction: fit the model $n$ times, each time leaving out one
+observation, and measure how well the model predicts the left-out point. The LOO-CV
+estimate of ELPD is:
+</p>
+
+$$\widehat{\text{ELPD}}_{\text{LOO}} = \sum_{i=1}^{n} \log p(y_i \mid D_{-i})$$
+
+<p>
+where $D_{-i}$ is the dataset with observation $i$ removed. Naive LOO-CV requires
+refitting the model $n$ times, which is computationally prohibitive for MCMC-based
+inference. The breakthrough of Vehtari, Gelman, and Gabry (2017) was to show that
+you can approximate LOO-CV using <strong>Pareto Smoothed Importance Sampling
+(PSIS)</strong> from a single posterior fit. The idea is to reweight the existing
+posterior samples to approximate the leave-one-out posteriors, then stabilize the
+importance weights using a generalized Pareto distribution fit to the tail.
+</p>
+
+<p>
+The quality of the PSIS approximation is diagnosed by the Pareto $\hat{k}$ parameter
+for each observation. If $\hat{k} < 0.7$, the approximation is reliable. If
+$\hat{k} > 0.7$, that observation has too much influence on the posterior, and you
+need to actually refit the model without that observation (or consider whether the
+observation is an outlier that warrants investigation, connecting to the anomaly
+detection methods of <a href="../module-30-anomaly-novelty/index.html">Chapter 30</a>).
+</p>
+
+<pre><code class="language-python">import pymc as pm
+import arviz as az
+import numpy as np
+
+# Two competing models for the same data
+rng = np.random.default_rng(42)
+n = 40
+x = rng.uniform(0, 10, size=n)
+y_true = 3.0 * np.sin(0.5 * x) + rng.normal(0, 0.8, size=n)
+
+# Model 1: Linear relationship
+with pm.Model() as linear_model:
+    a = pm.Normal("a", mu=0, sigma=5)
+    b = pm.Normal("b", mu=0, sigma=5)
+    sigma = pm.HalfNormal("sigma", sigma=3)
+    mu = a + b * x
+    pm.Normal("y", mu=mu, sigma=sigma, observed=y_true)
+    trace_linear = pm.sample(2000, tune=1000, chains=4, random_seed=42)
+
+# Model 2: Sinusoidal relationship (closer to truth)
+with pm.Model() as sine_model:
+    amp = pm.Normal("amp", mu=0, sigma=5)
+    freq = pm.HalfNormal("freq", sigma=2)
+    sigma = pm.HalfNormal("sigma", sigma=3)
+    mu = amp * pm.math.sin(freq * x)
+    pm.Normal("y", mu=mu, sigma=sigma, observed=y_true)
+    trace_sine = pm.sample(2000, tune=1000, chains=4, random_seed=42)
+
+# LOO-CV comparison
+loo_linear = az.loo(trace_linear, linear_model)
+loo_sine = az.loo(trace_sine, sine_model)
+
+# Compare models: ranks by ELPD, reports differences with standard errors
+comparison = az.compare(
+    {"linear": trace_linear, "sinusoidal": trace_sine},
+    ic="loo",
+)
+print(comparison)
+
+# Check Pareto k diagnostics for the winning model
+print(f"\nMax Pareto k (sinusoidal): {loo_sine.pareto_k.values.max():.3f}")
+print("Values > 0.7 indicate influential observations needing investigation.")
+</code></pre>
+<div class="code-caption">LOO-CV model comparison with ArviZ. The <code>az.compare</code> function ranks models by ELPD, reports the difference with standard errors, and flags the preferred model. Pareto $\hat{k}$ diagnostics for each observation are available in <code>loo_sine.pareto_k</code>.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: ELPD Differences, Not Absolute Values</div>
+<p>
+The absolute ELPD value of a model is not interpretable on its own; it depends on the
+scale and number of observations. What matters is the <em>difference</em> in ELPD
+between models, $\Delta \text{ELPD} = \text{ELPD}_1 - \text{ELPD}_2$, and whether
+this difference is large relative to its standard error. A rule of thumb from Vehtari
+et al.: if $|\Delta \text{ELPD}| > 4 \cdot \text{SE}$, the difference is decisive.
+If $|\Delta \text{ELPD}| < 2 \cdot \text{SE}$, the data cannot distinguish the models.
+In scientific contexts, the inability to distinguish models is itself a useful finding:
+it means you need more data or a different experimental design to resolve the question.
+</p>
+</div>
+
+<h2>3. Bayes Factors</h2>
+
+<p>
+The <strong>Bayes factor</strong> directly compares the marginal likelihoods of two
+models:
+</p>
+
+$$\text{BF}_{12} = \frac{p(D \mid M_1)}{p(D \mid M_2)} = \frac{\int p(D \mid \theta_1, M_1) \, p(\theta_1 \mid M_1) \, d\theta_1}{\int p(D \mid \theta_2, M_2) \, p(\theta_2 \mid M_2) \, d\theta_2}$$
+
+<p>
+A Bayes factor of 10 means the data are 10 times more likely under Model 1 than
+Model 2. Kass and Raftery (1995) provide an interpretation scale: $\text{BF} > 3.2$
+is "substantial" evidence, $> 10$ is "strong," and $> 100$ is "decisive." The Bayes
+factor embodies the Bayesian Occam's razor: a simpler model (narrower prior) that
+explains the data gets a higher marginal likelihood than a complex model (broad prior)
+that can explain anything but concentrates less prior mass on the actual observations.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the Bayesian Occam's razor like two weather forecasters competing over a year.
+Forecaster A (the simple model) always predicts "sunny, 70 to 75 degrees" for Los
+Angeles. Forecaster B (the complex model) hedges every morning: "somewhere between 30
+and 110 degrees, any conditions possible." When the actual temperature is 73, Forecaster
+A scores well because her narrow prediction concentrated probability right where the
+observation landed. Forecaster B scores poorly despite technically including 73 in her
+range, because she spread her probability so thin across all temperatures that the
+density at 73 is tiny. The Bayes factor measures exactly this: not whether a model
+<em>can</em> accommodate the data, but how much probability it <em>concentrates</em>
+on what actually happened. A model that predicts everything predicts nothing.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A Bayes factor of 10 does <em>not</em> mean there is a 90% probability that Model 1 is
+correct. The Bayes factor is a likelihood ratio, not a posterior probability. To convert
+a Bayes factor into a posterior model probability, you must also specify the prior odds:
+$\text{posterior odds} = \text{BF} \times \text{prior odds}$. If you started believing
+both models were equally likely (prior odds = 1), then $\text{BF}_{12} = 10$ yields
+posterior odds of 10:1, or roughly 91% for Model 1. But if your prior odds were 1:100
+(Model 1 seemed very unlikely before seeing data), the same Bayes factor of 10 gives
+posterior odds of only 1:10, meaning Model 1 is still the underdog at about 9%.
+Reporting a Bayes factor without acknowledging that prior model probabilities matter is
+a common source of overconfident conclusions.
+</p>
+</div>
+
+<p>
+Computing Bayes factors is harder than computing LOO-CV because it requires the
+marginal likelihood, which is an integral over the entire parameter space. Several
+approximation methods exist:
+</p>
+
+<ul>
+<li><strong>Bridge sampling</strong> (Meng and Wong, 1996): uses an auxiliary "bridge" distribution to connect posterior samples from both models. Available in the <code>bridgesampling</code> R package and Python implementations.</li>
+<li><strong>Savage-Dickey ratio</strong>: for nested models where one model fixes a parameter $\psi = \psi_0$ that the other estimates freely, the Bayes factor is simply the ratio of the posterior to the prior density at $\psi_0$. Elegant when applicable.</li>
+<li><strong>Harmonic mean estimator</strong>: tempting but numerically unstable; the variance is often infinite. Avoid in practice.</li>
+</ul>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Savage-Dickey for a "Does This Effect Exist?" Test</div>
+<p>
+A neuroscientist measures brain activation in response to a stimulus. Model 1 says
+the effect size $\delta$ is nonzero; Model 2 says $\delta = 0$ (no effect). These
+are nested: Model 2 is Model 1 with $\delta$ fixed at zero. The Savage-Dickey ratio
+gives the Bayes factor as $\text{BF}_{20} = p(\delta = 0 \mid D) / p(\delta = 0)$,
+the ratio of the posterior density at zero to the prior density at zero. If the
+posterior has moved mass away from zero, the denominator exceeds the numerator, and
+$\text{BF}_{20} < 1$, meaning the data favor a nonzero effect. This is computed from
+a single posterior fit, with no refitting needed.
+</p>
+</div>
+
+<pre><code class="language-python">import pymc as pm
+import numpy as np
+from scipy.stats import norm, gaussian_kde
+
+# Simulated experiment: small effect with moderate noise
+rng = np.random.default_rng(42)
+effect_true = 0.35     # small but real effect
+data = rng.normal(effect_true, 1.0, size=25)
+
+with pm.Model() as effect_model:
+    delta = pm.Normal("delta", mu=0, sigma=1)     # prior centered at 0
+    sigma = pm.HalfNormal("sigma", sigma=2)
+    pm.Normal("obs", mu=delta, sigma=sigma, observed=data)
+    trace = pm.sample(4000, tune=2000, chains=4, random_seed=42)
+
+# Savage-Dickey ratio: BF for delta = 0 (null) vs delta != 0
+posterior_samples = trace.posterior["delta"].values.flatten()
+prior_at_zero = norm.pdf(0, loc=0, scale=1)  # Normal(0,1) density at 0
+
+kde = gaussian_kde(posterior_samples)
+posterior_at_zero = kde.evaluate(0.0)[0]
+
+bf_null = posterior_at_zero / prior_at_zero
+bf_alt = 1.0 / bf_null
+
+print(f"Prior density at delta=0:     {prior_at_zero:.4f}")
+print(f"Posterior density at delta=0:  {posterior_at_zero:.4f}")
+print(f"BF (null vs alternative):     {bf_null:.3f}")
+print(f"BF (alternative vs null):     {bf_alt:.3f}")
+# BF_alt > 3 suggests substantial evidence for a nonzero effect
+</code></pre>
+<div class="code-caption">The Savage-Dickey ratio for testing whether an effect exists. The prior density at $\delta = 0$ is evaluated analytically (Normal(0,1) pdf at 0). The posterior density at $\delta = 0$ is estimated by kernel density estimation on the MCMC samples. A Bayes factor for the alternative exceeding 3 indicates substantial evidence that the effect is real.</div>
+
+<h2>4. WAIC vs. LOO-CV vs. Bayes Factors</h2>
+
+<p>
+These three approaches answer subtly different questions, and choosing among them
+depends on the scientific context:
+</p>
+
+<figure>
+<table>
+<thead>
+<tr><th>Criterion</th><th>Question Answered</th><th>Sensitivity to Priors</th><th>Best For</th></tr>
+</thead>
+<tbody>
+<tr><td>WAIC</td><td>Which model predicts best?</td><td>Low (data-dominated)</td><td>Routine model selection</td></tr>
+<tr><td>LOO-CV (PSIS)</td><td>Which model predicts best?</td><td>Low (data-dominated)</td><td>Same as WAIC, better diagnostics</td></tr>
+<tr><td>Bayes factor</td><td>Which hypothesis is more likely?</td><td>High (prior-dependent)</td><td>Hypothesis testing, theory comparison</td></tr>
+</tbody>
+</table>
+<figcaption>Table 32.3: Comparison of Bayesian model comparison methods. LOO-CV is generally preferred over WAIC due to its per-observation diagnostics (Pareto $\hat{k}$). Bayes factors are preferred when the scientific question is about the truth of a hypothesis rather than predictive accuracy.</figcaption>
+</figure>
+
+<p>
+In practice, LOO-CV is the default recommendation (Vehtari et al., 2017). It is easy
+to compute from posterior samples, provides per-observation diagnostics, and answers
+the practical question of which model predicts better. Bayes factors are appropriate
+when the scientific question is genuinely about comparing theories (does this effect
+exist? is this physical law the correct one?) rather than about prediction.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: ArviZ Model Comparison in Three Lines</div>
+<p>
+ArviZ handles all three criteria through a unified interface. <code>az.loo(trace)</code>
+computes PSIS-LOO-CV. <code>az.waic(trace)</code> computes WAIC. <code>az.compare({"m1":
+trace1, "m2": trace2})</code> ranks any number of models by either criterion, reports
+ELPD differences with standard errors, and produces publication-quality comparison
+plots with <code>az.plot_compare</code>. The entire comparison pipeline, which would
+require several hundred lines of manual code, is reduced to roughly 5 lines. ArviZ
+also provides <code>az.plot_loo_pit</code> for calibration checking (see below).
+</p>
+</div>
+
+<h2>5. Calibration: Does Your Uncertainty Match Reality?</h2>
+
+<p>
+A model that reports 95% credible intervals should contain the true value 95% of the
+time. If it does, the model is <strong>well-calibrated</strong>. If 95% intervals
+contain the truth only 80% of the time, the model is <strong>overconfident</strong>
+(reporting narrower uncertainty than it should). If they contain the truth 99% of the
+time, the model is <strong>underconfident</strong> (wasting information by reporting
+wider uncertainty than necessary).
+</p>
+
+<p>
+The standard tool for checking calibration is the <strong>probability integral
+transform</strong> (PIT). For each observation $y_i$, compute the posterior predictive
+CDF at $y_i$: $u_i = P(Y_i \leq y_i \mid D)$. If the model is well-calibrated,
+these PIT values should be uniformly distributed on $[0, 1]$. Deviations from
+uniformity diagnose specific problems: a U-shaped PIT histogram indicates
+overdispersion (the model's predictive intervals are too narrow), and an inverse
+U-shape indicates underdispersion.
+</p>
+
+<pre><code class="language-python">import arviz as az
+import numpy as np
+
+def check_calibration(trace, model, observed, var_name="y"):
+    """Check calibration via PIT histogram and coverage analysis.
+
+    Args:
+        trace: InferenceData from MCMC sampling
+        model: PyMC model context
+        observed: array of observed values
+        var_name: name of the observed variable in the model
+    Returns:
+        pit_values: array of PIT values for each observation
+    """
+    with model:
+        ppc = pm.sample_posterior_predictive(trace, random_seed=42)
+
+    # Compute PIT values: fraction of posterior predictive samples <= observed
+    ppc_samples = ppc.posterior_predictive[var_name].values
+    ppc_flat = ppc_samples.reshape(-1, len(observed))  # (total_draws, n_obs)
+
+    pit_values = np.mean(ppc_flat <= observed[np.newaxis, :], axis=0)
+
+    # Check coverage at multiple nominal levels
+    print("Calibration report:")
+    for level in [0.50, 0.80, 0.90, 0.95]:
+        alpha = 1 - level
+        lower = np.quantile(ppc_flat, alpha / 2, axis=0)
+        upper = np.quantile(ppc_flat, 1 - alpha / 2, axis=0)
+        coverage = np.mean((observed >= lower) & (observed <= upper))
+        gap = abs(coverage - level)
+        status = "GOOD" if gap < 0.05 else "WARN" if gap < 0.10 else "BAD"
+        print(f"  {level*100:.0f}% interval: coverage = {coverage:.3f} [{status}]")
+
+    # ArviZ provides the PIT plot as a one-liner
+    az.plot_loo_pit(idata=trace, y=var_name)
+
+    return pit_values
+</code></pre>
+<div class="code-caption">Calibration checking via PIT values and coverage analysis. The function computes empirical coverage at multiple credible interval levels and compares to nominal coverage. A well-calibrated model shows coverage close to the nominal level at every threshold. ArviZ's <code>plot_loo_pit</code> provides the same analysis as a publication-quality plot.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Simulation-Based Calibration and Diagnostics at Scale</div>
+<p>
+Standard Bayesian credible intervals are calibrated only when the model is
+well-specified and the inference algorithm converges correctly. <strong>Simulation-Based
+Calibration</strong> (SBC), formalized by Talts et al. (2018), checks both at once by
+repeatedly simulating data from the prior, running inference, and verifying that the
+resulting rank statistics are uniform. In 2023, Säilynoja, Bürkner, and Vehtari
+extended SBC into a practical toolkit with their paper "Graphical test for discrete
+uniformity and its applications in goodness of fit evaluation and multiple sample
+comparison" (<em>Statistics and Computing</em>, 2022/2023), providing powerful visual
+diagnostics (ECDF difference plots) that detect subtle inference failures traditional
+trace plots miss. The ArviZ library now integrates SBC workflows via
+<code>az.plot_ecdf</code> and related utilities. Separately, Fong and Holmes's
+<strong>conformal Bayesian prediction</strong> framework continues to gain traction,
+with Angelopoulos and Bates (2023) publishing "Conformal Prediction: A Gentle
+Introduction" (<em>Foundations and Trends in Machine Learning</em>), which unifies
+conformal calibration methods and demonstrates their application to Bayesian models
+in drug discovery and materials science, providing distribution-free coverage
+guarantees even when the Bayesian model is misspecified.
+</p>
+</div>
+
+<h2>6. Value of Information: Which Experiment Should We Run Next?</h2>
+
+<p>
+The <strong>expected information gain</strong> (EIG) answers a question that is
+central to scientific discovery: given our current knowledge (the posterior), which
+possible experiment would teach us the most? The EIG of an experiment $\xi$ is the
+expected reduction in posterior entropy:
+</p>
+
+$$\text{EIG}(\xi) = \mathbb{E}_{p(y \mid \xi, D)} \left[ \text{KL}\!\left( p(\theta \mid y, \xi, D) \;\|\; p(\theta \mid D) \right) \right]$$
+
+<p>
+This is the expected KL divergence between the posterior we would have after observing
+the outcome $y$ and the posterior we have now. Experiments with high EIG are those
+whose outcomes would substantially change our beliefs, regardless of what those
+outcomes turn out to be.
+</p>
+
+<p>
+Computing EIG exactly requires marginalizing over all possible experimental outcomes,
+which is an integral over the data space. For models where we can sample from the
+posterior predictive distribution, we can estimate EIG by Monte Carlo:
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.stats import norm
+
+def expected_information_gain(
+    posterior_samples, likelihood_fn, design_points, n_mc=200, rng=None
+):
+    """Estimate expected information gain for candidate experimental designs.
+
+    Uses the nested Monte Carlo estimator of Myung et al. (2013).
+
+    Args:
+        posterior_samples: (n_post, n_params) draws from current posterior
+        likelihood_fn: callable (theta, x_design) -> (mean, std) of observation
+        design_points: array of candidate experimental conditions
+        n_mc: number of synthetic observations per design point
+        rng: numpy random generator
+    Returns:
+        eig: array of EIG estimates, one per design point
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+    n_post = len(posterior_samples)
+    eig = np.zeros(len(design_points))
+
+    for d_idx, x_d in enumerate(design_points):
+        mi_samples = []
+
+        for _ in range(n_mc):
+            # 1. Draw a "true" theta from the posterior
+            idx = rng.integers(n_post)
+            theta_star = posterior_samples[idx]
+            mu_star, sigma_star = likelihood_fn(theta_star, x_d)
+
+            # 2. Simulate an observation under theta_star
+            y_sim = rng.normal(mu_star, sigma_star)
+
+            # 3. Evaluate log p(y_sim | theta) for all posterior samples
+            log_likes = np.array([
+                norm.logpdf(y_sim, *likelihood_fn(theta, x_d))
+                for theta in posterior_samples
+            ])
+
+            # 4. Log marginal: log (1/S) sum_s p(y_sim | theta_s)
+            log_marginal = np.logaddexp.reduce(log_likes) - np.log(n_post)
+
+            # 5. Log conditional: log p(y_sim | theta_star)
+            log_cond = norm.logpdf(y_sim, mu_star, sigma_star)
+
+            mi_samples.append(log_cond - log_marginal)
+
+        eig[d_idx] = np.mean(mi_samples)
+
+    return eig
+
+# Example: which temperature to measure next for a reaction rate study?
+candidate_temps = np.linspace(250, 500, 50)  # Kelvin
+# eig = expected_information_gain(posterior_samples, arrhenius_likelihood, candidate_temps)
+# optimal_temp = candidate_temps[np.argmax(eig)]
+# print(f"Most informative next measurement: {optimal_temp:.0f} K")
+</code></pre>
+<div class="code-caption">Monte Carlo estimation of expected information gain using the nested estimator. For each candidate design point, the function simulates possible experimental outcomes from the current posterior, then estimates how much information each outcome would provide. The design point with the highest EIG is the optimal next experiment. This connects directly to the automated experiment design of <a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: EIG Balances Exploration and Exploitation Naturally</div>
+<p>
+Expected information gain has a beautiful property: it automatically balances
+exploring regions of parameter space where uncertainty is high against exploiting
+regions where the model predicts interesting phenomena. A design point in a
+well-characterized region has low EIG because no plausible outcome would change our
+beliefs much. A design point in an uncertain region has high EIG because many
+different outcomes are plausible, and each would update the posterior substantially.
+This is the same exploration-exploitation trade-off that appears in reinforcement
+learning and Bayesian optimization
+(<a href="../../part-5-simulation-optimization/module-45-optimization/index.html">Chapter 45</a>),
+but derived from first principles rather than imposed as a heuristic.
+</p>
+</div>
+
+<h2>7. The Decision-Theoretic Discovery Cycle</h2>
+
+<p>
+The complete Bayesian discovery cycle integrates model building, comparison, calibration,
+and experimental design into a coherent loop:
+</p>
+
+<ol>
+<li><strong>Formulate competing hypotheses</strong> as Bayesian models (<a href="section-32.1.html">Section 32.1</a>).</li>
+<li><strong>Compute posteriors</strong> for each model (<a href="section-32.2.html">Section 32.2</a>).</li>
+<li><strong>Compare models</strong> using LOO-CV to identify the best-supported hypothesis.</li>
+<li><strong>Check calibration</strong> to verify that the winning model's uncertainty is trustworthy.</li>
+<li><strong>Compute EIG</strong> to determine the most informative next experiment.</li>
+<li><strong>Run the experiment</strong>, update the data, and return to step 2.</li>
+</ol>
+
+<p>
+This loop is the quantitative backbone of the
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">automated
+experiment design</a> systems in Chapter 46 and the
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">self-driving
+laboratories</a> of Chapter 55. In those chapters, the loop runs autonomously, with a
+robot executing the experiments and a Bayesian model deciding what to try next. The
+foundations laid here make that autonomy possible.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: When the Models Agree, That Is Also a Result</div>
+<p>
+Sometimes LOO-CV reports that two competing models predict equally well. This is not
+a failure of the method; it is a genuine scientific finding: the available data
+cannot distinguish between the hypotheses. In pharmaceutical research, this often
+means that a cheaper, simpler assay would be sufficient (the complex model adds no
+predictive value). In physics, it might mean that a proposed extension to the
+standard model is neither confirmed nor ruled out by current accelerator data. The
+EIG calculation then tells you exactly which experiment would break the tie.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Compare Three Regression Models with LOO-CV</h4>
+<p>
+Build a complete model comparison pipeline on your laptop using PyMC and ArviZ.
+</p>
+<p>
+<strong>Step 1.</strong> Generate 50 data points from a quadratic model:
+<code>y = 1.0 + 0.8*x + 0.3*x**2 + noise</code> where <code>x</code> is uniformly
+spaced on [-3, 3] and noise is Normal(0, 1). Use <code>numpy</code> only.
+</p>
+<p>
+<strong>Step 2.</strong> Define three PyMC models for this data: (a) linear
+(<code>mu = a + b*x</code>), (b) quadratic (<code>mu = a + b*x + c*x**2</code>),
+and (c) cubic (<code>mu = a + b*x + c*x**2 + d*x**3</code>). Use Normal(0, 5)
+priors for all coefficients and HalfNormal(sigma=3) for the noise. Sample 2000
+draws with 4 chains for each model.
+</p>
+<p>
+<strong>Step 3.</strong> Run <code>az.compare({"linear": trace1, "quadratic": trace2,
+"cubic": trace3}, ic="loo")</code> and print the resulting DataFrame. Verify that the
+quadratic model ranks first and check whether the ELPD difference to the cubic model
+is within 2 standard errors (meaning the data cannot distinguish them).
+</p>
+<p>
+<strong>Step 4.</strong> Inspect the Pareto $\hat{k}$ values for the winning model
+with <code>az.loo(trace2, quadratic_model).pareto_k.values.max()</code>. If any value
+exceeds 0.7, identify which observation is problematic and consider whether it is an
+outlier.
+</p>
+<p>
+<strong>Step 5.</strong> Generate a calibration check for the winning model: run
+<code>pm.sample_posterior_predictive</code>, compute empirical coverage at the 50%,
+80%, and 95% levels, and compare to the nominal values. A well-calibrated model
+should show coverage within 5 percentage points of each target. Plot the PIT
+histogram with <code>az.plot_loo_pit</code> and confirm it looks approximately
+uniform.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> A Bayes factor of 0.5 for Model A versus Model B means the data moderately favor Model B. But a LOO-CV comparison shows Model A has higher ELPD. Explain how these two criteria can disagree. Which should you trust, and under what circumstances? Hint: consider the role of priors in each criterion.
+</li>
+<li>
+<strong>(Coding)</strong> Generate data from a quadratic model $y = 2 + 0.5x + 0.1x^2 + \epsilon$ with $n = 30$ points and $\epsilon \sim \text{Normal}(0, 1)$. Fit three PyMC models (linear, quadratic, cubic) and compare them using <code>az.compare</code> with LOO-CV. How does the ranking change as you increase $n$ to 100 and 500? At what sample size does LOO-CV reliably identify the quadratic model as best?
+</li>
+<li>
+<strong>(Analysis)</strong> Using the EIG estimation function from this section, design an optimal 5-point experiment for a simple linear regression model $y = a + bx + \epsilon$. Start with a prior $a \sim \text{Normal}(0, 10)$, $b \sim \text{Normal}(0, 10)$, $\sigma = 1$, and candidate design points $x \in \{-5, -4, \ldots, 4, 5\}$. After each observation (simulated from the true model with $a=1, b=2$), update the posterior and recompute EIG. Where does the optimal design place its points, and how does this compare to classical D-optimal design?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have the complete Bayesian toolkit: model specification, posterior inference,
+model comparison, calibration, and experimental design. In
+<a href="section-32.4.html">Section 32.4: Building a Bayesian Discovery Model</a>,
+we bring all of these pieces together in a complete recipe: two competing hypotheses
+about enzyme kinetics, full PyMC inference with NUTS, LOO-CV model comparison, expected
+information gain for the next experiment, and integration with the Discovery Workbench.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1507.02646" target="_blank">Vehtari, A., Gelman, A., &amp; Gabry, J. (2017). Practical Bayesian model evaluation using leave-one-out cross-validation and WAIC. <em>Statistics and Computing</em>, 27(5), 1413-1432.</a>
+<p>The foundational paper on PSIS-LOO-CV with Pareto $\hat{k}$ diagnostics.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1214/09-BA424" target="_blank">Watanabe, S. (2010). Asymptotic equivalence of Bayes cross validation and widely applicable information criterion in singular learning theory. <em>JMLR</em>, 11, 3571-3594.</a>
+<p>The original WAIC paper deriving the criterion from singular learning theory.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1080/01621459.1995.10476572" target="_blank">Kass, R. E. &amp; Raftery, A. E. (1995). Bayes factors. <em>JASA</em>, 90(430), 773-795.</a>
+<p>The standard reference for interpreting and computing Bayes factors in scientific hypothesis testing.</p>
+</div>
+<div class="bib-card">
+<a href="https://python.arviz.org/" target="_blank">Kumar, R., et al. (2019). ArviZ: A unified library for exploratory analysis of Bayesian models in Python. <em>JOSS</em>, 4(33), 1143.</a>
+<p>The library providing LOO-CV, WAIC, PIT calibration checks, and model comparison plots used throughout this section.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1016/j.jmp.2013.03.003" target="_blank">Myung, J. I., Cavagnaro, D. R., &amp; Pitt, M. A. (2013). A tutorial on adaptive design optimization. <em>Journal of Mathematical Psychology</em>, 57(3-4), 53-67.</a>
+<p>Tutorial on Bayesian adaptive experimental design, providing the nested Monte Carlo estimator for EIG used in this section.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1007/978-3-031-06649-8" target="_blank">Ryan, E. G., Drovandi, C. C., McGree, J. M., &amp; Pettitt, A. N. (2016). A review of modern computational algorithms for Bayesian optimal design. <em>International Statistical Review</em>, 84(1), 128-154.</a>
+<p>Survey of computational methods for Bayesian experimental design connecting EIG to classical optimal design theory.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-32.2.html">&#8592; 32.2 Posterior Inference</a>
+<a href="index.html">Chapter 32</a>
+<a href="section-32.4.html">32.4 Building a Discovery Model &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

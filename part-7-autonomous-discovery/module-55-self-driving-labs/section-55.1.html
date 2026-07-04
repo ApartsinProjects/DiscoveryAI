@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 55.1: Laboratory Automation Infrastructure. Robotic platforms, instrument APIs, scheduling systems, and the software stack connecting AI planners to physical hardware." name="description"/>
+<title>Section 55.1: Laboratory Automation Infrastructure | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Autonomous Discovery Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 55: Self-Driving Laboratories</a></div>
+<h1>55.1 Laboratory Automation Infrastructure</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The robot doesn't complain about working weekends. It complains about poorly formatted JSON payloads."</p>
+<cite>A Liquid Handler With Opinions About Schema Validation</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section assumes familiarity with REST APIs and JSON data formats from
+<a href="../../part-2-software-engineering/module-12-mcp-servers/index.html">Chapter 12</a>,
+basic chemistry concepts (solutions, concentrations, plate formats) from
+<a href="../../part-6-scientific-domains/module-49-chemistry-materials/index.html">Chapter 49</a>,
+and the system architecture principles from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.
+No robotics experience is required.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A self-driving laboratory is only as autonomous as its least automated component.
+If a human must manually load samples, read a value from a screen, or copy a result
+into a spreadsheet, the loop breaks. This section surveys the hardware and software
+layers that enable full automation: robotic liquid handlers that dispense nanoliter
+volumes, plate readers that measure absorbance and fluorescence, robotic arms that
+transfer plates between instruments, and the software orchestration layer that
+coordinates them all. Understanding this infrastructure is essential before we can
+close the loop in <a href="section-55.2.html">Section 55.2</a>.
+</p>
+</div>
+
+<h2>1. The Laboratory Automation Stack</h2>
+
+<p>
+Laboratory automation arranges into four layers, each abstracting the one below it.
+At the bottom, <strong>actuators</strong> (motors, pumps, syringes) move physical matter. Above
+them, <strong>instruments</strong> (liquid handlers, plate readers, spectrometers) combine actuators
+with sensors into functional units. The <strong>orchestration</strong> layer schedules instrument
+operations into workflows, handling timing dependencies and error recovery. At the top,
+the <strong>intelligence</strong> layer (our AI planner) decides what to do next based on
+accumulated results.
+</p>
+
+<p data-agent="02">
+The laboratory automation stack is a hierarchical software and hardware architecture that separates physical motion from scientific decision-making through well-defined interfaces at each level. It matters because without this separation, every change to an instrument driver would require rewriting the AI planner, and every new AI strategy would require re-engineering the hardware integration. The mechanism is interface abstraction: each layer exposes a standardized API to the layer above it (for example, an instrument exposes "aspirate 10 uL" rather than "move stepper motor 400 steps"), so upper layers never need to know the implementation details below. Use this layered approach whenever you integrate more than one instrument or anticipate swapping components; for single-instrument setups with no plans to scale, a monolithic script that directly controls the hardware may be simpler and sufficient.
+</p>
+
+<p>
+This four-layer stack mirrors the software architecture from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>:
+actuators correspond to hardware drivers, instruments to service modules, orchestration
+to the workflow engine, and intelligence to the decision layer. The parallel is not
+accidental. Laboratory automation software evolved from industrial process control,
+inheriting its layered architecture.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Abstraction Boundaries Define Integration Complexity</div>
+<p>
+The hardest part of building an SDL is not any single layer; it is the interfaces
+between layers. A liquid handler speaks SiLA 2 (Standardization in Laboratory
+Automation), a plate reader returns CSV files, a robotic arm uses a proprietary binary
+protocol, and the AI planner expects a Python dictionary. Each interface translation
+is a potential failure point. The number of integration seams grows linearly with the
+number of instruments, but the number of potential failure modes grows
+combinatorially. Standardization efforts like SiLA 2 and the Allotrope Data Format
+exist precisely to reduce this combinatorial burden.
+</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the laboratory automation stack like a restaurant kitchen. The <strong>actuators</strong> are the individual burners, knobs, and timers on the stove. The <strong>instruments</strong> are the stations: the grill station, the pastry station, the prep station, each combining several tools into a functional unit. The <strong>orchestration</strong> layer is the expeditor (the person calling orders and timing courses so that every dish for a table arrives together, rerouting work when a station falls behind). The <strong>intelligence</strong> layer is the head chef deciding the menu and adjusting tonight's specials based on what ingredients arrived and what sold well yesterday. Just as a head chef never reaches over to adjust a burner directly (that would bypass the station cook and the expeditor, creating chaos), the AI planner never sends raw motor commands. Each layer trusts the one below it to handle its own complexity.
+</p>
+</div>
+
+<h2>2. Robotic Platforms and Liquid Handling</h2>
+
+<p>
+The workhorse of high-throughput experimentation is the <strong>liquid handler</strong>: a
+Cartesian robot (X-Y-Z gantry with a pipetting head) that dispenses precise volumes of
+liquid into multiwell plates. Modern liquid handlers achieve volumetric precision of
+better than 1% at microliter volumes and better than 5% at nanoliter volumes. Key
+platforms include the Hamilton STAR, Beckman Coulter Biomek, and Opentrons OT-2.
+</p>
+
+<p>
+The Opentrons OT-2 is notable because its control software is open-source Python.
+Unlike proprietary systems that require vendor-specific scripting languages, the OT-2
+exposes a Python API where each physical operation (aspirate, dispense, move to well)
+is a method call. This makes it an ideal platform for SDL integration because the
+AI planner can generate executable instrument commands directly.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that "laboratory automation" means the AI is in full control, making all decisions and directly commanding every motor. In reality, the AI planner occupies only the top layer of the stack and issues high-level requests ("measure compound X at five concentrations"); the vast majority of the automation infrastructure consists of deterministic scheduling logic, protocol translation, error handling, and safety interlocks that operate independently of any AI, and these layers would function identically with a human scientist typing commands instead of an AI planner.
+</p>
+</div>
+
+<p>
+Let us model a simplified liquid handler as a Python class. This abstraction captures
+the essential operations without requiring physical hardware.
+</p>
+
+<pre><code class="language-python">"""Simulated liquid handler with the core operations of a real platform.
+
+Models volumetric operations on multiwell plates with realistic
+constraints: dead volume, maximum aspiration, tip tracking.
+"""
+from dataclasses import dataclass, field
+from typing import Optional
+import numpy as np
+
+
+@dataclass
+class Well:
+    """Single well in a multiwell plate."""
+    row: int
+    col: int
+    max_volume_ul: float = 200.0    # standard 96-well plate
+    current_volume_ul: float = 0.0
+    contents: dict = field(default_factory=dict)  # solute -> concentration
+
+    @property
+    def address(self) -> str:
+        """Human-readable well address, e.g., 'A1', 'H12'."""
+        return f"{chr(65 + self.row)}{self.col + 1}"
+
+
+@dataclass
+class Plate:
+    """Multiwell plate (96-well default)."""
+    rows: int = 8
+    cols: int = 12
+    wells: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        for r in range(self.rows):
+            for c in range(self.cols):
+                self.wells[(r, c)] = Well(row=r, col=c)
+
+    def well(self, address: str) -> Well:
+        """Look up well by address string, e.g., 'A1'."""
+        row = ord(address[0].upper()) - 65
+        col = int(address[1:]) - 1
+        return self.wells[(row, col)]
+
+
+class LiquidHandler:
+    """Simulated liquid handler with volumetric tracking.
+
+    Models the core operations of a Hamilton STAR or Opentrons OT-2:
+    aspirate, dispense, mix, and transfer. Tracks tip state and
+    enforces volume constraints.
+    """
+
+    def __init__(self, dead_volume_ul: float = 5.0,
+                 max_aspirate_ul: float = 200.0):
+        self.dead_volume_ul = dead_volume_ul
+        self.max_aspirate_ul = max_aspirate_ul
+        self.tip_volume_ul: float = 0.0
+        self.tip_contents: dict = {}
+        self.log: list[dict] = []
+
+    def aspirate(self, plate: Plate, well_address: str,
+                 volume_ul: float) -> None:
+        """Aspirate liquid from a well into the current tip."""
+        well = plate.well(well_address)
+        available = well.current_volume_ul - self.dead_volume_ul
+        if volume_ul > available:
+            raise ValueError(
+                f"Cannot aspirate {volume_ul} uL from {well_address}: "
+                f"only {available:.1f} uL available above dead volume"
+            )
+        if self.tip_volume_ul + volume_ul > self.max_aspirate_ul:
+            raise ValueError(
+                f"Aspirating {volume_ul} uL would exceed tip capacity "
+                f"({self.max_aspirate_ul} uL)"
+            )
+        well.current_volume_ul -= volume_ul
+        self.tip_volume_ul += volume_ul
+        self.tip_contents = dict(well.contents)
+        self.log.append({
+            "action": "aspirate", "well": well_address,
+            "volume_ul": volume_ul
+        })
+
+    def dispense(self, plate: Plate, well_address: str,
+                 volume_ul: float) -> None:
+        """Dispense liquid from the current tip into a well."""
+        well = plate.well(well_address)
+        if volume_ul > self.tip_volume_ul:
+            raise ValueError(
+                f"Cannot dispense {volume_ul} uL: tip contains "
+                f"only {self.tip_volume_ul:.1f} uL"
+            )
+        if well.current_volume_ul + volume_ul > well.max_volume_ul:
+            raise ValueError(
+                f"Dispensing {volume_ul} uL into {well_address} would "
+                f"exceed well capacity ({well.max_volume_ul} uL)"
+            )
+        well.current_volume_ul += volume_ul
+        self.tip_volume_ul -= volume_ul
+        # Simplified mixing model: update well contents
+        for solute, conc in self.tip_contents.items():
+            if solute in well.contents:
+                # Volume-weighted average
+                total_vol = well.current_volume_ul
+                old_vol = total_vol - volume_ul
+                well.contents[solute] = (
+                    well.contents[solute] * old_vol + conc * volume_ul
+                ) / total_vol
+            else:
+                well.contents[solute] = conc * volume_ul / well.current_volume_ul
+        self.log.append({
+            "action": "dispense", "well": well_address,
+            "volume_ul": volume_ul
+        })
+
+    def transfer(self, plate: Plate, source: str, dest: str,
+                 volume_ul: float) -> None:
+        """Transfer liquid from one well to another."""
+        self.aspirate(plate, source, volume_ul)
+        self.dispense(plate, dest, volume_ul)
+
+
+# Demonstrate the liquid handler
+plate = Plate()
+handler = LiquidHandler()
+
+# Prepare a stock solution in well A1
+stock_well = plate.well("A1")
+stock_well.current_volume_ul = 150.0
+stock_well.contents = {"compound_X": 10.0}  # 10 mM
+
+# Serial dilution into A2, A3, A4
+for i, dest in enumerate(["A2", "A3", "A4"], start=1):
+    dest_well = plate.well(dest)
+    dest_well.current_volume_ul = 100.0  # pre-filled with buffer
+    dest_well.contents = {"buffer": 1.0}
+    handler.transfer(plate, "A1", dest, volume_ul=20.0)
+
+# Print resulting concentrations
+for addr in ["A1", "A2", "A3", "A4"]:
+    w = plate.well(addr)
+    conc = w.contents.get("compound_X", 0.0)
+    print(f"Well {addr}: {w.current_volume_ul:.1f} uL, "
+          f"[compound_X] = {conc:.3f} mM")
+</code></pre>
+<div class="code-caption">Listing 55.1: Simulated liquid handler with volumetric tracking, dead volume enforcement, and dilution-series preparation. The <code>transfer</code> method composes aspirate and dispense into a single operation, matching the API of real platforms like the Opentrons OT-2.</div>
+
+<p>
+The simulation in Listing 55.1 enforces the same constraints a physical handler
+enforces: dead volume (liquid that cannot be aspirated from the bottom of a well),
+tip capacity, and well overflow. These constraints matter for SDL design because they
+limit the space of executable experiments. An AI planner that ignores dead volume will
+propose experiments that fail on the robot.
+</p>
+
+<h2>3. Measurement Instruments and Readout</h2>
+
+<p>
+After the liquid handler prepares samples, measurement instruments characterize them.
+The most common high-throughput measurement is <strong>plate reading</strong>: passing light
+through each well of a multiwell plate and measuring absorbance, fluorescence, or
+luminescence. A plate reader can measure all 96 (or 384, or 1536) wells in under a
+minute, producing a matrix of values that maps directly to the experimental design.
+</p>
+
+<p>
+Beyond plate readers, SDLs integrate more specialized instruments. X-ray diffraction
+(XRD) identifies crystal structures. Mass spectrometry (MS) determines molecular
+weights and fragmentation patterns. Nuclear magnetic resonance (NMR) resolves molecular
+geometry. Each instrument produces data in different formats (vendor-specific binary,
+CSV, JCAMP-DX), at different time scales (seconds for UV-Vis, hours for NMR), and with
+different reliability characteristics (plate readers rarely fail; mass spectrometers
+require calibration).
+</p>
+
+<p>
+Let us model a plate reader that returns absorbance measurements with realistic noise.
+</p>
+
+<pre><code class="language-python">"""Simulated plate reader returning absorbance measurements.
+
+Models Beer-Lambert law with Gaussian measurement noise,
+background correction, and saturation at high optical density.
+"""
+import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class PlateReaderConfig:
+    """Configuration for a simulated plate reader."""
+    wavelength_nm: float = 450.0
+    path_length_cm: float = 0.56     # standard 96-well plate
+    noise_std: float = 0.005         # typical CV ~1% at OD 0.5
+    saturation_od: float = 3.5       # detector saturation
+    background_od: float = 0.045     # plate + buffer background
+
+
+class SimulatedPlateReader:
+    """Plate reader following Beer-Lambert with noise and saturation.
+
+    Absorbance = epsilon * c * l, where epsilon is the molar
+    absorptivity, c is concentration, and l is path length.
+    """
+
+    def __init__(self, config: PlateReaderConfig = None):
+        self.config = config or PlateReaderConfig()
+        self.rng = np.random.default_rng(seed=42)
+
+    def read_well(self, concentration_mM: float,
+                  extinction_coeff: float = 21000.0) -> float:
+        """Read absorbance for a single well.
+
+        Args:
+            concentration_mM: analyte concentration in millimolar
+            extinction_coeff: molar absorptivity in L/(mol*cm)
+
+        Returns:
+            Measured optical density (absorbance units)
+        """
+        # Beer-Lambert: A = epsilon * c * l
+        # Convert mM to M for standard units
+        concentration_M = concentration_mM / 1000.0
+        true_od = (extinction_coeff * concentration_M
+                   * self.config.path_length_cm)
+
+        # Add background and noise
+        measured_od = (true_od + self.config.background_od
+                       + self.rng.normal(0, self.config.noise_std))
+
+        # Apply saturation (detector cannot read above this value)
+        measured_od = min(measured_od, self.config.saturation_od)
+        return max(measured_od, 0.0)  # OD cannot be negative
+
+    def read_plate(self, concentration_matrix: np.ndarray,
+                   extinction_coeff: float = 21000.0) -> np.ndarray:
+        """Read all wells of a plate.
+
+        Args:
+            concentration_matrix: (rows, cols) array of concentrations
+            extinction_coeff: molar absorptivity
+
+        Returns:
+            (rows, cols) array of measured absorbance values
+        """
+        readings = np.zeros_like(concentration_matrix)
+        for i in range(concentration_matrix.shape[0]):
+            for j in range(concentration_matrix.shape[1]):
+                readings[i, j] = self.read_well(
+                    concentration_matrix[i, j], extinction_coeff
+                )
+        return readings
+
+
+# Demonstrate: read a dilution series
+reader = SimulatedPlateReader()
+concentrations = np.array([10.0, 5.0, 2.5, 1.25, 0.625, 0.3125])
+readings = np.array([reader.read_well(c) for c in concentrations])
+
+print("Concentration (mM) | Absorbance (OD)")
+print("-" * 38)
+for c, od in zip(concentrations, readings):
+    print(f"    {c:>8.4f}       |    {od:.4f}")
+</code></pre>
+<div class="code-caption">Listing 55.2: Simulated plate reader applying Beer-Lambert law with Gaussian noise, background absorbance, and detector saturation. The <code>read_plate</code> method processes an entire multiwell plate, returning a matrix of absorbance values that maps directly to the experimental design matrix.</div>
+
+<h2>4. Instrument Control Protocols</h2>
+
+<p>
+Real laboratory instruments communicate over several standardized protocols. The
+most important for SDL integration are:
+</p>
+
+<p>
+<strong>SiLA 2</strong> (Standardization in Laboratory Automation, version 2) defines a gRPC-based
+protocol for instrument control. Each instrument exposes "features" (capabilities like
+"Aspirate," "Dispense," "ReadAbsorbance") as gRPC services with defined request and
+response schemas. SiLA 2's strength is composability: because every instrument speaks
+the same protocol, the orchestration layer can address any instrument through the same
+client code.
+</p>
+
+<p>
+<strong>OPC UA</strong> (Open Platform Communications Unified Architecture) is the industrial
+automation standard for process instruments. It provides a hierarchical information
+model where instruments publish variables (temperature, pressure, flow rate) that
+clients can read, write, and subscribe to. OPC UA is more common in chemical
+engineering and process chemistry than in life sciences.
+</p>
+
+<p>
+<strong>REST/HTTP</strong> is increasingly used by modern platforms, particularly cloud-connected
+instruments. The Opentrons HTTP API, Emerald Cloud Lab's API, and many LIMS (Laboratory
+Information Management Systems) expose REST endpoints. REST has lower latency overhead
+than gRPC for simple request-response patterns and is easier to integrate with
+web-based AI planners.
+</p>
+
+<p>
+We model the instrument interface as a Python abstract class that any instrument
+adapter must implement.
+</p>
+
+<pre><code class="language-python">"""Abstract instrument interface for SDL integration.
+
+Every instrument in the SDL must implement this interface,
+providing a uniform API for the orchestration layer.
+"""
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+import json
+import time
+
+
+class InstrumentStatus(Enum):
+    IDLE = "idle"
+    BUSY = "busy"
+    ERROR = "error"
+    MAINTENANCE = "maintenance"
+
+
+@dataclass
+class InstrumentCommand:
+    """A command to be sent to an instrument."""
+    instrument_id: str
+    action: str
+    parameters: dict
+    timestamp: float = 0.0
+
+    def __post_init__(self):
+        if self.timestamp == 0.0:
+            self.timestamp = time.time()
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "instrument_id": self.instrument_id,
+            "action": self.action,
+            "parameters": self.parameters,
+            "timestamp": self.timestamp
+        })
+
+
+@dataclass
+class InstrumentResult:
+    """Result returned by an instrument after executing a command."""
+    instrument_id: str
+    command_action: str
+    success: bool
+    data: dict
+    error_message: str = ""
+    execution_time_s: float = 0.0
+
+
+class InstrumentAdapter(ABC):
+    """Abstract base class for instrument integration.
+
+    Every physical or simulated instrument in the SDL implements
+    this interface. The orchestration layer interacts with instruments
+    exclusively through these methods.
+    """
+
+    @abstractmethod
+    def get_status(self) -> InstrumentStatus:
+        """Query the current instrument status."""
+        ...
+
+    @abstractmethod
+    def execute(self, command: InstrumentCommand) -> InstrumentResult:
+        """Execute a command and return the result."""
+        ...
+
+    @abstractmethod
+    def validate_command(self, command: InstrumentCommand) -> bool:
+        """Check whether a command is valid before execution."""
+        ...
+
+    @property
+    @abstractmethod
+    def capabilities(self) -> list[str]:
+        """List the actions this instrument supports."""
+        ...
+
+
+class SimulatedPlateReaderAdapter(InstrumentAdapter):
+    """Adapter wrapping our simulated plate reader."""
+
+    def __init__(self):
+        self.reader = SimulatedPlateReader()
+        self._status = InstrumentStatus.IDLE
+
+    def get_status(self) -> InstrumentStatus:
+        return self._status
+
+    def execute(self, command: InstrumentCommand) -> InstrumentResult:
+        self._status = InstrumentStatus.BUSY
+        start = time.time()
+        try:
+            if command.action == "read_well":
+                od = self.reader.read_well(
+                    concentration_mM=command.parameters["concentration_mM"],
+                    extinction_coeff=command.parameters.get(
+                        "extinction_coeff", 21000.0
+                    )
+                )
+                result = InstrumentResult(
+                    instrument_id=command.instrument_id,
+                    command_action=command.action,
+                    success=True,
+                    data={"absorbance_od": od},
+                    execution_time_s=time.time() - start
+                )
+            else:
+                result = InstrumentResult(
+                    instrument_id=command.instrument_id,
+                    command_action=command.action,
+                    success=False,
+                    data={},
+                    error_message=f"Unknown action: {command.action}"
+                )
+        finally:
+            self._status = InstrumentStatus.IDLE
+        return result
+
+    def validate_command(self, command: InstrumentCommand) -> bool:
+        if command.action == "read_well":
+            return "concentration_mM" in command.parameters
+        return False
+
+    @property
+    def capabilities(self) -> list[str]:
+        return ["read_well"]
+
+
+# Demonstrate the adapter pattern
+adapter = SimulatedPlateReaderAdapter()
+cmd = InstrumentCommand(
+    instrument_id="plate_reader_01",
+    action="read_well",
+    parameters={"concentration_mM": 5.0}
+)
+
+print(f"Status: {adapter.get_status().value}")
+print(f"Valid command: {adapter.validate_command(cmd)}")
+result = adapter.execute(cmd)
+print(f"Absorbance: {result.data['absorbance_od']:.4f} OD")
+print(f"Execution time: {result.execution_time_s*1000:.1f} ms")
+</code></pre>
+<div class="code-caption">Listing 55.3: Abstract instrument adapter pattern for SDL integration. Every instrument (liquid handler, plate reader, spectrometer) implements the same <code>InstrumentAdapter</code> interface, allowing the orchestration layer to address any instrument uniformly. The <code>SimulatedPlateReaderAdapter</code> wraps the plate reader from Listing 55.2.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: SiLA 2 Python</div>
+<p>
+The <code>sila2</code> Python package provides auto-generated client and server stubs from
+SiLA 2 Feature Definition Language (FDL) files. Instead of writing the adapter
+pattern from scratch, you define your instrument's capabilities in an XML-based FDL
+file, run the code generator, and get a gRPC client and server with type-checked
+request/response objects. This reduces the adapter code from ~80 lines to ~15 lines
+of glue code connecting the generated server to your instrument driver. The trade-off
+is that SiLA 2 requires a gRPC runtime and its FDL schema adds complexity for
+instruments with simple interfaces.
+</p>
+</div>
+
+<h2>5. Scheduling and Orchestration</h2>
+
+<p>
+A realistic SDL runs multiple instruments concurrently. While the plate reader measures
+batch $n$, the liquid handler prepares batch $n+1$, and the AI planner computes
+acquisition scores for batch $n+2$. This concurrency requires a
+<strong>scheduler</strong> that manages instrument availability, handles timing dependencies, and
+recovers from failures.
+</p>
+
+<p>
+The scheduling problem is a variant of the job-shop scheduling problem from operations
+research. Each experiment is a "job" consisting of ordered "operations" (prepare, incubate,
+measure). Each instrument is a "machine" that can process one operation at a time.
+The objective is to maximize throughput (experiments per hour) subject to timing
+constraints (incubation times, measurement windows) and resource constraints
+(limited tips, limited plate positions).
+</p>
+
+<pre><code class="language-python">"""Simple priority-queue scheduler for SDL instrument orchestration.
+
+Manages a queue of experiment tasks, dispatches them to available
+instruments, and handles completion callbacks.
+"""
+import heapq
+from dataclasses import dataclass, field
+from typing import Callable
+from enum import Enum
+
+
+class TaskState(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+@dataclass(order=True)
+class ExperimentTask:
+    """A single task in the SDL workflow."""
+    priority: int
+    task_id: str = field(compare=False)
+    instrument_id: str = field(compare=False)
+    command: InstrumentCommand = field(compare=False)
+    state: TaskState = field(default=TaskState.PENDING, compare=False)
+    depends_on: list[str] = field(default_factory=list, compare=False)
+    result: InstrumentResult = field(default=None, compare=False)
+
+
+class SDLScheduler:
+    """Priority-queue scheduler for SDL experiments.
+
+    Dispatches tasks to instruments when their dependencies are
+    satisfied and instruments are available.
+    """
+
+    def __init__(self):
+        self.queue: list[ExperimentTask] = []
+        self.instruments: dict[str, InstrumentAdapter] = {}
+        self.completed: dict[str, ExperimentTask] = {}
+        self.task_registry: dict[str, ExperimentTask] = {}
+
+    def register_instrument(self, instrument_id: str,
+                            adapter: InstrumentAdapter) -> None:
+        """Register an instrument with the scheduler."""
+        self.instruments[instrument_id] = adapter
+
+    def submit(self, task: ExperimentTask) -> None:
+        """Submit a task to the scheduling queue."""
+        heapq.heappush(self.queue, task)
+        self.task_registry[task.task_id] = task
+
+    def _dependencies_met(self, task: ExperimentTask) -> bool:
+        """Check if all dependencies for a task are completed."""
+        return all(
+            dep_id in self.completed
+            for dep_id in task.depends_on
+        )
+
+    def _instrument_available(self, instrument_id: str) -> bool:
+        """Check if an instrument is idle and ready."""
+        if instrument_id not in self.instruments:
+            return False
+        return (self.instruments[instrument_id].get_status()
+                == InstrumentStatus.IDLE)
+
+    def step(self) -> list[ExperimentTask]:
+        """Execute one scheduling step: dispatch ready tasks.
+
+        Returns list of tasks that completed in this step.
+        """
+        completed_this_step = []
+        remaining = []
+
+        while self.queue:
+            task = heapq.heappop(self.queue)
+
+            if (self._dependencies_met(task)
+                    and self._instrument_available(task.instrument_id)):
+                # Dispatch the task
+                task.state = TaskState.RUNNING
+                adapter = self.instruments[task.instrument_id]
+                result = adapter.execute(task.command)
+                task.result = result
+                task.state = (TaskState.COMPLETED if result.success
+                              else TaskState.FAILED)
+                self.completed[task.task_id] = task
+                completed_this_step.append(task)
+            else:
+                remaining.append(task)
+
+        # Re-queue tasks that could not run
+        for task in remaining:
+            heapq.heappush(self.queue, task)
+
+        return completed_this_step
+
+    def run_all(self, max_steps: int = 100) -> dict[str, ExperimentTask]:
+        """Run the scheduler until the queue is empty or max steps."""
+        for _ in range(max_steps):
+            if not self.queue:
+                break
+            self.step()
+        return self.completed
+
+
+# Demonstrate: schedule three measurements with dependencies
+scheduler = SDLScheduler()
+scheduler.register_instrument(
+    "plate_reader_01", SimulatedPlateReaderAdapter()
+)
+
+# Three experiments: measure at 1, 5, and 10 mM
+for i, conc in enumerate([1.0, 5.0, 10.0]):
+    task = ExperimentTask(
+        priority=i,
+        task_id=f"measure_{i}",
+        instrument_id="plate_reader_01",
+        command=InstrumentCommand(
+            instrument_id="plate_reader_01",
+            action="read_well",
+            parameters={"concentration_mM": conc}
+        )
+    )
+    scheduler.submit(task)
+
+results = scheduler.run_all()
+for task_id, task in sorted(results.items()):
+    od = task.result.data.get("absorbance_od", "N/A")
+    print(f"{task_id}: OD = {od:.4f} ({task.state.value})")
+</code></pre>
+<div class="code-caption">Listing 55.4: Priority-queue scheduler for SDL orchestration. Tasks are dispatched to instruments when dependencies are satisfied and instruments are idle. The scheduler supports priority ordering, dependency chains, and failure tracking. Production SDLs use more sophisticated scheduling (e.g., constraint programming with OR-Tools), but this pattern captures the core abstraction.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Emerald Cloud Lab</div>
+<p>
+Emerald Cloud Lab (ECL) operates a fully remote laboratory where researchers design
+experiments in a web interface and robotic systems execute them in a facility in
+South San Francisco. ECL's software stack exposes a symbolic protocol language (SLL)
+where each experiment is a structured expression specifying instruments, parameters,
+and data flows. The system compiles SLL expressions into instrument-level commands,
+schedules them across a fleet of robots, and returns results through a data API.
+Researchers at Princeton, Stanford, and Carnegie Mellon have published results using
+ECL without ever entering the physical lab. This model, where the "laboratory" is a
+cloud service with an API, represents the most mature commercial SDL architecture
+available today.
+</p>
+</div>
+
+<h2>6. The Software Stack in Practice</h2>
+
+<p>
+Putting the pieces together, a production SDL software stack typically includes:
+</p>
+
+<ul>
+<li><strong>Instrument drivers</strong>: vendor SDKs or SiLA 2 adapters that translate between the orchestration layer and physical hardware.</li>
+<li><strong>A workflow engine</strong>: Prefect, Airflow, or a custom DAG executor that manages experiment pipelines with retry logic and logging.</li>
+<li><strong>A data layer</strong>: a database (PostgreSQL, MongoDB) storing experiment definitions, instrument readings, and provenance metadata. This connects to the experiment registry from <a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">Chapter 47</a>.</li>
+<li><strong>An API gateway</strong>: a FastAPI or Flask server that exposes the SDL's capabilities to the AI planner. We build this in <a href="section-55.3.html">Section 55.3</a>.</li>
+<li><strong>The AI planner</strong>: a Bayesian optimization loop (BoTorch, Ax) or an LLM-based planner (as in Coscientist) that consumes results and proposes new experiments.</li>
+</ul>
+
+<p>
+The Acceleration Consortium at the University of Toronto maintains an open-source
+reference implementation of this stack called <strong>Atlas</strong>, which provides pluggable
+modules for each layer. We use a simplified version of this architecture for the
+SDL recipe in <a href="section-55.4.html">Section 55.4</a>.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Prefect for Lab Workflows</div>
+<p>
+<code>prefect</code> reduces the scheduler code in Listing 55.4 from ~70 lines to ~20 lines.
+Define each instrument operation as a <code>@task</code>, compose them into a <code>@flow</code>, and
+Prefect handles dependency resolution, retry logic, distributed execution, and
+result caching. The key advantage over a custom scheduler is observability: Prefect's
+dashboard shows real-time task status, execution times, and failure traces, which is
+critical for debugging SDL workflows that run overnight.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+In 2023, Boiko et al. introduced <strong>Coscientist</strong> (Nature, 2023), a system in which GPT-4 acts as the intelligence layer of an SDL, autonomously planning chemical syntheses, writing Opentrons liquid-handler code, querying documentation and web resources, and interpreting experimental results to decide next steps. Coscientist successfully planned and executed palladium-catalyzed cross-coupling reactions (Suzuki and Sonogashira couplings) with no human intervention beyond the initial prompt. This work demonstrates that LLMs can serve as the top layer of the automation stack described in this section, replacing hand-coded Bayesian optimization loops with natural-language reasoning over instrument capabilities. The key open challenge is reliability: Coscientist's generated protocols occasionally contained errors that required safety interlocks at the orchestration layer to catch, underscoring that the deterministic lower layers of the stack remain essential even when an LLM occupies the intelligence layer.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Run a Simulated SDL Pipeline</h4>
+<p>
+Build a complete simulated SDL loop on your laptop using only Python and NumPy.
+(1) Copy the <code>Well</code>, <code>Plate</code>, and <code>LiquidHandler</code> classes from Listing 55.1 and the <code>SimulatedPlateReader</code> from Listing 55.2 into a single file called <code>mini_sdl.py</code>.
+(2) Write a function <code>prepare_dilution_series(plate, handler, stock_well, n_dilutions, dilution_factor)</code> that creates an n-point serial dilution from a stock well, returning the list of destination well addresses.
+(3) Write a function <code>measure_series(reader, plate, well_addresses)</code> that reads the absorbance of each well and returns a dictionary mapping well address to measured OD.
+(4) Combine the two functions into a <code>run_experiment(concentration_mM, n_points=6)</code> pipeline that prepares a stock at the given concentration, dilutes it, measures the series, and prints a table of concentration vs. absorbance.
+(5) Call <code>run_experiment</code> at three different stock concentrations (e.g., 1.0, 5.0, 10.0 mM), collect all results, and plot absorbance vs. concentration using <code>matplotlib</code> to verify the expected linear relationship from Beer-Lambert law. Bonus: add a line of best fit with <code>numpy.polyfit</code> and print the estimated extinction coefficient.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+We now have the building blocks: robots that move liquids, instruments that measure
+outcomes, adapters that translate between protocols, and schedulers that coordinate
+operations. <a href="section-55.2.html">Section 55.2</a> closes the loop by connecting
+an AI planner to this infrastructure, creating a system that autonomously decides what
+to synthesize, dispatches the synthesis to the liquid handler, reads the measurement
+from the plate reader, and updates its surrogate model to decide the next experiment.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 55 Overview</a>
+<a href="section-55.2.html">55.2 Closed-Loop Experimentation &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

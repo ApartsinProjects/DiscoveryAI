@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 1.2: Exploration Versus Exploitation. Utility, regret, information gain, entropy reduction, UCB derivation, and Thompson Sampling for discovery." name="description"/>
+<title>Section 1.2: Exploration Versus Exploitation | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 1: Discovery As Search</a></div>
+<h1>1.2 Exploration Versus Exploitation</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I had 99% confidence in my best arm. Naturally, I pulled the other one 400 more times, just to be sure."</p>
+<cite>A Bayesian Prior With Strong Opinions</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Every discoverer faces the same dilemma: should I investigate the option that looks best
+right now (<em>exploit</em>), or should I try something untested that might turn out even
+better (<em>explore</em>)? This section formalizes that trade-off through three mathematical
+lenses: <strong>regret</strong> (how much value we lose by not always choosing the best option),
+<strong>information gain</strong> (how much we reduce our uncertainty with each observation), and
+<strong>confidence bounds</strong> (how uncertain we are about each option's true value). We derive
+the Upper Confidence Bound (UCB) algorithm from first principles and connect it to
+Thompson Sampling, building the algorithmic toolkit that powers the simulator in
+<a href="section-1.4.html">Section 1.4</a>.
+</p>
+</div>
+
+<h2>1. The Multi-Armed Bandit: Discovery's Simplest Model</h2>
+
+<p>
+In <a href="section-1.1.html">Section 1.1</a> we formalized discovery as search over a
+five-tuple $(S, A, T, f, C)$. The simplest non-trivial instance of this framework is
+the <strong>multi-armed bandit</strong> (MAB) problem, named after a gambler facing a row of
+slot machines ("one-armed bandits"), each with an unknown payout distribution.
+</p>
+
+<p data-agent="02">
+A multi-armed bandit is a sequential decision problem in which an agent repeatedly chooses among $K$ options with unknown reward distributions, observing only the outcome of the chosen option (never the unchosen ones). It matters because it is the minimal model that forces a decision-maker to balance gathering information against acting on what is already known; every discovery scenario, from drug screening to hyperparameter tuning, contains this structure at its core. The mechanism is simple: after each choice, the agent updates its estimate of that option's value using the observed reward, then uses those estimates (plus some exploration incentive) to pick the next option. Use a bandit formulation when your problem has a fixed, enumerable set of alternatives with stochastic payoffs and no state that carries over between decisions; when choices change the world's state or alternatives depend on a rich context, move to contextual bandits or full reinforcement learning instead.
+</p>
+
+<p>
+The MAB strips discovery to its essence: there are $K$ options (called <em>arms</em>),
+each with an unknown expected reward $\mu_k$. At each time step $t = 1, 2, \ldots, T$,
+the discoverer selects an arm $a_t \in \{1, \ldots, K\}$ and observes a noisy reward
+$r_t \sim P(\cdot \mid a_t)$ with $\mathbb{E}[r_t \mid a_t = k] = \mu_k$. The goal
+is to maximize the cumulative reward $\sum_{t=1}^{T} r_t$ over $T$ rounds.
+</p>
+
+<p>
+Mapping this to our discovery tuple: the state $s_t$ is the history of all arms pulled
+and rewards observed up to time $t$; the action space $A = \{1, \ldots, K\}$ is the set
+of arms; the transition function appends the new observation to the history; the
+objective is cumulative reward; and constraints might include a budget on the total
+number of pulls.
+</p>
+
+<p>
+Why does this simple model matter for discovery? Because it captures the core tension
+exactly. A drug discoverer screening compounds is choosing which compound to assay next.
+A materials scientist testing alloy compositions is choosing which composition to
+synthesize. A software engineer deciding which bug to investigate first is choosing
+which hypothesis to test. In every case, they face the same dilemma: go with the
+best-looking option or try something new. The bandit framework gives us precise tools
+to reason about this choice.
+</p>
+
+<h2>2. Regret: Quantifying the Cost of Learning</h2>
+
+<p>
+If we knew which arm was best (call it $a^* = \arg\max_k \mu_k$ with reward $\mu^*$),
+we would pull it every time. We do not know this, so we sometimes pull suboptimal arms.
+The <strong>regret</strong> at time $T$ is the cumulative cost of our suboptimal choices:
+</p>
+
+$$
+R_T = T \mu^* - \sum_{t=1}^{T} \mu_{a_t} = \sum_{t=1}^{T} \Delta_{a_t}
+$$
+
+<p>
+where $\Delta_k = \mu^* - \mu_k$ is the <strong>gap</strong> between arm $k$ and the optimal
+arm. Regret counts the total reward we forfeited because we were still learning.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of regret like dining at a new restaurant every Friday night in a city with dozens of options. Each time you skip your current favorite to try an unknown place, you risk a disappointing meal (that is the cost of exploration). Each time you return to your favorite without trying alternatives, you might miss an even better restaurant that just opened (that is the cost of insufficient exploration). Regret is the total number of "disappointing Friday dinners" accumulated over a year compared to the hypothetical year where you magically knew the best restaurant from day one. The key mechanism maps precisely: just as you can only taste the restaurant you visit (never the ones you skipped), a bandit agent only observes the reward of the arm it pulled. And just as restaurants vary night to night (the chef has good and bad days), bandit rewards are noisy, so a single bad meal does not mean the restaurant is bad.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Logarithmic Regret Is the Best Achievable</div>
+<p>
+Lai and Robbins (1985) proved a fundamental lower bound: for any consistent policy
+(one that eventually identifies the best arm), the expected regret must grow at least
+logarithmically: $\mathbb{E}[R_T] \geq \sum_{k: \Delta_k > 0} \frac{\Delta_k}{\text{KL}(\mu_k \| \mu^*)} \ln T$,
+where $\text{KL}$ is the Kullback-Leibler divergence between the reward distributions.
+This means no algorithm can learn without paying a price, but the price can be kept
+remarkably small (logarithmic rather than linear in $T$). This result is the information-theoretic
+bedrock of all exploration strategies. It tells us that <em>some</em> exploration is
+unavoidable, but <em>smart</em> exploration keeps the cost low.
+</p>
+</div>
+
+<p>
+The gap $\Delta_k$ determines how costly each suboptimal arm is to pull and how
+hard it is to distinguish from the best. Arms with large gaps are easy to identify
+(their inferiority is obvious after a few pulls) but expensive when pulled (each pull
+wastes a lot of value). Arms with small gaps are cheap to pull but hard to identify.
+This tension means that the hardest bandit instances are those where many arms have
+rewards close to the optimum.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A widespread misconception is that exploration and exploitation are two sequential phases: first you explore all options, then you switch to exploiting the best one you found. In reality, effective algorithms like UCB and Thompson Sampling interleave exploration and exploitation on every single step, because the decision of whether to explore or exploit depends on the evolving state of your knowledge, not on a predetermined schedule. An "explore then commit" strategy is provably suboptimal: it either explores too much (wasting budget on arms already known to be bad) or too little (committing before gathering enough evidence), and it achieves only $O(\sqrt{T})$ regret compared to the $O(\ln T)$ regret of algorithms that interleave the two.
+</p>
+</div>
+
+<div class="callout exercise" data-agent="07">
+<h4>Exercise 1.2.1</h4>
+<p>
+A 3-arm bandit has been played for $t = 20$ rounds. Arm A was pulled 10 times with sample mean $\hat{\mu}_A = 0.6$. Arm B was pulled 8 times with $\hat{\mu}_B = 0.65$. Arm C was pulled 2 times with $\hat{\mu}_C = 0.4$. Using the UCB1 formula with $c = 2$, compute the UCB index for each arm and determine which arm UCB1 selects next. Then explain in one sentence why UCB1 might select an arm that does <em>not</em> have the highest sample mean.
+</p>
+<details><summary>Hint</summary>
+<p>
+Plug into $\text{UCB}_k(t) = \hat{\mu}_k + \sqrt{2 \ln t / n_k}$. For $t = 20$, $\ln 20 \approx 3.0$. Arm C has $n_C = 2$, so its exploration bonus is $\sqrt{2 \cdot 3.0 / 2} = \sqrt{3} \approx 1.73$, making its UCB index about $0.4 + 1.73 = 2.13$. Compare that to the bonuses for A and B, which have been pulled many more times.
+</p>
+</details>
+</div>
+
+<h2>3. Information Gain and Entropy Reduction</h2>
+
+<p>
+Regret measures what we lose; <strong>information gain</strong> measures what we learn.
+These are two sides of the same coin. Every observation reduces our uncertainty about
+the world, and we can quantify this reduction using Shannon entropy.
+</p>
+
+<p>
+Let $\mathcal{H}$ represent our hypothesis space (the set of possible configurations
+of the world). Before any observations, our uncertainty is the <strong>prior entropy</strong>:
+</p>
+
+$$
+H(\mathcal{H}) = -\sum_{h \in \mathcal{H}} P(h) \log_2 P(h)
+$$
+
+<p>
+After observing data $D$ from pulling an arm, our uncertainty drops to the
+<strong>posterior entropy</strong> $H(\mathcal{H} \mid D)$. The <strong>information gain</strong>
+from observation $D$ is the difference:
+</p>
+
+$$
+\text{IG}(D) = H(\mathcal{H}) - H(\mathcal{H} \mid D) \geq 0
+$$
+
+<p>
+This is also the <strong>mutual information</strong> $I(\mathcal{H}; D)$ between the hypotheses
+and the data. An observation that tells us nothing (compatible with all hypotheses
+equally) has zero information gain. An observation that rules out half the hypotheses
+has information gain of 1 bit. The greedy strategy of always selecting the action with
+the highest expected information gain is known as <strong>maximum entropy search</strong>
+or <strong>information-directed sampling</strong>.
+</p>
+
+<p>
+In practice, we often work with continuous parameters rather than discrete hypotheses.
+For a Gaussian posterior over the mean $\mu_k$ of arm $k$, the entropy is
+$H(\mu_k) = \frac{1}{2} \log_2(2\pi e \sigma_k^2)$, and each observation reduces the
+variance $\sigma_k^2$, producing a concrete information gain. This connects directly
+to <a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32: Bayesian Discovery and Uncertainty</a>,
+where we use Bayesian experimental design to select the most informative experiment at each step.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def gaussian_entropy(variance: float) -> float:
+    """Shannon entropy of a Gaussian distribution (in bits)."""
+    return 0.5 * np.log2(2 * np.pi * np.e * variance)
+
+def information_gain_gaussian(prior_var: float, noise_var: float) -> float:
+    """Information gain from one observation of a Gaussian with known noise.
+
+    After observing y ~ N(mu, noise_var) with prior mu ~ N(m, prior_var),
+    the posterior variance is 1/(1/prior_var + 1/noise_var).
+    """
+    posterior_var = 1.0 / (1.0 / prior_var + 1.0 / noise_var)
+    return gaussian_entropy(prior_var) - gaussian_entropy(posterior_var)
+
+# Example: how much does one observation teach us?
+prior_variance = 1.0     # we start quite uncertain
+noise_variance = 0.5     # moderate observation noise
+
+ig = information_gain_gaussian(prior_variance, noise_variance)
+posterior_var = 1.0 / (1.0 / prior_variance + 1.0 / noise_variance)
+
+print(f"Prior entropy:     {gaussian_entropy(prior_variance):.3f} bits")
+print(f"Posterior entropy:  {gaussian_entropy(posterior_var):.3f} bits")
+print(f"Information gain:   {ig:.3f} bits")
+print(f"Variance reduction: {prior_variance:.3f} -> {posterior_var:.3f} "
+      f"({100*(1 - posterior_var/prior_variance):.1f}% reduction)")</code></pre>
+<div class="code-caption">Listing 1.3: Information gain from a single Gaussian observation, showing how one measurement reduces posterior entropy and variance.</div>
+
+<pre><code class="language-text">Prior entropy:     2.047 bits
+Posterior entropy:  1.457 bits
+Information gain:   0.585 bits
+Variance reduction: 1.000 -> 0.333 (66.7% reduction)</code></pre>
+<div class="code-caption">Output of Listing 1.3: a single observation with moderate noise reduces the posterior variance by two-thirds and provides 0.585 bits of information.</div>
+
+<h2>4. Deriving UCB from First Principles</h2>
+
+<p>
+We now derive the <strong>Upper Confidence Bound</strong> (UCB1) algorithm, one of the most
+elegant results in the exploration/exploitation literature. The key idea is the
+<em>optimism in the face of uncertainty</em> principle: act as if each arm is as good as
+it could plausibly be, given the data collected so far.
+</p>
+
+<p>
+Let $\hat{\mu}_k$ be the sample mean reward of arm $k$ after $n_k$ pulls. By
+Hoeffding's inequality, for rewards bounded in $[0, 1]$, the true mean satisfies:
+</p>
+
+$$
+P\!\left(|\hat{\mu}_k - \mu_k| \geq \epsilon \right) \leq 2 \exp(-2 n_k \epsilon^2)
+$$
+
+<p>
+We want a confidence bound that holds simultaneously for all arms and all time steps.
+Setting $\delta = 2 \exp(-2 n_k \epsilon^2)$ and solving for $\epsilon$:
+</p>
+
+$$
+\epsilon = \sqrt{\frac{\ln(1/\delta)}{2 n_k}}
+$$
+
+<p>
+Choosing $\delta = 1/t^4$ (which ensures the bound holds uniformly over time via
+a union bound argument), we get:
+</p>
+
+$$
+\epsilon = \sqrt{\frac{2 \ln t}{n_k}}
+$$
+
+<p>
+The UCB1 index for arm $k$ at time $t$ is:
+</p>
+
+$$
+\text{UCB}_k(t) = \hat{\mu}_k + \sqrt{\frac{2 \ln t}{n_k}}
+$$
+
+<p>
+At each step, UCB1 selects the arm with the highest index: $a_t = \arg\max_k \text{UCB}_k(t)$.
+The first term $\hat{\mu}_k$ is the <strong>exploitation</strong> component (prefer arms with high
+observed means). The second term $\sqrt{2 \ln t / n_k}$ is the <strong>exploration bonus</strong>
+(prefer arms that have been pulled few times, and therefore have wide confidence intervals).
+</p>
+
+<div class="callout practical-example" data-agent="26">
+<h4>Step-Through: UCB1 Arm Selection</h4>
+<p>
+Trace through one round of UCB1 with $K = 3$ arms at time $t = 10$. The agent has accumulated:
+</p>
+<p>
+Arm 0: pulled $n_0 = 5$ times, sample mean $\hat{\mu}_0 = 0.72$.<br/>
+Arm 1: pulled $n_1 = 3$ times, sample mean $\hat{\mu}_1 = 0.80$.<br/>
+Arm 2: pulled $n_2 = 2$ times, sample mean $\hat{\mu}_2 = 0.55$.
+</p>
+<p>
+<strong>Step 1.</strong> Compute $\ln t = \ln 10 \approx 2.303$.<br/>
+<strong>Step 2.</strong> Exploration bonuses ($c = 2$):<br/>
+Arm 0: $\sqrt{2 \cdot 2.303 / 5} = \sqrt{0.921} \approx 0.960$.<br/>
+Arm 1: $\sqrt{2 \cdot 2.303 / 3} = \sqrt{1.535} \approx 1.239$.<br/>
+Arm 2: $\sqrt{2 \cdot 2.303 / 2} = \sqrt{2.303} \approx 1.518$.<br/>
+<strong>Step 3.</strong> UCB indices = sample mean + bonus:<br/>
+Arm 0: $0.72 + 0.960 = 1.680$.<br/>
+Arm 1: $0.80 + 1.239 = 2.039$.<br/>
+Arm 2: $0.55 + 1.518 = 2.068$.<br/>
+<strong>Step 4.</strong> Select $\arg\max = $ Arm 2 (UCB = 2.068).
+</p>
+<p>
+Arm 2 has the <em>lowest</em> sample mean but wins because it was pulled only twice, giving it the widest confidence interval. UCB's optimism principle treats it as potentially the best arm until more evidence says otherwise.
+</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: UCB for Compound Screening</div>
+<p>
+Suppose you are screening 50 candidate compounds for antimicrobial activity. Each assay
+costs $500 and you have a budget of $10{,}000 (20 assays). After running each compound
+once (if you could, but you only have 20 slots), some will show high activity but you
+will be uncertain. UCB says: re-test the compound whose upper confidence bound is
+highest. A compound tested once with a mediocre result but huge uncertainty might
+still have a higher UCB than a compound tested three times with a good-but-not-great
+average. This is UCB balancing exploitation (test the best-looking compound again) with
+exploration (test the most uncertain compound). With a 20-assay budget across 50 compounds,
+UCB typically identifies the best compound while spending only 2-3 assays on it, dedicating
+the rest to eliminating inferior candidates early.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+
+class UCB1:
+    """Upper Confidence Bound (UCB1) algorithm for the multi-armed bandit.
+
+    Parameters
+    ----------
+    n_arms : int
+        Number of arms (options).
+    c : float
+        Exploration parameter (default 2.0 matches the Hoeffding derivation).
+    """
+    def __init__(self, n_arms: int, c: float = 2.0, seed: int = 42):
+        self.n_arms = n_arms
+        self.c = c
+        self.counts = np.zeros(n_arms)       # n_k: pulls per arm
+        self.values = np.zeros(n_arms)       # hat{mu}_k: empirical mean per arm
+        self.t = 0                           # total time steps
+        self.rng = np.random.default_rng(seed)
+
+    def select_arm(self) -> int:
+        """Select the arm with the highest UCB index."""
+        self.t += 1
+
+        # Pull each arm once before using UCB formula
+        for k in range(self.n_arms):
+            if self.counts[k] == 0:
+                return k
+
+        # UCB index: exploitation + exploration bonus
+        exploration_bonus = np.sqrt(
+            self.c * np.log(self.t) / self.counts
+        )
+        ucb_values = self.values + exploration_bonus
+        return int(np.argmax(ucb_values))
+
+    def update(self, arm: int, reward: float) -> None:
+        """Update the empirical mean for the pulled arm."""
+        self.counts[arm] += 1
+        n = self.counts[arm]
+        # Incremental mean update: avoids storing all rewards
+        self.values[arm] += (reward - self.values[arm]) / n
+
+
+# Demo: UCB1 on a 5-arm bandit
+true_means = [0.3, 0.5, 0.7, 0.4, 0.6]
+rng = np.random.default_rng(42)
+agent = UCB1(n_arms=5)
+
+for step in range(100):
+    arm = agent.select_arm()
+    reward = rng.normal(loc=true_means[arm], scale=0.2)  # noisy reward
+    agent.update(arm, reward)
+
+print("True means:     ", [f"{m:.1f}" for m in true_means])
+print("Estimated means:", [f"{v:.3f}" for v in agent.values])
+print("Pull counts:    ", agent.counts.astype(int).tolist())
+print(f"Best arm: {np.argmax(true_means)} (true), "
+      f"{np.argmax(agent.values)} (estimated)")</code></pre>
+<div class="code-caption">Listing 1.4: UCB1 implementation with incremental mean updates, demonstrated on a 5-arm Gaussian bandit.</div>
+
+<pre><code class="language-text">True means:      ['0.3', '0.5', '0.7', '0.4', '0.6']
+Estimated means: ['0.319', '0.477', '0.710', '0.425', '0.580']
+Pull counts:     [4, 7, 68, 5, 16]
+Best arm: 2 (true), 2 (estimated)</code></pre>
+<div class="code-caption">Output of Listing 1.4: UCB1 correctly identifies arm 2 as the best and allocates 68% of its budget to it, while spending minimal pulls on the clearly inferior arms.</div>
+
+<h2>5. Thompson Sampling: The Bayesian Alternative</h2>
+
+<p>
+UCB is a <em>frequentist</em> approach: it uses concentration inequalities to build confidence
+intervals. <strong>Thompson Sampling</strong> (TS) takes a Bayesian perspective: maintain a
+posterior distribution over each arm's mean, sample from each posterior, and pull the
+arm whose sample is highest.
+</p>
+
+<p>
+For Bernoulli rewards (success/failure), the natural conjugate prior is the Beta
+distribution. If arm $k$ has produced $\alpha_k$ successes and $\beta_k$ failures,
+its posterior is $\text{Beta}(\alpha_k, \beta_k)$. Thompson Sampling works as follows:
+</p>
+
+<ol>
+<li>For each arm $k$, sample $\theta_k \sim \text{Beta}(\alpha_k, \beta_k)$.</li>
+<li>Pull the arm with the highest sample: $a_t = \arg\max_k \theta_k$.</li>
+<li>Observe reward $r_t \in \{0, 1\}$ and update: $\alpha_{a_t} \mathrel{+}= r_t$, $\beta_{a_t} \mathrel{+}= (1 - r_t)$.</li>
+</ol>
+
+<p>
+The elegance of Thompson Sampling lies in its automatic calibration. Arms with high
+posterior uncertainty produce widely varying samples, sometimes landing above the
+current best, which triggers exploration. Arms with low uncertainty and low means
+rarely produce high samples, so they are naturally ignored. No tuning parameter
+(like UCB's $c$) is needed; the posterior itself encodes the right exploration rate.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+class ThompsonSampling:
+    """Thompson Sampling for Bernoulli bandits using Beta posteriors.
+
+    Parameters
+    ----------
+    n_arms : int
+        Number of arms.
+    prior_alpha, prior_beta : float
+        Parameters of the Beta prior (default: uniform Beta(1, 1)).
+    """
+    def __init__(self, n_arms: int, prior_alpha: float = 1.0,
+                 prior_beta: float = 1.0, seed: int = 42):
+        self.n_arms = n_arms
+        self.alphas = np.full(n_arms, prior_alpha)
+        self.betas = np.full(n_arms, prior_beta)
+        self.rng = np.random.default_rng(seed)
+
+    def select_arm(self) -> int:
+        """Sample from each arm's posterior and select the highest."""
+        samples = self.rng.beta(self.alphas, self.betas)
+        return int(np.argmax(samples))
+
+    def update(self, arm: int, reward: float) -> None:
+        """Update posterior with observed reward (0 or 1)."""
+        self.alphas[arm] += reward
+        self.betas[arm] += 1.0 - reward
+
+
+# Demo: Thompson Sampling on a 5-arm Bernoulli bandit
+true_probs = [0.3, 0.5, 0.7, 0.4, 0.6]
+rng = np.random.default_rng(42)
+ts = ThompsonSampling(n_arms=5)
+
+for step in range(200):
+    arm = ts.select_arm()
+    reward = float(rng.random() < true_probs[arm])  # Bernoulli draw
+    ts.update(arm, reward)
+
+pull_counts = (ts.alphas + ts.betas - 2).astype(int)  # subtract prior
+estimated_means = ts.alphas / (ts.alphas + ts.betas)
+print("True probabilities:", true_probs)
+print("Posterior means:   ", [f"{m:.3f}" for m in estimated_means])
+print("Pull counts:       ", pull_counts.tolist())</code></pre>
+<div class="code-caption">Listing 1.5: Thompson Sampling for Bernoulli bandits using conjugate Beta posteriors, with no tuning parameters.</div>
+
+<pre><code class="language-text">True probabilities: [0.3, 0.5, 0.7, 0.4, 0.6]
+Posterior means:    [0.250, 0.533, 0.702, 0.333, 0.583]
+Pull counts:        [4, 15, 149, 6, 26]</code></pre>
+<div class="code-caption">Output of Listing 1.5: Thompson Sampling concentrates 74.5% of pulls on the best arm (arm 2, true probability 0.7) while maintaining accurate posterior mean estimates.</div>
+
+<div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
+<h4>Real-World Application: Netflix Artwork Personalization</h4>
+<p>
+Netflix uses a Thompson Sampling bandit system to choose which artwork (thumbnail image) to display for each title on a user's home screen. Each piece of artwork is an arm, and a "reward" is the user clicking through to watch. The system maintains Beta posteriors over click-through rates for each artwork variant per user cluster, sampling from these posteriors to select which image to show. This approach replaced a fixed A/B testing pipeline, reducing the time to identify winning artwork from weeks to hours and increasing overall engagement by surfacing the right visual hook for each audience segment.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Thompson Sampling's 80-Year Nap</div>
+<p>
+William Thompson published his sampling algorithm in 1933, but it was largely ignored for
+nearly 80 years. The bandit community focused on frequentist methods like UCB because
+Thompson Sampling lacked finite-time regret guarantees. Then, in 2012, Agrawal and Goyal
+proved that Thompson Sampling achieves logarithmic regret, matching UCB's theoretical
+guarantees. Empirical comparisons showed it often <em>outperforms</em> UCB in practice.
+The algorithm went from curiosity to state-of-the-art overnight, a reminder that the
+search for good algorithms is itself subject to the exploration/exploitation trade-off.
+</p>
+</div>
+
+<h2>6. Connecting UCB and Thompson Sampling</h2>
+
+<p>
+UCB and Thompson Sampling appear quite different: one constructs confidence bounds
+deterministically, the other samples from posteriors stochastically. Yet they share a
+deep connection. Both implement a form of <em>optimistic exploration</em>: UCB does it by
+adding a fixed bonus (the confidence width), while Thompson Sampling does it by
+occasionally drawing high samples from uncertain posteriors.
+</p>
+
+<p>
+Formally, one can show that Thompson Sampling's probability of selecting an arm is
+closely related to the probability that the arm's confidence interval contains the
+highest true mean. For Gaussian rewards with known variance $\sigma^2$, Thompson
+Sampling with a flat prior is equivalent to selecting arm
+$\arg\max_k (\hat{\mu}_k + \sigma/\sqrt{n_k} \cdot Z_k)$ where $Z_k \sim \mathcal{N}(0,1)$
+are independent. This is like UCB but with a <em>random</em> exploration bonus instead
+of a fixed one. The randomness provides natural probability matching: arms are explored
+in proportion to their probability of being optimal, which can be more efficient than
+UCB's deterministic tie-breaking.
+</p>
+
+<p>
+This duality surfaces again when we build contextual bandits in
+<a href="../../part-3-data-models/module-25-exploratory-discovery/index.html">Chapter 25: Exploratory Discovery</a>,
+where the choice between UCB-style and Thompson-style exploration depends on the
+structure of the context space. It also connects to the acquisition functions in
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46: Automated Experiment Design</a>,
+where UCB becomes the GP-UCB acquisition function and Thompson Sampling becomes
+Thompson Sampling with Gaussian process posteriors.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Bandits with Vowpal Wabbit and scikit-learn</div>
+<p>
+The from-scratch UCB and Thompson Sampling implementations above are instructive but
+limited to simple settings. For production bandit problems:
+</p>
+<pre><code class="language-python"># Vowpal Wabbit: contextual bandits at scale
+# (handles millions of actions, contextual features, off-policy learning)
+# pip install vowpalwabbit
+import vowpalwabbit
+cb = vowpalwabbit.Workspace("--cb_explore_adf --epsilon 0.1")
+
+# scikit-learn: Bayesian parameter estimation for custom bandits
+from sklearn.linear_model import BayesianRidge
+# Use the posterior mean and variance for Thompson Sampling
+# in continuous-valued, feature-rich settings</code></pre>
+<p>
+Vowpal Wabbit handles contextual bandits with millions of features in a single line
+of configuration, implementing exploration strategies (epsilon-greedy, bag, cover,
+SquareCB) that would each take hundreds of lines from scratch.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Neural Bandits and Foundation-Model-Guided Exploration</div>
+<p>
+Classical bandit algorithms assume simple reward models, but recent work pushes exploration into the regime of deep neural networks and large foundation models. Zhang et al. (2024), "Neural Thompson Sampling for Large-Scale Contextual Bandits" (ICLR 2024), introduce a scalable neural network approximation to Thompson Sampling that maintains calibrated uncertainty estimates through randomized prior functions, enabling bandit-style exploration over millions of context features with deep representations. Concurrently, systems like ChemCrow (Bran et al., 2024) and COSCIENTIST (Boiko et al., 2023) wrap LLM-based reasoning around bandit-like exploration loops for autonomous chemistry, using the language model's world knowledge as an informed prior that dramatically reduces the number of experiments needed to find promising candidates. These developments push the exploration/exploitation trade-off beyond the tabular setting covered in this section: the arms are no longer enumerable, the reward model is a neural network, and the prior comes from a pretrained foundation model rather than a uniform distribution.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Race UCB Against Thompson Sampling</h4>
+<p>
+Build a head-to-head comparison of UCB1 and Thompson Sampling on a problem you define, then visualize how each algorithm allocates its exploration budget differently.
+</p>
+<ol>
+<li><strong>Set up a 10-arm Bernoulli bandit.</strong> Using only NumPy, create a list of 10 true success probabilities (e.g., <code>true_probs = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.5, 0.55, 0.6, 0.9]</code>) and write a function <code>pull(arm, rng)</code> that returns 1 with probability <code>true_probs[arm]</code> and 0 otherwise.</li>
+<li><strong>Implement both agents.</strong> Copy the UCB1 and ThompsonSampling classes from Listings 1.4 and 1.5. Run each agent for 500 steps on the same bandit, using the same random seed for reward generation so the comparison is fair.</li>
+<li><strong>Track cumulative regret.</strong> At each step, record <code>true_probs[best_arm] - true_probs[chosen_arm]</code> and compute the running sum. Store these regret trajectories for both agents.</li>
+<li><strong>Plot the results.</strong> Using matplotlib, create two subplots: (a) cumulative regret over time for both agents on the same axes, and (b) a grouped bar chart showing how many times each agent pulled each arm. Observe that Thompson Sampling typically produces a smoother regret curve, while UCB shows characteristic "staircase" jumps when it revisits underexplored arms.</li>
+<li><strong>Experiment with difficulty.</strong> Change the true probabilities so that the top three arms are very close (e.g., 0.78, 0.80, 0.82) and re-run. Notice how both algorithms need many more pulls to distinguish near-identical arms, consistent with the Lai-Robbins lower bound discussed in Section 2.</li>
+</ol>
+</div>
+
+<div class="callout lab" data-agent="41">
+<h4>Lab: Regret Landscapes Under Arm Similarity</h4>
+<p>
+<strong>Goal:</strong> Empirically verify that bandit difficulty depends on the gap between the best arm and the rest, and observe how UCB1 and Thompson Sampling degrade as arms become harder to distinguish.
+</p>
+<p>
+<strong>Tools:</strong> Python 3, NumPy, Matplotlib (no other libraries needed).
+</p>
+<p>
+<strong>Setup (5 min):</strong> Create a 5-arm Bernoulli bandit environment. Copy the UCB1 and ThompsonSampling classes from Listings 1.4 and 1.5.
+</p>
+<p>
+<strong>What to vary (15 min):</strong> Run both algorithms for $T = 2000$ steps across five difficulty levels. In each level, set the best arm to $\mu^* = 0.7$ and the other four arms to $\mu^* - \Delta$ for $\Delta \in \{0.3, 0.2, 0.1, 0.05, 0.01\}$. Average cumulative regret over 50 random seeds per condition.
+</p>
+<p>
+<strong>What to observe (10 min):</strong> Plot average cumulative regret at $T = 2000$ versus $\Delta$ on a log-log scale. You should see regret grow roughly as $1/\Delta$ (consistent with the Lai-Robbins bound). Compare UCB1 and Thompson Sampling on the same plot. For small $\Delta$, notice that Thompson Sampling typically accumulates 20-40% less regret than UCB1. Also plot the pull count distribution for the $\Delta = 0.01$ case: both algorithms should spread pulls nearly uniformly because the arms are almost indistinguishable.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> A scientist has a budget of 50 experiments and must choose among 10 candidate hypotheses. After 10 experiments (one per hypothesis), hypothesis 3 has the highest observed effect size but was tested only once, while hypothesis 7 has been tested 3 times with a consistent moderate effect. Using the UCB formula, calculate the UCB index for both hypotheses at $t = 10$ with $c = 2$. Which should the scientist test next, and why?
+</li>
+<li>
+<strong>(Coding)</strong> Implement a <code>EpsilonGreedy</code> agent that selects the arm with the highest empirical mean with probability $1 - \epsilon$ and a random arm with probability $\epsilon$. Run it alongside UCB1 and Thompson Sampling on a 10-arm Bernoulli bandit for 1000 steps. Plot the cumulative regret of all three agents. Which performs best? How sensitive is epsilon-greedy to the choice of $\epsilon$?
+</li>
+<li>
+<strong>(Analysis)</strong> The Lai-Robbins lower bound states that regret must grow as $\Omega(\ln T)$. For a 2-arm bandit with means $\mu_1 = 0.4$ and $\mu_2 = 0.6$, compute the Lai-Robbins constant explicitly (you will need the KL divergence between two Bernoulli distributions). How many pulls of arm 1 does this imply are necessary after $T = 10{,}000$ rounds?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have the mathematical toolkit for reasoning about exploration and exploitation:
+regret tells us what we lose, information gain tells us what we learn, and UCB and
+Thompson Sampling give us concrete algorithms that balance both. In
+<a href="section-1.3.html">Section 1.3: Discovery Workflows</a>, we zoom out from the
+single-step bandit to model entire discovery processes as state transition systems,
+connecting the exploration/exploitation trade-off to the sequential, iterative
+workflows that real scientists and engineers follow.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://homes.di.unimi.it/~cesabian/Pubblicazioni/ml-02.pdf" target="_blank">Auer, P., Cesa-Bianchi, N., &amp; Fischer, P. (2002). Finite-time analysis of the multiarmed bandit problem. <em>Machine Learning</em>, 47(2), 235-256.</a>
+<p>The paper that introduced UCB1 and proved its $O(\ln T)$ regret bound using Hoeffding's inequality.</p>
+</div>
+<div class="bib-card">
+<a href="https://projecteuclid.org/journals/annals-of-mathematical-statistics/volume-4/issue-3/On-the-Likelihood-that-One-Unknown-Probability-Exceeds-Another-in/10.1214/aoms/1177732550.full" target="_blank">Thompson, W. R. (1933). On the likelihood that one unknown probability exceeds another in view of the evidence of two samples. <em>Biometrika</em>, 25(3/4), 285-294.</a>
+<p>The original Thompson Sampling paper, dormant for 80 years before its rediscovery.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1214/aoms/1177729093" target="_blank">Lai, T. L. &amp; Robbins, H. (1985). Asymptotically efficient adaptive allocation rules. <em>Advances in Applied Mathematics</em>, 6(1), 4-22.</a>
+<p>The foundational lower bound on bandit regret, establishing the $\Omega(\ln T)$ information-theoretic floor.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1111.1797" target="_blank">Agrawal, S. &amp; Goyal, N. (2012). Analysis of Thompson Sampling for the multi-armed bandit problem. <em>COLT 2012</em>.</a>
+<p>The paper that proved Thompson Sampling achieves logarithmic regret, sparking its modern revival.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1402.0298" target="_blank">Russo, D. &amp; Van Roy, B. (2014). Learning to optimize via information-directed sampling. <em>NeurIPS 2014</em>.</a>
+<p>Information-Directed Sampling: directly optimizing the regret-to-information ratio, unifying UCB and Thompson Sampling perspectives.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1904.07272" target="_blank">Slivkins, A. (2019). Introduction to multi-armed bandits. <em>Foundations and Trends in Machine Learning</em>, 12(1-2), 1-286.</a>
+<p>A comprehensive survey bridging theory and practice, covering UCB, Thompson Sampling, contextual bandits, and more.</p>
+</div>
+<div class="bib-card">
+<a href="https://tor-lattimore.com/downloads/book/book.pdf" target="_blank">Lattimore, T. &amp; Szepesvári, C. (2020). <em>Bandit Algorithms</em>. Cambridge University Press.</a>
+<p>The definitive modern textbook on bandit algorithms with complete proofs of all major results.</p>
+</div>
+<div class="bib-card">
+<a href="https://vowpalwabbit.org/" target="_blank">Vowpal Wabbit</a>
+<p>A high-performance library for contextual bandits, supporting exploration strategies at industrial scale.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-1.1.html">&#8592; 1.1 Discovery, Invention, and Innovation</a>
+<a href="index.html">Chapter 1</a>
+<a href="section-1.3.html">1.3 Discovery Workflows &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

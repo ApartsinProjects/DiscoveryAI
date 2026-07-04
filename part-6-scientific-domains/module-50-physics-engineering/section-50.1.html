@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 50.1: Symbolic Regression for Physics. Dimensional analysis as a hard constraint, PySR with custom operators, rediscovering physical laws, and extrapolation advantages over neural networks." name="description"/>
+<title>Section 50.1: Symbolic Regression for Physics | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Discovery in Scientific Domains</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 50: Discovery AI for Physics and Engineering</a></div>
+<h1>50.1 Symbolic Regression for Physics</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"My fitness function says $F = 3.7x^{2.1}$ fits beautifully. My physics advisor says that exponent should be exactly 2.0 and the coefficient should have units. We are no longer on speaking terms."</p>
+<cite>A Genetic Program That Never Took Dimensional Analysis</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Standard symbolic regression (covered in
+<a href="../../part-3-data-models/module-35-symbolic-regression/index.html">Chapter 35</a>)
+searches for mathematical expressions that fit data. Physics-aware symbolic regression
+adds a crucial constraint: the discovered equation must be <em>dimensionally
+consistent</em>. This single requirement eliminates the vast majority of candidate
+expressions, transforming an intractable combinatorial search into a manageable one.
+When combined with custom operator libraries and symmetry priors, the result is a
+system that can rediscover known physical laws from noisy data and, more importantly,
+propose new ones that extrapolate correctly because they respect the structure of
+physical quantities.
+</p>
+</div>
+
+<h2>1. Why Dimensions Matter</h2>
+
+<p>
+Every physical quantity carries units. Velocity is meters per second. Force is kilograms
+times meters per second squared. Energy is kilograms times meters squared per second
+squared. The <strong>Buckingham Pi theorem</strong> states that any physically meaningful
+equation relating $n$ variables with $k$ independent dimensions can be rewritten as a
+relationship among $n - k$ dimensionless groups. This is not a heuristic; it is a
+mathematical theorem with a straightforward proof from linear algebra over the
+dimension matrix.
+</p>
+
+<p data-agent="02">
+Dimensional analysis is the practice of tracking the physical units (such as mass, length, and time) through every term of an equation and requiring that both sides match. It matters because equations that violate dimensional consistency are guaranteed to be physically meaningless, regardless of how well they fit training data. The mechanism is simple: represent each variable as a vector of unit exponents (for example, velocity is $[0, 1, -1]$ in the mass-length-time system), then enforce that arithmetic operations produce valid exponent combinations at every step. Use dimensional analysis as a first filter whenever the variables have known physical units; reserve unconstrained symbolic regression for problems where quantities are abstract or dimensionless by nature.
+</p>
+
+<p>
+Consider the drag force on a sphere moving through a fluid. The relevant variables are
+the drag force $F_D$ (dimensions $[MLT^{-2}]$), fluid density $\rho$ ($[ML^{-3}]$),
+velocity $v$ ($[LT^{-1}]$), sphere diameter $d$ ($[L]$), and dynamic viscosity
+$\mu$ ($[ML^{-1}T^{-1}]$). We have $n = 5$ variables and $k = 3$ independent
+dimensions ($M$, $L$, $T$), so the Buckingham Pi theorem guarantees that the
+relationship can be expressed in terms of $5 - 3 = 2$ dimensionless groups. The
+standard choice is the drag coefficient $C_D = F_D / (\frac{1}{2} \rho v^2 A)$
+and the Reynolds number $\text{Re} = \rho v d / \mu$. The entire physics of drag
+on a sphere is captured by a single function: $C_D = f(\text{Re})$.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of dimensional analysis like sorting ingredients by category when following a recipe. You would never add "3 cups of oven temperature" to "2 tablespoons of baking time" because cups-of-degrees and tablespoons-of-minutes are nonsensical combinations. In the same way, dimensional analysis rejects any equation that tries to add meters to seconds or multiply force by force when the result should be energy. Just as a recipe checker that flags "add 350 degrees to the flour" would eliminate most nonsense recipes before you ever turn on the oven, dimensional constraints eliminate most nonsense equations before the symbolic regression algorithm ever evaluates their fit to data. The "categories" are the base units (mass, length, time), and the "recipe rules" are that you can only add quantities of the same category and that multiplication creates new combined categories.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Dimensional Analysis as Search Space Reduction</div>
+<p>
+Without dimensional constraints, symbolic regression over $n$ variables explores
+expressions like $x_1^{2.3} + \sin(x_2 / x_3^{0.7})$, a space that grows
+combinatorially. With dimensional constraints, most of these expressions are
+immediately invalid (you cannot add meters to seconds, or take the sine of a
+dimensional quantity). The constraint acts as a massive pruning operator on the
+search tree, often reducing the effective search space by orders of magnitude.
+Tegmark and Udrescu's AI Feynman system reports that dimensional analysis alone
+reduces the search space by a factor of $10^3$ to $10^6$ on typical physics problems.
+</p>
+</div>
+
+<h2>2. PySR with Dimensional Constraints</h2>
+
+<p>
+<a href="https://astroautomata.com/PySR/" target="_blank">PySR</a> is the leading
+open-source symbolic regression library, backed by the high-performance
+SymbolicRegression.jl engine in Julia. Since version 0.12, PySR supports dimensional
+constraints natively. You specify the physical dimensions of each input variable and
+the target, and PySR ensures that every candidate expression is dimensionally
+consistent at every node of the expression tree.
+</p>
+
+<p>
+The mechanism works as follows. Each node in the expression tree carries a dimension
+vector. For binary operations like addition and subtraction, PySR requires that both
+children have identical dimension vectors (you cannot add meters to kilograms). For
+multiplication, dimension vectors add. For division, they subtract. For
+exponentiation by a constant, they scale. For transcendental functions (sin, cos,
+exp), PySR requires a dimensionless argument. These rules propagate from leaves to
+root, and any tree whose root dimensions do not match the target is rejected before
+fitness evaluation.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misunderstanding is that symbolic regression, given enough iterations and data, will inevitably converge to the "true" physical law. This is incorrect: symbolic regression is a stochastic search over a discrete space of expression trees, and it can get trapped in local optima, miss the correct functional form if the required operators are not in its library, or return a numerically close approximation (such as $r^{1.97}$ instead of $r^2$) that fits the training data but fails on extrapolation. Dimensional constraints greatly improve the odds by pruning invalid candidates, but they do not guarantee discovery of the exact law. Always validate discovered expressions against held-out data, check that exponents are physically plausible rational numbers, and run multiple independent searches to confirm consistency.
+</p>
+</div>
+
+<p>
+Let us set up a dimensionally-constrained PySR run that rediscovers Newton's law of
+gravitation from synthetic data.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from pysr import PySRRegressor
+
+# Generate synthetic gravitational force data
+rng = np.random.default_rng(42)
+n_samples = 200
+
+m1 = rng.uniform(1e20, 1e30, n_samples)   # mass 1 (kg)
+m2 = rng.uniform(1e20, 1e30, n_samples)   # mass 2 (kg)
+r = rng.uniform(1e8, 1e12, n_samples)     # distance (m)
+
+G = 6.674e-11  # gravitational constant (m^3 kg^-1 s^-2)
+F = G * m1 * m2 / r**2                    # Newton's law
+
+# Add 1% Gaussian noise
+F_noisy = F * (1 + 0.01 * rng.standard_normal(n_samples))
+
+X = np.column_stack([m1, m2, r])
+y = F_noisy
+</code></pre>
+<div class="code-caption">Generating synthetic gravitational force data with 1% noise for symbolic regression.</div>
+
+<p>
+Now we configure PySR with dimensional constraints. Each variable and the target gets
+a dimension vector in the MLT system (mass, length, time).
+</p>
+
+<pre><code class="language-python">model = PySRRegressor(
+    niterations=100,
+    binary_operators=["+", "-", "*", "/"],
+    unary_operators=["square", "cube", "sqrt"],
+    maxsize=20,
+    # Dimensional constraints: [mass, length, time]
+    # m1, m2: [1, 0, 0] (kg)
+    # r: [0, 1, 0] (m)
+    # F: [1, 1, -2] (kg m s^-2 = Newton)
+    dimensional_constraint_penalty=1e6,
+    select_k_features=3,
+    populations=30,
+    population_size=50,
+    parsimony=0.005,       # prefer simpler expressions
+    progress=True,
+)
+
+# PySR accepts units via X_units and y_units
+model.fit(
+    X, y,
+    X_units=["kg", "kg", "m"],
+    y_units="kg * m / s^2",
+)
+
+print(model)
+</code></pre>
+<div class="code-caption">Configuring PySR with MLT dimensional constraints to search for the gravitational force law.</div>
+
+<p>
+After a few minutes of evolution, PySR typically returns a Pareto front of expressions
+trading complexity against accuracy. The dominant expression on the front for this
+problem is:
+</p>
+
+$$F = C \cdot \frac{m_1 \cdot m_2}{r^2}$$
+
+<p>
+where $C \approx 6.67 \times 10^{-11}$ in SI units. PySR discovers the correct
+functional form because dimensional analysis forces the numerator to have dimensions
+$[M^2]$ and the denominator $[L^2]$, yielding the required $[MLT^{-2}]$ for force.
+Alternative expressions like $m_1 + m_2$ (dimensionally valid only for mass, not
+force) or $m_1 / r$ (dimensions $[MT^0L^{-1}]$, not $[MLT^{-2}]$) are pruned
+before evaluation.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Rediscovering Kepler's Third Law</div>
+<p>
+Kepler's third law states that the square of a planet's orbital period is proportional
+to the cube of its semi-major axis: $T^2 = \frac{4\pi^2}{GM} a^3$. Using PySR with
+variables $a$ (meters), $M$ (kilograms), and target $T$ (seconds), dimensional
+analysis requires expressions with dimensions $[T]$. The search quickly converges to
+$T \propto a^{3/2} / \sqrt{M}$, the correct scaling. The constant $4\pi^2/G$ emerges
+from the fitted coefficient. Without dimensional constraints, PySR explores many
+spurious alternatives like $T = a^{1.49} \cdot M^{-0.51}$, which fits the training
+data equally well but fails to extrapolate to new planetary systems because the
+exponents are approximate rather than exact.
+</p>
+</div>
+
+<h2>3. Custom Operators and Physics Priors</h2>
+
+<p>
+Real physics problems often involve operators beyond the standard arithmetic set.
+Oscillatory systems need trigonometric functions. Exponential decay requires exp and
+log. Fluid dynamics involves power laws with specific rational exponents. PySR allows
+you to define custom operators and constrain their use.
+</p>
+
+<pre><code class="language-python">from pysr import PySRRegressor
+
+# Custom operator: inverse square (common in physics)
+model = PySRRegressor(
+    niterations=80,
+    binary_operators=["+", "-", "*", "/"],
+    unary_operators=[
+        "square",
+        "cube",
+        "sqrt",
+        "inv(x) = 1/x",          # explicit inverse
+        "neg(x) = -x",
+    ],
+    # Constrain nesting depth to avoid exp(exp(exp(...)))
+    nested_constraints={
+        "square": {"square": 0, "cube": 0},
+        "cube": {"square": 0, "cube": 0},
+        "sqrt": {"sqrt": 0},
+    },
+    maxsize=25,
+    parsimony=0.003,
+    populations=40,
+)
+</code></pre>
+<div class="code-caption">Defining custom operators with nesting constraints to encode physics priors about expected expression structure.</div>
+
+<p>
+The <code>nested_constraints</code> parameter is particularly powerful for physics.
+Setting <code>"square": {"square": 0}</code> prevents expressions like $(x^2)^2$,
+which should be written as $x^4$ if the fourth power is relevant. This constraint
+reduces search space bloat without excluding any genuinely useful expressions.
+</p>
+
+<h2>4. SymPy Verification and Simplification</h2>
+
+<p>
+PySR outputs expressions as strings, but for physics applications you need to verify
+dimensional consistency, simplify, and convert to publication-quality LaTeX. SymPy
+handles all three tasks.
+</p>
+
+<pre><code class="language-python">import sympy as sp
+from sympy.physics.units import (
+    kilogram, meter, second, newton,
+    convert_to
+)
+from sympy.physics.units.systems import SI
+
+# Suppose PySR discovered: F = C * m1 * m2 / r**2
+m1, m2, r, C = sp.symbols('m_1 m_2 r C', positive=True)
+F_expr = C * m1 * m2 / r**2
+
+# Verify dimensions symbolically
+from sympy.physics.units.dimensions import (
+    mass, length, time, Dimension
+)
+
+# Assign dimensions to symbols
+dim_map = {m1: mass, m2: mass, r: length}
+
+def check_dimensions(expr, dim_map, target_dim):
+    """Verify that expr has the target dimension."""
+    # Substitute dimensions for symbols
+    dim_expr = expr
+    for sym, dim in dim_map.items():
+        dim_expr = dim_expr.subs(sym, dim)
+    # C must have dimensions to make F = force
+    # Force = mass * length / time**2
+    return sp.simplify(dim_expr)
+
+result = check_dimensions(F_expr, dim_map, mass * length / time**2)
+print(f"Dimensional form: {result}")
+
+# Simplify the discovered expression
+F_simplified = sp.simplify(F_expr)
+print(f"Simplified: {F_simplified}")
+
+# Convert to LaTeX for publication
+latex_str = sp.latex(F_simplified)
+print(f"LaTeX: {latex_str}")
+# Output: \frac{C m_{1} m_{2}}{r^{2}}
+</code></pre>
+<div class="code-caption">Using SymPy to verify dimensional consistency, simplify discovered expressions, and generate LaTeX output.</div>
+
+<p>
+For more complex discovered expressions, SymPy's <code>simplify</code>,
+<code>trigsimp</code>, and <code>powsimp</code> functions can reveal hidden structure.
+An expression that PySR outputs as <code>sqrt(x**2 + y**2) * cos(atan2(y, x))</code>
+simplifies to <code>x</code>, exposing the coordinate transformation underlying the data.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PySR Handles Units End-to-End</div>
+<p>
+The manual dimensional analysis code above illustrates the mechanics, but PySR's
+built-in unit system handles everything automatically. When you pass
+<code>X_units</code> and <code>y_units</code> to <code>model.fit()</code>, PySR
+propagates units through every candidate expression and rejects dimensionally
+inconsistent ones before fitness evaluation. This reduces a 50-line dimensional
+analysis pipeline to two keyword arguments. The library also exports discovered
+equations directly as SymPy expressions via <code>model.sympy()</code>, saving the
+manual string parsing shown above.
+</p>
+</div>
+
+<h2>5. Extrapolation: Where Symbolic Regression Wins</h2>
+
+<p>
+The decisive advantage of symbolic regression over neural networks in physics is
+<strong>extrapolation</strong>. A neural network trained on drag force data for
+Reynolds numbers between 100 and 10,000 has no principled way to predict drag at
+$\text{Re} = 100{,}000$. Its prediction depends on the arbitrary behavior of its
+activation functions outside the training distribution. A symbolic expression with
+the correct functional form (say, $C_D \propto \text{Re}^{-0.5}$ in the laminar regime)
+extrapolates correctly because the mathematical structure encodes the underlying physics.
+</p>
+
+<p>
+Let us quantify this advantage on a concrete benchmark: the damped harmonic oscillator
+$x(t) = A e^{-\gamma t} \cos(\omega t + \phi)$.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from pysr import PySRRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+
+# Ground truth: damped oscillator
+A, gamma, omega, phi = 2.0, 0.3, 4.0, 0.5
+
+def oscillator(t):
+    return A * np.exp(-gamma * t) * np.cos(omega * t + phi)
+
+# Training data: t in [0, 5]
+t_train = np.linspace(0, 5, 200).reshape(-1, 1)
+y_train = oscillator(t_train.ravel())
+
+# Test data: t in [5, 10] (extrapolation region)
+t_test = np.linspace(5, 10, 200).reshape(-1, 1)
+y_test = oscillator(t_test.ravel())
+
+# Neural network baseline
+scaler = StandardScaler()
+t_train_scaled = scaler.fit_transform(t_train)
+t_test_scaled = scaler.transform(t_test)
+
+nn = MLPRegressor(
+    hidden_layer_sizes=(64, 64, 64),
+    max_iter=5000,
+    random_state=42,
+    activation='tanh',
+)
+nn.fit(t_train_scaled, y_train)
+y_nn_extrap = nn.predict(t_test_scaled)
+
+# Symbolic regression
+sr = PySRRegressor(
+    niterations=60,
+    binary_operators=["+", "-", "*", "/"],
+    unary_operators=["cos", "sin", "exp", "neg"],
+    maxsize=25,
+    parsimony=0.002,
+)
+sr.fit(t_train, y_train)
+y_sr_extrap = sr.predict(t_test)
+
+# Compare extrapolation error
+nn_rmse = np.sqrt(np.mean((y_nn_extrap - y_test)**2))
+sr_rmse = np.sqrt(np.mean((y_sr_extrap - y_test)**2))
+
+print(f"Neural network extrapolation RMSE: {nn_rmse:.4f}")
+print(f"Symbolic regression extrapolation RMSE: {sr_rmse:.4f}")
+print(f"Improvement factor: {nn_rmse / sr_rmse:.1f}x")
+</code></pre>
+<div class="code-caption">Comparing symbolic regression and neural network extrapolation on a damped oscillator, training on [0, 5] and testing on [5, 10].</div>
+
+<p>
+On this problem, the neural network achieves training RMSE below 0.01 but
+extrapolation RMSE above 1.0: it has memorized the training waveform but cannot
+predict future oscillations. PySR, when it discovers the correct functional form
+$x(t) = c_1 e^{-c_2 t} \cos(c_3 t + c_4)$, extrapolates with RMSE comparable to
+the noise level. The improvement factor is typically 100x or more.
+</p>
+
+<p>
+This advantage is not universal. Symbolic regression requires that the true relationship
+be expressible as a compact mathematical formula. For chaotic systems, turbulent flows,
+or high-dimensional many-body interactions, no compact expression exists, and neural
+networks with appropriate inductive biases (see
+<a href="section-50.3.html">Section 50.3</a>) are the better tool. The decision
+framework is straightforward: if you believe the physics admits a simple law, use
+symbolic regression. If the complexity is inherently high-dimensional, use neural
+operators or PINNs.
+</p>
+
+<h2>6. Multi-Objective Symbolic Search</h2>
+
+<p>
+PySR's Pareto front provides multiple candidate expressions, each representing a
+different tradeoff between accuracy and complexity. In physics, the right choice is
+often not the most accurate expression but the simplest one that captures the dominant
+behavior. This is Occam's razor formalized as multi-objective optimization.
+</p>
+
+<pre><code class="language-python"># After fitting, inspect the Pareto front
+print(model.equations_)
+
+# Each row shows: complexity, loss, equation, score
+# Score = -d(loss)/d(complexity) measures the marginal
+# value of each additional unit of complexity.
+# The "knee" of the Pareto front (highest score) is
+# typically the best physics equation.
+
+best_idx = model.equations_.score.idxmax()
+best_eq = model.equations_.iloc[best_idx]
+print(f"\nBest equation (Pareto knee):")
+print(f"  Complexity: {best_eq.complexity}")
+print(f"  Loss: {best_eq.loss:.2e}")
+print(f"  Equation: {best_eq.equation}")
+
+# Convert to SymPy for analysis
+best_sympy = model.sympy(best_idx)
+print(f"  SymPy: {best_sympy}")
+</code></pre>
+<div class="code-caption">Selecting the best equation from PySR's Pareto front using the score metric to find the complexity-accuracy knee.</div>
+
+<p>
+The Pareto front often reveals physically meaningful intermediate expressions. For the
+gravitational force problem, simpler expressions like $F \propto m_1 m_2$ (ignoring
+distance) or $F \propto 1/r^2$ (ignoring masses) appear at low complexity. These are
+not wrong; they capture partial physics. The full expression $F \propto m_1 m_2 / r^2$
+appears at the knee, and adding more complexity yields negligible improvement, confirming
+that we have found the correct law.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Pareto Knee as a Discovery Signal</div>
+<p>
+When the Pareto front shows a sharp knee, where adding one more unit of complexity
+produces a large drop in loss, followed by a plateau, the expression at the knee is
+almost always the correct physical law. This "elbow" pattern is a reliable heuristic
+for identifying the true equation amidst a sea of overfitting alternatives. When the
+front is smooth with no clear knee, the underlying relationship is likely too complex
+for symbolic regression, and you should consider neural methods instead.
+</p>
+</div>
+
+<h2>7. Scaling Symbolic Regression to Real Physics Data</h2>
+
+<p>
+Laboratory data is noisier, sparser, and more heterogeneous than the synthetic examples
+above. Several practical techniques improve PySR's performance on real physics datasets.
+</p>
+
+<p>
+<strong>Feature engineering with dimensionless groups.</strong> Before running PySR,
+compute the Buckingham Pi groups for your problem. If you have 8 variables with 3
+independent dimensions, PySR searches over 5 dimensionless groups instead of 8 raw
+variables. This reduction is often the difference between convergence in minutes and
+failure after hours.
+</p>
+
+<pre><code class="language-python">import numpy as np
+import sympy as sp
+
+def buckingham_pi(variables, dimensions):
+    """
+    Compute dimensionless Pi groups using the null space
+    of the dimension matrix.
+
+    Args:
+        variables: list of variable names
+        dimensions: dict mapping variable -> [M, L, T, ...] exponents
+
+    Returns:
+        List of Pi groups as SymPy expressions
+    """
+    # Build the dimension matrix
+    dim_names = list(next(iter(dimensions.values())).keys())
+    n_vars = len(variables)
+    n_dims = len(dim_names)
+
+    D = np.zeros((n_dims, n_vars))
+    for j, var in enumerate(variables):
+        for i, dim in enumerate(dim_names):
+            D[i, j] = dimensions[var].get(dim, 0)
+
+    # Null space of D gives the Pi groups
+    from scipy.linalg import null_space
+    ns = null_space(D)
+
+    # Convert to symbolic expressions
+    symbols = [sp.Symbol(v) for v in variables]
+    pi_groups = []
+    for col in ns.T:
+        # Round to nearest rational for clean exponents
+        expr = sp.Integer(1)
+        for sym, exp in zip(symbols, col):
+            rational_exp = sp.nsimplify(exp, rational=True)
+            if rational_exp != 0:
+                expr *= sym ** rational_exp
+        pi_groups.append(expr)
+
+    return pi_groups
+
+# Example: drag force problem
+variables = ['F_D', 'rho', 'v', 'd', 'mu']
+dimensions = {
+    'F_D': {'M': 1, 'L': 1, 'T': -2},
+    'rho': {'M': 1, 'L': -3, 'T': 0},
+    'v':   {'M': 0, 'L': 1, 'T': -1},
+    'd':   {'M': 0, 'L': 1, 'T': 0},
+    'mu':  {'M': 1, 'L': -1, 'T': -1},
+}
+
+pi_groups = buckingham_pi(variables, dimensions)
+for i, pi in enumerate(pi_groups):
+    print(f"Pi_{i+1} = {pi}")
+</code></pre>
+<div class="code-caption">Computing Buckingham Pi dimensionless groups from a dimension matrix, reducing the symbolic search space from raw variables to dimensionless combinations.</div>
+
+<p>
+<strong>Noise-robust fitness functions.</strong> PySR's default loss is mean squared
+error, which is sensitive to outliers. For experimental physics data, consider using
+the Huber loss or trimmed mean loss. PySR accepts custom loss functions written in
+Julia syntax.
+</p>
+
+<p>
+<strong>Ensemble runs.</strong> Symbolic regression is stochastic. Running PySR multiple
+times with different random seeds and taking the intersection of Pareto fronts increases
+confidence that a discovered equation is robust rather than a lucky fit. If the same
+functional form appears across 5 out of 5 runs, it is almost certainly the correct law.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+A major development since 2023 is the use of large language models to guide symbolic regression search. The LLM-SR system (Shojaee et al., "LLM-SR: Scientific Equation Discovery via Programming with Large Language Models," 2024) replaces the random mutation operators in genetic programming with LLM-generated hypotheses: given partial Pareto fronts and problem context, a language model proposes structurally plausible candidate expressions that the evolutionary search would take many generations to discover through random recombination alone. On the Feynman symbolic regression benchmark, LLM-SR recovers more ground-truth equations than PySR alone and converges faster on complex multi-variable problems. This hybrid approach points toward a future where symbolic regression is not purely a bottom-up search from data but a collaboration between data-driven fitness evaluation and the learned scientific priors embedded in foundation models.
+</p>
+</div>
+
+<h2>8. Connection to the Discovery Workbench</h2>
+
+<p>
+In the <a href="../../part-1-foundations/module-06-system-architecture/index.html">Discovery
+Workbench architecture</a> of Chapter 6, symbolic regression serves as a
+<strong>hypothesis generator</strong>. The Pareto front of candidate expressions maps
+directly to the hypothesis queue. Each candidate equation is a hypothesis about the
+underlying physical law. The workbench can then test each hypothesis against held-out
+data, check dimensional consistency, and compare extrapolation performance. In
+<a href="section-50.4.html">Section 50.4</a>, we integrate PySR into a full
+discovery pipeline that also uses PINNs for parameter estimation and neural operators
+for rapid surrogate evaluation.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Rediscover the Pendulum Period Formula</h4>
+<p>
+Test physics-aware symbolic regression on your own laptop by rediscovering the period of a simple pendulum, $T = 2\pi\sqrt{L/g}$, from synthetic data.
+</p>
+<p>
+<strong>Step 1.</strong> Install PySR (<code>pip install pysr</code>) and ensure Julia is available (PySR will install it automatically on first run if needed).
+</p>
+<p>
+<strong>Step 2.</strong> Generate 300 synthetic data points: sample pendulum length $L$ uniformly from 0.1 to 5.0 meters, set $g = 9.81\,\text{m/s}^2$, compute $T = 2\pi\sqrt{L/g}$, and add 2% Gaussian noise to $T$.
+</p>
+<p>
+<strong>Step 3.</strong> Run PySR with <code>X_units=["m", "m/s^2"]</code> and <code>y_units="s"</code>, using operators <code>["+", "-", "*", "/"]</code> and unary operators <code>["sqrt", "square"]</code>. Set <code>maxsize=15</code> and <code>niterations=60</code>.
+</p>
+<p>
+<strong>Step 4.</strong> Inspect the Pareto front with <code>model.equations_</code>. Identify the knee point and verify that the discovered expression matches $T \propto \sqrt{L/g}$ (the constant should be close to $2\pi \approx 6.28$).
+</p>
+<p>
+<strong>Step 5.</strong> Re-run with dimensional constraints removed (omit <code>X_units</code> and <code>y_units</code>) and compare the Pareto fronts. Count how many more candidate expressions PySR evaluates without dimensional pruning, and check whether the unconstrained run still finds the exact exponent $1/2$ or returns an approximation like $L^{0.48}$.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+Symbolic regression discovers the <em>form</em> of physical laws. But many physics
+problems require solving the <em>inverse</em> problem: given observations, recover
+the unknown parameters or governing equations of a PDE.
+<a href="section-50.2.html">Section 50.2</a> introduces physics-informed neural
+networks for inverse problems, where the PDE itself becomes part of the loss function,
+and Noether's theorem provides structural priors about what conservation laws the
+system must obey.
+</p>
+</section>
+
+</main>
+
+<footer>
+<nav class="section-nav">
+<a href="index.html">&larr; Chapter 50</a>
+<a href="section-50.2.html">Section 50.2 &rarr;</a>
+</nav>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

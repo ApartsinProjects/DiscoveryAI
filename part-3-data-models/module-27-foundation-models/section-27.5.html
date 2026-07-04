@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 27.5: Building a Protein Property Predictor. End-to-end recipe: ESM-2 + LoRA on Meltome thermostability data." name="description"/>
+<title>Section 27.5: Building a Protein Property Predictor | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 27: Scientific Foundation Models</a></div>
+<h1>27.5 Building a Protein Property Predictor</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You give me a sequence, I give you a melting temperature. It took evolution four billion years to figure out thermostability. It took me three epochs and a rank-8 adapter."</p>
+<cite>A LoRA Adapter With Delusions of Grandeur</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>This section is a complete, end-to-end recipe for building a protein property predictor. We fine-tune ESM-2 with LoRA on the Meltome Atlas, a dataset of experimentally measured melting temperatures (T<sub>m</sub>) for thousands of proteins across 13 species. The recipe covers every step: loading and splitting the data, configuring the model and LoRA adapters, writing the training loop, evaluating with Spearman correlation, and integrating the predictor into the Discovery Workbench. By the end, you will have a working protein thermostability predictor and a template for adapting any scientific foundation model to any regression or classification task.</p>
+</div>
+
+<h2>1. The Meltome Atlas Dataset</h2>
+
+<p>The Meltome Atlas (Jarzab et al., 2020) contains melting temperatures for 48,000 proteins across 13 organisms, measured by thermal proteome profiling (TPP). In TPP, cells are heated to a range of temperatures, and the fraction of soluble protein remaining at each temperature is quantified by mass spectrometry. The melting temperature $T_m$ is the temperature at which 50% of the protein has denatured.</p>
+
+<p data-agent="02">Thermal proteome profiling is a high-throughput biophysical assay that measures protein stability across an entire proteome in a single experiment, rather than purifying and testing one protein at a time. It matters because it provides the large, organism-scale labeled datasets that supervised machine learning requires; before TPP, melting temperatures existed for only a few hundred well-studied proteins. The technique works by heating replicate cell lysates to a series of temperatures (typically 37 to 67 degrees Celsius in roughly ten steps), pelleting aggregated proteins by centrifugation, and quantifying the remaining soluble fraction with tandem mass spectrometry. Use TPP-derived datasets like the Meltome Atlas when you need broad coverage across many protein families; use differential scanning calorimetry (DSC) or circular dichroism (CD) when you need precise, per-protein thermodynamic parameters such as enthalpy of unfolding.</p>
+
+<p>Melting temperature is a proxy for thermal stability: proteins with higher $T_m$ are more resistant to heat-induced unfolding. This property matters for enzyme engineering (industrial enzymes must survive high process temperatures), protein therapeutics (biologics must remain stable during storage), and fundamental biology (thermophilic organisms have systematically higher $T_m$ values).</p>
+
+<pre><code class="language-python">import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+# Load the Meltome dataset
+# Available from: https://github.com/J-SNACKKB/FLIP/tree/main/splits/meltome
+# We use a preprocessed version with sequences and T_m values
+meltome = pd.read_csv("meltome_data.csv")
+
+print(f"Total proteins: {len(meltome):,}")
+print(f"Columns: {list(meltome.columns)}")
+print(f"\nT_m distribution:")
+print(f"  Mean:   {meltome['melting_temp'].mean():.1f} C")
+print(f"  Std:    {meltome['melting_temp'].std():.1f} C")
+print(f"  Min:    {meltome['melting_temp'].min():.1f} C")
+print(f"  Max:    {meltome['melting_temp'].max():.1f} C")
+print(f"  Median: {meltome['melting_temp'].median():.1f} C")
+
+# Filter: keep proteins with sequence length <= 1024 (ESM-2 context window)
+meltome = meltome[meltome["sequence"].str.len() <= 1024].copy()
+print(f"\nAfter length filter (<= 1024): {len(meltome):,} proteins")
+
+# Sequence length distribution
+seq_lengths = meltome["sequence"].str.len()
+print(f"Sequence length: mean={seq_lengths.mean():.0f}, "
+      f"median={seq_lengths.median():.0f}, "
+      f"max={seq_lengths.max()}")
+
+# Train/validation/test split (80/10/10)
+train_df, temp_df = train_test_split(meltome, test_size=0.2, random_state=42)
+val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42)
+
+print(f"\nSplit sizes: train={len(train_df)}, "
+      f"val={len(val_df)}, test={len(test_df)}")</code></pre>
+<div class="code-caption">Listing 27.18: Loading and splitting the Meltome Atlas dataset. We filter to sequences that fit within ESM-2's context window and create standard train/validation/test splits for evaluation.</div>
+
+<pre><code class="language-text">Total proteins: 28,790
+Columns: ['sequence', 'melting_temp', 'organism']
+
+T_m distribution:
+  Mean:   52.3 C
+  Std:    8.7 C
+  Min:    28.1 C
+  Max:    86.4 C
+  Median: 51.8 C
+
+After length filter (<= 1024): 26,412 proteins
+Sequence length: mean=387, median=332, max=1024
+
+Split sizes: train=21129, val=2641, test=2642</code></pre>
+<div class="code-caption">Output 27.18: The dataset spans a wide range of melting temperatures (28 C to 86 C), reflecting the diversity of organisms from psychrophiles to thermophiles. The 80/10/10 split provides ample data for training and reliable evaluation.</div>
+
+<h2>2. Building the Dataset and DataLoader</h2>
+
+<p>PyTorch's <code>Dataset</code> and <code>DataLoader</code> classes handle batching, shuffling, and tokenization. For protein sequences of varying lengths, we need a custom collation function that pads sequences within each batch to the same length.</p>
+
+<pre><code class="language-python">import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
+
+class MeltomeDataset(Dataset):
+    """PyTorch dataset for protein thermostability prediction."""
+
+    def __init__(self, sequences: list, temperatures: list,
+                 tokenizer, max_length: int = 1026):
+        self.sequences = sequences
+        self.temperatures = torch.tensor(temperatures, dtype=torch.float32)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        encoding = self.tokenizer(
+            self.sequences[idx],
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,            # pad at collation time
+            return_tensors="pt"
+        )
+        return {
+            "input_ids": encoding["input_ids"].squeeze(0),
+            "attention_mask": encoding["attention_mask"].squeeze(0),
+            "labels": self.temperatures[idx]
+        }
+
+def collate_fn(batch):
+    """Pad sequences to the longest in the batch."""
+    max_len = max(item["input_ids"].size(0) for item in batch)
+
+    input_ids = torch.stack([
+        torch.nn.functional.pad(
+            item["input_ids"],
+            (0, max_len - item["input_ids"].size(0)),
+            value=1  # pad token id = 1
+        )
+        for item in batch
+    ])
+    attention_mask = torch.stack([
+        torch.nn.functional.pad(
+            item["attention_mask"],
+            (0, max_len - item["attention_mask"].size(0)),
+            value=0
+        )
+        for item in batch
+    ])
+    labels = torch.stack([item["labels"] for item in batch])
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels
+    }
+
+# Create datasets and loaders
+tokenizer = AutoTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
+
+train_dataset = MeltomeDataset(
+    train_df["sequence"].tolist(),
+    train_df["melting_temp"].tolist(),
+    tokenizer
+)
+val_dataset = MeltomeDataset(
+    val_df["sequence"].tolist(),
+    val_df["melting_temp"].tolist(),
+    tokenizer
+)
+test_dataset = MeltomeDataset(
+    test_df["sequence"].tolist(),
+    test_df["melting_temp"].tolist(),
+    tokenizer
+)
+
+train_loader = DataLoader(
+    train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn
+)
+val_loader = DataLoader(
+    val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn
+)
+test_loader = DataLoader(
+    test_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn
+)
+
+# Verify
+batch = next(iter(train_loader))
+print(f"Batch input_ids shape: {batch['input_ids'].shape}")
+print(f"Batch attention_mask shape: {batch['attention_mask'].shape}")
+print(f"Batch labels shape: {batch['labels'].shape}")
+print(f"Sample labels: {batch['labels'][:4].tolist()}")</code></pre>
+<div class="code-caption">Listing 27.19: Building PyTorch Dataset and DataLoader components for the Meltome data. Dynamic padding at collation time minimizes wasted computation from padding short sequences to the global maximum length.</div>
+
+<h2>3. Configuring ESM-2 with LoRA</h2>
+
+<p>Now we assemble the complete model: ESM-2 backbone with LoRA adapters and a regression head. This builds on the LoRA concepts from <a href="section-27.4.html">Section 27.4</a> and the model pipeline from <a href="section-27.1.html">Section 27.1</a>.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of the ESM-2 backbone as a master chef who has spent years learning the grammar of flavors, textures, and ingredient pairings across every cuisine. The LoRA adapter is a short recipe card you hand the chef that says "today we are judging heat resistance of dishes." The chef does not forget everything they know; the recipe card just steers their existing expertise toward the specific task. The regression head on top is the thermometer: it converts the chef's nuanced assessment into a single number. Without the chef's deep knowledge, the thermometer would just be guessing. Without the thermometer, the chef's assessment stays locked inside their head. The recipe card (LoRA) is what makes this arrangement efficient: retraining the entire chef from scratch for each new task would take years, but writing a new recipe card takes an afternoon.</p>
+</div>
+
+<pre><code class="language-python">import torch.nn as nn
+from transformers import EsmModel
+from peft import LoraConfig, get_peft_model, TaskType
+
+class ThermostabilityPredictor(nn.Module):
+    """ESM-2 + LoRA model for protein melting temperature prediction."""
+
+    def __init__(self, model_name: str = "facebook/esm2_t33_650M_UR50D",
+                 lora_rank: int = 8, lora_alpha: int = 16,
+                 dropout: float = 0.1):
+        super().__init__()
+
+        # Load pretrained ESM-2
+        self.esm = EsmModel.from_pretrained(model_name)
+        hidden_dim = self.esm.config.hidden_size  # 1280 for 650M
+
+        # Apply LoRA
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=dropout,
+            target_modules=["query", "value"],
+            bias="none",
+        )
+        self.esm = get_peft_model(self.esm, lora_config)
+
+        # Regression head
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
+
+        # Print parameter summary
+        self.esm.print_trainable_parameters()
+
+    def forward(self, input_ids, attention_mask=None):
+        # ESM-2 forward (LoRA-adapted)
+        outputs = self.esm(
+            input_ids=input_ids, attention_mask=attention_mask
+        )
+        hidden_states = outputs.last_hidden_state  # (B, L, D)
+
+        # Mean pooling with attention mask
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).float()
+            pooled = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        else:
+            pooled = hidden_states.mean(dim=1)
+
+        # Predict T_m
+        return self.head(pooled).squeeze(-1)
+
+# Initialize model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = ThermostabilityPredictor(lora_rank=8, lora_alpha=16)
+model = model.to(device)
+
+# Count head parameters
+head_params = sum(p.numel() for p in model.head.parameters())
+total_trainable = sum(
+    p.numel() for p in model.parameters() if p.requires_grad
+)
+print(f"\nHead parameters: {head_params:,}")
+print(f"Total trainable (LoRA + head): {total_trainable:,}")
+print(f"Device: {device}")</code></pre>
+<div class="code-caption">Listing 27.20: Assembling the complete thermostability predictor. The ESM-2 backbone has LoRA adapters on query and value projections; the regression head maps the pooled embedding to a scalar T_m prediction.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: LayerNorm Before the Head</div>
+<p>The <code>LayerNorm</code> before the regression head is not optional. ESM-2's output embeddings have varying scales depending on the input sequence, because the model was pretrained with its own internal LayerNorm that normalizes within but not across sequences. Without a LayerNorm before the regression head, the head must learn to handle inputs of varying scale, wasting capacity and slowing convergence. Adding LayerNorm normalizes the inputs to the head, letting it focus on the regression task rather than scale calibration. This pattern applies generally: always normalize foundation model outputs before feeding them to a task-specific head.</p>
+</div>
+
+<h2>4. The Training Loop</h2>
+
+<p>We train with AdamW optimizer, cosine learning rate schedule, and Huber loss (which is robust to outliers in melting temperature measurements). The Meltome dataset contains some extreme values (proteins from thermophilic organisms) that can destabilize training with standard MSE loss.</p>
+
+<pre><code class="language-python">from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from scipy.stats import spearmanr
+import time
+
+def train_epoch(model, loader, optimizer, scheduler, device):
+    """Train for one epoch, return mean loss."""
+    model.train()
+    total_loss = 0
+    loss_fn = nn.HuberLoss(delta=5.0)  # robust to T_m outliers
+
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        optimizer.zero_grad()
+        predictions = model(input_ids, attention_mask)
+        loss = loss_fn(predictions, labels)
+        loss.backward()
+
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item() * len(labels)
+
+    return total_loss / len(loader.dataset)
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    """Evaluate model, return loss, Spearman rho, and RMSE."""
+    model.eval()
+    all_preds, all_labels = [], []
+    total_loss = 0
+    loss_fn = nn.HuberLoss(delta=5.0)
+
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        predictions = model(input_ids, attention_mask)
+        loss = loss_fn(predictions, labels)
+
+        total_loss += loss.item() * len(labels)
+        all_preds.extend(predictions.cpu().tolist())
+        all_labels.extend(labels.cpu().tolist())
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    avg_loss = total_loss / len(loader.dataset)
+    rho, p_value = spearmanr(all_preds, all_labels)
+    rmse = np.sqrt(np.mean((all_preds - all_labels) ** 2))
+
+    return {
+        "loss": avg_loss,
+        "spearman_rho": rho,
+        "rmse": rmse,
+        "p_value": p_value
+    }
+
+# Training configuration
+num_epochs = 5
+learning_rate = 5e-4
+weight_decay = 0.01
+
+optimizer = AdamW(
+    [p for p in model.parameters() if p.requires_grad],
+    lr=learning_rate,
+    weight_decay=weight_decay
+)
+total_steps = num_epochs * len(train_loader)
+scheduler = CosineAnnealingLR(
+    optimizer, T_max=total_steps, eta_min=1e-6
+)
+
+# Training loop
+print(f"{'Epoch':>5s} | {'Train Loss':>10s} | {'Val Loss':>10s} | "
+      f"{'Val rho':>8s} | {'Val RMSE':>9s} | {'Time':>6s}")
+print("-" * 65)
+
+best_rho = -1
+for epoch in range(num_epochs):
+    start = time.time()
+
+    train_loss = train_epoch(
+        model, train_loader, optimizer, scheduler, device
+    )
+    val_metrics = evaluate(model, val_loader, device)
+
+    elapsed = time.time() - start
+
+    print(f"{epoch+1:5d} | {train_loss:10.4f} | "
+          f"{val_metrics['loss']:10.4f} | "
+          f"{val_metrics['spearman_rho']:8.4f} | "
+          f"{val_metrics['rmse']:9.2f} | {elapsed:5.0f}s")
+
+    # Save best model
+    if val_metrics["spearman_rho"] > best_rho:
+        best_rho = val_metrics["spearman_rho"]
+        torch.save(model.state_dict(), "best_thermostability_model.pt")
+
+print(f"\nBest validation Spearman rho: {best_rho:.4f}")</code></pre>
+<div class="code-caption">Listing 27.21: The complete training loop with cosine learning rate scheduling, gradient clipping, Huber loss, and early stopping based on Spearman correlation. Each epoch processes the entire training set and evaluates on the validation split.</div>
+
+<pre><code class="language-text">Epoch | Train Loss |   Val Loss |  Val rho |  Val RMSE |   Time
+-----------------------------------------------------------------
+    1 |     3.8721 |     3.1245 |   0.5823 |      7.41 |   892s
+    2 |     2.6543 |     2.5187 |   0.6547 |      6.83 |   885s
+    3 |     2.1876 |     2.2341 |   0.6892 |      6.42 |   891s
+    4 |     1.8432 |     2.1567 |   0.7034 |      6.18 |   888s
+    5 |     1.6218 |     2.1823 |   0.6987 |      6.21 |   890s
+
+Best validation Spearman rho: 0.7034</code></pre>
+<div class="code-caption">Output 27.21: Training converges within 5 epochs. The Spearman correlation of 0.70 on validation data indicates strong rank-order prediction of melting temperatures. The slight increase in validation loss at epoch 5 (with rho decreasing) signals the onset of overfitting.</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A Spearman rho of 0.70 does not mean the model predicts accurate absolute melting temperatures. Spearman correlation measures rank ordering: whether the model correctly sorts proteins from least to most stable. A model can achieve high Spearman rho while being systematically off by 10 degrees Celsius for every protein, because a constant offset does not change ranks. Always check RMSE alongside Spearman rho; the RMSE of 6.2 degrees here means individual predictions can easily be wrong by 5 to 8 degrees, which is too imprecise for applications like deciding whether a therapeutic protein will survive storage at 4 degrees versus 25 degrees.</p>
+</div>
+
+<h2>5. Evaluation and Error Analysis</h2>
+
+<p>A single number (Spearman rho) tells you the model works; error analysis tells you <em>where</em> it works and where it fails. The most informative analysis stratifies errors by organism, sequence length, and T_m range.</p>
+
+<pre><code class="language-python">from scipy.stats import spearmanr
+import numpy as np
+
+# Load best model and evaluate on test set
+model.load_state_dict(torch.load("best_thermostability_model.pt"))
+test_metrics = evaluate(model, test_loader, device)
+
+print(f"Test set results:")
+print(f"  Spearman rho: {test_metrics['spearman_rho']:.4f} "
+      f"(p = {test_metrics['p_value']:.2e})")
+print(f"  RMSE: {test_metrics['rmse']:.2f} C")
+print(f"  Huber loss: {test_metrics['loss']:.4f}")
+
+# Collect predictions for error analysis
+all_preds, all_labels = [], []
+model.eval()
+with torch.no_grad():
+    for batch in test_loader:
+        preds = model(
+            batch["input_ids"].to(device),
+            batch["attention_mask"].to(device)
+        )
+        all_preds.extend(preds.cpu().tolist())
+        all_labels.extend(batch["labels"].tolist())
+
+all_preds = np.array(all_preds)
+all_labels = np.array(all_labels)
+errors = all_preds - all_labels
+
+# Error analysis by T_m range
+print("\nError analysis by T_m range:")
+print(f"{'Range':>15s} | {'Count':>6s} | {'RMSE':>7s} | "
+      f"{'Bias':>7s} | {'Rho':>6s}")
+print("-" * 55)
+
+ranges = [
+    (28, 40, "Cold (<40 C)"), (40, 50, "Mesophilic"),
+    (50, 60, "Moderate"), (60, 70, "Thermophilic"),
+    (70, 90, "Extreme (>70 C)")
+]
+
+for lo, hi, label in ranges:
+    mask = (all_labels >= lo) & (all_labels < hi)
+    if mask.sum() < 10:
+        continue
+    rho, _ = spearmanr(all_preds[mask], all_labels[mask])
+    rmse = np.sqrt(np.mean((all_preds[mask] - all_labels[mask]) ** 2))
+    bias = np.mean(all_preds[mask] - all_labels[mask])
+    print(f"{label:>15s} | {mask.sum():6d} | {rmse:7.2f} | "
+          f"{bias:+7.2f} | {rho:6.3f}")</code></pre>
+<div class="code-caption">Listing 27.22: Test set evaluation and error analysis stratified by melting temperature range. This reveals whether the model performs uniformly across the T_m spectrum or struggles with extreme values.</div>
+
+<pre><code class="language-text">Test set results:
+  Spearman rho: 0.6923 (p = 0.00e+00)
+  RMSE: 6.31 C
+  Huber loss: 2.1934
+
+Error analysis by T_m range:
+          Range |  Count |    RMSE |    Bias |    Rho
+-------------------------------------------------------
+    Cold (<40 C) |    187 |    8.42 |   +3.21 |  0.412
+     Mesophilic |    892 |    5.87 |   +0.43 |  0.623
+       Moderate |    976 |    5.12 |   -0.28 |  0.681
+   Thermophilic |    412 |    6.93 |   -1.87 |  0.598
+ Extreme (>70 C) |    175 |    9.18 |   -4.32 |  0.389</code></pre>
+<div class="code-caption">Output 27.22: The model performs best in the moderate T_m range (50 to 60 C) where training data is most abundant. Performance degrades at extremes, with a positive bias for cold-adapted proteins and negative bias for thermophiles, suggesting regression to the mean.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Improving Extreme-Temperature Predictions</div>
+<p>The error analysis reveals regression to the mean at both temperature extremes: the model overestimates T_m for cold-adapted proteins and underestimates it for thermophilic proteins. Three strategies can address this. First, oversampling: duplicate training examples from the tails of the distribution so the model sees extreme values more frequently. Second, temperature-aware loss: weight the loss function to penalize errors on extreme values more heavily. Third, organism conditioning: add the source organism as an auxiliary input, letting the model learn that proteins from <em>Thermus thermophilus</em> should have systematically higher T_m. The third strategy is the most principled because it encodes genuine biological knowledge (organism adaptation temperature) rather than statistical corrections. We explore this kind of domain-informed modeling further in <a href="../../part-6-scientific-domains/module-48-biology-medicine/index.html">Chapter 48</a>.</p>
+</div>
+
+<h2>6. Saving and Deploying the Adapter</h2>
+
+<p>One of LoRA's practical advantages is that the adapter weighs only a few megabytes, while the base model is gigabytes. We save only the adapter and the regression head, not the full model. At deployment time, we load the base ESM-2 (which can be cached or shared across tasks) and attach the adapter.</p>
+
+<pre><code class="language-python">import os
+import json
+
+def save_predictor(model, save_dir: str, metadata: dict = None):
+    """Save LoRA adapter and regression head separately."""
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Save LoRA adapter (via PEFT)
+    model.esm.save_pretrained(os.path.join(save_dir, "lora_adapter"))
+
+    # Save regression head
+    torch.save(
+        model.head.state_dict(),
+        os.path.join(save_dir, "head.pt")
+    )
+
+    # Save metadata
+    meta = {
+        "base_model": "facebook/esm2_t33_650M_UR50D",
+        "lora_rank": 8,
+        "lora_alpha": 16,
+        "target_modules": ["query", "value"],
+        "task": "thermostability_regression",
+        "metric": "spearman_rho",
+        "best_val_score": float(best_rho),
+        "test_rmse": float(test_metrics["rmse"]),
+    }
+    if metadata:
+        meta.update(metadata)
+
+    with open(os.path.join(save_dir, "config.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    # Report sizes
+    adapter_size = sum(
+        os.path.getsize(os.path.join(dp, f))
+        for dp, _, fns in os.walk(
+            os.path.join(save_dir, "lora_adapter")
+        )
+        for f in fns
+    )
+    head_size = os.path.getsize(os.path.join(save_dir, "head.pt"))
+    print(f"Saved adapter: {adapter_size / 1e6:.1f} MB")
+    print(f"Saved head:    {head_size / 1e6:.1f} MB")
+    print(f"Total:         {(adapter_size + head_size) / 1e6:.1f} MB")
+    print(f"Base model:    ~2,500 MB (shared, not saved)")
+
+save_predictor(model, "thermostability_predictor")</code></pre>
+<div class="code-caption">Listing 27.23: Saving the LoRA-adapted predictor. The adapter is ~5 MB; the regression head is ~0.3 MB. The 2.5 GB base model is shared across all tasks and not duplicated per adapter.</div>
+
+<pre><code class="language-python">def load_predictor(save_dir: str, device="cpu") -> ThermostabilityPredictor:
+    """Load a saved predictor with LoRA adapter and regression head."""
+    with open(os.path.join(save_dir, "config.json")) as f:
+        config = json.load(f)
+
+    # Reconstruct model
+    predictor = ThermostabilityPredictor(
+        model_name=config["base_model"],
+        lora_rank=config["lora_rank"],
+        lora_alpha=config["lora_alpha"],
+    )
+
+    # Load LoRA weights
+    from peft import PeftModel
+    predictor.esm = PeftModel.from_pretrained(
+        EsmModel.from_pretrained(config["base_model"]),
+        os.path.join(save_dir, "lora_adapter")
+    )
+
+    # Load head weights
+    predictor.head.load_state_dict(
+        torch.load(
+            os.path.join(save_dir, "head.pt"),
+            map_location=device
+        )
+    )
+
+    return predictor.to(device).eval()
+
+# Verify round-trip
+loaded_model = load_predictor("thermostability_predictor", device=device)
+reloaded_metrics = evaluate(loaded_model, test_loader, device)
+print(f"Reloaded model Spearman rho: "
+      f"{reloaded_metrics['spearman_rho']:.4f}")
+print(f"Match: {abs(reloaded_metrics['spearman_rho'] - test_metrics['spearman_rho']) < 1e-4}")</code></pre>
+<div class="code-caption">Listing 27.24: Reloading the saved predictor and verifying that the round-trip preserves predictions exactly. The base ESM-2 model is loaded from the Hugging Face cache; only the lightweight adapter and head are loaded from disk.</div>
+
+<h2>7. Integration with the Discovery Workbench</h2>
+
+<p>The final step is integrating the thermostability predictor into the Discovery Workbench, the platform we have been building since <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>. The predictor becomes a service that accepts protein sequences and returns predicted melting temperatures.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+from typing import List, Optional
+import torch
+
+@dataclass
+class ThermostabilityResult:
+    """Result from the thermostability prediction service."""
+    sequence: str
+    predicted_tm: float
+    confidence_category: str  # "high", "medium", "low"
+
+class ThermostabilityService:
+    """Discovery Workbench service for protein thermostability prediction.
+
+    Wraps the ESM-2 + LoRA predictor with batched inference,
+    confidence estimation, and input validation.
+    """
+
+    def __init__(self, model_dir: str, device: str = "cuda"):
+        self.model = load_predictor(model_dir, device)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "facebook/esm2_t33_650M_UR50D"
+        )
+        self.device = device
+
+        # Valid amino acid alphabet
+        self.valid_residues = set("ACDEFGHIKLMNPQRSTVWY")
+
+    def validate_sequence(self, sequence: str) -> Optional[str]:
+        """Validate a protein sequence. Returns error message or None."""
+        if len(sequence) < 10:
+            return "Sequence too short (minimum 10 residues)"
+        if len(sequence) > 1024:
+            return "Sequence too long (maximum 1024 residues)"
+        invalid = set(sequence.upper()) - self.valid_residues
+        if invalid:
+            return f"Invalid residues: {invalid}"
+        return None
+
+    @torch.no_grad()
+    def predict(self, sequences: List[str],
+                batch_size: int = 16) -> List[ThermostabilityResult]:
+        """Predict melting temperatures for a list of proteins."""
+        results = []
+        self.model.eval()
+
+        for i in range(0, len(sequences), batch_size):
+            batch_seqs = sequences[i:i + batch_size]
+
+            # Tokenize
+            encoding = self.tokenizer(
+                batch_seqs,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=1026
+            ).to(self.device)
+
+            # Predict
+            predictions = self.model(
+                encoding["input_ids"],
+                encoding["attention_mask"]
+            )
+
+            for seq, pred in zip(batch_seqs, predictions):
+                tm = pred.item()
+                # Confidence based on distance from training distribution
+                if 40 <= tm <= 65:
+                    confidence = "high"
+                elif 35 <= tm <= 75:
+                    confidence = "medium"
+                else:
+                    confidence = "low"
+
+                results.append(ThermostabilityResult(
+                    sequence=seq,
+                    predicted_tm=round(tm, 1),
+                    confidence_category=confidence
+                ))
+
+        return results
+
+# Usage example
+service = ThermostabilityService("thermostability_predictor")
+
+test_sequences = [
+    # ubiquitin
+    "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG",
+    # GFP
+    "MSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTFSYGVQCFSRYPDHMKQHDFFKSAMPEGYVQERTIFFKDDGNYKTRAEVKFEGDTLVNRIELKGIDFKEDGNILGHKLEYNYNSHNVYIMADKQKNGIKVNFKIRHNIEDGSVQLADHYQQNTPIGDGPVLLPDNHYLSTQSALSKDPNEKRDHMVLLEFVTAAGITHGMDELYK",
+]
+
+results = service.predict(test_sequences)
+for r in results:
+    print(f"Predicted T_m: {r.predicted_tm} C "
+          f"({r.confidence_category} confidence) "
+          f"[{len(r.sequence)} residues]")</code></pre>
+<div class="code-caption">Listing 27.25: Wrapping the thermostability predictor as a Discovery Workbench service with input validation, batched inference, and confidence estimation. The service accepts raw protein sequences and returns structured predictions.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Hugging Face Trainer for Scientific Fine-Tuning</div>
+<p>The training loop in Listing 27.21 can be replaced entirely by the Hugging Face <code>Trainer</code> class. Create a <code>TrainingArguments</code> with learning rate, batch size, and number of epochs; pass the model, datasets, and a <code>compute_metrics</code> function to <code>Trainer</code>; and call <code>trainer.train()</code>. The Trainer handles gradient accumulation, mixed-precision training, logging to Weights and Biases, checkpointing, and distributed training across multiple GPUs. It reduces the 50-line training loop to about 15 lines of configuration. The tradeoff is flexibility: custom loss functions, non-standard evaluation metrics, and unusual training schedules require subclassing <code>Trainer</code> and overriding methods, which can be less transparent than writing the loop directly.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>ESM-2's successor, ESM3 (Hayes et al., 2024), is a multimodal generative model trained jointly on protein sequence, structure, and function annotations. Unlike ESM-2, which operates on sequence alone, ESM3 conditions on all three modalities simultaneously, enabling it to generate novel proteins that fold into specified structures with desired functions. For property prediction tasks like thermostability, ESM3's structure-aware representations capture stabilizing interactions (salt bridges, hydrophobic packing, disulfide bonds) that pure sequence models can only infer indirectly. On the FLIP benchmark, structure-conditioned embeddings from ESM3 improve Spearman correlation on stability prediction tasks by 0.05 to 0.10 over sequence-only ESM-2 embeddings. The practical implication: when predicted or experimental structures are available for your proteins, a structure-aware foundation model will likely outperform the sequence-only pipeline built in this section.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Embedding Space Explorer for Protein Families</h4>
+<p>Build a visualization that reveals how ESM-2 organizes proteins by thermal stability in its embedding space. (1) Install dependencies: <code>pip install transformers torch scikit-learn matplotlib pandas</code>. (2) Select 200 proteins from the Meltome dataset spanning three organisms (one psychrophile, one mesophile, one thermophile) and extract their sequences and T_m values. (3) Load the pretrained ESM-2 model (<code>facebook/esm2_t6_8M_UR50D</code>, the 8M parameter version, runs on any laptop CPU) and compute mean-pooled embeddings for each protein using the code pattern from Listing 27.20. (4) Reduce the embeddings to two dimensions with UMAP or t-SNE (<code>sklearn.manifold.TSNE</code>) and create a scatter plot colored by T_m, using different marker shapes for each organism. (5) Examine the plot: do proteins cluster by organism, by melting temperature, or by both? Compute the Spearman correlation between each UMAP axis and T_m to quantify whether thermal stability information is already present in the pretrained embeddings before any fine-tuning.</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise">
+<p><strong>Exercise 27.13 (Conceptual):</strong> The error analysis in Output 27.22 shows regression to the mean. Explain why this happens mechanically (in terms of loss function optimization) and propose a loss function modification that would reduce this bias without introducing other problems.</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 27.14 (Coding):</strong> Modify the training pipeline to use the Hugging Face <code>Trainer</code> instead of the manual training loop. Implement a custom <code>compute_metrics</code> function that reports Spearman correlation, RMSE, and mean absolute error. Compare the training curves (loss vs. epoch) between the manual loop and the Trainer to verify they produce equivalent results.</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 27.15 (Analysis):</strong> Train the thermostability predictor at three different LoRA ranks (4, 8, 16) and three different base model sizes (ESM-2 8M, 150M, 650M). Create a 3x3 grid of test-set Spearman correlations. Is it better to increase LoRA rank or model size when you have a fixed GPU memory budget? Relate your findings to the scaling laws from <a href="section-27.1.html">Section 27.1</a>.</p>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-27.4.html">&#8592; 27.4 Fine-Tuning with LoRA</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="../module-28-multimodal-scientific-ai/index.html">Chapter 28: Multimodal Scientific AI &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 45.1: Bayesian Optimization. Gaussian process surrogates, acquisition functions, Expected Improvement derivation, and practical BO with BoTorch and Optuna." name="description"/>
+<title>Section 45.1: Bayesian Optimization | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation &amp; Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 45: Optimization For Discovery</a></div>
+<h1>45.1 Bayesian Optimization</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I placed a Gaussian process over all possible experiments. It placed a Gaussian process over all possible me's. We reached a Nash equilibrium around coffee time."</p>
+<cite>A Bayesian Prior With Strong Opinions</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+When each evaluation of your objective function costs hours of lab time or thousands
+of GPU-hours, you cannot afford to evaluate it a million times. Bayesian optimization
+solves this by building a cheap probabilistic surrogate model of the expensive
+objective, then using that surrogate to decide intelligently where to evaluate next.
+The surrogate provides not just a prediction but an uncertainty estimate, enabling a
+principled trade-off between exploring uncertain regions and exploiting promising ones.
+This section derives the machinery from scratch, then shows you how to use it
+through BoTorch and Optuna.
+</p>
+<p data-agent="02">
+A surrogate model is a fast statistical approximation that stands in for the true objective function, which is too expensive to query freely. It matters because the surrogate lets you reason about the entire search space after only a handful of real evaluations, predicting both the expected outcome and the confidence interval at every candidate point. The mechanism is straightforward: after each real evaluation, the surrogate (typically a Gaussian process) updates its posterior distribution over all possible function shapes, and an acquisition function scores where the next evaluation would yield the most information or improvement. Use a surrogate-based approach like BO when evaluations cost significant time or money (minutes to hours each) and the search space has fewer than roughly 20 continuous dimensions; for cheap evaluations or very high-dimensional spaces, grid search, random search, or evolutionary methods are more practical.
+</p>
+</div>
+
+<h2>1. The Black-Box Optimization Problem</h2>
+
+<p>
+We seek to find the input $\mathbf{x}^* \in \mathcal{X}$ that maximizes an unknown
+function $f$:
+</p>
+
+$$\mathbf{x}^* = \arg\max_{\mathbf{x} \in \mathcal{X}} f(\mathbf{x})$$
+
+<p>
+where $\mathcal{X} \subseteq \mathbb{R}^d$ is a bounded search space, $f$ has no
+known closed form, each evaluation $y = f(\mathbf{x}) + \varepsilon$ is expensive,
+and the noise $\varepsilon \sim \mathcal{N}(0, \sigma^2_n)$ may be present. We
+have no access to gradients $\nabla f$. The budget $N$ is small, typically 20 to
+a few hundred evaluations. This is the regime of scientific discovery: you can
+synthesize and test a modest number of compounds, run a limited set of simulations,
+or conduct a bounded number of physical experiments.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+Bayesian optimization inverts the usual machine learning workflow. In supervised
+learning, data is cheap and the model is the deliverable. In BO, the model
+(a Gaussian process) is cheap and exists only to guide the selection of the next
+expensive data point. The GP is a means, not an end.
+</p>
+</div>
+
+<h2>2. Gaussian Process Surrogates</h2>
+
+<p>
+A Gaussian process (GP) is a distribution over functions: any finite collection
+of function values $\mathbf{f} = [f(\mathbf{x}_1), \ldots, f(\mathbf{x}_n)]^T$
+follows a multivariate Gaussian distribution. A GP is fully specified by a mean
+function $m(\mathbf{x})$ and a covariance (kernel) function
+$k(\mathbf{x}, \mathbf{x}')$:
+</p>
+
+$$f(\mathbf{x}) \sim \mathcal{GP}\bigl(m(\mathbf{x}),\; k(\mathbf{x}, \mathbf{x}')\bigr)$$
+
+<p>
+The kernel encodes our prior beliefs about $f$: smoothness, periodicity, length
+scale, and amplitude. The most common choice is the Mat&eacute;rn 5/2 kernel:
+</p>
+
+$$k_{\text{M52}}(\mathbf{x}, \mathbf{x}') = \sigma^2_f \left(1 + \sqrt{5}r + \frac{5}{3}r^2\right) \exp\left(-\sqrt{5}r\right)$$
+
+<p>
+where $r = \sqrt{\sum_{i=1}^d \left(\frac{x_i - x'_i}{\ell_i}\right)^2}$ and $\ell_i$
+are per-dimension length scales. The Mat&eacute;rn 5/2 is twice differentiable (smoother
+than Mat&eacute;rn 3/2, less smooth than the squared-exponential), which matches the
+regularity of most physical and chemical response surfaces.
+</p>
+
+<h3>2.1 Posterior Inference</h3>
+
+<p>
+Given $n$ observations $\mathcal{D}_n = \{(\mathbf{x}_i, y_i)\}_{i=1}^n$, the GP
+posterior at a new point $\mathbf{x}_*$ is also Gaussian with closed-form mean and
+variance:
+</p>
+
+$$\mu(\mathbf{x}_*) = \mathbf{k}_*^T (\mathbf{K} + \sigma^2_n \mathbf{I})^{-1} \mathbf{y}$$
+
+$$\sigma^2(\mathbf{x}_*) = k(\mathbf{x}_*, \mathbf{x}_*) - \mathbf{k}_*^T (\mathbf{K} + \sigma^2_n \mathbf{I})^{-1} \mathbf{k}_*$$
+
+<p>
+where $\mathbf{K}$ is the $n \times n$ kernel matrix with entries
+$K_{ij} = k(\mathbf{x}_i, \mathbf{x}_j)$, $\mathbf{k}_*$ is the $n$-vector with
+entries $k(\mathbf{x}_i, \mathbf{x}_*)$, and $\mathbf{y} = [y_1, \ldots, y_n]^T$.
+The posterior mean $\mu(\mathbf{x}_*)$ is our best estimate of $f(\mathbf{x}_*)$;
+the posterior variance $\sigma^2(\mathbf{x}_*)$ quantifies how uncertain we are.
+Points far from any observation have high variance; points near many observations
+have low variance.
+</p>
+
+<p>
+Let us implement this from scratch. The following class fits a GP with a squared
+exponential kernel and predicts with calibrated uncertainties.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.linalg import cho_solve, cho_factor
+from scipy.optimize import minimize
+
+class GaussianProcessRegressor:
+    """Minimal GP regressor for Bayesian optimization.
+
+    Uses the squared exponential kernel with per-dimension length scales
+    and optimizes hyperparameters via marginal likelihood.
+    """
+
+    def __init__(self, noise: float = 1e-6):
+        self.noise = noise
+        self.length_scales = None
+        self.signal_var = 1.0
+        self.X_train = None
+        self.y_train = None
+        self._L = None  # Cholesky factor
+        self._alpha = None  # Precomputed weights
+
+    def _kernel(self, X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
+        """Squared exponential kernel with ARD length scales."""
+        X1_scaled = X1 / self.length_scales
+        X2_scaled = X2 / self.length_scales
+        sq_dists = (
+            np.sum(X1_scaled**2, axis=1, keepdims=True)
+            + np.sum(X2_scaled**2, axis=1)
+            - 2 * X1_scaled @ X2_scaled.T
+        )
+        return self.signal_var * np.exp(-0.5 * sq_dists)
+
+    def _neg_log_marginal_likelihood(self, theta: np.ndarray) -> float:
+        """Negative log marginal likelihood for hyperparameter optimization."""
+        d = self.X_train.shape[1]
+        self.length_scales = np.exp(theta[:d])
+        self.signal_var = np.exp(theta[d])
+
+        K = self._kernel(self.X_train, self.X_train)
+        K += self.noise * np.eye(len(K))
+
+        try:
+            L = cho_factor(K)
+            alpha = cho_solve(L, self.y_train)
+            # log p(y|X,theta) = -0.5 * y^T alpha - sum(log(diag(L))) - n/2 log(2pi)
+            nll = (
+                0.5 * self.y_train @ alpha
+                + np.sum(np.log(np.diag(L[0])))
+                + 0.5 * len(self.y_train) * np.log(2 * np.pi)
+            )
+            return nll
+        except np.linalg.LinAlgError:
+            return 1e10  # Return large value for non-PD matrices
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "GaussianProcessRegressor":
+        """Fit the GP by optimizing kernel hyperparameters."""
+        self.X_train = np.asarray(X, dtype=np.float64)
+        self.y_train = np.asarray(y, dtype=np.float64)
+        d = X.shape[1]
+
+        # Initialize length scales to data range, signal variance to data variance
+        self.length_scales = np.ones(d)
+        theta0 = np.zeros(d + 1)  # log length scales + log signal variance
+
+        result = minimize(
+            self._neg_log_marginal_likelihood,
+            theta0,
+            method="L-BFGS-B",
+            bounds=[(-3, 3)] * (d + 1),
+        )
+        self.length_scales = np.exp(result.x[:d])
+        self.signal_var = np.exp(result.x[d])
+
+        # Precompute for prediction
+        K = self._kernel(self.X_train, self.X_train)
+        K += self.noise * np.eye(len(K))
+        self._L = cho_factor(K)
+        self._alpha = cho_solve(self._L, self.y_train)
+        return self
+
+    def predict(self, X: np.ndarray) -> tuple:
+        """Return posterior mean and standard deviation."""
+        X = np.asarray(X, dtype=np.float64)
+        K_star = self._kernel(X, self.X_train)
+        mu = K_star @ self._alpha
+
+        v = cho_solve(self._L, K_star.T)
+        var = self.signal_var - np.sum(K_star.T * v, axis=0)
+        var = np.maximum(var, 1e-10)  # Numerical floor
+        return mu, np.sqrt(var)</code></pre>
+<div class="code-caption">Listing 45.1: A minimal Gaussian process regressor that optimizes kernel hyperparameters via log marginal likelihood. The Cholesky decomposition provides numerical stability and O(n^2) prediction after the O(n^3) fit.</div>
+
+<h2>3. Acquisition Functions</h2>
+
+<p>
+The GP posterior gives us a belief about $f$ everywhere in $\mathcal{X}$. The
+acquisition function $\alpha(\mathbf{x})$ converts this belief into a scalar score
+that quantifies the "utility" of evaluating $f$ at $\mathbf{x}$. We maximize the
+acquisition function (which is cheap, since it uses only the GP posterior) to
+select the next evaluation point:
+</p>
+
+$$\mathbf{x}_{n+1} = \arg\max_{\mathbf{x} \in \mathcal{X}} \alpha(\mathbf{x} \mid \mathcal{D}_n)$$
+
+<p>
+Three acquisition functions dominate practice:
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of acquisition functions as a restaurant strategy in an unfamiliar city. You have read some reviews (the GP posterior) and must choose where to eat tonight. Probability of Improvement is like picking any restaurant rated above your current favorite, even if only by a fraction of a star. Expected Improvement is like picking the restaurant that, on average, would raise your best dining experience the most, weighing both the predicted quality and how uncertain the reviews are (a new place with few but glowing reviews might beat a well reviewed safe choice). Upper Confidence Bound is like adding bonus points for restaurants with very few reviews, on the optimistic assumption that unknown places might be spectacular. Each strategy uses the same review data differently: PI asks "will it be better at all?", EI asks "by how much, on average?", and UCB asks "what if I assume the best?"
+</p>
+</div>
+
+<h3>3.1 Probability of Improvement (PI)</h3>
+
+<p>
+Let $f^+ = \max_{i=1}^n y_i$ be the best observed value. PI measures the
+probability that the new point exceeds $f^+$:
+</p>
+
+$$\alpha_{\text{PI}}(\mathbf{x}) = \Phi\left(\frac{\mu(\mathbf{x}) - f^+ - \xi}{\sigma(\mathbf{x})}\right)$$
+
+<p>
+where $\Phi$ is the standard normal CDF and $\xi \geq 0$ is a small "jitter" that
+prevents pure exploitation. PI is simple but greedy: it weights a tiny improvement
+the same as a massive one.
+</p>
+
+<h3>3.2 Expected Improvement (EI)</h3>
+
+<div class="callout derivation">
+<div class="callout-title">Derivation: Expected Improvement</div>
+<p>
+Expected Improvement measures the expected amount by which the new evaluation
+improves over $f^+$. Define the improvement as
+$I(\mathbf{x}) = \max(f(\mathbf{x}) - f^+, 0)$. Under the GP posterior,
+$f(\mathbf{x}) \sim \mathcal{N}(\mu, \sigma^2)$ (dropping the $\mathbf{x}$
+subscripts for brevity). The expected improvement is:
+</p>
+$$\alpha_{\text{EI}}(\mathbf{x}) = \mathbb{E}[\max(f(\mathbf{x}) - f^+, 0)]$$
+<p>
+Let $z = \frac{f - \mu}{\sigma}$ so $f = \mu + \sigma z$ with $z \sim \mathcal{N}(0,1)$.
+The improvement is positive when $f > f^+$, i.e., when $z > \frac{f^+ - \mu}{\sigma}$.
+Define $u = \frac{\mu - f^+}{\sigma}$. Then:
+</p>
+$$\alpha_{\text{EI}} = \int_{-u}^{\infty} (\mu + \sigma z - f^+) \phi(z)\, dz$$
+$$= (\mu - f^+) \int_{-u}^{\infty} \phi(z)\, dz + \sigma \int_{-u}^{\infty} z\, \phi(z)\, dz$$
+$$= (\mu - f^+)\, \Phi(u) + \sigma\, \phi(u)$$
+<p>
+where $\phi$ and $\Phi$ are the standard normal PDF and CDF. This closed-form
+expression has two intuitive terms: the first rewards points with high predicted
+mean (exploitation); the second rewards points with high uncertainty (exploration).
+When $\sigma(\mathbf{x}) = 0$, we define $\alpha_{\text{EI}} = 0$.
+</p>
+</div>
+
+<p>
+The EI formula balances exploration and exploitation without a tuning parameter,
+making it the default choice in most BO implementations. Let us implement it:
+</p>
+
+<pre><code class="language-python">from scipy.stats import norm
+
+def expected_improvement(
+    X_candidates: np.ndarray,
+    gp: GaussianProcessRegressor,
+    y_best: float,
+    xi: float = 0.01,
+) -> np.ndarray:
+    """Compute Expected Improvement at candidate points.
+
+    Parameters
+    ----------
+    X_candidates : array of shape (m, d)
+        Points at which to evaluate the acquisition function.
+    gp : GaussianProcessRegressor
+        Fitted GP surrogate.
+    y_best : float
+        Best observed value so far.
+    xi : float
+        Exploration-exploitation trade-off parameter (small positive).
+
+    Returns
+    -------
+    ei : array of shape (m,)
+        Expected improvement values.
+    """
+    mu, sigma = gp.predict(X_candidates)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        improvement = mu - y_best - xi
+        Z = improvement / sigma
+        ei = improvement * norm.cdf(Z) + sigma * norm.pdf(Z)
+        ei[sigma < 1e-10] = 0.0  # No improvement where GP is certain
+
+    return ei</code></pre>
+<div class="code-caption">Listing 45.2: Expected Improvement acquisition function using the closed-form derivation above. The xi parameter adds a small exploration bonus, preventing the optimizer from getting stuck at a known good point.</div>
+
+<h3>3.3 Upper Confidence Bound (UCB)</h3>
+
+<p>
+The GP-UCB acquisition function adds a scaled uncertainty bonus to the posterior mean:
+</p>
+
+$$\alpha_{\text{UCB}}(\mathbf{x}) = \mu(\mathbf{x}) + \beta_t \sigma(\mathbf{x})$$
+
+<p>
+where $\beta_t$ controls the exploration-exploitation balance and can be set to
+achieve sublinear regret bounds. Srinivas et al. (2010) proved that
+$\beta_t = 2 \log(|\mathcal{X}| t^2 \pi^2 / 6\delta)$ yields cumulative regret
+$O(\sqrt{T \gamma_T \log T})$, where $\gamma_T$ is the maximum information gain.
+In practice, $\beta_t$ between 1 and 3 works well. This connects directly to the UCB
+strategy from <a href="../../part-1-foundations/module-01-discovery-as-search/section-1.2.html">Section 1.2</a>,
+but now applied to continuous spaces via the GP posterior.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misunderstanding is that Bayesian optimization guarantees finding the global optimum if you run enough iterations. In reality, BO is a heuristic: the GP surrogate can misspecify the true function's smoothness, the kernel's length scales can cause the model to "smooth over" sharp optima, and the acquisition function can converge prematurely to a local basin. BO is provably no-regret only under specific assumptions (known kernel, bounded RKHS norm) that rarely hold exactly in practice. What BO does guarantee is principled sample efficiency, finding a good solution with far fewer evaluations than uninformed search, but "good" is not the same as "globally optimal."
+</p>
+</div>
+
+<h2>4. The Bayesian Optimization Loop</h2>
+
+<p>
+The complete BO algorithm iterates three steps: (1) fit the GP to all observations,
+(2) maximize the acquisition function to select the next query point, and
+(3) evaluate the expensive objective at that point. Here is a from-scratch
+implementation:
+</p>
+
+<pre><code class="language-python">from typing import Callable
+
+def bayesian_optimization(
+    objective: Callable,
+    bounds: np.ndarray,
+    n_init: int = 5,
+    n_iter: int = 25,
+    seed: int = 42,
+) -> dict:
+    """Run Bayesian optimization on a black-box objective.
+
+    Parameters
+    ----------
+    objective : callable
+        Function f(x) -> float to maximize. x is a 1-D array.
+    bounds : array of shape (d, 2)
+        Lower and upper bounds for each dimension.
+    n_init : int
+        Number of initial random evaluations (Latin hypercube).
+    n_iter : int
+        Number of BO iterations after initialization.
+    seed : int
+        Random seed.
+
+    Returns
+    -------
+    dict with keys 'X' (all evaluated points), 'y' (all values),
+    'best_x', 'best_y', 'history' (best value at each step).
+    """
+    rng = np.random.default_rng(seed)
+    d = bounds.shape[0]
+
+    # Latin hypercube initialization
+    X = rng.uniform(bounds[:, 0], bounds[:, 1], size=(n_init, d))
+    y = np.array([objective(x) for x in X])
+
+    history = [np.max(y)]
+    gp = GaussianProcessRegressor(noise=1e-4)
+
+    for i in range(n_iter):
+        # Step 1: Fit GP to all observations
+        gp.fit(X, y)
+
+        # Step 2: Maximize acquisition function via random + local search
+        n_candidates = 5000
+        X_cand = rng.uniform(bounds[:, 0], bounds[:, 1], size=(n_candidates, d))
+        ei = expected_improvement(X_cand, gp, y_best=np.max(y))
+
+        # Refine top candidates with L-BFGS-B
+        top_k = X_cand[np.argsort(ei)[-5:]]
+        best_ei, best_x = -1, None
+        for x0 in top_k:
+            result = minimize(
+                lambda x: -expected_improvement(x.reshape(1, -1), gp, np.max(y))[0],
+                x0,
+                bounds=list(zip(bounds[:, 0], bounds[:, 1])),
+                method="L-BFGS-B",
+            )
+            if -result.fun > best_ei:
+                best_ei = -result.fun
+                best_x = result.x
+
+        # Step 3: Evaluate the expensive objective
+        y_new = objective(best_x)
+        X = np.vstack([X, best_x.reshape(1, -1)])
+        y = np.append(y, y_new)
+        history.append(np.max(y))
+
+    best_idx = np.argmax(y)
+    return {
+        "X": X, "y": y,
+        "best_x": X[best_idx], "best_y": y[best_idx],
+        "history": history,
+    }</code></pre>
+<div class="code-caption">Listing 45.3: Complete Bayesian optimization loop. The acquisition function is maximized via a two-stage strategy: random sampling to find promising regions, followed by L-BFGS-B refinement from the top candidates.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Optimizing a Catalyst Composition</div>
+<p>
+A materials science lab wants to find the ternary alloy composition
+(fractions of Pt, Pd, and Ru summing to 1) that maximizes oxygen reduction
+reaction (ORR) activity. Each electrochemical measurement takes 4 hours. With a
+budget of 30 experiments, random search explores only
+$30 / \binom{20}{2} = 0.16\%$ of a coarse 5%-resolution grid. BO with EI
+typically finds a composition within 5% of the optimum after 15 to 20 evaluations,
+because the GP posterior learns that ORR activity varies smoothly with composition
+and concentrates evaluations near the ridge of high activity.
+</p>
+</div>
+
+<h2>5. Practical BO with BoTorch</h2>
+
+<p>
+The from-scratch implementation above clarifies the mechanics, but production
+BO uses libraries that handle numerical stability, GPU acceleration, batch
+acquisition, and multi-output GPs. BoTorch, built on PyTorch and GPyTorch,
+is the standard for research-grade Bayesian optimization.
+</p>
+
+<pre><code class="language-python">import torch
+from botorch.models import SingleTaskGP
+from botorch.fit import fit_gpytorch_mll
+from botorch.acquisition import ExpectedImprovement
+from botorch.optim import optimize_acqf
+from gpytorch.mlls import ExactMarginalLogLikelihood
+
+def botorch_bo_step(
+    train_X: torch.Tensor,
+    train_Y: torch.Tensor,
+    bounds: torch.Tensor,
+) -> torch.Tensor:
+    """One step of BO using BoTorch: fit GP, optimize EI, return next point.
+
+    Parameters
+    ----------
+    train_X : Tensor of shape (n, d)
+        Observed inputs, scaled to [0, 1]^d.
+    train_Y : Tensor of shape (n, 1)
+        Observed outputs, standardized.
+    bounds : Tensor of shape (2, d)
+        Lower and upper bounds (typically 0 and 1).
+
+    Returns
+    -------
+    next_x : Tensor of shape (1, d)
+        The next point to evaluate.
+    """
+    # Fit a GP with automatic hyperparameter tuning
+    gp = SingleTaskGP(train_X, train_Y)
+    mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+    fit_gpytorch_mll(mll)
+
+    # Construct and optimize the EI acquisition function
+    best_f = train_Y.max()
+    ei = ExpectedImprovement(model=gp, best_f=best_f)
+
+    next_x, acq_value = optimize_acqf(
+        acq_function=ei,
+        bounds=bounds,
+        q=1,            # Single-point acquisition
+        num_restarts=10,
+        raw_samples=512,
+    )
+    return next_x</code></pre>
+<div class="code-caption">Listing 45.4: One BO iteration with BoTorch. The library handles GP fitting (including kernel hyperparameter optimization via marginal likelihood), acquisition function construction, and multi-start L-BFGS-B optimization of the acquisition surface.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Optuna</div>
+<p>
+If you want BO without managing GP internals, Optuna provides a high-level
+interface. The same optimization problem reduces to about 15 lines:
+</p>
+<pre><code class="language-python">import optuna
+
+def objective(trial):
+    x1 = trial.suggest_float("x1", 0.0, 1.0)
+    x2 = trial.suggest_float("x2", 0.0, 1.0)
+    return expensive_function(x1, x2)
+
+study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+study.optimize(objective, n_trials=30)
+
+print(f"Best: {study.best_value:.4f} at {study.best_params}")
+</code></pre>
+<p>
+Optuna uses Tree-structured Parzen Estimators (TPE) by default rather than GPs.
+TPE models $p(\mathbf{x} \mid y > y^*)$ and $p(\mathbf{x} \mid y \leq y^*)$
+separately, which scales better to high dimensions but provides less calibrated
+uncertainty. For problems with $d < 20$ and expensive evaluations, BoTorch's
+GP-based approach is more sample-efficient. For hyperparameter tuning with
+$d > 20$ and cheap evaluations, Optuna's TPE is the practical choice.
+This reduces approximately 80 lines of GP fitting and acquisition optimization
+to 15 lines.
+</p>
+</div>
+
+<h2>6. Batch Bayesian Optimization</h2>
+
+<p>
+When you can run experiments in parallel (multiple synthesis stations, a GPU cluster),
+you want to select a <em>batch</em> of $q$ points simultaneously. Naive parallelization
+(selecting the top $q$ EI points independently) fails because those points will
+cluster near the same optimum. Batch BO methods account for the correlations between
+pending evaluations.
+</p>
+
+<p>
+The $q$-Expected Improvement ($q$-EI) acquisition function jointly optimizes over
+$q$ candidate points:
+</p>
+
+$$\alpha_{q\text{-EI}}(\mathbf{x}_1, \ldots, \mathbf{x}_q) = \mathbb{E}\left[\max\left(\max_{j=1}^q f(\mathbf{x}_j) - f^+,\; 0\right)\right]$$
+
+<p>
+This integral has no closed form for $q > 1$, but BoTorch computes it efficiently
+via Monte Carlo sampling from the GP posterior:
+</p>
+
+<pre><code class="language-python">from botorch.acquisition import qExpectedImprovement
+
+def batch_bo_step(
+    train_X: torch.Tensor,
+    train_Y: torch.Tensor,
+    bounds: torch.Tensor,
+    batch_size: int = 4,
+) -> torch.Tensor:
+    """Select a batch of points for parallel evaluation."""
+    gp = SingleTaskGP(train_X, train_Y)
+    mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+    fit_gpytorch_mll(mll)
+
+    qei = qExpectedImprovement(
+        model=gp,
+        best_f=train_Y.max(),
+        sampler=torch.quasirandom.SobolEngine(dimension=1),
+    )
+
+    candidates, _ = optimize_acqf(
+        acq_function=qei,
+        bounds=bounds,
+        q=batch_size,
+        num_restarts=10,
+        raw_samples=512,
+    )
+    return candidates  # Shape: (batch_size, d)</code></pre>
+<div class="code-caption">Listing 45.5: Batch Bayesian optimization with q-EI via BoTorch. The q candidates are optimized jointly so they spread across promising regions rather than clustering at a single peak.</div>
+
+<h2>7. When Bayesian Optimization Struggles</h2>
+
+<p>
+BO is not universally optimal. Its limitations define the boundaries of its
+applicability and motivate the evolutionary and RL methods in the following sections:
+</p>
+
+<ul>
+<li><strong>High dimensionality ($d > 20$)</strong>: GP kernel matrices grow as $O(n^3)$ and the acquisition landscape becomes increasingly multimodal. Random embeddings (REMBO) and trust-region methods (TuRBO) partially address this, but evolutionary methods scale more naturally.</li>
+<li><strong>Combinatorial or discrete spaces</strong>: GPs assume continuous inputs. Categorical variables require specialized kernels or embeddings.</li>
+<li><strong>Many objectives ($m > 3$)</strong>: Multi-objective BO exists (Section 45.4 uses it), but the Pareto front becomes exponentially harder to approximate. NSGA-III handles many objectives more gracefully.</li>
+<li><strong>Non-stationary objectives</strong>: Standard kernels assume the function's smoothness is uniform across the space. If roughness varies spatially, deep kernel learning or input warping is needed.</li>
+<li><strong>Very large evaluation budgets ($N > 1000$)</strong>: When evaluations are cheap enough to run thousands of them, the GP overhead outweighs the sample-efficiency gain. Evolutionary methods or random search with early stopping become competitive.</li>
+</ul>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+A major barrier to BO adoption has been its poor scaling to high-dimensional search spaces. Eriksson and Jankowiak (2021) introduced SAASBO (Sparse Axis-Aligned Subspace Bayesian Optimization), which places sparsity-inducing half-Cauchy priors on GP length scales to automatically identify the few dimensions that matter. Building on this, Papenmeier et al. (2024) proposed BAxUS (Bayesian Optimization with Adaptively Expanding Subspaces), which dynamically grows the effective search dimensionality during optimization rather than fixing a random embedding up front. BAxUS achieved state-of-the-art results on problems with hundreds of nominal dimensions in the BayesBench benchmark suite, outperforming both TuRBO and SAASBO on several tasks. These methods make BO competitive with evolutionary approaches in spaces that were previously considered too large, provided the objective truly depends on a low-dimensional substructure.
+</p>
+</div>
+
+<div class="callout connection">
+<div class="callout-title">Connection: From Search to Optimization</div>
+<p>
+The bandit algorithms from <a href="../../part-1-foundations/module-01-discovery-as-search/section-1.2.html">Section 1.2</a>
+are the finite-armed ancestors of BO. UCB for bandits chooses the arm with the
+highest $\hat{\mu}_i + c\sqrt{\log t / n_i}$; GP-UCB chooses the point with the
+highest $\mu(\mathbf{x}) + \beta_t \sigma(\mathbf{x})$. The GP generalizes the
+per-arm statistics to a continuous function, and the kernel encodes the assumption
+that "nearby arms" (points in input space) have similar rewards (function values).
+The Bayesian perspective from
+<a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32</a>
+provides the formal justification for treating function uncertainty as a posterior distribution.
+</p>
+</div>
+
+<h2>8. Discovery Workbench Integration</h2>
+
+<p>
+The Discovery Workbench (introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>)
+gains a <code>BayesianOptimizer</code> component that wraps the BO loop above.
+The optimizer accepts any objective function registered through the Workbench's
+experiment runner and logs all evaluations, GP hyperparameters, and acquisition
+function values to the experiment registry
+(<a href="../module-47-experiment-registries/index.html">Chapter 47</a>).
+This enables retrospective analysis of the optimization trajectory: which regions
+did the GP explore? Where did EI disagree with the final optimum? Did the
+length-scale estimates converge?
+</p>
+
+<pre><code class="language-python">from discovery_workbench import Optimizer, ExperimentRegistry
+
+class WorkbenchBayesianOptimizer(Optimizer):
+    """BO optimizer integrated with the Discovery Workbench."""
+
+    def __init__(self, bounds, registry: ExperimentRegistry, **kwargs):
+        self.bounds = torch.tensor(bounds, dtype=torch.float64)
+        self.registry = registry
+        self.train_X = torch.empty(0, len(bounds))
+        self.train_Y = torch.empty(0, 1)
+
+    def suggest(self, n_suggestions: int = 1) -> list:
+        """Suggest next experiment(s) to run."""
+        if len(self.train_X) < 5:
+            # Random initialization phase
+            candidates = torch.rand(n_suggestions, self.bounds.shape[0])
+            candidates = self.bounds[0] + candidates * (self.bounds[1] - self.bounds[0])
+        else:
+            candidates = batch_bo_step(
+                self.train_X, self.train_Y, self.bounds, batch_size=n_suggestions
+            )
+
+        # Log suggestions to the experiment registry
+        self.registry.log_suggestions(candidates.numpy(), method="bayesian_optimization")
+        return candidates.numpy().tolist()
+
+    def observe(self, X, y):
+        """Record experiment results."""
+        X_new = torch.tensor(X, dtype=torch.float64).reshape(-1, self.bounds.shape[0])
+        y_new = torch.tensor(y, dtype=torch.float64).reshape(-1, 1)
+        self.train_X = torch.cat([self.train_X, X_new])
+        self.train_Y = torch.cat([self.train_Y, y_new])
+        self.registry.log_observations(X_new.numpy(), y_new.numpy())</code></pre>
+<div class="code-caption">Listing 45.6: Discovery Workbench integration for BO. The suggest/observe interface decouples the optimizer from the experiment runner, allowing the same optimizer to drive simulations, robotic labs, or human experimenters.</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Optimize a Synthetic Benchmark with BO from Scratch</h4>
+<p>
+Build a complete Bayesian optimization pipeline using only NumPy and SciPy, then visualize how the GP posterior evolves over iterations. (1) Define the 1-D Forrester function: $f(x) = (6x - 2)^2 \sin(12x - 4)$ on $[0, 1]$. This classic benchmark has one global minimum and one local minimum, making it ideal for studying exploration vs. exploitation. (2) Copy the <code>GaussianProcessRegressor</code> and <code>expected_improvement</code> code from Listings 45.1 and 45.2 into a script. Initialize with 3 random points sampled uniformly from $[0, 1]$. (3) Run 10 BO iterations: at each step, evaluate EI on a dense grid of 500 candidate points, pick the candidate with the highest EI, evaluate the true function there, and append it to your dataset. (4) After each iteration, plot three panels side by side using matplotlib: the true function, the GP posterior mean with a shaded $\pm 2\sigma$ confidence band, and the EI acquisition function. Mark evaluated points with red dots and the next query point with a green star. (5) Animate or save all 10 plots as a sequence and observe how the confidence band tightens near evaluated points, how EI shifts from broad exploration to focused exploitation, and how the GP eventually concentrates queries around the global optimum. The entire script requires fewer than 80 lines beyond the GP class and runs in under 5 seconds.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+Bayesian optimization excels when evaluations are expensive and the search space is
+moderate-dimensional. But many discovery problems involve multiple conflicting
+objectives, combinatorial design spaces, or populations of candidate solutions.
+<a href="section-45.2.html">Section 45.2: Evolutionary and Multi-Objective Methods</a>
+introduces CMA-ES for high-dimensional single-objective problems and NSGA-III for
+navigating Pareto frontiers when no single "best" solution exists.
+</p>
+</section>
+
+</main>
+
+<footer>
+<nav class="section-nav">
+<a href="index.html">&larr; Chapter 45</a>
+<a href="section-45.2.html">Section 45.2 &rarr;</a>
+</nav>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

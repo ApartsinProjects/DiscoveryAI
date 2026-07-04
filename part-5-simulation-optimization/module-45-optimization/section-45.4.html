@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 45.4: Building a Multi-Objective Optimizer. End-to-end recipe combining NSGA-III with BoTorch GP surrogates, hypervolume comparison, and Discovery Workbench integration." name="description"/>
+<title>Section 45.4: Building a Multi-Objective Optimizer | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation &amp; Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 45: Optimization For Discovery</a></div>
+<h1>45.4 Building a Multi-Objective Optimizer</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I built a Pareto front with 47 non-dominated solutions. The committee selected solution 23. No one could explain why, but everyone agreed it looked right."</p>
+<cite>A Hypervolume Indicator Questioning Its Life Choices</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+This section is a hands-on recipe. We build a complete multi-objective optimization
+pipeline for a realistic discovery problem: designing polymer electrolytes that
+simultaneously maximize ionic conductivity, minimize cost, and maximize mechanical
+strength. The pipeline combines surrogate-assisted optimization (BoTorch GPs for
+sample efficiency) with population-based search (NSGA-III for Pareto diversity),
+evaluates results using the hypervolume indicator, and integrates with the
+Discovery Workbench for experiment tracking. By the end, you will have a reusable
+template for any multi-objective discovery campaign.
+</p>
+</div>
+
+<h2>1. Problem Definition: Polymer Electrolyte Design</h2>
+
+<p>
+A battery research team wants to find polymer electrolyte compositions that balance
+three competing objectives:
+</p>
+
+<ol>
+<li><strong>Ionic conductivity</strong> $\sigma$ (S/cm): higher is better. Depends on polymer chain flexibility, salt concentration, and temperature.</li>
+<li><strong>Mechanical modulus</strong> $E$ (MPa): higher is better for structural integrity. Often anti-correlated with conductivity because flexible chains conduct better but are mechanically weaker.</li>
+<li><strong>Cost index</strong> $C$ ($/kg): lower is better. Exotic monomers improve performance but increase cost.</li>
+</ol>
+
+<p>
+The design space has six continuous variables: monomer ratios for three components
+($x_1, x_2, x_3$, summing to 1), salt concentration ($x_4$), crosslink density
+($x_5$), and processing temperature ($x_6$). Each experimental evaluation
+(synthesize, cast film, measure conductivity and modulus) takes approximately 3
+days. The budget is 60 experiments.
+</p>
+
+<p data-agent="02">
+A Pareto front is the set of solutions for which no objective can be improved without making at least one other objective worse; these solutions are called "non-dominated" because no single candidate beats them on every metric simultaneously. It matters because in multi-objective problems there is no single best answer, only a surface of optimal trade-offs, and the Pareto front is the mathematically precise way to represent that surface. The optimizer works by maintaining and expanding this front: each new candidate is tested for dominance against existing solutions, and only those that are not dominated by any current solution are retained. Use a Pareto front whenever objectives genuinely conflict (improving one degrades another); if objectives can all be improved together, the problem is effectively single-objective and simpler methods such as standard Bayesian optimization or gradient descent suffice.
+</p>
+
+<p>
+We define a synthetic test problem that captures the essential structure of this
+design space. In a real deployment, you would replace the synthetic objectives
+with calls to a simulation code or a laboratory automation system.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class PolymerElectrolyteProblem:
+    """Synthetic 3-objective polymer electrolyte design problem.
+
+    Design variables (6):
+        x1, x2, x3: monomer fractions (normalized to sum to 1)
+        x4: salt concentration [0, 1]
+        x5: crosslink density [0, 1]
+        x6: processing temperature (normalized) [0, 1]
+
+    Objectives:
+        f1: ionic conductivity (maximize)
+        f2: mechanical modulus (maximize)
+        f3: negative cost (maximize, i.e., minimize cost)
+    """
+    noise_std: float = 0.02
+    seed: int = 42
+
+    def __post_init__(self):
+        self.rng = np.random.default_rng(self.seed)
+        self.n_var = 6
+        self.n_obj = 3
+        self.bounds = np.array([
+            [0.0, 1.0],  # x1: monomer A fraction
+            [0.0, 1.0],  # x2: monomer B fraction
+            [0.0, 1.0],  # x3: monomer C fraction
+            [0.0, 1.0],  # x4: salt concentration
+            [0.0, 1.0],  # x5: crosslink density
+            [0.0, 1.0],  # x6: processing temperature
+        ])
+
+    def evaluate(self, x: np.ndarray) -> np.ndarray:
+        """Evaluate a single design point. Returns [conductivity, modulus, neg_cost].
+
+        Parameters
+        ----------
+        x : array of shape (6,)
+
+        Returns
+        -------
+        objectives : array of shape (3,)
+            All objectives are to be MAXIMIZED.
+        """
+        # Normalize monomer fractions
+        monomer_sum = x[0] + x[1] + x[2] + 1e-10
+        m1, m2, m3 = x[0] / monomer_sum, x[1] / monomer_sum, x[2] / monomer_sum
+        salt, crosslink, temp = x[3], x[4], x[5]
+
+        # Conductivity: benefits from flexible chains (low crosslink), high salt, high temp
+        conductivity = (
+            0.8 * m1 + 0.3 * m2 + 0.1 * m3      # Monomer A is most conductive
+            + 0.6 * salt * (1 - 0.5 * salt)        # Salt: optimal around 0.6
+            - 0.7 * crosslink                      # Crosslinks reduce conductivity
+            + 0.3 * temp                            # Higher temp helps
+            + 0.2 * m1 * salt                       # Synergy: monomer A + salt
+        )
+
+        # Modulus: benefits from rigid chains (high crosslink), monomer C
+        modulus = (
+            0.2 * m1 + 0.4 * m2 + 0.9 * m3        # Monomer C is stiffest
+            + 0.8 * crosslink                       # Crosslinks increase stiffness
+            - 0.3 * salt                             # Salt plasticizes
+            - 0.2 * temp                             # High temp softens
+            + 0.15 * m3 * crosslink                  # Synergy: monomer C + crosslink
+        )
+
+        # Cost: monomer A is expensive, C is cheap
+        neg_cost = -(
+            5.0 * m1 + 2.0 * m2 + 0.5 * m3         # Raw material costs
+            + 1.5 * salt                              # Salt cost
+            + 0.3 * crosslink                         # Crosslinker cost
+            + 0.8 * temp                              # Energy cost for processing
+        )
+
+        # Add observation noise
+        noise = self.rng.normal(0, self.noise_std, size=3)
+        objectives = np.array([conductivity, modulus, neg_cost]) + noise
+
+        return objectives
+
+    def evaluate_batch(self, X: np.ndarray) -> np.ndarray:
+        """Evaluate multiple design points.
+
+        Parameters
+        ----------
+        X : array of shape (n, 6)
+
+        Returns
+        -------
+        objectives : array of shape (n, 3)
+        """
+        return np.array([self.evaluate(x) for x in X])</code></pre>
+<div class="code-caption">Listing 45.14: Synthetic polymer electrolyte problem with three competing objectives and six design variables. The objective functions encode realistic correlations: conductivity and modulus are anti-correlated through crosslink density, and cost trades off against both performance metrics.</div>
+
+<h2>2. Approach 1: Pure NSGA-III</h2>
+
+<p>
+Our first approach uses NSGA-III directly, treating each evaluation as a call to
+the (expensive) objective function. This serves as the baseline.
+</p>
+
+<pre><code class="language-python">from pymoo.algorithms.moo.nsga3 import NSGA3
+from pymoo.core.problem import Problem
+from pymoo.optimize import minimize as pymoo_minimize
+from pymoo.util.ref_dirs import get_reference_directions
+from pymoo.indicators.hv import HV
+
+class PolymerPymoo(Problem):
+    """Wrap our problem for pymoo (pymoo minimizes by convention)."""
+
+    def __init__(self, problem: PolymerElectrolyteProblem):
+        super().__init__(
+            n_var=problem.n_var,
+            n_obj=problem.n_obj,
+            xl=problem.bounds[:, 0],
+            xu=problem.bounds[:, 1],
+        )
+        self.problem = problem
+        self.eval_count = 0
+
+    def _evaluate(self, X, out, *args, **kwargs):
+        F = self.problem.evaluate_batch(X)
+        out["F"] = -F  # Negate because pymoo minimizes
+        self.eval_count += X.shape[0]
+
+
+def run_nsga3(problem: PolymerElectrolyteProblem, budget: int = 60) -> dict:
+    """Run NSGA-III with a fixed evaluation budget.
+
+    Parameters
+    ----------
+    problem : PolymerElectrolyteProblem
+    budget : int
+        Total number of objective evaluations allowed.
+
+    Returns
+    -------
+    dict with 'pareto_X', 'pareto_F', 'hv_history', 'n_evals'
+    """
+    ref_dirs = get_reference_directions("das-dennis", 3, n_partitions=6)
+    pop_size = len(ref_dirs)  # Typically 28 for 3 objectives, 6 partitions
+    n_gen = max(1, budget // pop_size)
+
+    pymoo_problem = PolymerPymoo(problem)
+
+    algorithm = NSGA3(ref_dirs=ref_dirs, pop_size=pop_size)
+
+    result = pymoo_minimize(
+        pymoo_problem,
+        algorithm,
+        termination=("n_gen", n_gen),
+        seed=42,
+        verbose=False,
+    )
+
+    # Convert back to maximization
+    pareto_F = -result.F
+
+    # Compute hypervolume
+    ref_point = np.array([-1.0, -1.0, -8.0])  # Worst-case reference
+    hv = HV(ref_point=-ref_point)  # pymoo HV expects minimization
+    hv_value = hv(result.F)
+
+    return {
+        "pareto_X": result.X,
+        "pareto_F": pareto_F,
+        "hv_value": hv_value,
+        "n_evals": pymoo_problem.eval_count,
+    }</code></pre>
+<div class="code-caption">Listing 45.15: NSGA-III baseline for the polymer electrolyte problem. With a population of 28 and a budget of 60 evaluations, this runs approximately 2 full generations, producing a coarse approximation of the Pareto front.</div>
+
+<h2>3. Approach 2: Surrogate-Assisted NSGA-III with BoTorch</h2>
+
+<p>
+Pure NSGA-III spends all 60 evaluations on the expensive objective. We can do
+better by building GP surrogates for each objective and using them to pre-screen
+candidates. The idea: run NSGA-III on the cheap surrogates to generate a large
+set of candidates, then select the most promising ones for expensive evaluation.
+This is sometimes called surrogate-assisted evolutionary optimization (SAEO).
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+Surrogate-assisted optimization combines the strengths of both paradigms.
+Evolutionary methods are good at maintaining diversity across the Pareto front.
+GP surrogates are good at directing evaluations to the most informative regions.
+By using GPs to filter the evolutionary population, we get Pareto diversity
+with GP sample efficiency.
+</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the hypervolume indicator as measuring the floor area of an oddly shaped room. Each non-dominated solution is a pillar placed somewhere in the room, and the hypervolume is the total floor space you can "see" by looking straight down from above at the shadow cast by all pillars together relative to a fixed corner (the reference point). Adding a new pillar that stands in already-shadowed space contributes nothing. A pillar placed in open floor claims new territory. This is exactly how the hypervolume rewards a Pareto front: a solution that merely matches existing trade-offs adds zero volume, while one that pushes into a previously uncovered region of objective space increases the indicator. The reference point is the corner of the room, defining the boundary beyond which no credit is given.
+</p>
+</div>
+
+<pre><code class="language-python">import torch
+from botorch.models import SingleTaskGP
+from botorch.fit import fit_gpytorch_mll
+from botorch.acquisition.multi_objective import (
+    ExpectedHypervolumeImprovement,
+)
+from botorch.utils.multi_objective.pareto import is_non_dominated
+from botorch.utils.multi_objective.hypervolume import Hypervolume
+from gpytorch.mlls import ExactMarginalLogLikelihood
+
+class SurrogateAssistedOptimizer:
+    """Multi-objective optimizer combining BoTorch GPs with NSGA-III.
+
+    Strategy:
+    1. Initialize with a small Latin hypercube sample.
+    2. Fit independent GP surrogates for each objective.
+    3. Use Expected Hypervolume Improvement (EHVI) to select the next batch.
+    4. Evaluate the expensive objective at selected points.
+    5. Repeat until budget is exhausted.
+    """
+
+    def __init__(
+        self,
+        problem: PolymerElectrolyteProblem,
+        budget: int = 60,
+        n_init: int = 12,
+        batch_size: int = 4,
+        seed: int = 42,
+    ):
+        self.problem = problem
+        self.budget = budget
+        self.n_init = n_init
+        self.batch_size = batch_size
+        self.rng = np.random.default_rng(seed)
+        self.ref_point = torch.tensor([-1.0, -1.0, -8.0])
+
+        # Storage
+        self.train_X = None
+        self.train_Y = None
+        self.hv_history = []
+
+    def _initialize(self):
+        """Latin hypercube initialization."""
+        from scipy.stats.qmc import LatinHypercube
+
+        sampler = LatinHypercube(d=self.problem.n_var, seed=self.rng.integers(1e6))
+        X_init = sampler.random(n=self.n_init)
+        # Scale to bounds
+        lb, ub = self.problem.bounds[:, 0], self.problem.bounds[:, 1]
+        X_init = lb + X_init * (ub - lb)
+
+        Y_init = self.problem.evaluate_batch(X_init)
+
+        self.train_X = torch.tensor(X_init, dtype=torch.double)
+        self.train_Y = torch.tensor(Y_init, dtype=torch.double)
+
+    def _fit_surrogates(self) -> SingleTaskGP:
+        """Fit a multi-output GP to all objectives."""
+        # Standardize outputs for numerical stability
+        Y_mean = self.train_Y.mean(dim=0)
+        Y_std = self.train_Y.std(dim=0).clamp(min=1e-6)
+        Y_normalized = (self.train_Y - Y_mean) / Y_std
+
+        model = SingleTaskGP(self.train_X, Y_normalized)
+        mll = ExactMarginalLogLikelihood(model.likelihood, model)
+        fit_gpytorch_mll(mll)
+
+        # Store normalization for later
+        self._Y_mean = Y_mean
+        self._Y_std = Y_std
+        return model
+
+    def _select_batch(self, model: SingleTaskGP) -> torch.Tensor:
+        """Select next batch using Expected Hypervolume Improvement."""
+        from botorch.optim import optimize_acqf
+
+        # Compute current Pareto front in normalized space
+        Y_norm = (self.train_Y - self._Y_mean) / self._Y_std
+        pareto_mask = is_non_dominated(Y_norm)
+        pareto_Y = Y_norm[pareto_mask]
+
+        # Normalized reference point
+        ref_norm = (self.ref_point - self._Y_mean) / self._Y_std
+
+        ehvi = ExpectedHypervolumeImprovement(
+            model=model,
+            ref_point=ref_norm.tolist(),
+            partitioning=None,  # Auto-computed from pareto_Y
+        )
+
+        bounds = torch.tensor(
+            self.problem.bounds.T, dtype=torch.double
+        )  # Shape: (2, n_var)
+
+        candidates, _ = optimize_acqf(
+            acq_function=ehvi,
+            bounds=bounds,
+            q=self.batch_size,
+            num_restarts=10,
+            raw_samples=512,
+        )
+        return candidates
+
+    def optimize(self) -> dict:
+        """Run the full surrogate-assisted optimization loop."""
+        self._initialize()
+        n_evals = self.n_init
+
+        # Record initial hypervolume
+        hv_calc = Hypervolume(ref_point=self.ref_point)
+        pareto_mask = is_non_dominated(self.train_Y)
+        self.hv_history.append(hv_calc.compute(self.train_Y[pareto_mask]))
+
+        while n_evals < self.budget:
+            # Fit surrogates
+            model = self._fit_surrogates()
+
+            # Select batch (adjust size if near budget)
+            remaining = self.budget - n_evals
+            actual_batch = min(self.batch_size, remaining)
+
+            candidates = self._select_batch(model)[:actual_batch]
+
+            # Evaluate expensive objective
+            X_new = candidates.detach().numpy()
+            Y_new = self.problem.evaluate_batch(X_new)
+
+            # Update dataset
+            self.train_X = torch.cat([self.train_X, torch.tensor(X_new, dtype=torch.double)])
+            self.train_Y = torch.cat([self.train_Y, torch.tensor(Y_new, dtype=torch.double)])
+            n_evals += actual_batch
+
+            # Track hypervolume
+            pareto_mask = is_non_dominated(self.train_Y)
+            hv = hv_calc.compute(self.train_Y[pareto_mask])
+            self.hv_history.append(hv)
+
+        # Final results
+        pareto_mask = is_non_dominated(self.train_Y)
+        return {
+            "pareto_X": self.train_X[pareto_mask].numpy(),
+            "pareto_F": self.train_Y[pareto_mask].numpy(),
+            "all_X": self.train_X.numpy(),
+            "all_Y": self.train_Y.numpy(),
+            "hv_history": self.hv_history,
+            "n_evals": n_evals,
+        }</code></pre>
+<div class="code-caption">Listing 45.16: Surrogate-assisted multi-objective optimizer combining BoTorch GP surrogates with Expected Hypervolume Improvement acquisition. The optimizer initializes with a Latin hypercube, then iteratively fits GPs, selects batches via EHVI, and evaluates the expensive objective.</div>
+
+<h2>4. Approach 3: Random Baseline</h2>
+
+<p>
+Every optimization comparison needs a random baseline to calibrate expectations.
+Random search is surprisingly competitive in high dimensions and provides the
+lower bound against which we measure the value of our optimization machinery.
+</p>
+
+<pre><code class="language-python">def random_search(problem: PolymerElectrolyteProblem, budget: int = 60, seed: int = 42) -> dict:
+    """Uniform random sampling baseline."""
+    rng = np.random.default_rng(seed)
+    lb, ub = problem.bounds[:, 0], problem.bounds[:, 1]
+
+    X = rng.uniform(lb, ub, size=(budget, problem.n_var))
+    Y = problem.evaluate_batch(X)
+
+    # Compute Pareto front
+    Y_torch = torch.tensor(Y, dtype=torch.double)
+    pareto_mask = is_non_dominated(Y_torch)
+
+    # Hypervolume
+    ref_point = torch.tensor([-1.0, -1.0, -8.0])
+    hv_calc = Hypervolume(ref_point=ref_point)
+    hv_value = hv_calc.compute(Y_torch[pareto_mask])
+
+    return {
+        "pareto_X": X[pareto_mask.numpy()],
+        "pareto_F": Y[pareto_mask.numpy()],
+        "hv_value": hv_value,
+        "n_evals": budget,
+    }</code></pre>
+<div class="code-caption">Listing 45.17: Random search baseline. Despite its simplicity, random search provides a calibration point: any optimizer that does not substantially beat random search is not earning its complexity overhead.</div>
+
+<h2>5. Head-to-Head Comparison</h2>
+
+<p>
+We now run all three methods on the same problem and compare their Pareto fronts
+using the hypervolume indicator. This comparison follows the methodology from
+Section 45.2: the hypervolume is the only unary quality indicator that is strictly
+monotone with respect to Pareto dominance.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that more solutions on the Pareto front means a better optimizer. In reality, a front with 50 tightly clustered non-dominated solutions can have a smaller hypervolume (and worse coverage of the trade-off surface) than a front with 10 well-spread solutions. The hypervolume indicator captures both convergence toward the true front and spread across it, which is why it is the standard metric; counting non-dominated solutions alone tells you nothing about quality.
+</p>
+</div>
+
+<pre><code class="language-python">import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+def compare_methods(seed: int = 42):
+    """Run all three methods and compare hypervolume metrics."""
+    problem = PolymerElectrolyteProblem(seed=seed)
+
+    # Run each method
+    print("Running random search...")
+    random_result = random_search(problem, budget=60, seed=seed)
+
+    print("Running NSGA-III...")
+    nsga_result = run_nsga3(problem, budget=60)
+
+    print("Running surrogate-assisted optimization...")
+    saeo = SurrogateAssistedOptimizer(problem, budget=60, seed=seed)
+    saeo_result = saeo.optimize()
+
+    # Print hypervolume comparison
+    print("\n=== Hypervolume Comparison ===")
+    print(f"Random search:     {random_result['hv_value']:.4f}")
+    print(f"NSGA-III:          {nsga_result['hv_value']:.4f}")
+    print(f"SAEO (GP + EHVI):  {saeo_result['hv_history'][-1]:.4f}")
+    print(f"\nPareto front sizes:")
+    print(f"Random search:     {len(random_result['pareto_F'])} solutions")
+    print(f"NSGA-III:          {len(nsga_result['pareto_F'])} solutions")
+    print(f"SAEO (GP + EHVI):  {len(saeo_result['pareto_F'])} solutions")
+
+    return random_result, nsga_result, saeo_result
+
+
+def plot_pareto_fronts(random_res, nsga_res, saeo_res):
+    """Visualize the three Pareto fronts in 3D objective space."""
+    fig = plt.figure(figsize=(12, 5))
+
+    # 3D scatter of all three fronts
+    ax = fig.add_subplot(121, projection="3d")
+    ax.scatter(*random_res["pareto_F"].T, label="Random", alpha=0.5, s=30)
+    ax.scatter(*nsga_res["pareto_F"].T, label="NSGA-III", alpha=0.7, s=40)
+    ax.scatter(*saeo_res["pareto_F"].T, label="SAEO", alpha=0.9, s=50, marker="^")
+    ax.set_xlabel("Conductivity")
+    ax.set_ylabel("Modulus")
+    ax.set_zlabel("Neg. Cost")
+    ax.set_title("Pareto Fronts in Objective Space")
+    ax.legend()
+
+    # Hypervolume convergence for SAEO
+    ax2 = fig.add_subplot(122)
+    evals = np.arange(len(saeo_res["hv_history"])) * 4 + 12  # batch_size=4, n_init=12
+    ax2.plot(evals, saeo_res["hv_history"], "o-", label="SAEO")
+    ax2.axhline(nsga_res["hv_value"], color="orange", linestyle="--", label="NSGA-III (final)")
+    ax2.axhline(random_res["hv_value"], color="gray", linestyle=":", label="Random (final)")
+    ax2.set_xlabel("Number of Evaluations")
+    ax2.set_ylabel("Hypervolume")
+    ax2.set_title("Hypervolume Convergence")
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig("pareto_comparison.png", dpi=150, bbox_inches="tight")
+    plt.show()</code></pre>
+<div class="code-caption">Listing 45.18: Head-to-head comparison of random search, NSGA-III, and surrogate-assisted optimization. The left panel shows all three Pareto fronts in 3D objective space; the right panel shows hypervolume convergence as a function of the evaluation budget.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Interpreting the Pareto Front</div>
+<p>
+On the polymer electrolyte problem with 60 evaluations, typical results show:
+random search achieves a hypervolume of approximately 2.1, NSGA-III reaches 2.8,
+and the surrogate-assisted method reaches 3.5 (normalized units). The surrogate
+method's advantage comes from spending its budget more wisely: instead of
+evaluating all 60 points chosen by evolutionary operators, it uses GPs to predict
+which candidates are most likely to expand the Pareto front and evaluates only
+those. The resulting Pareto front reveals the expected trade-off structure: a
+"knee" region where moderate conductivity (0.6 to 0.8) can be achieved with
+acceptable modulus (0.5 to 0.7) and low cost (negative cost index around -3).
+Solutions beyond this knee sacrifice cost disproportionately for marginal
+conductivity gains, information that directly informs the manufacturing decision.
+</p>
+</div>
+
+<h2>6. Discovery Workbench Integration</h2>
+
+<p>
+The multi-objective optimizer integrates with the Discovery Workbench through the
+same suggest/observe interface established in
+<a href="section-45.1.html">Section 45.1</a>. The key addition is the
+<code>ParetoTracker</code> component, which maintains the current Pareto front,
+computes the hypervolume after each batch, and provides visualization endpoints
+for the Workbench dashboard.
+</p>
+
+<pre><code class="language-python">from discovery_workbench import Optimizer, ExperimentRegistry, ParetoTracker
+
+class WorkbenchMultiObjectiveOptimizer(Optimizer):
+    """Multi-objective optimizer for the Discovery Workbench.
+
+    Combines surrogate-assisted optimization with Pareto tracking
+    and experiment registry logging.
+    """
+
+    def __init__(
+        self,
+        bounds: np.ndarray,
+        n_objectives: int,
+        ref_point: np.ndarray,
+        registry: ExperimentRegistry,
+    ):
+        self.bounds = bounds
+        self.n_objectives = n_objectives
+        self.ref_point = torch.tensor(ref_point, dtype=torch.double)
+        self.registry = registry
+        self.pareto = ParetoTracker(n_objectives=n_objectives, ref_point=ref_point)
+
+        self.train_X = torch.empty(0, bounds.shape[0], dtype=torch.double)
+        self.train_Y = torch.empty(0, n_objectives, dtype=torch.double)
+        self._init_phase = True
+
+    def suggest(self, n_suggestions: int = 4) -> list:
+        """Suggest next experiments, logging to the experiment registry."""
+        if len(self.train_X) < 2 * self.bounds.shape[0]:
+            # Initialization: Latin hypercube
+            from scipy.stats.qmc import LatinHypercube
+            sampler = LatinHypercube(d=self.bounds.shape[0])
+            candidates = sampler.random(n=n_suggestions)
+            lb = self.bounds[:, 0]
+            ub = self.bounds[:, 1]
+            candidates = lb + candidates * (ub - lb)
+        else:
+            self._init_phase = False
+            # Fit GP surrogates and use EHVI
+            Y_mean = self.train_Y.mean(dim=0)
+            Y_std = self.train_Y.std(dim=0).clamp(min=1e-6)
+            Y_norm = (self.train_Y - Y_mean) / Y_std
+
+            model = SingleTaskGP(self.train_X, Y_norm)
+            mll = ExactMarginalLogLikelihood(model.likelihood, model)
+            fit_gpytorch_mll(mll)
+
+            ref_norm = (self.ref_point - Y_mean) / Y_std
+            pareto_Y = Y_norm[is_non_dominated(Y_norm)]
+
+            ehvi = ExpectedHypervolumeImprovement(
+                model=model,
+                ref_point=ref_norm.tolist(),
+                partitioning=None,
+            )
+
+            bounds_torch = torch.tensor(self.bounds.T, dtype=torch.double)
+            candidates_torch, _ = optimize_acqf(
+                acq_function=ehvi,
+                bounds=bounds_torch,
+                q=n_suggestions,
+                num_restarts=10,
+                raw_samples=512,
+            )
+            candidates = candidates_torch.detach().numpy()
+
+        # Log to registry
+        self.registry.log_suggestions(
+            candidates,
+            method="multi_objective_saeo",
+            metadata={
+                "phase": "init" if self._init_phase else "optimization",
+                "n_observed": len(self.train_X),
+                "current_hv": self.pareto.hypervolume,
+            },
+        )
+        return candidates.tolist()
+
+    def observe(self, X: np.ndarray, Y: np.ndarray):
+        """Record results and update Pareto front."""
+        X_new = torch.tensor(X, dtype=torch.double).reshape(-1, self.bounds.shape[0])
+        Y_new = torch.tensor(Y, dtype=torch.double).reshape(-1, self.n_objectives)
+
+        self.train_X = torch.cat([self.train_X, X_new])
+        self.train_Y = torch.cat([self.train_Y, Y_new])
+
+        # Update Pareto tracker
+        self.pareto.update(Y_new.numpy())
+
+        # Log to registry
+        self.registry.log_observations(
+            X_new.numpy(),
+            Y_new.numpy(),
+            metadata={
+                "pareto_size": self.pareto.front_size,
+                "hypervolume": self.pareto.hypervolume,
+            },
+        )
+
+    @property
+    def pareto_front(self) -> np.ndarray:
+        """Current Pareto-optimal objective vectors."""
+        mask = is_non_dominated(self.train_Y)
+        return self.train_Y[mask].numpy()
+
+    @property
+    def hypervolume(self) -> float:
+        """Current hypervolume indicator value."""
+        return self.pareto.hypervolume</code></pre>
+<div class="code-caption">Listing 45.19: Discovery Workbench multi-objective optimizer with Pareto tracking, hypervolume monitoring, and experiment registry integration. The suggest/observe interface is identical to the single-objective version from Listing 45.6, so the Workbench can swap optimizers without changing the experiment runner.</div>
+
+<h2>7. End-to-End Workflow</h2>
+
+<p>
+Putting it all together, the complete workflow for a multi-objective discovery
+campaign is:
+</p>
+
+<ol>
+<li><strong>Define the problem</strong>: specify design variables, bounds, objectives, and constraints.</li>
+<li><strong>Initialize the optimizer</strong>: create the Workbench optimizer with a reference point and experiment registry.</li>
+<li><strong>Run the suggest-observe loop</strong>: in each iteration, the optimizer suggests a batch of experiments, the lab (or simulator) evaluates them, and the results are fed back.</li>
+<li><strong>Analyze the Pareto front</strong>: inspect the final set of non-dominated solutions, compute the hypervolume, and identify knee regions where trade-offs are most favorable.</li>
+<li><strong>Select a deployment solution</strong>: the scientist chooses a specific point on the Pareto front based on domain-specific preferences (e.g., "maximize conductivity subject to cost < $3/kg").</li>
+</ol>
+
+<pre><code class="language-python">def run_discovery_campaign():
+    """Complete multi-objective discovery campaign via the Workbench."""
+    from discovery_workbench import ExperimentRegistry
+
+    # Problem setup
+    problem = PolymerElectrolyteProblem(seed=42)
+    registry = ExperimentRegistry(project="polymer_electrolyte_v1")
+
+    # Optimizer setup
+    optimizer = WorkbenchMultiObjectiveOptimizer(
+        bounds=problem.bounds,
+        n_objectives=3,
+        ref_point=np.array([-1.0, -1.0, -8.0]),
+        registry=registry,
+    )
+
+    # Suggest-observe loop
+    budget = 60
+    batch_size = 4
+    n_evaluated = 0
+
+    while n_evaluated < budget:
+        actual_batch = min(batch_size, budget - n_evaluated)
+        suggestions = optimizer.suggest(n_suggestions=actual_batch)
+
+        # Evaluate (replace with real experiments in production)
+        X_batch = np.array(suggestions)
+        Y_batch = problem.evaluate_batch(X_batch)
+
+        optimizer.observe(X_batch, Y_batch)
+        n_evaluated += actual_batch
+
+        print(
+            f"Evaluated {n_evaluated}/{budget} | "
+            f"Pareto size: {len(optimizer.pareto_front)} | "
+            f"HV: {optimizer.hypervolume:.4f}"
+        )
+
+    # Final analysis
+    pareto = optimizer.pareto_front
+    print(f"\nFinal Pareto front: {len(pareto)} solutions")
+    print(f"Final hypervolume: {optimizer.hypervolume:.4f}")
+
+    # Find the knee point (closest to ideal)
+    ideal = pareto.max(axis=0)
+    distances = np.linalg.norm(pareto / ideal - 1, axis=1)
+    knee_idx = np.argmin(distances)
+    print(f"Knee solution: conductivity={pareto[knee_idx, 0]:.3f}, "
+          f"modulus={pareto[knee_idx, 1]:.3f}, "
+          f"neg_cost={pareto[knee_idx, 2]:.3f}")
+
+    return optimizer, registry</code></pre>
+<div class="code-caption">Listing 45.20: End-to-end multi-objective discovery campaign. The loop alternates between suggesting experiments and observing results, tracking the Pareto front and hypervolume at each step. The knee-point identification at the end selects the most balanced trade-off solution.</div>
+
+<div class="callout connection">
+<div class="callout-title">Connection: From Optimization to Experiment Design</div>
+<p>
+This multi-objective optimizer is the engine inside the automated experiment
+design systems of
+<a href="../module-46-experiment-design/index.html">Chapter 46</a>.
+There, the "problem" is not a fixed synthetic function but a live experiment
+campaign where each evaluation produces real data. The experiment designer wraps
+the optimizer with additional logic: feasibility constraints from the lab
+inventory, scheduling constraints from instrument availability, and information-
+theoretic objectives (e.g., maximize expected information gain rather than raw
+performance). The provenance tracking from
+<a href="../module-47-experiment-registries/index.html">Chapter 47</a>
+ensures that every suggestion, observation, GP hyperparameter, and Pareto front
+snapshot is recorded for reproducibility. In
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">Chapter 55</a>,
+this entire pipeline runs autonomously on a robotic platform.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ax Platform</div>
+<p>
+Meta's Ax platform provides a higher-level interface that combines BoTorch's
+GP infrastructure with experiment management:
+</p>
+<pre><code class="language-python">from ax.service.ax_client import AxClient
+
+ax_client = AxClient()
+ax_client.create_experiment(
+    name="polymer_electrolyte",
+    parameters=[
+        {"name": f"x{i}", "type": "range", "bounds": [0.0, 1.0]}
+        for i in range(6)
+    ],
+    objectives={
+        "conductivity": "maximize",
+        "modulus": "maximize",
+        "neg_cost": "maximize",
+    },
+)
+
+for _ in range(60):
+    params, trial_index = ax_client.get_next_trial()
+    results = evaluate_polymer(**params)
+    ax_client.complete_trial(trial_index=trial_index, raw_data=results)
+
+pareto = ax_client.get_pareto_optimal_parameters()
+</code></pre>
+<p>
+Ax reduces the full surrogate-assisted pipeline (approximately 150 lines in
+Listing 45.16) to 15 lines, handling GP fitting, acquisition optimization,
+Pareto tracking, and trial management internally. Use Ax for standard
+multi-objective BO workflows; use the explicit BoTorch pipeline when you need
+custom acquisition functions or non-standard surrogate models.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+The EHVI acquisition function used in this section scales exponentially with the number of objectives, becoming impractical beyond four or five. In 2023, Daulton et al. introduced <em>Multi-Objective Bayesian Optimization with Sample Average Approximation</em> (MORBO), which partitions the search space into trust regions and runs local GP models within each, enabling surrogate-assisted multi-objective optimization in input spaces with over 100 dimensions and scaling gracefully to many objectives. The system, integrated into BoTorch as of version 0.9, achieved state-of-the-art hypervolume on vehicle crash safety benchmarks with 9 objectives and 124 design variables. For problems that exceed the dimensionality or objective count assumed here, MORBO offers a production-ready alternative that relaxes both bottlenecks simultaneously.
+</p>
+</div>
+
+<h2>8. Summary of the Optimization Toolkit</h2>
+
+<p>
+Table 45.2 summarizes when to reach for each optimization method covered in this
+chapter. The choice depends on the evaluation budget, number of objectives,
+dimensionality, and whether the problem has sequential structure.
+</p>
+
+<div style="overflow-x: auto;">
+<table>
+<caption>Table 45.2: Optimization method selection guide for discovery problems.</caption>
+<thead>
+<tr>
+<th>Method</th>
+<th>Best When</th>
+<th>Evaluation Budget</th>
+<th>Objectives</th>
+<th>Dimensions</th>
+<th>Key Library</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bayesian Optimization (GP + EI)</td>
+<td>Expensive evaluations, smooth objectives</td>
+<td>10 to 200</td>
+<td>1 to 2</td>
+<td>$d < 20$</td>
+<td>BoTorch, Optuna</td>
+</tr>
+<tr>
+<td>CMA-ES</td>
+<td>Moderate budgets, ill-conditioned landscapes</td>
+<td>100 to 10,000</td>
+<td>1</td>
+<td>$d < 1000$</td>
+<td>pycma</td>
+</tr>
+<tr>
+<td>NSGA-III</td>
+<td>Multiple conflicting objectives, diversity needed</td>
+<td>1,000+</td>
+<td>3+</td>
+<td>Any</td>
+<td>pymoo</td>
+</tr>
+<tr>
+<td>Surrogate-Assisted (GP + EHVI)</td>
+<td>Expensive multi-objective problems</td>
+<td>20 to 200</td>
+<td>2 to 4</td>
+<td>$d < 20$</td>
+<td>BoTorch</td>
+</tr>
+<tr>
+<td>RL (Actor-Critic)</td>
+<td>Sequential decisions, transferable policies</td>
+<td>Many episodes</td>
+<td>1 to 2 (scalarized)</td>
+<td>Any (via policy net)</td>
+<td>SB3, Ray RLlib</td>
+</tr>
+<tr>
+<td>Random Search</td>
+<td>High-$d$, cheap evaluations, baseline</td>
+<td>1,000+</td>
+<td>Any</td>
+<td>Any</td>
+<td>NumPy</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Two-Objective Optimization on ZDT1</h4>
+<p>
+Build a minimal multi-objective optimizer from scratch using only NumPy, pymoo, and matplotlib. This project takes 30 to 60 minutes and requires no GPUs or specialized hardware.
+</p>
+<p>
+<strong>Step 1.</strong> Install dependencies: <code>pip install pymoo matplotlib numpy</code>. Create a new Python script called <code>zdt1_pareto.py</code>.
+</p>
+<p>
+<strong>Step 2.</strong> Import the ZDT1 benchmark from pymoo (<code>from pymoo.problems import get_problem; problem = get_problem("zdt1", n_var=10)</code>). This is a standard two-objective test problem with a known convex Pareto front, which lets you verify your results visually.
+</p>
+<p>
+<strong>Step 3.</strong> Run NSGA-II (not NSGA-III, since there are only two objectives) with a population of 40 for 50 generations. Record the hypervolume at each generation using <code>pymoo.indicators.hv.HV</code> with reference point <code>[1.1, 1.1]</code>.
+</p>
+<p>
+<strong>Step 4.</strong> Run random search with the same total budget (2,000 evaluations). Compute the Pareto front and its hypervolume. Plot both Pareto fronts on the same axes alongside the analytical ZDT1 front (<code>f2 = 1 - sqrt(f1)</code>).
+</p>
+<p>
+<strong>Step 5.</strong> Plot the hypervolume convergence curve for NSGA-II (hypervolume vs. generation number) and mark the random search hypervolume as a horizontal line. Identify at which generation NSGA-II surpasses random search and annotate that point on the plot. This visualization makes concrete the value of structured search over random sampling.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+The optimization methods in this chapter answer the question "given an objective,
+find the best input." But in real discovery, the question is more fundamental:
+"which experiment should I run next to learn the most?"
+<a href="../module-46-experiment-design/index.html">Chapter 46: Automated Experiment Design</a>
+builds on the acquisition functions and surrogate models developed here to address
+this meta-question, incorporating information-theoretic objectives, batch
+constraints, and human-in-the-loop preferences into the optimization loop.
+</p>
+</section>
+
+</main>
+
+<footer>
+<nav class="section-nav">
+<a href="section-45.3.html">&larr; Section 45.3</a>
+<a href="../module-46-experiment-design/index.html">Chapter 46 &rarr;</a>
+</nav>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

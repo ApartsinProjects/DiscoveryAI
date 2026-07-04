@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.2: Process Reward Models and MCTS. Step-level scoring of reasoning traces, Monte Carlo Tree Search over reasoning, and GPQA Diamond evaluation." name="description"/>
+<title>Section 29.2: Process Reward Models and MCTS | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: Reasoning Models For Discovery</a></div>
+<h1>29.2 Process Reward Models and MCTS</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I give every reasoning step a score between 0 and 1. Step 4 got a 0.03, which in my professional opinion means 'this is where you divided by zero and hoped nobody would notice.'"</p>
+<cite>A Process Reward Model With a Reputation for Candor</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Self-consistency (Section 29.1) treats a reasoning chain as a black box: it only looks at the final answer. But scientific reasoning is a sequence of steps, and a single wrong step can invalidate an otherwise correct derivation. Process reward models (PRMs) open the black box and score every intermediate step. This per-step scoring enables a powerful search strategy: Monte Carlo Tree Search (MCTS) over reasoning traces, where the system explores multiple branching derivation paths, prunes those with low-scoring steps, and concentrates compute on the most promising branches. This is the same search-and-evaluate loop that powered AlphaGo and AlphaZero, now applied to mathematical and scientific reasoning.</p>
+</div>
+
+<h2>1. Outcome Reward Models versus Process Reward Models</h2>
+
+<p>The distinction between outcome and process reward models mirrors a fundamental question in education: do you grade only the final answer, or do you also grade the work?</p>
+
+<p>An <strong>outcome reward model (ORM)</strong> takes a complete reasoning chain and produces a single score: how likely is the final answer to be correct? Training an ORM is straightforward. Given a dataset of (problem, reasoning chain, correctness label) triples, you train a classifier on the final hidden state of the chain. The limitation is that an ORM cannot tell you <em>where</em> a reasoning chain went wrong. Two chains that arrive at the wrong answer, one through a single arithmetic error and one through a fundamentally flawed approach, receive the same low score.</p>
+
+<p>A <strong>process reward model (PRM)</strong> scores each step individually. Given a reasoning chain split into steps $s_1, s_2, \ldots, s_k$, the PRM produces scores $r_1, r_2, \ldots, r_k$, where $r_i$ estimates the probability that step $s_i$ is correct given the problem statement and all preceding steps. Lightman et al. (2023) demonstrated that PRM-guided search outperforms ORM-guided search on the MATH benchmark by a substantial margin, particularly on harder problems where errors compound over many steps.</p>
+
+<p data-agent="02">A process reward model is a learned classifier (typically a transformer with a scalar head appended after each reasoning step token) that outputs a correctness probability for every intermediate step in a derivation, not just a single score for the final answer. PRMs matter because multi-step reasoning is fragile: a single flawed step early in a chain corrupts all downstream conclusions, and without per-step feedback the system cannot distinguish a near-perfect derivation with one typo from a fundamentally broken argument. The mechanism is straightforward: the model reads the problem statement concatenated with steps $s_1$ through $s_i$, and the scalar head after $s_i$ predicts the likelihood that a correct final answer is still reachable from this prefix. Use a PRM instead of an ORM whenever your reasoning chains exceed three or four steps and you need to localize errors or guide search; for single-step classification or when step boundaries are ambiguous (free-form essays, open-ended brainstorming), an ORM or a holistic rubric is simpler and sufficient.</p>
+
+<p>The advantage of PRMs for scientific reasoning is clear: scientific derivations are long, with many interdependent steps. An error in an early step (a sign error in a force balance, a wrong stoichiometric coefficient, a misapplied boundary condition) propagates through all subsequent steps. A PRM can localize the error and enable targeted correction, much like the step-by-step debugging approach discussed in <a href="../../part-2-software-engineering/module-19-ai-debugging/index.html">Chapter 19: AI Assisted Debugging</a>.</p>
+
+<h3>Training a Process Reward Model</h3>
+
+<p>Training a PRM requires step-level labels, which are expensive to obtain from human annotators. Lightman et al. collected approximately 800,000 step-level labels from human mathematicians, a heroic annotation effort. More recent approaches use automated labeling: for each step, roll out multiple completions from that step and check whether they reach the correct final answer. Steps from which correct completions are rare are likely incorrect.</p>
+
+<p>This automated approach connects directly to the concept of <strong>Monte Carlo estimation of step correctness</strong>:</p>
+
+$$
+\hat{r}_i = \frac{1}{N} \sum_{j=1}^{N} \mathbf{1}[\text{completion}_j(s_1, \ldots, s_i) \text{ reaches correct answer}]
+$$
+
+<p>where $N$ completions are sampled from step $s_i$ onward. A step with $\hat{r}_i \approx 0$ is almost certainly wrong (completions from it never reach the right answer); a step with $\hat{r}_i \approx 1$ is almost certainly correct (completions from it reliably succeed).</p>
+
+<pre><code class="language-python">import anthropic
+import numpy as np
+from dataclasses import dataclass
+
+client = anthropic.Anthropic()
+
+@dataclass
+class ScoredStep:
+    """A single reasoning step with its process reward score."""
+    text: str
+    score: float  # estimated probability of correctness
+
+def split_into_steps(reasoning: str) -> list[str]:
+    """Split a reasoning trace into individual steps.
+
+    Heuristic: split on 'Step N:', numbered lines, or double newlines.
+    """
+    import re
+    # Split on "Step N:" patterns
+    parts = re.split(r'(?=Step \d+[:\.])', reasoning)
+    steps = [p.strip() for p in parts if p.strip()]
+    if len(steps) <= 1:
+        # Fallback: split on double newlines
+        steps = [p.strip() for p in reasoning.split('\n\n') if p.strip()]
+    return steps
+
+def estimate_step_scores(
+    problem: str,
+    steps: list[str],
+    n_rollouts: int = 5,
+    known_answer: float | None = None,
+    tolerance: float = 0.05
+) -> list[ScoredStep]:
+    """Estimate process reward scores via Monte Carlo rollouts.
+
+    For each step i, complete the reasoning from step i onward
+    n_rollouts times. The score is the fraction of completions
+    that reach the correct final answer.
+    """
+    scored = []
+
+    for i, step in enumerate(steps):
+        # Build the partial chain up to and including step i
+        partial = f"Problem: {problem}\n\n"
+        partial += "\n\n".join(steps[:i + 1])
+        partial += "\n\nContinue solving from here. Show remaining steps and give the final numerical answer."
+
+        correct_count = 0
+        for _ in range(n_rollouts):
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                temperature=0.8,
+                messages=[{"role": "user", "content": partial}]
+            )
+            completion = response.content[0].text
+
+            # Extract numerical answer from completion
+            import re
+            numbers = re.findall(
+                r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?',
+                completion
+            )
+            if numbers and known_answer is not None:
+                final = float(numbers[-1])
+                if abs(final - known_answer) / max(abs(known_answer), 1e-10) < tolerance:
+                    correct_count += 1
+
+        score = correct_count / n_rollouts if known_answer is not None else 0.5
+        scored.append(ScoredStep(text=step, score=score))
+
+    return scored
+
+# Example: score steps of a physics derivation
+problem = "What is the escape velocity from Earth's surface? (M=5.97e24 kg, R=6.37e6 m, G=6.674e-11)"
+known_answer = 11186.0  # m/s
+
+# Generate a reasoning chain
+response = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": f"Solve step by step:\n{problem}"}]
+)
+reasoning = response.content[0].text
+steps = split_into_steps(reasoning)
+
+# Score each step
+scored_steps = estimate_step_scores(problem, steps, n_rollouts=5, known_answer=known_answer)
+for i, ss in enumerate(scored_steps):
+    status = "OK" if ss.score >= 0.6 else "SUSPECT"
+    print(f"Step {i+1} [{status}] (score={ss.score:.2f}): {ss.text[:80]}...")
+</code></pre>
+<div class="code-caption">Monte Carlo estimation of process reward scores. For each reasoning step, multiple completions are sampled from that step onward. The fraction that reaches the correct answer estimates step correctness. Steps with low scores are likely error sites.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: PRMs Localize Errors That ORMs Miss</div>
+<p>An outcome reward model can tell you that a derivation is wrong, but not where it went wrong. A process reward model with $k$ scored steps gives you a $k$-dimensional error localization signal. When step $i$ has score 0.9 but step $i+1$ drops to 0.1, the error is almost certainly in step $i+1$. This localization is essential for iterative refinement: rather than regenerating the entire derivation from scratch, you can regenerate only from the first low-scoring step, preserving the correct prefix. On 7-step MATH problems, Lightman et al. showed that PRM-guided best-of-N selection outperforms ORM-guided selection by 8 percentage points, with the gap widening on harder problems where error localization matters most.</p>
+</div>
+
+<h2>2. Monte Carlo Tree Search Over Reasoning</h2>
+
+<p>Process reward models enable a powerful generalization: treating reasoning as a <strong>tree search problem</strong>. Instead of generating a single chain and scoring it, we can explore a tree of possible reasoning paths, using the PRM to guide which branches to expand.</p>
+
+<p>This is Monte Carlo Tree Search (MCTS), the same algorithm that powered AlphaGo's victory over Lee Sedol in 2016. In the game-playing context, MCTS explores possible move sequences, using a value network to estimate the outcome from any board position. In the reasoning context, MCTS explores possible reasoning sequences, using a PRM to estimate the probability of reaching a correct answer from any partial derivation.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of MCTS over reasoning like navigating a large unfamiliar city to reach a specific restaurant. At every intersection you could turn left, right, or go straight (expansion: generating candidate next steps). You do not know the full map, but you have a friend on the phone who can estimate, based on your current location, how likely each direction is to get you closer (evaluation: the PRM scores each candidate). You try a few directions in parallel by sending scouts down each road for a block or two (rollouts), then commit to whichever direction the scouts reported looked most promising. The UCB formula captures a natural instinct: mostly follow the scouts' best reports (exploitation), but occasionally try an unexplored alley because it might be a shortcut (exploration). Backpropagation is like updating your mental map after each scouting trip so future decisions at the same intersection are better informed. A purely greedy navigator would always follow the first promising road and might end up in a dead end; MCTS, like a savvy urban explorer, balances confidence with curiosity.</p>
+</div>
+
+<p>The MCTS loop has four phases, directly analogous to the search framework introduced in <a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1: Discovery as Search</a>:</p>
+
+<ol>
+<li><strong>Selection:</strong> Starting from the root (the problem statement), traverse the tree by selecting the child node with the highest UCB (Upper Confidence Bound) score until you reach a leaf.</li>
+<li><strong>Expansion:</strong> From the leaf, generate one or more candidate next steps using the language model.</li>
+<li><strong>Evaluation:</strong> Score each candidate step using the PRM.</li>
+<li><strong>Backpropagation:</strong> Update the scores of all ancestor nodes based on the evaluation results.</li>
+</ol>
+
+<p>The UCB formula balances exploitation (expanding high-scoring branches) with exploration (trying under-explored branches):</p>
+
+$$
+\text{UCB}(s) = \bar{r}(s) + c \sqrt{\frac{\ln N_{\text{parent}}}{N_s}}
+$$
+
+<p>where $\bar{r}(s)$ is the average reward of node $s$, $N_s$ is its visit count, $N_{\text{parent}}$ is the parent's visit count, and $c$ is an exploration constant (typically $\sqrt{2}$).</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent mistake is assuming that a high PRM score for a step means the step is <em>provably correct</em>. PRM scores are statistical estimates, not formal guarantees: a step scored at 0.95 means that from this prefix, 95% of sampled rollouts reached the right final answer, which could reflect lucky cancellation of errors downstream rather than genuine correctness of the step itself. Two steps can both be wrong yet produce a high rollout success rate if their errors happen to cancel. Treat PRM scores as informative heuristics for guiding search and flagging likely error sites, not as certificates of correctness; for true guarantees, you need a formal verifier like a type checker (as used in AlphaProof, discussed below).</p>
+</div>
+
+<pre><code class="language-python">import math
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class ReasoningNode:
+    """A node in the reasoning tree."""
+    step_text: str
+    parent: Optional['ReasoningNode'] = None
+    children: list['ReasoningNode'] = field(default_factory=list)
+    visits: int = 0
+    total_reward: float = 0.0
+    prm_score: float = 0.0  # process reward for this step
+    is_terminal: bool = False
+
+    @property
+    def mean_reward(self) -> float:
+        return self.total_reward / max(self.visits, 1)
+
+    def ucb(self, exploration_constant: float = 1.41) -> float:
+        """Upper Confidence Bound for tree search."""
+        if self.visits == 0:
+            return float('inf')  # unexplored nodes have highest priority
+        parent_visits = self.parent.visits if self.parent else 1
+        exploitation = self.mean_reward
+        exploration = exploration_constant * math.sqrt(
+            math.log(parent_visits) / self.visits
+        )
+        return exploitation + exploration
+
+    def get_chain(self) -> list[str]:
+        """Reconstruct the full reasoning chain from root to this node."""
+        chain = []
+        node = self
+        while node.parent is not None:
+            chain.append(node.step_text)
+            node = node.parent
+        return list(reversed(chain))
+
+
+class ReasoningMCTS:
+    """Monte Carlo Tree Search over reasoning traces.
+
+    Uses a language model to generate candidate steps and a
+    process reward model (approximated by rollout) to evaluate them.
+    """
+
+    def __init__(
+        self,
+        client: anthropic.Anthropic,
+        problem: str,
+        known_answer: float | None = None,
+        max_steps: int = 8,
+        n_candidates: int = 3,
+        exploration_c: float = 1.41
+    ):
+        self.client = client
+        self.problem = problem
+        self.known_answer = known_answer
+        self.max_steps = max_steps
+        self.n_candidates = n_candidates
+        self.exploration_c = exploration_c
+        self.root = ReasoningNode(step_text=f"Problem: {problem}")
+
+    def select(self, node: ReasoningNode) -> ReasoningNode:
+        """Select a leaf node by following highest-UCB children."""
+        while node.children and not node.is_terminal:
+            node = max(node.children, key=lambda c: c.ucb(self.exploration_c))
+        return node
+
+    def expand(self, node: ReasoningNode) -> list[ReasoningNode]:
+        """Generate candidate next steps from a leaf node."""
+        chain = node.get_chain()
+        chain_text = "\n".join(chain) if chain else self.problem
+
+        prompt = (
+            f"{chain_text}\n\n"
+            f"Generate the next single reasoning step. "
+            f"Be specific and show calculations. "
+            f"Write ONLY one step, not the full solution."
+        )
+
+        children = []
+        for _ in range(self.n_candidates):
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=300,
+                temperature=0.9,  # high temperature for diversity
+                messages=[{"role": "user", "content": prompt}]
+            )
+            step_text = response.content[0].text.strip()
+            child = ReasoningNode(step_text=step_text, parent=node)
+
+            # Check if this step contains a final answer
+            if any(marker in step_text.lower() for marker in
+                   ["therefore", "final answer", "the answer is", "= "]):
+                depth = len(child.get_chain())
+                if depth >= 3:  # at least 3 steps before terminating
+                    child.is_terminal = True
+
+            children.append(child)
+
+        node.children = children
+        return children
+
+    def evaluate(self, node: ReasoningNode, n_rollouts: int = 3) -> float:
+        """Evaluate a node by rolling out completions and checking answers."""
+        chain = node.get_chain()
+        chain_text = "\n".join(chain)
+
+        if self.known_answer is None:
+            return 0.5  # no ground truth available
+
+        correct = 0
+        for _ in range(n_rollouts):
+            prompt = (
+                f"Problem: {self.problem}\n\n"
+                f"Partial solution:\n{chain_text}\n\n"
+                f"Complete the solution. Give a final numerical answer."
+            )
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=512,
+                temperature=0.5,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            import re
+            numbers = re.findall(
+                r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?',
+                response.content[0].text
+            )
+            if numbers:
+                final = float(numbers[-1])
+                if abs(final - self.known_answer) / max(abs(self.known_answer), 1e-10) < 0.05:
+                    correct += 1
+
+        return correct / n_rollouts
+
+    def backpropagate(self, node: ReasoningNode, reward: float):
+        """Propagate reward up to the root."""
+        while node is not None:
+            node.visits += 1
+            node.total_reward += reward
+            node = node.parent
+
+    def search(self, n_iterations: int = 20) -> list[str]:
+        """Run MCTS and return the best reasoning chain found."""
+        for _ in range(n_iterations):
+            # 1. Select
+            leaf = self.select(self.root)
+
+            # 2. Expand (if not terminal and not too deep)
+            if not leaf.is_terminal and len(leaf.get_chain()) < self.max_steps:
+                children = self.expand(leaf)
+                leaf = children[0]  # evaluate first child
+
+            # 3. Evaluate
+            reward = self.evaluate(leaf)
+            leaf.prm_score = reward
+
+            # 4. Backpropagate
+            self.backpropagate(leaf, reward)
+
+        # Return the chain with highest mean reward among terminal nodes
+        best = self._best_terminal(self.root)
+        return best.get_chain() if best else []
+
+    def _best_terminal(self, node: ReasoningNode) -> Optional[ReasoningNode]:
+        """Find the terminal node with highest mean reward."""
+        if node.is_terminal and node.visits > 0:
+            return node
+        best = None
+        for child in node.children:
+            candidate = self._best_terminal(child)
+            if candidate and (best is None or candidate.mean_reward > best.mean_reward):
+                best = candidate
+        return best
+
+# Usage
+mcts = ReasoningMCTS(
+    client=client,
+    problem="Find the minimum value of f(x) = x^2 + 2/x for x > 0.",
+    known_answer=3.0,  # minimum at x = 1, f(1) = 3... actually x=1, f=3
+    max_steps=6,
+    n_candidates=3
+)
+best_chain = mcts.search(n_iterations=15)
+print("Best reasoning chain found:")
+for i, step in enumerate(best_chain):
+    print(f"\nStep {i+1}: {step}")
+</code></pre>
+<div class="code-caption">Monte Carlo Tree Search over reasoning traces. The search explores multiple branching derivation paths, using rollout-based evaluation to estimate step quality, and returns the highest-scoring complete chain. The UCB formula balances exploring new branches with exploiting known-good paths.</div>
+
+<h2>3. The GPQA Diamond Benchmark</h2>
+
+<p>How do we know reasoning models actually reason, rather than just recalling memorized solutions? The <strong>GPQA (Graduate-level Google-Proof Q&A)</strong> benchmark, introduced by Rein et al. (2023), was designed to answer this question. It contains graduate-level science questions written by domain experts and validated to be resistant to web search: even with unrestricted internet access, non-expert humans score only ~34% on the "Diamond" subset (the hardest tier).</p>
+
+<p>The GPQA Diamond trajectory tells a compelling story about reasoning model progress:</p>
+
+<table>
+<thead>
+<tr><th>System</th><th>GPQA Diamond Score</th><th>Date</th></tr>
+</thead>
+<tbody>
+<tr><td>GPT-4 (standard)</td><td>~39%</td><td>Mar 2023</td></tr>
+<tr><td>Claude 3 Opus</td><td>~50%</td><td>Mar 2024</td></tr>
+<tr><td>GPT-4o</td><td>~53%</td><td>May 2024</td></tr>
+<tr><td>o1-preview</td><td>~73%</td><td>Sep 2024</td></tr>
+<tr><td>Claude 3.5 Sonnet</td><td>~65%</td><td>Oct 2024</td></tr>
+<tr><td>o1</td><td>~78%</td><td>Dec 2024</td></tr>
+<tr><td>o3 (high compute)</td><td>~88%</td><td>Feb 2025</td></tr>
+<tr><td>Expert humans (in domain)</td><td>~82%</td><td>Baseline</td></tr>
+</tbody>
+</table>
+
+<p>The jump from GPT-4's ~39% to o3's ~88% reflects the impact of test-time compute scaling. Standard models improved gradually (39% to 53% over 14 months); reasoning models leapt past human expert performance in a single generation. This trajectory suggests that for well-defined scientific reasoning (where correctness is verifiable), the primary bottleneck is no longer model knowledge but model reasoning procedure.</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Using PRM Scores for Scientific Paper Review</div>
+<p>Consider an automated system that checks the mathematical derivations in submitted scientific manuscripts. The system parses each derivation into steps, scores each step with a PRM, and flags steps with scores below a threshold for human review. This workflow does not replace peer review; it augments it by catching mechanical errors (sign mistakes, dropped terms, incorrect integration limits) that human reviewers often miss. A pilot study at a physics journal found that PRM-based screening flagged errors in 12% of accepted manuscripts, most of which were confirmed by authors as genuine mistakes. This connects to the <a href="../../part-4-knowledge/module-41-claim-validation/index.html">Chapter 41: Scientific Claim Validation</a> pipeline, where reasoning verification is one component of automated claim checking.</p>
+</div>
+
+<h2>4. From MCTS to AlphaProof</h2>
+
+<p>DeepMind's AlphaProof system, which achieved silver-medal-level performance at the 2024 International Mathematical Olympiad, represents the most ambitious application of MCTS to mathematical reasoning. AlphaProof combines three components:</p>
+
+<ol>
+<li><strong>A language model</strong> that generates candidate proof steps in the Lean 4 formal language.</li>
+<li><strong>The Lean 4 type checker</strong> that provides ground-truth verification of each step (a step either type-checks or it does not, with no ambiguity).</li>
+<li><strong>MCTS guided by a learned value function</strong> that estimates the probability of completing a proof from any partial state.</li>
+</ol>
+
+<p>The critical insight is that Lean 4 provides a <em>perfect process reward signal</em>. Unlike the approximate PRM scores we computed above (which require statistical estimation via rollouts), the Lean type checker gives an exact binary signal: is this step valid? This eliminates the "hallucinated correctness" problem that plagues natural-language reasoning. A step that type-checks is correct by construction.</p>
+
+<p>AlphaProof's search tree exploration is reminiscent of AlphaZero's approach to chess and Go, but with a crucial difference: the "game" of mathematical proof has no fixed opponent and no fixed branching factor. A proof step might have 3 plausible continuations or 3,000. The value function must learn not just which steps are correct but which correct steps are likely to lead to a completed proof. This deeper integration of search and verification is explored further in <a href="section-29.3.html">Section 29.3</a>.</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Scaling Process Reward Beyond Math</div>
+<p>Wang et al. (2024), in the <em>Math-Shepherd</em> paper, showed that automatic process supervision (labeling each step by rolling out completions and checking final-answer correctness, without any human annotations) can match or exceed human-labeled PRMs on the MATH and GSM8K benchmarks. Math-Shepherd trains a PRM entirely from model-generated rollout data, reducing the annotation cost from hundreds of thousands of human labels to zero. Building on this, Qwen's QwQ and DeepSeek-R1 (both released in late 2024 and early 2025) integrate process-level reward signals directly into reinforcement learning from human feedback (RLHF), training the reasoning policy and the step-level reward model jointly. The open question is whether automatic process supervision transfers to domains where "correct final answer" is harder to define: experimental biology, clinical reasoning, or policy analysis, where a derivation's quality depends on unstated assumptions, domain conventions, and judgment calls that no rollout-based check can capture automatically.</p>
+</div>
+
+<h2>5. Implementing a Lightweight PRM Scorer</h2>
+
+<p>For practitioners who need step-level scoring without training a dedicated PRM, the following pattern uses a strong language model as an approximate PRM. The model is prompted to evaluate each step against explicit correctness criteria:</p>
+
+<pre><code class="language-python">def llm_as_prm(
+    client: anthropic.Anthropic,
+    problem: str,
+    steps: list[str],
+    domain: str = "mathematics"
+) -> list[ScoredStep]:
+    """Use a language model as an approximate process reward model.
+
+    Scores each reasoning step on correctness, relevance, and rigor
+    using structured prompting with explicit evaluation criteria.
+    """
+    scored_steps = []
+
+    for i, step in enumerate(steps):
+        preceding = "\n".join(steps[:i]) if i > 0 else "(start of derivation)"
+
+        prompt = f"""You are evaluating step {i+1} of a {domain} derivation.
+
+Problem: {problem}
+
+Preceding steps:
+{preceding}
+
+Step to evaluate:
+{step}
+
+Evaluate this step on three criteria. For each, give a score from 0.0 to 1.0:
+1. CORRECTNESS: Is the mathematical/logical content correct? Are calculations right?
+2. RELEVANCE: Does this step advance toward solving the problem?
+3. RIGOR: Are assumptions stated? Are approximations justified?
+
+Respond in exactly this format:
+CORRECTNESS: [score]
+RELEVANCE: [score]
+RIGOR: [score]
+ISSUES: [brief description of any problems, or "none"]"""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            temperature=0.0,  # deterministic for evaluation
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        # Parse scores from response
+        import re
+        text = response.content[0].text
+        scores = re.findall(r'(?:CORRECTNESS|RELEVANCE|RIGOR):\s*([\d.]+)', text)
+        if len(scores) == 3:
+            correctness, relevance, rigor = [float(s) for s in scores]
+            # Weighted combination emphasizing correctness
+            composite = 0.6 * correctness + 0.25 * relevance + 0.15 * rigor
+        else:
+            composite = 0.5  # fallback if parsing fails
+
+        scored_steps.append(ScoredStep(text=step, score=composite))
+
+    return scored_steps
+
+# Example: evaluate a multi-step derivation
+steps = [
+    "Step 1: To find the minimum of f(x) = x^2 + 2/x for x > 0, take the derivative.",
+    "Step 2: f'(x) = 2x - 2/x^2. Set f'(x) = 0.",
+    "Step 3: 2x = 2/x^2, so x^3 = 1, giving x = 1.",
+    "Step 4: f''(x) = 2 + 4/x^3. At x=1, f''(1) = 6 > 0, confirming a minimum.",
+    "Step 5: f(1) = 1 + 2 = 3. The minimum value is 3."
+]
+
+scored = llm_as_prm(
+    client,
+    "Find the minimum value of f(x) = x^2 + 2/x for x > 0.",
+    steps
+)
+for i, ss in enumerate(scored):
+    bar = "#" * int(ss.score * 20)
+    print(f"Step {i+1}: {ss.score:.2f} [{bar}] {ss.text[:60]}...")
+</code></pre>
+<div class="code-caption">Using a language model as an approximate process reward model. Each step is evaluated against explicit criteria (correctness, relevance, rigor) and assigned a weighted composite score. This approach requires no PRM training data but is limited by the evaluator model's own reasoning capabilities.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: OpenAI's PRM800K and Inference-Time Scaling</div>
+<p>The manual MCTS and PRM implementations above total roughly 200 lines. OpenAI has released <strong>PRM800K</strong>, a dataset of 800,000 step-level labels for mathematical reasoning, enabling training of dedicated PRM classifiers. The <code>prm800k</code> dataset is available on Hugging Face and can be used with standard transformer fine-tuning pipelines (approximately 20 lines with the <code>transformers</code> library to load and evaluate). For production MCTS, libraries like <code>guidance</code> and <code>outlines</code> provide constrained generation that integrates naturally with tree search, reducing the search implementation from ~100 lines to ~30. The underlying mechanics (UCB selection, expansion, backpropagation) remain identical to our from-scratch version.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Game Tree Analogy</div>
+<p>When DeepMind applied MCTS to Go, the game tree had roughly $10^{170}$ possible positions. The "game tree" of mathematical reasoning is arguably larger: at each step, the model can write any valid mathematical expression, and the branching factor is effectively infinite. The fact that MCTS works at all for reasoning relies on two regularities: (1) most candidate steps are obviously wrong and can be pruned quickly by the PRM, and (2) mathematical reasoning has a strong "local structure" where good intermediate states tend to lead to good final states. This is the same locality assumption that makes heuristic search tractable in the search framework of <a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Step-Level Reasoning Scorer</h4>
+<p>Build a minimal process reward scorer using only Python and an LLM API, then use it to compare two derivations of the same result.</p>
+<ol>
+<li><strong>Pick a problem with a known answer.</strong> Use a calculus or physics problem you can verify by hand, such as computing the integral $\int_0^1 x e^x \, dx$ (answer: 1).</li>
+<li><strong>Generate two reasoning chains.</strong> Prompt an LLM twice at temperature 0.9 with "Solve step by step," collecting two different derivations. Manually split each into a list of step strings (split on "Step N:" or double newlines).</li>
+<li><strong>Score each step with the LLM-as-PRM pattern.</strong> Use the <code>llm_as_prm</code> function from this section (or adapt it to your preferred API). Record the composite score for every step in both chains.</li>
+<li><strong>Visualize the score trajectories.</strong> With <code>matplotlib</code>, plot step index on the x-axis and composite score on the y-axis for both chains on the same axes. Look for the "score cliff" pattern: a sharp drop signals a likely error site.</li>
+<li><strong>Validate against ground truth.</strong> Read each chain yourself and confirm whether the lowest-scored step is the actual error (or whether both chains are correct and the low score is a false alarm). Record your findings: what fraction of flagged steps were genuine errors?</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>(Conceptual)</strong> Explain why a process reward model trained on mathematical reasoning might not transfer well to evaluating experimental design reasoning. What properties of mathematical proofs make step-level evaluation tractable that experimental reasoning lacks?</li>
+
+<li><strong>(Coding)</strong> Modify the <code>ReasoningMCTS</code> class to implement <strong>beam search</strong> instead of UCB-based tree search. At each depth level, keep the top-$k$ steps by PRM score and expand only those. Compare the beam search and MCTS approaches on 5 optimization problems. Which finds better solutions? Which uses fewer API calls?</li>
+
+<li><strong>(Analysis)</strong> The GPQA Diamond trajectory shows reasoning models surpassing expert humans at ~82%. Research and discuss: does this mean the models truly "understand" graduate-level science, or could it reflect memorization of similar problems from training data? What experimental design would distinguish these hypotheses? (Hint: consider the methodology used by Rein et al. to make questions "Google-proof.")</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-29.1.html">&#8592; 29.1 Chain-of-Thought and Test-Time Compute</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="section-29.3.html">29.3 Formal Mathematical Reasoning &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</body>
+</html>

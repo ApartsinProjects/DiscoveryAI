@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.2: Programmatic Prompt Optimization. DSPy signatures, predictors, modules, and prompt optimization as discrete search over instruction space." name="description"/>
+<title>Section 10.2: Programmatic Prompt Optimization | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Prompting to Programming</a></div>
+<h1>10.2 Programmatic Prompt Optimization</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I spent three weeks hand-tuning my prompt. Then a compiler found a better one in four minutes. I am not bitter. I am refactored."</p>
+<cite>A Prompt Engineer Who Became a Loss Function</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Section 10.1 showed how to constrain <em>what</em> a model outputs. This section tackles a deeper question: how do you choose the instructions, demonstrations, and reasoning strategies that make the model produce <em>good</em> outputs? The traditional answer is prompt engineering: a human iterates on the prompt text until the results look right. DSPy replaces this manual process with a programming model where prompts are parameters, quality metrics are loss functions, and optimization is automated search. The result is a system where you write the program logic and the compiler writes the prompts.</p>
+</div>
+
+<h2>1. The Prompt Engineering Bottleneck</h2>
+
+<p>In the previous section, we built typed interfaces that guarantee structural correctness: every response conforms to a schema. But structural correctness is not semantic correctness. A model can return a perfectly valid <code>PaperMetadata</code> object with the wrong title, incorrect year, or a methodology classification that does not match the paper's actual approach. The quality of the content depends on the prompt.</p>
+
+<p>Prompt engineering, as practiced today, has three fundamental problems:</p>
+
+<ol>
+<li><strong>It is manual</strong>. A human tries a prompt, inspects outputs, tweaks wording, and repeats. This does not scale to systems with dozens of LLM calls, each needing its own instructions.</li>
+<li><strong>It is brittle</strong>. A prompt tuned for GPT-4 may fail on Claude. A prompt tuned on 10 examples may degrade on a different distribution. Switching models means re-engineering every prompt.</li>
+<li><strong>It is opaque</strong>. There is no systematic way to know whether a prompt is optimal, or even good. Two prompt engineers working on the same task will produce different prompts with different failure modes.</li>
+</ol>
+
+<p>DSPy (Declarative Self-improving Python) addresses all three problems by treating prompt construction as a compilation step. You write the program; the compiler generates the prompts. Let us build this up from first principles.</p>
+
+<h2>2. The DSPy Programming Model</h2>
+
+<p>DSPy introduces three core abstractions: <strong>signatures</strong>, <strong>modules</strong>, and <strong>optimizers</strong> (historically called teleprompters). Together, they separate what the program does from how the LLM is prompted to do it.</p>
+
+<h3>Signatures: Typed Input/Output Contracts</h3>
+
+<p>A DSPy signature is a declarative specification of an LLM task. It declares the input and output fields with their types and descriptions, but says nothing about the prompt text. Think of it as a function type signature in a statically typed language.</p>
+
+<p data-agent="02">A signature is a Python class that inherits from <code>dspy.Signature</code> and serves as a contract between your code and the language model: it specifies exactly which named fields go in and which come out, along with type annotations and natural language descriptions for each. Signatures matter because they decouple the task definition from the prompting strategy; you can swap the underlying module (e.g., from <code>Predict</code> to <code>ChainOfThought</code>) or recompile for a different model without changing the signature at all. Mechanistically, the DSPy runtime reads the class's docstring and field metadata at compile time, then assembles them into a prompt template whose structure depends on the module wrapping the signature. Use a signature whenever your LLM call has clearly defined input and output fields; for free-form, conversational, or single-turn exploratory queries, a plain prompt string is simpler and sufficient.</p>
+
+<pre><code class="language-python">import dspy
+
+class ExtractClaims(dspy.Signature):
+    """Extract scientific claims from a paper abstract,
+    identifying the methodology and confidence level for each."""
+
+    abstract: str = dspy.InputField(desc="Full text of the paper abstract")
+    title: str = dspy.InputField(desc="Title of the paper")
+
+    claims: list[str] = dspy.OutputField(
+        desc="List of distinct scientific claims made in the abstract"
+    )
+    methodology: str = dspy.OutputField(
+        desc="Primary research methodology: experimental, computational, "
+        "theoretical, review, or meta-analysis"
+    )
+    confidence: str = dspy.OutputField(
+        desc="Overall confidence assessment: high, medium, or low"
+    )</code></pre>
+<div class="code-caption">A DSPy signature for claim extraction. The docstring becomes part of the generated prompt; the field descriptions guide the model's output. No prompt text is written by hand.</div>
+
+<p>The signature's docstring and field descriptions are the <em>only</em> natural language the programmer writes. Everything else (the actual prompt template, few-shot examples, chain-of-thought instructions) is generated by the optimizer.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>A DSPy signature is the prompt-programming analog of a function type signature in Haskell or Rust. Just as a type signature like <code>sort :: Ord a => [a] -> [a]</code> constrains the implementation without specifying the algorithm, a DSPy signature constrains what the LLM must produce without specifying how to prompt it. The "implementation" (the actual prompt) is generated by the compiler, not written by the programmer.</p>
+</div>
+
+<h3>Modules: Composable LLM Operations</h3>
+
+<p>A module wraps a signature with a specific prompting strategy. DSPy provides several built-in modules:</p>
+
+<ul>
+<li><code>dspy.Predict</code>: direct prediction, the simplest module. Generates a prompt from the signature and returns the output fields.</li>
+<li><code>dspy.ChainOfThought</code>: adds a <code>reasoning</code> field before the output, implementing chain-of-thought prompting (see <a href="../../part-1-foundations/module-04-reasoning-for-discovery/index.html">Section 4.2</a>) automatically.</li>
+<li><code>dspy.ProgramOfThought</code>: generates executable code to solve the task, then runs it.</li>
+<li><code>dspy.ReAct</code>: interleaves reasoning with tool calls, implementing the ReAct pattern.</li>
+</ul>
+
+<pre><code class="language-python">import dspy
+
+# Configure the language model
+lm = dspy.LM("anthropic/claude-sonnet-4-20250514")
+dspy.configure(lm=lm)
+
+# Wrap the signature in a ChainOfThought module
+extractor = dspy.ChainOfThought(ExtractClaims)
+
+# Call it like a function
+result = extractor(
+    abstract="We demonstrate that transformer-based models can predict "
+    "protein stability changes upon mutation with an RMSE of 0.8 kcal/mol, "
+    "outperforming physics-based methods by 30% on the ProTherm dataset.",
+    title="Deep Learning for Protein Stability Prediction"
+)
+
+print(result.claims)
+# ['Transformer-based models predict protein stability changes ...',
+#  'The model outperforms physics-based methods by 30% ...']
+print(result.methodology)
+# 'computational'
+print(result.reasoning)
+# 'The abstract describes a machine learning approach that ...'</code></pre>
+<div class="code-caption">Using a <code>ChainOfThought</code> module with the claim extraction signature. DSPy automatically adds a reasoning step before the output fields. The <code>reasoning</code> field is generated by the module, not declared in the signature.</div>
+
+<p>Modules are composable. You can build complex programs by chaining modules, just as you chain functions in regular Python:</p>
+
+<pre><code class="language-python">class SummarizeClaims(dspy.Signature):
+    """Synthesize a set of scientific claims into a coherent
+    summary paragraph, noting agreements and contradictions."""
+
+    claims: list[str] = dspy.InputField(
+        desc="Scientific claims from multiple papers"
+    )
+    research_question: str = dspy.InputField(
+        desc="The overarching research question"
+    )
+
+    summary: str = dspy.OutputField(
+        desc="Synthesis paragraph covering key findings"
+    )
+    contradictions: list[str] = dspy.OutputField(
+        desc="Any contradictions found between claims"
+    )
+    gaps: list[str] = dspy.OutputField(
+        desc="Knowledge gaps not addressed by the claims"
+    )
+
+
+class LiteratureAnalyzer(dspy.Module):
+    """A two-stage pipeline: extract claims, then synthesize."""
+
+    def __init__(self):
+        self.extract = dspy.ChainOfThought(ExtractClaims)
+        self.synthesize = dspy.ChainOfThought(SummarizeClaims)
+
+    def forward(self, abstracts: list[str], titles: list[str],
+                research_question: str):
+        # Stage 1: extract claims from each paper
+        all_claims = []
+        for abstract, title in zip(abstracts, titles):
+            result = self.extract(abstract=abstract, title=title)
+            all_claims.extend(result.claims)
+
+        # Stage 2: synthesize all claims
+        synthesis = self.synthesize(
+            claims=all_claims,
+            research_question=research_question
+        )
+        return synthesis</code></pre>
+<div class="code-caption">A two-stage DSPy program that extracts claims from multiple papers and synthesizes them. Each stage is a separate module with its own signature; the <code>forward</code> method defines the program flow. Compare this with the manual prompt chains from <a href="../module-09-vibe-coding/index.html">Chapter 9</a>.</div>
+
+<h2>3. Prompt Optimization as Discrete Search</h2>
+
+<p>Here is the central idea that makes DSPy different from every other LLM framework: the prompt text is not fixed. It is a <em>parameter</em> that can be optimized.</p>
+
+<p>Formally, let $\mathcal{P}$ be the space of all possible prompt programs (instructions plus demonstrations), let $\mathcal{D}$ be a dataset of input/output examples, and let $M: \mathcal{P} \times \mathcal{X} \rightarrow \mathcal{Y}$ be the language model viewed as a function from prompts and inputs to outputs. A <strong>quality metric</strong> $Q: \mathcal{Y} \times \mathcal{Y}^* \rightarrow [0, 1]$ scores how well the model's output matches the expected output. The optimization problem is:</p>
+
+$$
+p^* = \arg\max_{p \in \mathcal{P}} \mathbb{E}_{(x, y^*) \sim \mathcal{D}} \left[ Q(M(p, x), y^*) \right]
+$$
+
+<p>This is a discrete optimization problem because the search space $\mathcal{P}$ consists of natural language strings and sets of demonstrations, not continuous parameters. You cannot compute gradients through prompt text. Instead, DSPy optimizers use combinatorial search strategies: bootstrap sampling, Bayesian optimization over a surrogate model, or LLM-generated instruction proposals.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of prompt optimization like a cooking competition where you cannot taste the food yourself. You have a pantry of ingredients (candidate instructions, demonstration examples) and a panel of judges (your quality metric). You combine ingredients into a dish (a complete prompt), serve it to the judges, and receive a score. Because you cannot taste directly (no gradients through text), you must rely on the scores to guide your next attempt. <code>BootstrapFewShot</code> is like picking the best dishes from a potluck and putting them on the menu as examples. <code>MIPROv2</code> is like hiring a sous chef (an LLM) to propose new recipes, running a blind tasting (evaluation), and keeping a notebook of which flavor combinations scored well (Bayesian surrogate) so the next round of proposals is more targeted. The key insight: you never write the recipe by hand; you define what "delicious" means (the metric) and let the search find the recipe.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>Prompt optimization is to prompt engineering what compiler optimization is to hand-written assembly. The programmer specifies <em>what</em> the program should do (the signature and metric). The optimizer finds <em>how</em> to instruct the model (the prompt text and demonstrations). Just as you would not hand-write assembly for a production system, you should not hand-write prompts for a production LLM pipeline.</p>
+</div>
+
+<h2>4. DSPy Optimizers</h2>
+
+<p>DSPy ships several optimizers, each suited to different scenarios. The three most important ones are:</p>
+
+<h3>BootstrapFewShot</h3>
+
+<p>The simplest optimizer. It runs the program on training examples, collects the successful input/output traces, and selects the best ones as few-shot demonstrations for each module. No instruction optimization; just demonstration selection.</p>
+
+<pre><code class="language-python">import dspy
+from dspy.evaluate import Evaluate
+
+
+# Define a quality metric
+def claim_quality(example, prediction, trace=None):
+    """Score claim extraction quality.
+
+    Checks: (1) at least one claim extracted,
+    (2) methodology is valid, (3) claims are specific.
+    """
+    if not prediction.claims:
+        return 0.0
+
+    valid_methods = {
+        "experimental", "computational", "theoretical",
+        "review", "meta-analysis"
+    }
+    method_score = 1.0 if prediction.methodology in valid_methods else 0.0
+
+    # Check that claims are specific (more than 10 words each)
+    specificity = sum(
+        1 for c in prediction.claims if len(c.split()) > 10
+    ) / len(prediction.claims)
+
+    return (method_score + specificity) / 2.0
+
+
+# Training data: list of dspy.Example objects
+trainset = [
+    dspy.Example(
+        abstract="We develop a convolutional neural network that ...",
+        title="CNN for Retinal Disease Classification",
+        claims=["CNNs achieve 94% accuracy on retinal OCT images ..."],
+        methodology="computational",
+        confidence="high"
+    ).with_inputs("abstract", "title"),
+    # ... more examples
+]
+
+# Create and run the optimizer
+optimizer = dspy.BootstrapFewShot(
+    metric=claim_quality,
+    max_bootstrapped_demos=4,   # up to 4 few-shot examples per module
+    max_labeled_demos=4,
+    max_rounds=2,
+)
+
+# Compile: optimize the program's prompts
+analyzer = LiteratureAnalyzer()
+compiled_analyzer = optimizer.compile(
+    analyzer,
+    trainset=trainset,
+)</code></pre>
+<div class="code-caption">Compiling a DSPy program with <code>BootstrapFewShot</code>. The optimizer runs the program on training examples, collects successful traces, and selects them as few-shot demonstrations. The <code>compiled_analyzer</code> uses these demonstrations automatically in every call.</div>
+
+<h3>MIPROv2</h3>
+
+<p>The most powerful optimizer in DSPy. MIPROv2 (Multi-prompt Instruction PRoposal Optimizer, version 2) jointly optimizes both instructions and demonstrations. It works in three phases:</p>
+
+<ol>
+<li><strong>Proposal</strong>: an LLM generates candidate instruction strings for each module, informed by the task description, the training data distribution, and previous evaluation results.</li>
+<li><strong>Evaluation</strong>: each candidate program (instruction + demonstrations) is evaluated on a validation set using the quality metric.</li>
+<li><strong>Selection</strong>: a Bayesian surrogate model (specifically, a Tree-structured Parzen Estimator) selects the most promising candidates for the next round of proposals.</li>
+</ol>
+
+<pre><code class="language-python">optimizer = dspy.MIPROv2(
+    metric=claim_quality,
+    num_candidates=10,       # generate 10 candidate instructions
+    init_temperature=1.2,    # exploration temperature for proposals
+    max_bootstrapped_demos=4,
+    max_labeled_demos=4,
+    num_trials=30,           # total evaluation budget
+)
+
+compiled_analyzer = optimizer.compile(
+    LiteratureAnalyzer(),
+    trainset=trainset,
+    valset=valset,           # separate validation set
+    requires_permission_to_run=False,
+)
+
+# Inspect what the optimizer chose
+for name, module in compiled_analyzer.named_predictors():
+    print(f"Module: {name}")
+    # The compiled module now has optimized instructions
+    # and selected demonstrations baked into its prompt</code></pre>
+<div class="code-caption">Compiling with <code>MIPROv2</code>. The optimizer generates, evaluates, and selects both instructions and demonstrations using Bayesian optimization. This is the recommended optimizer for production DSPy programs.</div>
+
+<p>The search space is combinatorial. With 10 candidate instructions per module and 4 possible demonstration sets, a two-module program has $10^2 \times \binom{n}{4}^2$ possible configurations. MIPROv2's Bayesian surrogate makes this tractable by modeling the relationship between program configurations and quality scores, focusing evaluation budget on the most promising regions of the search space.</p>
+
+<h3>Choosing an Optimizer</h3>
+
+<p>The decision tree is straightforward:</p>
+
+<ul>
+<li><strong>Few training examples (&lt;20)</strong>: use <code>BootstrapFewShot</code>. It needs minimal data and is fast.</li>
+<li><strong>Moderate data (20-200 examples)</strong>: use <code>MIPROv2</code>. The Bayesian optimization pays off when there is enough data to estimate quality reliably.</li>
+<li><strong>Large data or complex programs</strong>: use <code>MIPROv2</code> with a larger trial budget. Consider caching LLM calls to reduce cost.</li>
+<li><strong>Need to optimize for a specific model</strong>: recompile. The same DSPy program compiled for Claude will produce different prompts than when compiled for GPT-4, because the optimizer adapts to each model's strengths.</li>
+</ul>
+
+<h2>5. Quality Metrics: The Heart of Optimization</h2>
+
+<p>The quality metric is the most important design decision in a DSPy program. A poorly chosen metric optimizes the wrong thing. A good metric captures exactly what "correct" means for your task.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent misunderstanding is that DSPy's optimizer will "figure out" what you want even if your metric is approximate or incomplete. In reality, the optimizer maximizes exactly the metric you provide, nothing more: if your metric checks only output format but not factual accuracy, the optimizer will find prompts that produce perfectly formatted but potentially wrong answers. The optimizer is a faithful maximizer of your scoring function, so the burden of encoding what "good" means falls entirely on the metric designer.</p>
+</div>
+
+<p>DSPy metrics follow a simple contract: they receive an <code>example</code> (the ground truth), a <code>prediction</code> (the model's output), and an optional <code>trace</code> (the full execution trace). They return a float between 0 and 1.</p>
+
+<pre><code class="language-python">def literature_synthesis_metric(example, prediction, trace=None):
+    """Multi-dimensional quality metric for literature synthesis.
+
+    Evaluates: factual grounding, coverage, contradiction detection,
+    and gap identification.
+    """
+    scores = {}
+
+    # 1. Factual grounding: are claims traceable to papers?
+    if hasattr(prediction, 'summary') and prediction.summary:
+        # Use an LLM-as-judge to check factual grounding
+        grounding_check = dspy.ChainOfThought(
+            "summary, claims -> grounding_score: float"
+        )
+        result = grounding_check(
+            summary=prediction.summary,
+            claims=str(example.claims)
+        )
+        scores['grounding'] = min(float(result.grounding_score), 1.0)
+    else:
+        scores['grounding'] = 0.0
+
+    # 2. Coverage: does the summary address the research question?
+    if prediction.summary and len(prediction.summary.split()) > 50:
+        scores['coverage'] = 1.0
+    else:
+        scores['coverage'] = 0.5
+
+    # 3. Contradiction detection
+    expected_contradictions = set(example.get('contradictions', []))
+    found_contradictions = set(getattr(prediction, 'contradictions', []))
+    if expected_contradictions:
+        scores['contradictions'] = (
+            len(expected_contradictions & found_contradictions)
+            / len(expected_contradictions)
+        )
+    else:
+        scores['contradictions'] = 1.0 if not found_contradictions else 0.5
+
+    # 4. Gap identification
+    if prediction.gaps and len(prediction.gaps) >= 1:
+        scores['gaps'] = 1.0
+    else:
+        scores['gaps'] = 0.0
+
+    # Weighted average
+    weights = {
+        'grounding': 0.4,
+        'coverage': 0.2,
+        'contradictions': 0.2,
+        'gaps': 0.2,
+    }
+    return sum(scores[k] * weights[k] for k in scores)</code></pre>
+<div class="code-caption">A multi-dimensional quality metric for literature synthesis. The grounding check itself uses an LLM call (LLM-as-judge), which is common in DSPy metrics. Weights reflect the relative importance of each dimension.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: When Optimization Hurts</div>
+<p>A research team at a pharmaceutical company built a DSPy program to extract drug-target interactions from abstracts. Their initial metric checked only whether the extracted target name appeared in a curated database. The optimizer quickly found a prompt that produced valid target names 98% of the time, but it achieved this by ignoring the abstract and guessing common targets. The fix was a multi-part metric that also checked (1) whether the target was actually mentioned in the abstract, (2) whether the interaction type (agonist, antagonist, inhibitor) was correctly classified, and (3) whether the confidence score correlated with the claim's evidentiary support. The lesson: a metric that can be gamed will be gamed. Build metrics that test what you actually care about, not a proxy.</p>
+</div>
+
+<h2>6. The Compilation Pipeline</h2>
+
+<p>Putting it all together, the DSPy compilation pipeline has four stages:</p>
+
+<ol>
+<li><strong>Define</strong>: write signatures (input/output contracts) and modules (program logic).</li>
+<li><strong>Instrument</strong>: create a quality metric that scores outputs against ground truth.</li>
+<li><strong>Compile</strong>: run an optimizer to generate optimal instructions and demonstrations.</li>
+<li><strong>Deploy</strong>: use the compiled program in production, optionally saving/loading the optimized state.</li>
+</ol>
+
+<pre><code class="language-python">import dspy
+import json
+
+# --- Stage 1: Define ---
+class ClassifyPaper(dspy.Signature):
+    """Classify a scientific paper into one or more research areas."""
+    abstract: str = dspy.InputField()
+    title: str = dspy.InputField()
+    areas: list[str] = dspy.OutputField(
+        desc="Research areas from: ML, NLP, CV, bio, chem, physics, other"
+    )
+    reasoning: str = dspy.OutputField(
+        desc="Brief justification for the classification"
+    )
+
+classifier = dspy.ChainOfThought(ClassifyPaper)
+
+# --- Stage 2: Instrument ---
+VALID_AREAS = {"ML", "NLP", "CV", "bio", "chem", "physics", "other"}
+
+def classification_metric(example, prediction, trace=None):
+    predicted = set(prediction.areas)
+    expected = set(example.areas)
+    # Check valid vocabulary
+    vocab_ok = predicted.issubset(VALID_AREAS)
+    # F1 score for multi-label classification
+    if not predicted or not expected:
+        f1 = 0.0
+    else:
+        precision = len(predicted & expected) / len(predicted)
+        recall = len(predicted & expected) / len(expected)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    return f1 * (1.0 if vocab_ok else 0.5)
+
+# --- Stage 3: Compile ---
+compiled_classifier = dspy.BootstrapFewShot(
+    metric=classification_metric,
+    max_bootstrapped_demos=3,
+).compile(classifier, trainset=trainset)
+
+# --- Stage 4: Deploy ---
+# Save compiled state
+compiled_classifier.save("paper_classifier_v1.json")
+
+# Load in production
+production_classifier = dspy.ChainOfThought(ClassifyPaper)
+production_classifier.load("paper_classifier_v1.json")
+
+# Use like any function
+result = production_classifier(
+    abstract="We propose a novel attention mechanism...",
+    title="Efficient Transformers for Long Documents"
+)
+print(result.areas)     # ['ML', 'NLP']
+print(result.reasoning) # 'The paper proposes a transformer ...'</code></pre>
+<div class="code-caption">The complete DSPy compilation pipeline: define, instrument, compile, deploy. The compiled program's optimized state is serialized to JSON and loaded in production without re-running the optimizer.</div>
+
+<h2>7. DSPy vs. Manual Prompt Engineering</h2>
+
+<p>To make the comparison concrete, consider the same claim extraction task implemented both ways:</p>
+
+<p><strong>Manual approach</strong>: write a system prompt with instructions, formatting rules, and hand-picked examples. Test on a few cases. Tweak the wording. Repeat. When the model changes, start over. Time: hours to days. Result: a prompt that works for one model on one distribution.</p>
+
+<p><strong>DSPy approach</strong>: write a signature (5 lines), a metric (20 lines), and a compilation call (3 lines). The optimizer evaluates 30 configurations in minutes and selects the best one. When the model changes, recompile. Time: minutes. Result: an optimized prompt for the specific model and data distribution, with a quality score to prove it.</p>
+
+<p>The trade-off is real: DSPy requires training data and a well-defined metric. For exploratory, one-off tasks, manual prompting is faster. For production pipelines with multiple LLM calls, reliability requirements, and model migration plans, DSPy is the right tool. The <a href="section-10.3.html">next section</a> builds a complete example that demonstrates the payoff.</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: From Prompt Search to Learned Optimizers</div>
+<p>DSPy treats prompt optimization as a black-box discrete search problem. An active research direction seeks to make this differentiable. TextGrad (Yuksekgonul et al., 2024) computes "textual gradients" by asking an LLM to critique outputs and suggest prompt improvements, then applying these suggestions as gradient-like updates. More recently, BetterTogether (Khattab et al., 2025) demonstrated that jointly optimizing prompts, few-shot examples, and model weights through coordinated rounds of inference-time optimization and fine-tuning yields stronger results than optimizing any single component alone; on standard benchmarks, programs optimized with BetterTogether outperformed both prompt-only and fine-tuning-only baselines by 5 to 28 percentage points. DSPy 2.6+ integrates parts of this pipeline through the <code>BootstrapFinetune</code> optimizer. The boundary between prompt optimization and model training is blurring: in the limit, an optimizer that modifies both the prompt and the model weights is just training a system end-to-end, with the prompt as an additional set of "soft" parameters. This convergence connects back to the representation learning ideas in <a href="../../part-3-data-models/module-26-representation-learning/index.html">Chapter 26</a>.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>The DSPy project's original name for optimizers was "teleprompters," a pun on the device that feeds scripts to TV presenters. The metaphor is apt: just as a teleprompter feeds a human speaker the right words at the right time, a DSPy optimizer feeds the language model the right instructions and examples. The name was later changed to "optimizers" for clarity, but the original captures the spirit perfectly.</p>
+</div>
+
+<h2>8. When Not to Optimize</h2>
+
+<p>Prompt optimization is powerful, but it is not always the right choice. Four situations call for manual prompting instead:</p>
+
+<ol>
+<li><strong>Exploration</strong>: when you are still figuring out what the LLM should do, manual iteration is faster than writing metrics and training sets.</li>
+<li><strong>No ground truth</strong>: optimization requires a metric, and a metric requires some notion of "correct." For open-ended creative tasks, there may be no ground truth to optimize against.</li>
+<li><strong>Single-use tasks</strong>: if you will run a prompt once or twice, the cost of building a training set and running an optimizer exceeds the cost of just writing a good prompt.</li>
+<li><strong>Debugging</strong>: when a compiled program fails, you need to read and understand the generated prompt. If the optimizer produced something opaque, you may need to override it with a manual prompt to diagnose the issue.</li>
+</ol>
+
+<p>The practical rule of thumb: if you find yourself re-running the same LLM call more than a few dozen times with different prompt variations, you are doing optimization by hand. Use a compiler instead.</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Optimize a Sentiment Classifier with DSPy</h4>
+<p>Build and optimize a simple sentiment classifier to see DSPy's compilation pipeline in action. You need Python 3.10+, the <code>dspy</code> package (<code>pip install dspy</code>), and an API key for any supported model.</p>
+<ol>
+<li><strong>Define the signature.</strong> Create a <code>ClassifySentiment(dspy.Signature)</code> with an <code>InputField</code> called <code>text</code> (a product review) and two <code>OutputField</code>s: <code>sentiment</code> (one of "positive", "negative", "neutral") and <code>justification</code> (a one-sentence explanation).</li>
+<li><strong>Build a training set.</strong> Write 15 to 20 <code>dspy.Example</code> objects with short product reviews and their correct sentiment labels. Call <code>.with_inputs("text")</code> on each. Split roughly 70/30 into train and validation sets.</li>
+<li><strong>Write a metric.</strong> Define a function that returns 1.0 if <code>prediction.sentiment</code> matches <code>example.sentiment</code> exactly, 0.5 if the sentiment is valid but wrong, and 0.0 if the sentiment is not in the allowed set.</li>
+<li><strong>Compile and compare.</strong> Create a <code>dspy.ChainOfThought(ClassifySentiment)</code> module. Run it on your validation set <em>before</em> compilation to get a baseline score. Then compile with <code>dspy.BootstrapFewShot(metric=your_metric, max_bootstrapped_demos=3)</code> and re-evaluate on the same validation set. Print both scores side by side.</li>
+<li><strong>Inspect the generated prompt.</strong> Call <code>lm.inspect_history(n=1)</code> after running the compiled module on one example. Read the full prompt the optimizer produced, noting which demonstrations it selected and how the chain-of-thought instruction was formatted.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual</strong>: The optimization objective $p^* = \arg\max_{p \in \mathcal{P}} \mathbb{E}_{(x, y^*) \sim \mathcal{D}}[Q(M(p, x), y^*)]$ treats the model $M$ as a black box. What assumptions does this make about the model's behavior? Under what conditions might optimizing the prompt for one model produce a prompt that transfers well to another model?</li>
+
+<li><strong>Coding</strong>: Build a DSPy program with two signatures: (1) <code>ExtractEntities</code> that takes a biomedical abstract and extracts gene names, protein names, and disease names as three separate lists; (2) <code>ClassifyRelationship</code> that takes a pair of entities and the abstract and classifies their relationship as "causal", "correlative", "inhibitory", or "unknown". Write a quality metric that checks entity extraction recall against a provided ground truth and relationship classification accuracy. Compile with <code>BootstrapFewShot</code> and report the before/after quality scores.</li>
+
+<li><strong>Analysis</strong>: Compare the prompt text generated by <code>BootstrapFewShot</code> and <code>MIPROv2</code> for the same task. How do the instructions differ? How many demonstrations does each select? Run both on a held-out test set and compare quality scores. Which optimizer produces more consistent results across different random seeds?</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-10.1.html">&#8592; 10.1 Structured Outputs and Tool Use</a>
+<a href="index.html">Chapter 10</a>
+<a class="next" href="section-10.3.html">10.3 Building a DSPy Literature Program &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.1: Hypothesis-Driven Debugging. Delta debugging, spectrum-based fault localization with the Ochiai coefficient, structured logging, and OpenTelemetry tracing." name="description"/>
+<title>Section 19.1: Hypothesis-Driven Debugging | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: AI-Assisted Debugging</a></div>
+<h1>19.1 Hypothesis-Driven Debugging</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"Every bug is a failed prediction. The code predicted it would compute X; reality delivered Y. The question is not 'what went wrong' but 'which prediction, precisely, was false.'"</p>
+<cite>A Stack Trace Practicing Abductive Reasoning</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section opens Chapter 19. You should have completed
+<a href="../module-18-ai-testing/index.html">Chapter 18: AI-Assisted Testing and QA</a>,
+which introduced property-based testing and mutation analysis as the mechanisms that
+produce failing test cases. Familiarity with pytest, Python tracebacks, and basic
+conditional probability will be helpful. The search framework from
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1: Discovery as Search</a>
+provides the conceptual foundation: debugging is search over the space of possible
+root causes.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Debugging is abductive reasoning applied to software. Given an observed failure (the
+symptom), the debugger generates candidate explanations (hypotheses about which code is
+wrong), ranks them by plausibility, and tests the most promising ones first. This section
+formalizes that intuition with two algorithms: <strong>delta debugging</strong>, which
+isolates the minimal failure-inducing change through binary search, and
+<strong>spectrum-based fault localization</strong>, which ranks every source line by
+statistical suspiciousness. Together, they transform debugging from an art into a
+systematic, automatable process.
+</p>
+</div>
+
+<h2>1. Debugging as Scientific Inquiry</h2>
+
+<p>
+Consider a scientist who observes an unexpected experimental result. The response is not to
+stare at the apparatus and hope for insight. Instead, the scientist formulates hypotheses,
+designs experiments to distinguish between them, and iteratively narrows the set of plausible
+explanations until only one remains. Debugging follows exactly the same logic.
+</p>
+
+<p data-agent="02">
+Hypothesis-driven debugging is a disciplined methodology in which the developer treats
+every observed failure as evidence and systematically generates, ranks, and tests
+candidate root causes rather than modifying code at random. It matters because unstructured
+debugging (inserting print statements, toggling changes, and hoping something works) scales
+poorly: as codebases grow, the space of possible faults grows combinatorially, and ad hoc
+exploration wastes most of its effort on irrelevant code paths. The mechanism is straightforward:
+observe the symptom, enumerate plausible explanations, design the cheapest experiment that
+distinguishes between them, run it, eliminate the disproven hypotheses, and repeat until
+exactly one explanation survives. Use this approach whenever a bug resists a quick visual
+inspection of the traceback; for trivial typos or import errors that the traceback already
+pinpoints, a formal hypothesis cycle adds overhead without benefit.
+</p>
+
+<p>
+The analogy is precise. The "observation" is a failing test or a crash. The "hypotheses" are
+candidate root causes (a wrong conditional, an off-by-one error, a missing null check). The
+"experiments" are targeted test runs or trace inspections that confirm or eliminate each
+hypothesis. The "conclusion" is a patch that restores correct behavior, verified by re-running
+the failing test. This is the same cycle of observation, hypothesis, experiment, and conclusion
+that drives scientific discovery, as we explored in
+<a href="../../part-1-foundations/module-02-scientific-discovery/index.html">Chapter 2: Scientific Discovery and Knowledge Creation</a>.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Debugging Hypothesis Space</div>
+<p>
+Every debugging session is a search through the space of possible root causes. The search
+space is exponential in the size of the codebase: any line, any variable, any interaction
+could be at fault. The debugger's skill lies in pruning this space efficiently, using
+domain knowledge, execution traces, and statistical analysis to focus on the most likely
+candidates first. Delta debugging and fault localization are systematic pruning algorithms
+for this search.
+</p>
+</div>
+
+<h2>2. Delta Debugging: Binary Search Over Change Sets</h2>
+
+<p>
+Delta debugging, introduced by Andreas Zeller, answers a deceptively simple question: given a
+set of changes that caused a test to fail, what is the <em>minimal</em> subset of those changes
+that is sufficient to reproduce the failure? The answer is found through a binary search
+process that systematically partitions the change set and tests each partition.
+</p>
+
+<h3>2.1 The Algorithm</h3>
+
+<p>
+Let $C = \{c_1, c_2, \ldots, c_n\}$ be a set of changes (lines modified, commits applied,
+configuration values altered). Define a test function $\text{test}(S)$ that returns
+$\text{FAIL}$ when the subset $S \subseteq C$ reproduces the failure and $\text{PASS}$
+otherwise. The ddmin algorithm finds a 1-minimal subset $S^* \subseteq C$ such that
+$\text{test}(S^*) = \text{FAIL}$ and for every proper subset $S' \subset S^*$,
+$\text{test}(S') = \text{PASS}$.
+</p>
+
+<p>
+The algorithm works by repeatedly splitting the current change set into halves and testing
+each half. If one half alone triggers the failure, the other half is irrelevant and can be
+discarded. If neither half alone triggers the failure, the algorithm increases the
+granularity, splitting into quarters, eighths, and so on, until it finds the minimal set.
+The worst-case complexity is $O(n^2)$ test executions, but the typical case for bugs caused
+by a small number of interacting changes is $O(n \log n)$.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misunderstanding is that delta debugging finds <em>the single line</em> that
+caused the bug. In reality, ddmin finds the minimal <em>set</em> of changes that together
+reproduce the failure. Many bugs require multiple changes to interact (as in the example
+below, where both a decrement and a wrong guard must co-occur). If you expect ddmin to
+always return a single element, you will misinterpret multi-change results as algorithm
+failures rather than as evidence that the bug involves an interaction between components.
+</p>
+</div>
+
+<pre><code class="language-python">"""
+Delta debugging: find the minimal failure-inducing subset of changes.
+Implements the ddmin algorithm from Zeller & Hildebrandt (2002).
+"""
+from enum import Enum
+from typing import Callable, Sequence, TypeVar
+
+T = TypeVar("T")
+
+
+class TestResult(Enum):
+    PASS = "pass"
+    FAIL = "fail"
+    UNRESOLVED = "unresolved"
+
+
+def ddmin(
+    changes: Sequence[T],
+    test_fn: Callable[[Sequence[T]], TestResult],
+    granularity: int = 2,
+) -> list[T]:
+    """Find 1-minimal failure-inducing subset of changes.
+
+    Args:
+        changes: The full set of changes that causes a failure.
+        test_fn: Function that returns FAIL if the subset triggers
+                 the bug, PASS if it does not, UNRESOLVED otherwise.
+        granularity: Initial partition count (default 2 for binary).
+
+    Returns:
+        Minimal subset that still triggers the failure.
+    """
+    assert test_fn(changes) == TestResult.FAIL, "Full set must fail"
+
+    n = granularity
+    current = list(changes)
+
+    while len(current) >= 2:
+        # Partition current changes into n roughly equal subsets
+        chunk_size = max(1, len(current) // n)
+        subsets = [
+            current[i : i + chunk_size]
+            for i in range(0, len(current), chunk_size)
+        ]
+
+        found_smaller = False
+
+        # Try each subset alone
+        for subset in subsets:
+            if test_fn(subset) == TestResult.FAIL:
+                current = subset
+                n = 2
+                found_smaller = True
+                break
+
+        if found_smaller:
+            continue
+
+        # Try each complement (all changes except one subset)
+        for i, subset in enumerate(subsets):
+            complement = []
+            for j, s in enumerate(subsets):
+                if j != i:
+                    complement.extend(s)
+            if test_fn(complement) == TestResult.FAIL:
+                current = complement
+                n = max(n - 1, 2)
+                found_smaller = True
+                break
+
+        if not found_smaller:
+            if n >= len(current):
+                break  # Cannot split further; current is minimal
+            n = min(n * 2, len(current))
+
+    return current</code></pre>
+<div class="code-caption">The ddmin algorithm: binary search over change sets to find the minimal failure-inducing subset. The test function is called repeatedly with different subsets until no further reduction is possible.</div>
+
+<p>
+Let us see this in action. Suppose a commit introduces 20 changed lines, and only 3 of
+them interact to cause a regression. Instead of manually bisecting, ddmin systematically
+tests subsets and finds those 3 lines in roughly $O(20 \log 20) \approx 87$ test runs, far
+fewer than the $2^{20} \approx 1{,}000{,}000$ subsets a brute-force approach would require.
+</p>
+
+<pre><code class="language-python">"""
+Demonstration: applying ddmin to isolate a failure-inducing change.
+"""
+
+
+def apply_changes(base_code: str, changes: list[str]) -> str:
+    """Simulate applying a set of line-level changes to source code."""
+    result = base_code
+    for change in changes:
+        result += f"\n{change}"
+    return result
+
+
+def simulate_test(changes: list[str]) -> TestResult:
+    """A simulated test that fails when specific changes co-occur.
+
+    The bug requires BOTH 'x = x - 1' AND 'if x > 0' to be present;
+    either alone does not trigger the failure.
+    """
+    code = " ".join(changes)
+    has_decrement = "x = x - 1" in code
+    has_wrong_guard = "if x > 0" in code  # should be >= 0
+    if has_decrement and has_wrong_guard:
+        return TestResult.FAIL
+    return TestResult.PASS
+
+
+# 10 changes, only 2 of which interact to cause the bug
+all_changes = [
+    "y = 42",
+    "x = x - 1",       # Bug component 1
+    "z = compute(a)",
+    "log.info('step')",
+    "if x > 0",         # Bug component 2 (should be >= 0)
+    "cache.clear()",
+    "result.append(v)",
+    "counter += 1",
+    "db.commit()",
+    "return result",
+]
+
+minimal = ddmin(all_changes, simulate_test)
+print(f"Minimal failure set ({len(minimal)} changes): {minimal}")
+# Output: Minimal failure set (2 changes): ['x = x - 1', 'if x > 0']</code></pre>
+<div class="code-caption">Delta debugging in action: from 10 changes, ddmin isolates the 2 interacting changes that cause the failure, without any human guidance.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Git Bisect as Delta Debugging</div>
+<p>
+The <code>git bisect</code> command is a specialized form of delta debugging applied to
+commits rather than lines. Given a known-good commit and a known-bad commit, it performs
+binary search over the commit history, checking out the midpoint and asking you to test
+it. In $O(\log n)$ steps it identifies the first commit that introduced the regression.
+The ddmin algorithm generalizes this: it works on arbitrary change sets (not just linear
+commit sequences) and handles the case where multiple non-contiguous changes must
+co-occur to produce the failure.
+</p>
+</div>
+
+<h2>3. Spectrum-Based Fault Localization</h2>
+
+<p>
+Delta debugging tells you <em>which changes</em> caused a bug. Spectrum-based fault
+localization (SBFL) tells you <em>which lines of existing code</em> are most likely at fault,
+given a set of passing and failing test executions. The idea is simple: a line that is
+executed by many failing tests and few passing tests is more suspicious than a line
+executed uniformly by both.
+</p>
+
+<h3>3.1 The Program Spectrum</h3>
+
+<p>
+A <strong>program spectrum</strong> is a record of which source lines were executed during a
+particular test run. Given $m$ test cases $\{t_1, t_2, \ldots, t_m\}$ and $n$ source lines
+$\{s_1, s_2, \ldots, s_n\}$, the spectrum is a binary matrix $M$ where $M_{ij} = 1$ if
+test $t_i$ executed line $s_j$, and $M_{ij} = 0$ otherwise. Each test also has an outcome:
+pass ($P$) or fail ($F$).
+</p>
+
+<p>
+For each line $s_j$, we compute four counts from the spectrum:
+</p>
+
+<ul>
+<li>$e_f(s_j)$: number of failing tests that execute line $s_j$</li>
+<li>$e_p(s_j)$: number of passing tests that execute line $s_j$</li>
+<li>$n_f(s_j)$: number of failing tests that do <em>not</em> execute line $s_j$</li>
+<li>$n_p(s_j)$: number of passing tests that do <em>not</em> execute line $s_j$</li>
+</ul>
+
+<h3>3.2 The Ochiai Coefficient</h3>
+
+<p>
+Several suspiciousness metrics have been proposed. The <strong>Ochiai coefficient</strong>,
+borrowed from ecology where it measures species co-occurrence, consistently outperforms
+alternatives in empirical evaluations. For a source line $s_j$:
+</p>
+
+$$\text{Ochiai}(s_j) = \frac{e_f(s_j)}{\sqrt{(e_f(s_j) + n_f(s_j)) \cdot (e_f(s_j) + e_p(s_j))}}$$
+
+<p>
+The numerator rewards lines that appear in failing tests. The denominator penalizes lines
+that also appear in passing tests (low discrimination) and lines that are absent from some
+failing tests (incomplete coverage of failures). A line with $\text{Ochiai} = 1.0$ appears
+in every failing test and no passing test; it is maximally suspicious. A line with
+$\text{Ochiai} = 0.0$ never appears in a failing test; it is cleared.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the Ochiai coefficient like a food-poisoning investigation. A health inspector
+has reports from 20 diners: 5 got sick, 15 did not. Each report lists what the diner ate.
+If every sick diner ate the shrimp and none of the healthy diners did, the shrimp gets a
+suspiciousness score of 1.0. If both sick and healthy diners ate the bread, the bread
+scores low because it does not discriminate between outcomes. The Ochiai coefficient works
+the same way: it scores each line of code by how exclusively it co-occurs with failure,
+just as the inspector scores each dish by how exclusively it co-occurs with illness. The
+denominator penalizes "popular" dishes (lines run by many passing tests too) and rewards
+dishes consumed by every sick person (lines present in all failing tests).
+</p>
+</div>
+
+<p>
+For comparison, other metrics use the same four counts differently. The <strong>Tarantula</strong>
+metric normalizes by the total number of passing and failing tests:
+</p>
+
+$$\text{Tarantula}(s_j) = \frac{\frac{e_f(s_j)}{e_f(s_j) + n_f(s_j)}}{\frac{e_f(s_j)}{e_f(s_j) + n_f(s_j)} + \frac{e_p(s_j)}{e_p(s_j) + n_p(s_j)}}$$
+
+<p>
+Empirical studies by Abreu et al. (2007) show that Ochiai ranks the faulty line higher than
+Tarantula in 80% of cases, making it the preferred default for automated fault localization.
+</p>
+
+<pre><code class="language-python">"""
+Spectrum-based fault localization with the Ochiai coefficient.
+Given a coverage matrix and test outcomes, rank lines by suspiciousness.
+"""
+import math
+from dataclasses import dataclass
+
+
+@dataclass
+class SpectrumEntry:
+    """Coverage and outcome data for one source line."""
+    line_number: int
+    source_text: str
+    executed_by_failing: int   # e_f
+    executed_by_passing: int   # e_p
+    not_executed_failing: int  # n_f
+    not_executed_passing: int  # n_p
+
+
+def ochiai(entry: SpectrumEntry) -> float:
+    """Compute the Ochiai suspiciousness coefficient.
+
+    Returns a value in [0, 1] where 1.0 = maximally suspicious.
+    """
+    ef = entry.executed_by_failing
+    ep = entry.executed_by_passing
+    nf = entry.not_executed_failing
+
+    denominator = math.sqrt((ef + nf) * (ef + ep))
+    if denominator == 0:
+        return 0.0
+    return ef / denominator
+
+
+def tarantula(entry: SpectrumEntry) -> float:
+    """Compute the Tarantula suspiciousness metric for comparison."""
+    ef = entry.executed_by_failing
+    ep = entry.executed_by_passing
+    nf = entry.not_executed_failing
+    np_ = entry.not_executed_passing
+
+    fail_ratio = ef / (ef + nf) if (ef + nf) > 0 else 0
+    pass_ratio = ep / (ep + np_) if (ep + np_) > 0 else 0
+
+    denominator = fail_ratio + pass_ratio
+    if denominator == 0:
+        return 0.0
+    return fail_ratio / denominator
+
+
+def localize_faults(
+    spectrum: list[SpectrumEntry],
+    metric: str = "ochiai",
+) -> list[tuple[int, str, float]]:
+    """Rank source lines by suspiciousness.
+
+    Returns:
+        List of (line_number, source_text, score) sorted by
+        descending suspiciousness.
+    """
+    score_fn = ochiai if metric == "ochiai" else tarantula
+
+    scored = [
+        (entry.line_number, entry.source_text, score_fn(entry))
+        for entry in spectrum
+    ]
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return scored</code></pre>
+<div class="code-caption">Spectrum-based fault localization: computing Ochiai and Tarantula suspiciousness scores from a coverage spectrum, then ranking lines by decreasing suspiciousness.</div>
+
+<h3>3.3 Building the Spectrum from Coverage Data</h3>
+
+<p>
+In practice, the spectrum matrix is built from pytest's coverage data. Each test run
+produces a coverage report listing which lines were executed. We collect these reports
+across all tests in the suite, partition by pass/fail outcome, and compute the four
+counts for each line.
+</p>
+
+<pre><code class="language-python">"""
+Build a program spectrum from pytest coverage data.
+Uses coverage.py to collect per-test line coverage.
+"""
+import subprocess
+import json
+from pathlib import Path
+from collections import defaultdict
+
+
+def collect_per_test_coverage(
+    test_dir: str,
+    source_file: str,
+) -> dict[str, dict]:
+    """Run each test individually with coverage, collecting per-test spectra.
+
+    Returns:
+        Dict mapping test_name -> {"lines": [int, ...], "passed": bool}
+    """
+    # Discover test functions
+    result = subprocess.run(
+        ["python", "-m", "pytest", test_dir, "--collect-only", "-q"],
+        capture_output=True, text=True,
+    )
+    test_ids = [
+        line.strip() for line in result.stdout.splitlines()
+        if "::" in line
+    ]
+
+    spectra = {}
+    for test_id in test_ids:
+        # Run single test with coverage
+        cov_result = subprocess.run(
+            [
+                "python", "-m", "coverage", "run",
+                "--source", source_file,
+                "-m", "pytest", test_id, "-x", "-q",
+            ],
+            capture_output=True, text=True,
+        )
+        passed = cov_result.returncode == 0
+
+        # Export coverage as JSON
+        subprocess.run(
+            ["python", "-m", "coverage", "json", "-o", "cov_temp.json"],
+            capture_output=True,
+        )
+        cov_data = json.loads(Path("cov_temp.json").read_text())
+
+        # Extract executed lines for the target file
+        file_cov = cov_data.get("files", {}).get(source_file, {})
+        executed_lines = file_cov.get("executed_lines", [])
+
+        spectra[test_id] = {
+            "lines": executed_lines,
+            "passed": passed,
+        }
+
+    return spectra
+
+
+def build_spectrum(
+    spectra: dict[str, dict],
+    source_file: str,
+) -> list[SpectrumEntry]:
+    """Convert per-test coverage into a spectrum for fault localization."""
+    source_lines = Path(source_file).read_text().splitlines()
+    all_lines = set()
+    for data in spectra.values():
+        all_lines.update(data["lines"])
+
+    entries = []
+    for line_no in sorted(all_lines):
+        ef = ep = nf = np_ = 0
+        for data in spectra.values():
+            executed = line_no in data["lines"]
+            passed = data["passed"]
+            if executed and not passed:
+                ef += 1
+            elif executed and passed:
+                ep += 1
+            elif not executed and not passed:
+                nf += 1
+            else:
+                np_ += 1
+
+        text = source_lines[line_no - 1] if line_no <= len(source_lines) else ""
+        entries.append(SpectrumEntry(line_no, text.strip(), ef, ep, nf, np_))
+
+    return entries</code></pre>
+<div class="code-caption">Building a program spectrum from per-test coverage data collected by coverage.py, then converting it into SpectrumEntry objects ready for Ochiai scoring.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: fault-localization</div>
+<p>
+The <code>fault-localization</code> PyPI package wraps spectrum collection and multiple
+suspiciousness metrics (Ochiai, Tarantula, DStar, Op2) in a single API. Instead of the
+60 lines above, you can write:
+</p>
+<pre><code class="language-python">from fault_localization import FlAnalyzer
+
+analyzer = FlAnalyzer(source="app.py", tests="tests/")
+ranking = analyzer.rank(metric="ochiai")
+for line_no, score in ranking[:10]:
+    print(f"Line {line_no}: {score:.3f}")</code></pre>
+<p>
+Three lines replace the manual spectrum construction. The library handles per-test
+coverage collection, spectrum matrix assembly, and metric computation internally.
+</p>
+</div>
+
+<h2>4. Structured Logging for Machine-Readable Traces</h2>
+
+<p>
+Fault localization tells you which lines are suspicious. To understand <em>why</em> they
+are suspicious, you need execution traces: the values of variables, the sequence of
+function calls, the decisions made at each branch point. Traditional print-debugging
+produces unstructured text that is easy for humans to scan but difficult for machines to
+parse. Structured logging with
+<a href="https://www.structlog.org/" target="_blank">structlog</a> produces JSON events
+with typed fields, making every log entry a data point that an LLM agent can query,
+filter, and reason about.
+</p>
+
+<pre><code class="language-python">"""
+Structured logging with structlog: machine-readable execution traces.
+Each log event carries typed context that automated analyzers can parse.
+"""
+import structlog
+
+# Configure structlog for JSON output with timestamps
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.JSONRenderer(),
+    ],
+)
+
+log = structlog.get_logger()
+
+
+def process_order(order_id: str, items: list[dict]) -> dict:
+    """Process a customer order with structured logging at every step."""
+    log.info(
+        "order.processing_started",
+        order_id=order_id,
+        item_count=len(items),
+    )
+
+    total = 0.0
+    for item in items:
+        price = item["price"] * item["quantity"]
+        # BUG: discount applied incorrectly for bulk orders
+        if item["quantity"] > 10:
+            discount = price * 0.1  # 10% discount
+            price = price - discount
+            log.debug(
+                "order.bulk_discount_applied",
+                order_id=order_id,
+                item_name=item["name"],
+                original_price=item["price"] * item["quantity"],
+                discount=discount,
+                final_price=price,
+            )
+        total += price
+
+    log.info(
+        "order.processing_completed",
+        order_id=order_id,
+        total=total,
+        item_count=len(items),
+    )
+    return {"order_id": order_id, "total": total}
+
+
+# Example log output (single event, formatted for readability):
+# {
+#   "event": "order.bulk_discount_applied",
+#   "order_id": "ORD-1234",
+#   "item_name": "Reagent A",
+#   "original_price": 150.0,
+#   "discount": 15.0,
+#   "final_price": 135.0,
+#   "level": "debug",
+#   "timestamp": "2026-07-02T10:15:30.123456Z"
+# }</code></pre>
+<div class="code-caption">Structured logging with structlog: every log event is a JSON object with typed fields, enabling automated analysis by debugging agents.</div>
+
+<h2>5. Distributed Tracing with OpenTelemetry</h2>
+
+<p>
+Structured logging captures events within a single process. For distributed systems (or
+even complex single-process applications with async call chains), you need
+<strong>distributed tracing</strong>: a way to follow a request across function boundaries,
+recording the call hierarchy, timing, and context at each step. OpenTelemetry provides
+this through <strong>spans</strong> (units of work with start time, end time, attributes,
+and a parent-child relationship) and <strong>traces</strong> (trees of spans sharing a
+common trace ID).
+</p>
+
+<pre><code class="language-python">"""
+OpenTelemetry tracing: capturing execution structure for debugging.
+Each span records a unit of work with timing, attributes, and errors.
+"""
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import (
+    SimpleSpanProcessor,
+    ConsoleSpanExporter,
+)
+
+# Set up tracing with console export (use OTLP exporter in production)
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("discovery_workbench.debugger")
+
+
+def analyze_dataset(dataset_id: str, config: dict) -> dict:
+    """Analyze a dataset with full tracing for debugging."""
+    with tracer.start_as_current_span(
+        "analyze_dataset",
+        attributes={"dataset.id": dataset_id},
+    ) as root_span:
+
+        # Step 1: Load data
+        with tracer.start_as_current_span("load_data") as load_span:
+            data = load_from_storage(dataset_id)
+            load_span.set_attribute("data.row_count", len(data))
+            load_span.set_attribute("data.column_count", len(data[0]))
+
+        # Step 2: Validate
+        with tracer.start_as_current_span("validate") as val_span:
+            errors = validate_schema(data, config["schema"])
+            val_span.set_attribute("validation.error_count", len(errors))
+            if errors:
+                val_span.set_status(
+                    trace.Status(trace.StatusCode.ERROR, str(errors[:3]))
+                )
+
+        # Step 3: Transform
+        with tracer.start_as_current_span("transform") as tx_span:
+            try:
+                result = apply_transforms(data, config["transforms"])
+                tx_span.set_attribute("transform.output_rows", len(result))
+            except Exception as exc:
+                tx_span.set_status(
+                    trace.Status(trace.StatusCode.ERROR, str(exc))
+                )
+                tx_span.record_exception(exc)
+                raise
+
+        root_span.set_attribute("analysis.status", "completed")
+        return {"dataset_id": dataset_id, "rows": len(result)}</code></pre>
+<div class="code-caption">OpenTelemetry tracing: each function becomes a span with attributes, timing, and error status, producing a tree of execution context for automated debugging.</div>
+
+<p>
+The trace tree produced by this code is exactly the kind of structured context that a
+debugging agent needs. Instead of reading a wall of log text, the agent can traverse
+the span tree, identify which span errored, read its attributes, and correlate the
+error with the span's parent context. This is the bridge between trace collection
+(this section) and the self-debugging agents of
+<a href="section-19.2.html">Section 19.2</a>.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: LLM-Augmented Fault Localization</div>
+<p>
+Traditional SBFL relies purely on coverage statistics. Recent work augments these statistics
+with LLM reasoning. Kang et al. (2024, "Quantitative Evidence that LLMs Outperform
+Spectrum-Based Fault Localization," published at ISSTA 2024) systematically evaluated GPT-4
+and CodeLlama on the Defects4J benchmark, demonstrating that LLMs alone localize faults
+more accurately than Ochiai or DStar when given the failing test and relevant source context.
+Building on this, AgentFL (Qin et al., 2024) introduces a multi-agent architecture where
+specialized agents handle test analysis, code review, and fault confirmation as distinct
+steps, achieving top-1 accuracy improvements of over 20% compared to standalone SBFL on
+Defects4J. The emerging pattern is a two-stage pipeline: statistical pre-filtering (SBFL)
+narrows thousands of candidate lines to a manageable shortlist, then an LLM-based agent
+performs semantic re-ranking by reasoning about variable flow, domain constraints, and test
+intent. This hybrid approach is converging as the practical state of the art for automated
+fault localization in real codebases.
+</p>
+</div>
+
+<h2>6. Combining the Techniques</h2>
+
+<p>
+The tools in this section form a layered debugging infrastructure. At the base,
+<strong>structured logging</strong> and <strong>OpenTelemetry tracing</strong> capture
+execution context in machine-readable form. Above that, <strong>spectrum-based fault
+localization</strong> uses coverage data to rank suspicious lines. At the top,
+<strong>delta debugging</strong> isolates the minimal change that introduced the fault.
+These layers compose naturally: the fault localizer identifies candidate lines, the
+structured logs provide the runtime context around those lines, and delta debugging
+confirms which change is responsible.
+</p>
+
+<p>
+In the next section, we will add an LLM agent layer on top of this infrastructure. The
+agent reads the ranked suspicious lines, examines the structured log context, formulates
+root-cause hypotheses, and generates targeted patches. The infrastructure we have built
+here provides the agent with precisely the kind of structured, machine-readable evidence
+it needs to reason effectively about code failures.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Fault Localizer for a Toy Bug</h4>
+<p>
+Complete this mini-project using only Python and pytest (no additional packages required).
+</p>
+<ol>
+<li>Create a file <code>calculator.py</code> with four functions: <code>add</code>,
+<code>subtract</code>, <code>multiply</code>, and <code>divide</code>. Introduce a
+deliberate bug in one function (for example, make <code>subtract(a, b)</code> return
+<code>a + b</code> instead of <code>a - b</code>).</li>
+<li>Write a test file <code>test_calculator.py</code> with at least 8 tests: 2 per
+function, ensuring the buggy function has 1 passing and 1 failing test. Run the suite
+with <code>pytest -v</code> to confirm the expected pass/fail pattern.</li>
+<li>Run each test individually under <code>coverage.py</code> and record which source
+lines each test executes. You can do this manually with
+<code>python -m coverage run --source calculator -m pytest test_calculator.py::test_name</code>
+followed by <code>python -m coverage json</code>, or automate it with the
+<code>collect_per_test_coverage</code> function from this section.</li>
+<li>Compute the Ochiai score for every line of <code>calculator.py</code> using the four
+counts ($e_f$, $e_p$, $n_f$, $n_p$) you collected. Rank the lines by descending score
+and verify that the buggy line appears in the top 3.</li>
+<li>Change the bug (for example, move it to <code>multiply</code>) and repeat steps 2
+through 4. Confirm that the Ochiai ranking shifts to highlight the new buggy line. This
+exercise builds intuition for how test diversity affects localization precision.</li>
+</ol>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Ochiai Coefficient's Origin</div>
+<p>
+The Ochiai coefficient was not invented for software debugging. It was introduced by
+Akira Ochiai in 1957 to measure similarity between species distributions in ecological
+surveys. If species A appears at 5 out of 10 sample sites, and species B also appears
+at those same 5 sites and nowhere else, their Ochiai coefficient is 1.0 (perfect
+co-occurrence). The insight that "lines co-occurring with failures" is structurally
+identical to "species co-occurring at sample sites" came from Abreu et al. in 2007,
+demonstrating that good mathematical abstractions transcend their original domain.
+</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<ol>
+<li>
+<strong>Conceptual:</strong> Explain why delta debugging's worst case is $O(n^2)$ test
+executions rather than $O(n \log n)$. Under what conditions does the worst case occur?
+(Hint: consider what happens when every pair of changes must co-occur to trigger the failure.)
+</li>
+<li>
+<strong>Coding:</strong> Implement a variant of the <code>build_spectrum</code> function that
+uses pytest's <code>--tb=short</code> output to automatically classify tests as passing or
+failing, rather than relying on the return code. Handle the case where a test errors (as
+distinct from failing).
+</li>
+<li>
+<strong>Analysis:</strong> Given the following spectrum data for 5 lines across 4 tests
+(2 passing, 2 failing), compute the Ochiai score for each line and identify the most
+suspicious one: Line A: $e_f=2, e_p=2, n_f=0, n_p=0$; Line B: $e_f=2, e_p=0, n_f=0, n_p=2$;
+Line C: $e_f=1, e_p=1, n_f=1, n_p=1$; Line D: $e_f=0, e_p=2, n_f=2, n_p=0$;
+Line E: $e_f=2, e_p=1, n_f=0, n_p=1$.
+</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 19 Index</a>
+<a href="index.html">Chapter 19 Index</a>
+<a href="section-19.2.html">19.2 Self-Debugging Agents &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

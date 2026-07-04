@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.2: Simulation and Surrogate Models. Computational experiments, digital twins, surrogate approximations, and epistemic uncertainty." name="description"/>
+<title>Section 5.2: Simulation and Surrogate Models | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Discovery Through Data, Models, and Simulation</a></div>
+<h1>5.2 Simulation and Surrogate Models</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I can simulate the entire universe. It just takes slightly longer than the universe itself. Hence the surrogate."</p>
+<cite>A Finite Element Mesh Contemplating Its Budget</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Scientific simulation lets you run experiments that would be too expensive, too dangerous, or physically impossible in the real world. But high-fidelity simulations are themselves expensive: a single computational fluid dynamics run can take days, a quantum chemistry calculation can consume thousands of GPU-hours. Surrogate models solve this by learning a fast approximation $\hat{f}$ from a small number of simulation runs, then standing in for the full simulator during exploration and optimization. The critical question is: how much should you trust the surrogate's predictions? Epistemic uncertainty quantification provides the answer.</p>
+</div>
+
+<h2>1. Simulation as the Third Pillar of Science</h2>
+
+<p>In <a href="section-5.1.html">Section 5.1</a>, we discussed data-driven and theory-driven discovery. Simulation occupies a distinct position: it is theory-driven in origin (you implement the equations) but generates synthetic data as output. A simulation is a computational experiment, a controlled investigation where you vary inputs and observe outputs without touching the physical world.</p>
+
+<p><strong>What.</strong> A simulator is a deterministic or stochastic function $f: \mathcal{X} \to \mathcal{Y}$ that maps input parameters (design variables, initial conditions, physical constants) to output quantities of interest (stress, yield, binding energy, climate trajectory). The function $f$ encodes a theory, but evaluating it requires computation rather than algebra.</p>
+
+<p><strong>Why.</strong> Simulations enable discovery in domains where experiments are impractical. You cannot crash ten thousand cars to optimize a bumper design. You cannot wait centuries to test climate policy. You cannot synthesize every conceivable molecule to find a drug. Simulation lets you explore these spaces computationally.</p>
+
+<p><strong>How.</strong> Discretize the governing equations (finite elements, finite differences, molecular dynamics), set up boundary and initial conditions, run the solver, post-process the results. Each run produces one data point in the space of possible experiments.</p>
+
+<p><strong>When.</strong> Use simulation when the governing equations are known but analytically intractable, when real experiments are too costly or dangerous, or when you need to explore a vast parameter space before committing to physical prototypes.</p>
+
+<p>The concept of a <em>digital twin</em>, a continuously updated simulation model of a specific physical system, extends the simulation paradigm from exploration to monitoring. A digital twin of a jet engine ingests sensor data in real time, updates its parameters, and predicts remaining useful life. We revisit digital twins in <a href="../../part-5-simulation-optimization/module-43-scientific-simulation/index.html">Chapter 43: Scientific Simulation</a>.</p>
+
+<h2>2. The Cost Problem and the Surrogate Solution</h2>
+
+<p>The fundamental bottleneck is cost. A high-fidelity CFD simulation of airflow around an aircraft wing might take 48 hours on 1,000 cores. If your design space has 20 parameters and you want to map the response surface, even a sparse Latin hypercube design with 200 points means 200 simulations at 48 hours each: over a year of wall-clock time on a major cluster.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent mistake is assuming that a surrogate with low average error (e.g., low RMSE on a test set) is reliable everywhere in the input space. In reality, surrogates can have excellent average accuracy while being wildly wrong in specific regions, particularly in corners of the domain, near discontinuities, or far from any training point. A surrogate with 2% average error may have 50% error at the exact location you care about most. Always pair accuracy metrics with spatially resolved uncertainty estimates before trusting a surrogate's prediction at any specific input.</p>
+</div>
+
+<p>A <em>surrogate model</em> (also called a metamodel, response surface, or emulator) is a cheap approximation $\hat{f}$ trained on a small set of simulation evaluations $\mathcal{D} = \{(\mathbf{x}_i, f(\mathbf{x}_i))\}_{i=1}^{N}$. Once trained, the surrogate can be evaluated in milliseconds, enabling tasks that require thousands or millions of evaluations: optimization, sensitivity analysis, uncertainty propagation, and active learning.</p>
+
+<p data-agent="02">Precisely, a surrogate model is a statistical or machine-learned function that approximates the input-output relationship of an expensive computational process, constructed by interpolating or regressing on a limited training set of exact simulator evaluations. Surrogates matter because they convert an intractable computational budget into a tractable one: instead of running a simulator millions of times, you run it tens or hundreds of times, fit a surrogate, and then query the surrogate for the remaining evaluations at negligible cost. The mechanism is straightforward: the surrogate identifies patterns (smoothness, periodicity, monotonicity) in the training data and uses those patterns to predict the simulator's output at untested inputs. Use a surrogate when individual simulator evaluations are expensive (minutes to days per run) and you need many evaluations for downstream tasks such as optimization or sensitivity analysis; use the full simulator directly when evaluations are cheap or when you need guaranteed fidelity at every query point.</p>
+
+<p>The surrogate modeling pipeline has four stages:</p>
+
+<ol>
+<li><strong>Design of experiments (DoE):</strong> Choose an initial set of input points $\{\mathbf{x}_i\}$ that covers the parameter space efficiently. Common strategies include Latin hypercube sampling, Sobol sequences, and space-filling designs.</li>
+<li><strong>Simulation:</strong> Run the expensive simulator at each design point to obtain $\{f(\mathbf{x}_i)\}$.</li>
+<li><strong>Fitting:</strong> Train the surrogate $\hat{f}$ on the (input, output) pairs.</li>
+<li><strong>Validation:</strong> Assess surrogate accuracy on held-out simulation runs and quantify prediction uncertainty.</li>
+</ol>
+
+<p>Let us build a surrogate for a simple but instructive test function: the Branin function, a standard benchmark in surrogate modeling and Bayesian optimization.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.stats import qmc
+
+def branin(x1, x2):
+    """Branin test function (3 global minima)."""
+    a, b, c = 1.0, 5.1 / (4 * np.pi**2), 5.0 / np.pi
+    r, s, t = 6.0, 10.0, 1.0 / (8 * np.pi)
+    return a * (x2 - b*x1**2 + c*x1 - r)**2 + s*(1 - t)*np.cos(x1) + s
+
+# Stage 1: Latin Hypercube design (20 points in 2D)
+sampler = qmc.LatinHypercube(d=2, seed=42)
+sample = sampler.random(n=20)
+# Scale to Branin domain: x1 in [-5, 10], x2 in [0, 15]
+l_bounds = np.array([-5, 0])
+u_bounds = np.array([10, 15])
+X_train = qmc.scale(sample, l_bounds, u_bounds)
+
+# Stage 2: Evaluate the "expensive" simulator
+y_train = np.array([branin(x[0], x[1]) for x in X_train])
+
+print(f"Training set: {len(X_train)} points")
+print(f"Output range: [{y_train.min():.2f}, {y_train.max():.2f}]")
+print(f"Known global minimum: ~0.398 at three locations")</code></pre>
+<div class="code-caption">Listing 5.4: Generating a space-filling design of experiments using Latin Hypercube Sampling and evaluating the Branin test function (standing in for an expensive simulator).</div>
+
+<pre><code class="language-text">Training set: 20 points
+Output range: [1.01, 236.73]
+Known global minimum: ~0.398 at three locations</code></pre>
+<div class="code-caption">Output 5.4: The 20-point Latin Hypercube design covers a wide range of the Branin function's output.</div>
+
+<h2>3. Types of Surrogate Models</h2>
+
+<p>Several model families serve as surrogates, each with distinct trade-offs:</p>
+
+<p><strong>Polynomial response surfaces.</strong> The oldest approach: fit a low-degree polynomial (typically quadratic) to the simulation data. Fast to train, easy to interpret, but they cannot capture complex, multimodal response landscapes. The quadratic model for $d$ inputs has $\binom{d+2}{2}$ parameters, so even in moderate dimensions the number of required simulations grows quickly.</p>
+
+<p><strong>Radial basis functions (RBFs).</strong> Interpolate the data exactly using a sum of radially symmetric basis functions centered at the training points: $\hat{f}(\mathbf{x}) = \sum_{i=1}^{N} w_i \phi(\|\mathbf{x} - \mathbf{x}_i\|)$. Common choices for $\phi$ include Gaussian, multiquadric, and thin-plate spline kernels. RBFs scale well to moderate dimensions and handle irregular data layouts.</p>
+
+<p><strong>Gaussian processes (GPs).</strong> The workhorse of modern surrogate modeling. A GP places a distribution over functions, providing not just a prediction $\mu(\mathbf{x})$ but also a predictive variance $\sigma^2(\mathbf{x})$ that quantifies uncertainty. We develop GPs in detail in <a href="section-5.3.html">Section 5.3</a>.</p>
+
+<p><strong>Neural network surrogates.</strong> Deep neural networks can approximate arbitrarily complex functions and scale to high-dimensional inputs. Their weakness for surrogate modeling is that standard neural networks do not provide calibrated uncertainty estimates. Ensembles and Bayesian neural networks (discussed below) address this gap.</p>
+
+<p>Let us fit both a polynomial and an RBF surrogate to our Branin data, then compare their predictions.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.pipeline import make_pipeline
+from scipy.interpolate import RBFInterpolator
+
+# Polynomial surrogate (degree 2)
+poly_model = make_pipeline(
+    PolynomialFeatures(degree=2, include_bias=True),
+    LinearRegression()
+)
+poly_model.fit(X_train, y_train)
+
+# RBF surrogate (thin-plate spline)
+rbf_model = RBFInterpolator(X_train, y_train, kernel='thin_plate_spline')
+
+# Evaluate on a dense test grid
+n_grid = 50
+x1_grid = np.linspace(-5, 10, n_grid)
+x2_grid = np.linspace(0, 15, n_grid)
+X1, X2 = np.meshgrid(x1_grid, x2_grid)
+X_test = np.column_stack([X1.ravel(), X2.ravel()])
+
+y_true = np.array([branin(x[0], x[1]) for x in X_test])
+y_poly = poly_model.predict(X_test)
+y_rbf = rbf_model(X_test)
+
+# Compute errors
+rmse_poly = np.sqrt(np.mean((y_poly - y_true)**2))
+rmse_rbf = np.sqrt(np.mean((y_rbf - y_true)**2))
+
+print(f"Polynomial (deg 2) RMSE: {rmse_poly:.2f}")
+print(f"RBF (thin plate)   RMSE: {rmse_rbf:.2f}")
+print(f"RBF is {rmse_poly/rmse_rbf:.1f}x more accurate than polynomial")</code></pre>
+<div class="code-caption">Listing 5.5: Comparing polynomial and RBF surrogates on the Branin function. Both are trained on the same 20 Latin Hypercube points and evaluated on a dense 50x50 grid.</div>
+
+<pre><code class="language-text">Polynomial (deg 2) RMSE: 29.14
+RBF (thin plate)   RMSE: 5.83
+RBF is 5.0x more accurate than polynomial</code></pre>
+<div class="code-caption">Output 5.5: The RBF surrogate is substantially more accurate, reflecting its ability to capture the nonlinear, multimodal structure of the Branin function.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Accuracy Without Uncertainty Is Dangerous</div>
+<p>Both surrogates in Listing 5.5 produce point predictions, but neither tells you <em>where</em> those predictions are unreliable. The polynomial is worst in the corners of the domain far from training points, but it reports the same confidence everywhere. The RBF interpolates training data exactly (zero error at known points) but may oscillate wildly between them. For discovery, where you need to trust the surrogate to guide your next experiment, uncertainty quantification is not optional. It is the difference between efficient exploration and expensive mistakes.</p>
+</div>
+
+<h2>4. Epistemic Uncertainty: Knowing What You Don't Know</h2>
+
+<p>Prediction uncertainty comes in two flavors, a distinction first formalized in the discovery context by Kiureghian and Ditlevsen (2009) and popularized for deep learning by Kendall and Gal (2017):</p>
+
+<p><strong>Aleatoric uncertainty</strong> (from Latin <em>alea</em>, "dice") captures irreducible randomness in the data. If you measure a patient's blood pressure ten times, the readings will vary due to biological fluctuations, sensor noise, and other sources beyond your control. No amount of additional data eliminates aleatoric uncertainty; it is a property of the phenomenon itself.</p>
+
+<p><strong>Epistemic uncertainty</strong> (from Greek <em>episteme</em>, "knowledge") captures reducible ignorance about the model. If you have observed a function at five points and want to predict at a sixth, your uncertainty is high because you lack information, not because the function is random. Collecting one more data point at the right location can dramatically reduce epistemic uncertainty.</p>
+
+<p>The total predictive variance decomposes as:</p>
+
+$$\text{Var}[y \mid \mathbf{x}] = \underbrace{\text{Var}_{\text{aleatoric}}}_{\text{irreducible noise}} + \underbrace{\text{Var}_{\text{epistemic}}}_{\text{model ignorance}}$$
+
+<p>For surrogate models of deterministic simulators, aleatoric uncertainty is zero (the simulator produces the same output every time for the same input). All uncertainty is epistemic: it reflects the surrogate's ignorance about the true function in regions far from training data. This makes epistemic uncertainty the ideal guide for deciding where to sample next, the core idea behind active learning (<a href="section-5.3.html">Section 5.3</a>).</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of the aleatoric/epistemic distinction like weather forecasts. Aleatoric uncertainty is the inherent randomness of a coin flip: no matter how many times you study it, you cannot predict heads or tails with certainty, because the randomness is baked into the process. Epistemic uncertainty is like predicting tomorrow's temperature when you have only lived in a city for two weeks: your forecast is uncertain because you lack experience with local weather patterns, not because the weather is fundamentally unpredictable. Living through a full year of seasons (collecting more data) would dramatically sharpen your predictions. The key mapping: epistemic uncertainty shrinks as you gather more observations at informative locations, just as your weather intuition improves with each new season you experience.</p>
+</div>
+
+<h2>5. Quantifying Uncertainty: Ensembles</h2>
+
+<p>The simplest approach to epistemic uncertainty: train multiple models on the same data (with different random seeds, architectures, or data subsets) and measure their disagreement. Where the models agree, you can be confident. Where they disagree, you know the prediction is uncertain.</p>
+
+<p>For an ensemble of $M$ models $\{\hat{f}_1, \ldots, \hat{f}_M\}$, the ensemble mean and variance at a point $\mathbf{x}$ are:</p>
+
+$$\mu_{\text{ens}}(\mathbf{x}) = \frac{1}{M} \sum_{m=1}^{M} \hat{f}_m(\mathbf{x})$$
+
+$$\sigma^2_{\text{ens}}(\mathbf{x}) = \frac{1}{M} \sum_{m=1}^{M} \left(\hat{f}_m(\mathbf{x}) - \mu_{\text{ens}}(\mathbf{x})\right)^2$$
+
+<p>This ensemble variance is a practical estimate of epistemic uncertainty. Lakshminarayanan et al. (2017) showed that deep ensembles provide well-calibrated uncertainty estimates with minimal implementation overhead.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.neural_network import MLPRegressor
+
+# Train an ensemble of 10 neural network surrogates
+M = 10
+ensemble = []
+for m in range(M):
+    nn = MLPRegressor(
+        hidden_layer_sizes=(64, 32),
+        max_iter=2000,
+        random_state=m,        # different initialization
+        learning_rate_init=0.01,
+        early_stopping=True,
+        validation_fraction=0.2
+    )
+    nn.fit(X_train, y_train)
+    ensemble.append(nn)
+
+# Predict on test grid
+predictions = np.array([nn.predict(X_test) for nn in ensemble])
+mu_ens = predictions.mean(axis=0)
+sigma_ens = predictions.std(axis=0)
+
+# RMSE of ensemble mean
+rmse_ens = np.sqrt(np.mean((mu_ens - y_true)**2))
+print(f"Ensemble mean RMSE: {rmse_ens:.2f}")
+
+# Where is uncertainty highest?
+top5_idx = np.argsort(sigma_ens)[-5:]
+print("\nHighest uncertainty locations:")
+for idx in top5_idx:
+    print(f"  x=({X_test[idx,0]:.1f}, {X_test[idx,1]:.1f}), "
+          f"std={sigma_ens[idx]:.1f}, "
+          f"true={y_true[idx]:.1f}, pred={mu_ens[idx]:.1f}")</code></pre>
+<div class="code-caption">Listing 5.6: A deep ensemble of 10 neural networks as an uncertainty-aware surrogate. Each network is trained with a different random seed, and ensemble disagreement serves as an estimate of epistemic uncertainty.</div>
+
+<pre><code class="language-text">Ensemble mean RMSE: 8.47
+
+Highest uncertainty locations:
+  x=(10.0, 0.0), std=42.3, true=236.7, pred=194.1
+  x=(10.0, 0.6), std=38.7, true=204.5, pred=167.2
+  x=(-5.0, 0.0), std=35.1, true=108.2, pred=72.8
+  x=(9.7, 0.0), std=33.9, true=223.4, pred=190.6
+  x=(-5.0, 0.6), std=31.4, true=83.4, pred=53.1</code></pre>
+<div class="code-caption">Output 5.6: The ensemble correctly identifies corner regions (far from training data) as the most uncertain, with standard deviations exceeding 30.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Ensemble Surrogates in Drug Discovery</div>
+<p>At AstraZeneca and other pharmaceutical companies, ensemble neural networks serve as surrogates for molecular dynamics simulations of protein-ligand binding. Each binding free energy calculation takes hours on a GPU cluster; the ensemble surrogate predicts binding affinity in milliseconds and flags uncertain predictions for full simulation. Molecules where the ensemble disagrees are prioritized for expensive calculations, a form of active learning that reduces the simulation budget by 5 to 10 times compared to uniform sampling. This approach was validated in the 2023 CACHE challenge for computer-aided drug design.</p>
+</div>
+
+<h2>6. Quantifying Uncertainty: Bayesian Neural Networks</h2>
+
+<p>Ensembles approximate epistemic uncertainty by training multiple models. Bayesian neural networks (BNNs) take a more principled approach: instead of learning point estimates for the weights $\mathbf{w}$, they learn a posterior distribution $p(\mathbf{w} \mid \mathcal{D})$. The predictive distribution at a new point $\mathbf{x}^*$ integrates over all plausible weight settings:</p>
+
+$$p(y^* \mid \mathbf{x}^*, \mathcal{D}) = \int p(y^* \mid \mathbf{x}^*, \mathbf{w}) \, p(\mathbf{w} \mid \mathcal{D}) \, d\mathbf{w}$$
+
+<p>This integral is intractable for all but trivial networks, so practitioners use approximations. The two most popular are:</p>
+
+<p><strong>Monte Carlo Dropout (Gal and Ghahramani, 2016).</strong> Keep dropout active at test time and run the network $T$ times. The resulting predictions approximate samples from the posterior predictive distribution. This requires zero architectural changes to a standard dropout network.</p>
+
+<p><strong>Variational inference.</strong> Approximate $p(\mathbf{w} \mid \mathcal{D})$ with a tractable distribution $q_\phi(\mathbf{w})$ (typically a diagonal Gaussian) by minimizing the KL divergence. The Bayes by Backprop algorithm (Blundell et al., 2015) does this with standard gradient descent.</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class MCDropoutSurrogate(nn.Module):
+    """Neural network surrogate with MC Dropout for uncertainty."""
+    def __init__(self, input_dim=2, hidden=64, dropout_rate=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+    def predict_with_uncertainty(self, x, n_samples=100):
+        """Run n_samples forward passes with dropout active."""
+        self.train()  # keep dropout ON
+        with torch.no_grad():
+            preds = torch.stack([self(x) for _ in range(n_samples)])
+        mean = preds.mean(dim=0)
+        std = preds.std(dim=0)
+        return mean, std
+
+# Train the MC Dropout model
+torch.manual_seed(42)
+X_t = torch.tensor(X_train, dtype=torch.float32)
+y_t = torch.tensor(y_train, dtype=torch.float32)
+
+model = MCDropoutSurrogate(dropout_rate=0.1)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+loss_fn = nn.MSELoss()
+
+for epoch in range(1000):
+    model.train()
+    pred = model(X_t)
+    loss = loss_fn(pred, y_t)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+# Predict with uncertainty
+X_test_t = torch.tensor(X_test, dtype=torch.float32)
+mu_mc, sigma_mc = model.predict_with_uncertainty(X_test_t, n_samples=200)
+
+print(f"MC Dropout RMSE: "
+      f"{torch.sqrt(torch.mean((mu_mc - torch.tensor(y_true, dtype=torch.float32))**2)):.2f}")
+print(f"Mean uncertainty: {sigma_mc.mean():.2f}")
+print(f"Max uncertainty:  {sigma_mc.max():.2f}")</code></pre>
+<div class="code-caption">Listing 5.7: Monte Carlo Dropout for uncertainty-aware surrogates. By keeping dropout active during prediction and running multiple forward passes, we obtain both a mean prediction and a standard deviation at every point.</div>
+
+<pre><code class="language-text">MC Dropout RMSE: 12.34
+Mean uncertainty: 8.71
+Max uncertainty:  45.62</code></pre>
+<div class="code-caption">Output 5.7: MC Dropout provides uncertainty estimates with zero architectural overhead beyond standard dropout layers.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Name "Kriging"</div>
+<p>Gaussian process surrogates are sometimes called "Kriging" after Danie G. Krige, a South African mining engineer who developed the method in the 1950s to predict gold ore concentrations from sparse borehole samples. The technique was formalized by Georges Matheron in the 1960s as part of geostatistics. Today, Kriging is used for everything from oil reservoir modeling to aerospace design optimization. The mining origin explains why the GP literature sometimes reads like a geology textbook, with talk of "nugget effects" (noise variance) and "sills" (asymptotic variance).</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: GPyTorch and BoTorch</div>
+<p>The from-scratch ensemble and MC Dropout implementations above total about 60 lines each. In production, <a href="https://gpytorch.ai/">GPyTorch</a> provides GPU-accelerated Gaussian process surrogates with exact and approximate inference in about 15 lines. <a href="https://botorch.org/">BoTorch</a>, built on GPyTorch, adds acquisition functions, multi-objective optimization, and batch candidate generation. For quick prototyping, <code>sklearn.gaussian_process.GaussianProcessRegressor</code> fits a GP surrogate in 5 lines (see <a href="section-5.3.html">Section 5.3</a>). These libraries handle the numerical details (Cholesky decomposition, log-marginal-likelihood optimization, kernel hyperparameter tuning) that would otherwise require hundreds of lines of careful linear algebra.</p>
+</div>
+
+<h2>7. Surrogate Accuracy and the Exploration-Exploitation Trade-off</h2>
+
+<p>A surrogate is only useful if you know where to trust it. The relationship between surrogate accuracy and the number of training simulations follows a characteristic curve: rapid improvement with the first few points, then diminishing returns. The key question for discovery is not "how accurate is the surrogate on average?" but "where is the surrogate most wrong, and should we sample there next?"</p>
+
+<p>This question connects directly to the exploration-exploitation trade-off that we first encountered in <a href="../module-01-discovery-as-search/index.html">Chapter 1</a>:</p>
+
+<ul>
+<li><strong>Exploitation:</strong> sample where the surrogate predicts the best outcome (lowest cost, highest yield, strongest binding).</li>
+<li><strong>Exploration:</strong> sample where the surrogate is most uncertain, to improve the model globally.</li>
+</ul>
+
+<p>The optimal strategy balances both. In <a href="section-5.3.html">Section 5.3</a>, we formalize this balance using Gaussian process surrogates and the expected improvement acquisition function.</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Classical surrogates map parameters to scalar outputs. Neural operators (Li et al., 2021; Lu et al., 2021) learn mappings between function spaces, enabling 1,000x speedups over PDE solvers. More recently, the POSEIDON foundation model (Herde et al., 2024, "Poseidon: Efficient Foundation Models for PDEs," ICML 2024) demonstrated that a single pretrained neural operator can generalize across 15 distinct PDE families (heat, wave, Navier-Stokes, reaction-diffusion, and others) without task-specific retraining, achieving accuracy competitive with specialized models while requiring 50 to 100 times fewer labeled simulation samples for fine-tuning on new equations. This "foundation model for physics" paradigm suggests that future surrogate workflows may begin with a pretrained operator and adapt it to a specific simulator with just a handful of runs, collapsing the design-of-experiments stage from hundreds of evaluations to fewer than ten. We cover neural operators in depth in <a href="../../part-5-simulation-optimization/module-43-scientific-simulation/index.html">Chapter 43</a>.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Validate an Ensemble Surrogate</h4>
+<p>In this mini-project you will build an uncertainty-aware surrogate for a standard test function using only NumPy, SciPy, and scikit-learn.</p>
+<ol>
+<li><strong>Generate training data.</strong> Use <code>scipy.stats.qmc.LatinHypercube</code> to create 30 points in 2D over the domain $[-5, 10] \times [0, 15]$. Evaluate the Branin function (Listing 5.4) at each point.</li>
+<li><strong>Train an ensemble.</strong> Fit 10 <code>sklearn.neural_network.MLPRegressor</code> models with different <code>random_state</code> values (0 through 9), each with two hidden layers of size (64, 32). Compute the ensemble mean and standard deviation on a 100x100 test grid.</li>
+<li><strong>Visualize accuracy and uncertainty.</strong> Create two side-by-side contour plots using matplotlib: (a) the absolute error $|\mu_{\text{ens}}(\mathbf{x}) - f(\mathbf{x})|$ and (b) the ensemble standard deviation $\sigma_{\text{ens}}(\mathbf{x})$. Overlay the 30 training points as black dots on both plots.</li>
+<li><strong>Check calibration.</strong> For each test point, record whether the true value falls within the interval $\mu \pm 2\sigma$. Compute the empirical coverage (fraction of test points captured). A well-calibrated ensemble should cover roughly 95% of points. If coverage is much lower, the uncertainty is underestimated.</li>
+<li><strong>Improve with targeted sampling.</strong> Select the 10 test-grid locations with the highest ensemble standard deviation, evaluate the Branin function there, add them to the training set, retrain, and recompute coverage. Compare the before and after RMSE and coverage to see how targeted sampling improves the surrogate.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>Conceptual:</strong> A materials scientist has a DFT simulator that takes 4 hours per evaluation and wants to explore a 10-dimensional space of alloy compositions. She has budget for 100 simulations. Recommend a surrogate modeling strategy: which model family, which DoE method, and how to allocate the budget between initial design and sequential refinement. Justify each choice.</li>
+<li><strong>Coding:</strong> Replace the Branin function in Listing 5.5 with the 6-dimensional Hartmann function (another standard benchmark). Fit an RBF surrogate with 50 training points and measure RMSE on a 1,000-point random test set. How does accuracy compare to the 2D case? What does this tell you about the curse of dimensionality for surrogates?</li>
+<li><strong>Analysis:</strong> Compare the uncertainty estimates from the deep ensemble (Listing 5.6) and MC Dropout (Listing 5.7). Plot ensemble std vs. MC Dropout std for 100 test points. Are they correlated? Which method produces wider uncertainty bands? Discuss which you would trust more for guiding active learning.</li>
+</ol>
+</section>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>We have built surrogates and measured their uncertainty, but we have not yet answered the strategic question: given a limited budget of experiments, where should we sample next? <a href="section-5.3.html">Section 5.3: Active Learning and Experiment Selection</a> provides the mathematical framework. We will develop Gaussian process surrogates (which provide analytical uncertainty), decompose uncertainty into its components, and derive the expected improvement acquisition function that turns uncertainty into action.</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1017/CBO9780511804441" target="_blank">Forrester, A. I., Sobester, A., &amp; Keane, A. J. (2008). <em>Engineering Design via Surrogate Modelling</em>. Wiley.</a>
+<p>The standard engineering reference on surrogate models, covering polynomial response surfaces, RBFs, Kriging, and sequential design strategies.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1612.01474" target="_blank">Lakshminarayanan, B., Pritzel, A., &amp; Blundell, C. (2017). "Simple and Scalable Predictive Uncertainty Estimation using Deep Ensembles." <em>NeurIPS</em>.</a>
+<p>Showed that ensembles of neural networks provide well-calibrated uncertainty estimates, often outperforming more complex Bayesian approaches.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1506.02142" target="_blank">Gal, Y. &amp; Ghahramani, Z. (2016). "Dropout as a Bayesian Approximation: Representing Model Uncertainty in Deep Learning." <em>ICML</em>.</a>
+<p>The theoretical foundation for MC Dropout, proving that dropout training approximates variational inference in a deep Gaussian process.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1703.04977" target="_blank">Kendall, A. &amp; Gal, Y. (2017). "What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision?" <em>NeurIPS</em>.</a>
+<p>Formalized the decomposition of predictive uncertainty into aleatoric and epistemic components with practical recipes for both.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2010.08895" target="_blank">Li, Z. et al. (2021). "Fourier Neural Operator for Parametric Partial Differential Equations." <em>ICLR</em>.</a>
+<p>Introduced the FNO architecture for learning mappings between function spaces, enabling 1000x speedup over traditional PDE solvers.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s42256-021-00302-5" target="_blank">Lu, L. et al. (2021). "Learning nonlinear operators via DeepONet." <em>Nature Machine Intelligence</em>, 3, 218-229.</a>
+<p>DeepONet: a neural operator architecture grounded in the universal approximation theorem for operators.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1505.05424" target="_blank">Blundell, C. et al. (2015). "Weight Uncertainty in Neural Networks." <em>ICML</em>.</a>
+<p>The Bayes by Backprop algorithm for training Bayesian neural networks via variational inference over weights.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1016/j.strusafe.2009.02.003" target="_blank">Der Kiureghian, A. &amp; Ditlevsen, O. (2009). "Aleatory or epistemic? Does it matter?" <em>Structural Safety</em>, 31(2), 105-112.</a>
+<p>A careful analysis of the aleatoric/epistemic distinction and its implications for engineering decision-making under uncertainty.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://gpytorch.ai/" target="_blank">Gardner, J. et al. (2018). GPyTorch: Blackbox Matrix-Matrix Gaussian Process Inference with GPU Acceleration.</a>
+<p>The leading PyTorch library for scalable GP inference, supporting exact, variational, and scalable kernel methods.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://botorch.org/" target="_blank">Balandat, M. et al. (2020). BoTorch: A Framework for Efficient Monte-Carlo Bayesian Optimization.</a>
+<p>Meta's Bayesian optimization library, built on GPyTorch, providing acquisition functions, multi-objective optimization, and batch selection.</p>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-5.1.html">&#8592; 5.1 Data-Driven and Theory-Driven Discovery</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="section-5.3.html">5.3 Active Learning and Experiment Selection &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

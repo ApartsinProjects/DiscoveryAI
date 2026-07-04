@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.2: Implementing Scientific Tools. Building MCP tools that wrap PubChem, OpenAlex, and chemistry computation libraries with proper validation, error handling, and rate limiting." name="description"/>
+<title>Section 12.2: Implementing Scientific Tools | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Building MCP Servers for Scientific Workflows</a></div>
+<h1>12.2 Implementing Scientific Tools</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The agent asked me to look up aspirin by SMILES. I returned 47 isomers, three metabolites, and a gentle suggestion to be more specific."</p>
+<cite>A PubChem Wrapper With Boundary Issues</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+In <a href="section-12.1.html">Section 12.1</a>, we built the mental model of MCP:
+hosts, clients, servers, transports, and the three primitives (tools, resources,
+prompts). Now we turn that architecture into working code. You should have the
+MCP Python SDK installed (<code>pip install mcp</code>) along with
+<code>pubchempy</code>, <code>httpx</code>, and <code>rdkit</code>. Familiarity with
+Python's <code>async/await</code> syntax is essential.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A scientific MCP server is only as useful as the tools it exposes. This section builds
+three tools that represent the most common patterns in scientific computing:
+<strong>database lookup</strong> (querying PubChem for molecular data),
+<strong>literature search</strong> (querying OpenAlex for scholarly works), and
+<strong>local computation</strong> (calculating molecular descriptors with RDKit). Each
+pattern introduces different challenges: rate limiting for external APIs, pagination
+for large result sets, and input validation for domain-specific formats like SMILES
+notation. By implementing all three, you will have a toolkit of patterns that
+transfers to any scientific domain.
+</p>
+</div>
+
+<h2>1. Tool Design Principles</h2>
+
+<p>
+Before writing code, we need to establish design principles that separate useful
+scientific tools from fragile wrappers. These principles apply regardless of whether
+you are wrapping a chemistry database, a genomics API, or a telescope control system.
+</p>
+
+<p>
+<strong>Principle 1: Narrow scope, rich description.</strong> Each tool should do one thing
+well. A tool called <code>search_compounds</code> should search for compounds, not also
+compute properties, visualize structures, and predict toxicity. Narrow tools are easier
+for the LLM to select correctly. The description, however, should be generous: include
+input formats, example values, error conditions, and output structure. The description
+is the tool's documentation, and the LLM is the reader.
+</p>
+
+<p>
+<strong>Principle 2: Validate early, fail clearly.</strong> Every input should be validated
+before any external API call is made. If a SMILES string is syntactically invalid,
+report that immediately rather than sending it to PubChem and parsing a cryptic HTTP
+400 response. Error messages should be actionable: "Invalid SMILES: unmatched
+parenthesis at position 7" is useful; "Bad request" is not.
+</p>
+
+<p>
+<strong>Principle 3: Return structured data.</strong> Tools should return JSON strings that
+the LLM can parse, not free-text descriptions. Include units, identifiers, and
+provenance information. When the agent chains multiple tools (search a compound, then
+compute its properties, then find related literature), structured output makes each
+step's input derivable from the previous step's output. This principle connects to the
+<a href="../../part-1-foundations/module-03-knowledge-representation/index.html">knowledge representation</a>
+ideas from Chapter 3: the tool's output is a knowledge artifact that must be
+machine-readable.
+</p>
+
+<p>
+<strong>Principle 4: Respect rate limits.</strong> Scientific APIs are shared resources.
+PubChem allows 5 requests per second; OpenAlex allows 10. A well-behaved MCP server
+enforces these limits internally rather than relying on the host or the agent to
+throttle. Rate limiting also protects your server from an overeager agent that
+decides to enumerate every compound in a database.
+</p>
+
+<p data-agent="02">
+A rate limiter is a component that controls how many requests your code sends to an
+external service within a given time window, preventing your application from being
+blocked or banned for excessive usage. It matters because scientific APIs like PubChem
+serve millions of researchers worldwide; exceeding the posted limits results in HTTP 429
+errors that stall your entire agent pipeline, and repeated violations can lead to IP
+bans. The token-bucket algorithm used in this section works by maintaining a counter of
+available "tokens" that refills at a steady rate (e.g., 5 per second); each request
+consumes one token, and if none are available the caller sleeps until a token
+regenerates. Use a rate limiter whenever your MCP server wraps any external API; for
+purely local computation tools (like the RDKit descriptor calculator below), no rate
+limiting is needed because you control the resource entirely.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Tools Are Interfaces for Machines</div>
+<p>
+A human researcher using PubChem can glance at a results page, notice that the top
+hit is wrong, refine the query, and scan the corrected results in seconds. An LLM
+agent cannot do this. Every ambiguity in a tool's output becomes a potential reasoning
+error. This is why structured returns matter more for MCP tools than for human-facing
+APIs: the agent's "glance" is parsing JSON, and its "refinement" costs another full
+LLM inference. Designing tools for machine consumption is a skill distinct from
+designing APIs for human consumption, and mastering it is essential for the
+<a href="../../part-7-autonomous-discovery/module-53-ai-scientists/index.html">AI scientist</a>
+systems we build in Part VII.
+</p>
+</div>
+
+<h2>2. Pattern 1: Database Lookup (PubChem)</h2>
+
+<p>
+PubChem is the world's largest open chemistry database, containing over 115 million
+compounds with associated bioactivity data. Its PUG REST API provides programmatic
+access to compound searches, property lookups, and similarity queries. We will wrap
+three endpoints as MCP tools: compound search by name, property retrieval by CID
+(compound identifier), and similarity search by structure.
+</p>
+
+<pre><code class="language-python">"""PubChem MCP tools with rate limiting and structured output."""
+import asyncio
+import json
+import time
+from typing import Literal
+
+import httpx
+from mcp.server import Server
+from pydantic import BaseModel, Field
+
+PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+
+# Rate limiter: PubChem allows 5 requests/second
+class RateLimiter:
+    """Token-bucket rate limiter for API calls."""
+
+    def __init__(self, rate: float, burst: int = 1):
+        self.rate = rate          # tokens per second
+        self.burst = burst        # max tokens
+        self.tokens = float(burst)
+        self.last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+            self.last_refill = now
+            if self.tokens < 1.0:
+                wait = (1.0 - self.tokens) / self.rate
+                await asyncio.sleep(wait)
+                self.tokens = 0.0
+            else:
+                self.tokens -= 1.0
+
+pubchem_limiter = RateLimiter(rate=5.0, burst=5)
+
+server = Server("pubchem-tools")
+
+@server.tool()
+async def search_pubchem(
+    query: str,
+    search_type: Literal["name", "formula", "smiles"] = "name",
+    max_results: int = Field(default=5, ge=1, le=25),
+) -> str:
+    """Search PubChem for chemical compounds.
+
+    Finds compounds matching a name, molecular formula, or SMILES string
+    and returns their identifiers and basic properties.
+
+    Args:
+        query: The search term. Examples by search_type:
+               - name: 'aspirin', 'caffeine', 'glucose'
+               - formula: 'C9H8O4', 'C8H10N4O2'
+               - smiles: 'CC(=O)OC1=CC=CC=C1C(=O)O'
+        search_type: How to interpret the query string.
+        max_results: Number of results to return (1-25).
+
+    Returns:
+        JSON object with 'compounds' array and 'total_count' field.
+        Each compound has: cid, name, formula, weight, smiles.
+    """
+    await pubchem_limiter.acquire()
+
+    namespace_map = {"name": "name", "formula": "fastformula", "smiles": "smiles"}
+    namespace = namespace_map[search_type]
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Step 1: Search for CIDs
+        search_url = f"{PUBCHEM_BASE}/compound/{namespace}/{query}/cids/JSON"
+        resp = await client.get(search_url)
+
+        if resp.status_code == 404:
+            return json.dumps({"compounds": [], "total_count": 0,
+                               "message": f"No compounds found for '{query}'"})
+        resp.raise_for_status()
+
+        cids = resp.json()["IdentifierList"]["CID"][:max_results]
+
+        # Step 2: Fetch properties for matched CIDs
+        await pubchem_limiter.acquire()
+        cid_str = ",".join(str(c) for c in cids)
+        props_url = (
+            f"{PUBCHEM_BASE}/compound/cid/{cid_str}/property/"
+            "IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES/JSON"
+        )
+        props_resp = await client.get(props_url)
+        props_resp.raise_for_status()
+
+        properties = props_resp.json()["PropertyTable"]["Properties"]
+        compounds = [
+            {
+                "cid": p["CID"],
+                "name": p.get("IUPACName", "unknown"),
+                "formula": p.get("MolecularFormula", ""),
+                "weight": p.get("MolecularWeight", 0.0),
+                "smiles": p.get("CanonicalSMILES", ""),
+            }
+            for p in properties
+        ]
+
+    return json.dumps({
+        "compounds": compounds,
+        "total_count": len(cids),
+        "source": "PubChem",
+        "query": query,
+        "search_type": search_type,
+    }, indent=2)
+</code></pre>
+<div class="code-caption">A PubChem search tool with token-bucket rate limiting. The tool performs two API calls (search, then property fetch) and returns a structured JSON response with provenance metadata. The <code>RateLimiter</code> class ensures we never exceed PubChem's 5-request-per-second limit.</div>
+
+<p>
+Notice several design choices in the code above. First, the rate limiter is shared
+across all tool calls in the server process, not per-tool. If the server exposes
+three PubChem tools, they all draw from the same 5-requests-per-second budget.
+Second, the tool makes two sequential API calls (search, then property fetch), each
+rate-limited independently. Third, the output includes provenance fields
+(<code>source</code>, <code>query</code>, <code>search_type</code>) that help the agent
+(and the human reviewing the agent's work) trace where the data came from. Provenance
+tracking becomes critical in
+<a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">Chapter 47: Experiment Registries</a>.
+</p>
+
+<h2>3. Pattern 2: Literature Search (OpenAlex)</h2>
+
+<p>
+OpenAlex is an open catalog of scholarly works, authors, institutions, and concepts
+covering over 250 million publications. Its REST API supports full-text search,
+filtering by date, author, journal, and concept, and returns structured metadata
+including abstracts, citation counts, and open-access URLs.
+</p>
+
+<pre><code class="language-python">"""OpenAlex MCP tools for literature search."""
+import json
+from typing import Literal
+
+import httpx
+from mcp.server import Server
+from pydantic import Field
+
+server = Server("literature-tools")
+
+OPENALEX_BASE = "https://api.openalex.org"
+# OpenAlex polite pool: include your email for higher rate limits
+OPENALEX_EMAIL = "your-email@institution.edu"
+
+@server.tool()
+async def search_literature(
+    query: str,
+    max_results: int = 10,
+    sort_by: Literal["relevance", "cited_by_count", "publication_date"] = "relevance",
+    year_from: int | None = None,
+    year_to: int | None = None,
+    open_access_only: bool = False,
+) -> str:
+    """Search scholarly literature using OpenAlex.
+
+    Finds academic papers matching a text query, with optional filters
+    for date range, citation count, and open access availability.
+
+    Args:
+        query: Search terms (e.g., 'CRISPR gene editing efficiency').
+               Supports boolean operators: 'machine learning AND drug discovery'.
+        max_results: Number of papers to return (1-50, default 10).
+        sort_by: Sort order for results.
+        year_from: Filter to papers published on or after this year (e.g., 2020).
+        year_to: Filter to papers published on or before this year (e.g., 2026).
+        open_access_only: If true, return only open-access papers.
+
+    Returns:
+        JSON with 'papers' array (title, authors, year, doi, abstract, citations,
+        open_access_url) and 'total_count' of matching works.
+    """
+    params = {
+        "search": query,
+        "per_page": min(max_results, 50),
+        "mailto": OPENALEX_EMAIL,
+    }
+
+    # Build sort parameter
+    sort_map = {
+        "relevance": "relevance_score:desc",
+        "cited_by_count": "cited_by_count:desc",
+        "publication_date": "publication_date:desc",
+    }
+    params["sort"] = sort_map[sort_by]
+
+    # Build filter string
+    filters = []
+    if year_from:
+        filters.append(f"from_publication_date:{year_from}-01-01")
+    if year_to:
+        filters.append(f"to_publication_date:{year_to}-12-31")
+    if open_access_only:
+        filters.append("is_oa:true")
+    if filters:
+        params["filter"] = ",".join(filters)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"{OPENALEX_BASE}/works", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    papers = []
+    for work in data.get("results", []):
+        # Extract first 3 author names
+        authors = [
+            a.get("author", {}).get("display_name", "Unknown")
+            for a in work.get("authorships", [])[:3]
+        ]
+        if len(work.get("authorships", [])) > 3:
+            authors.append("et al.")
+
+        # Extract abstract from inverted index
+        abstract = _reconstruct_abstract(work.get("abstract_inverted_index"))
+
+        papers.append({
+            "title": work.get("title", "Untitled"),
+            "authors": authors,
+            "year": work.get("publication_year"),
+            "doi": work.get("doi"),
+            "abstract": abstract[:500] if abstract else None,
+            "cited_by_count": work.get("cited_by_count", 0),
+            "open_access_url": work.get("open_access", {}).get("oa_url"),
+            "openalex_id": work.get("id"),
+        })
+
+    return json.dumps({
+        "papers": papers,
+        "total_count": data.get("meta", {}).get("count", 0),
+        "source": "OpenAlex",
+        "query": query,
+    }, indent=2)
+
+
+def _reconstruct_abstract(inverted_index: dict | None) -> str | None:
+    """Reconstruct abstract text from OpenAlex inverted index format."""
+    if not inverted_index:
+        return None
+    # OpenAlex stores abstracts as {word: [positions]}
+    word_positions = []
+    for word, positions in inverted_index.items():
+        for pos in positions:
+            word_positions.append((pos, word))
+    word_positions.sort()
+    return " ".join(word for _, word in word_positions)
+</code></pre>
+<div class="code-caption">An OpenAlex literature search tool with date filtering, citation sorting, and abstract reconstruction. OpenAlex stores abstracts as inverted indices for compression; the helper function reconstructs readable text. Note the <code>mailto</code> parameter for the polite API pool.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Chaining Tools for Literature Review</div>
+<p>
+An agent conducting a literature review might chain three tools in sequence. First,
+<code>search_literature("CRISPR base editing efficiency", sort_by="cited_by_count")</code>
+to find the most influential papers. Second,
+<code>search_pubchem("adenine", search_type="name")</code> to get the molecular
+structure of the base being edited. Third, a vector database search (Section 12.4)
+to find related papers in the lab's private corpus. Each tool returns structured
+JSON, and the agent extracts the fields it needs for the next call. This tool-chaining
+pattern is the foundation of the
+<a href="../../part-4-knowledge/module-40-research-agents/index.html">research agents</a>
+we build in Chapter 40.
+</p>
+</div>
+
+<h2>4. Pattern 3: Local Computation (RDKit)</h2>
+
+<p>
+Not every tool calls an external API. Many scientific workflows require local
+computation: calculating molecular descriptors, parsing protein sequences, running
+statistical tests, or transforming coordinate systems. These tools are faster
+(no network latency), more reliable (no API downtime), and can process sensitive
+data that should not leave the local machine.
+</p>
+
+<pre><code class="language-python">"""Local chemistry computation tools using RDKit."""
+import json
+from mcp.server import Server
+
+server = Server("chemistry-compute")
+
+@server.tool()
+async def compute_descriptors(smiles: str) -> str:
+    """Compute physicochemical descriptors for a molecule.
+
+    Calculates drug-likeness properties commonly used in medicinal chemistry:
+    molecular weight, LogP (lipophilicity), number of hydrogen bond donors
+    and acceptors, topological polar surface area (TPSA), and number of
+    rotatable bonds.
+
+    Args:
+        smiles: Molecule in SMILES notation.
+                Examples: 'CCO' (ethanol), 'CC(=O)OC1=CC=CC=C1C(=O)O' (aspirin).
+
+    Returns:
+        JSON with molecular descriptors and Lipinski Rule of Five assessment.
+        Lipinski violations > 1 suggest poor oral bioavailability.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors, Crippen, Lipinski, rdMolDescriptors
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return json.dumps({
+            "error": f"Invalid SMILES: '{smiles}'. Could not parse molecule.",
+            "suggestion": "Check for unmatched parentheses, invalid atom symbols, "
+                          "or incorrect bond notation.",
+        })
+
+    # Compute descriptors
+    mw = Descriptors.MolWt(mol)
+    logp = Crippen.MolLogP(mol)
+    hbd = Lipinski.NumHDonors(mol)
+    hba = Lipinski.NumHAcceptors(mol)
+    tpsa = rdMolDescriptors.CalcTPSA(mol)
+    rotatable = Lipinski.NumRotatableBonds(mol)
+    rings = Lipinski.RingCount(mol)
+    heavy_atoms = mol.GetNumHeavyAtoms()
+
+    # Lipinski Rule of Five assessment
+    violations = sum([
+        mw > 500,
+        logp > 5,
+        hbd > 5,
+        hba > 10,
+    ])
+
+    return json.dumps({
+        "smiles": smiles,
+        "canonical_smiles": Chem.MolToSmiles(mol),
+        "descriptors": {
+            "molecular_weight": round(mw, 2),
+            "logP": round(logp, 2),
+            "hydrogen_bond_donors": hbd,
+            "hydrogen_bond_acceptors": hba,
+            "topological_polar_surface_area": round(tpsa, 2),
+            "rotatable_bonds": rotatable,
+            "ring_count": rings,
+            "heavy_atom_count": heavy_atoms,
+        },
+        "lipinski_rule_of_five": {
+            "violations": violations,
+            "drug_like": violations <= 1,
+            "details": {
+                "MW_le_500": mw <= 500,
+                "LogP_le_5": logp <= 5,
+                "HBD_le_5": hbd <= 5,
+                "HBA_le_10": hba <= 10,
+            },
+        },
+    }, indent=2)
+
+
+@server.tool()
+async def find_similar_compounds(
+    smiles: str,
+    threshold: float = 0.7,
+    fingerprint: str = "morgan",
+) -> str:
+    """Find structurally similar compounds using molecular fingerprints.
+
+    Computes a molecular fingerprint for the query and searches a local
+    compound database for molecules with Tanimoto similarity above the
+    threshold.
+
+    Args:
+        smiles: Query molecule in SMILES notation.
+        threshold: Minimum Tanimoto similarity (0.0 to 1.0, default 0.7).
+                   Values above 0.85 typically indicate the same scaffold.
+        fingerprint: Fingerprint algorithm. 'morgan' (default, recommended
+                     for activity similarity) or 'rdkit' (for substructure).
+
+    Returns:
+        JSON with similar compounds sorted by decreasing similarity.
+    """
+    from rdkit import Chem, DataStructs
+    from rdkit.Chem import AllChem, RDKFingerprint
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return json.dumps({"error": f"Invalid SMILES: '{smiles}'"})
+
+    # Generate fingerprint for query
+    if fingerprint == "morgan":
+        query_fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+    else:
+        query_fp = RDKFingerprint(mol)
+
+    # In production, search against a real database
+    # Here we demonstrate the pattern with a small reference set
+    reference_smiles = [
+        ("aspirin", "CC(=O)OC1=CC=CC=C1C(=O)O"),
+        ("ibuprofen", "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O"),
+        ("acetaminophen", "CC(=O)NC1=CC=C(O)C=C1"),
+        ("naproxen", "COC1=CC2=CC(=CC2=CC1)C(C)C(=O)O"),
+        ("caffeine", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C"),
+    ]
+
+    results = []
+    for name, ref_smi in reference_smiles:
+        ref_mol = Chem.MolFromSmiles(ref_smi)
+        if ref_mol is None:
+            continue
+        if fingerprint == "morgan":
+            ref_fp = AllChem.GetMorganFingerprintAsBitVect(ref_mol, radius=2, nBits=2048)
+        else:
+            ref_fp = RDKFingerprint(ref_mol)
+
+        similarity = DataStructs.TanimotoSimilarity(query_fp, ref_fp)
+        if similarity >= threshold:
+            results.append({
+                "name": name,
+                "smiles": ref_smi,
+                "tanimoto_similarity": round(similarity, 4),
+            })
+
+    results.sort(key=lambda x: x["tanimoto_similarity"], reverse=True)
+
+    return json.dumps({
+        "query_smiles": smiles,
+        "threshold": threshold,
+        "fingerprint_type": fingerprint,
+        "similar_compounds": results,
+        "count": len(results),
+    }, indent=2)
+</code></pre>
+<div class="code-caption">Local chemistry computation tools using RDKit. The <code>compute_descriptors</code> tool calculates physicochemical properties and assesses drug-likeness. The <code>find_similar_compounds</code> tool demonstrates fingerprint-based similarity search. Both return structured JSON with all parameters echoed back for traceability.</div>
+
+<p>
+The Tanimoto similarity coefficient used in <code>find_similar_compounds</code> measures
+the overlap between two molecular fingerprints. For two binary fingerprints $A$ and $B$,
+the Tanimoto coefficient is:
+</p>
+
+$$T(A, B) = \frac{|A \cap B|}{|A \cup B|} = \frac{c}{a + b - c}$$
+
+<p>
+where $a = |A|$, $b = |B|$, and $c = |A \cap B|$ are the bit counts. A value of 1.0
+means identical fingerprints; values above 0.85 typically indicate compounds sharing
+the same chemical scaffold. This metric appears again in
+<a href="../../part-6-scientific-domains/module-49-chemistry-materials/index.html">Chapter 49</a>
+when we build chemistry-specific discovery systems.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of a molecular fingerprint as a grocery receipt, and Tanimoto similarity as
+comparing two receipts item by item. Each possible "item" is a specific molecular
+substructure (a benzene ring, a hydroxyl group, a particular three-atom chain), and
+the fingerprint marks which items are "purchased" (present in the molecule). Comparing
+two molecules is like laying two receipts side by side and counting how many items
+appear on both versus how many appear on either: if two shoppers bought 8 of the same
+items out of 10 total distinct items across both receipts, their Tanimoto score is
+8/10 = 0.8. Just as two shoppers with nearly identical receipts probably cook similar
+meals, two molecules with high Tanimoto similarity tend to have similar biological
+activity.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: MCP SDK Decorators</div>
+<p>
+The code above uses the MCP Python SDK's <code>@server.tool()</code> decorator, which
+handles schema generation, input deserialization, and error wrapping in about 3 lines
+of boilerplate per tool. Without the SDK, you would need to manually construct the
+JSON-RPC handler, parse the <code>params</code> object, validate against the JSON Schema,
+serialize the response, and handle errors. That adds roughly 40 lines of protocol
+plumbing per tool. For a server with 10 tools, the SDK saves approximately 400 lines
+of repetitive code. The SDK also provides <code>@server.resource()</code> and
+<code>@server.prompt()</code> decorators with the same savings.
+</p>
+</div>
+
+<h2>5. Error Handling Patterns</h2>
+
+<p>
+Scientific tools fail in predictable ways. External APIs return 429 (rate limited),
+404 (compound not found), or 500 (server error). Local computation fails on invalid
+input (bad SMILES), missing dependencies (RDKit not installed), or resource exhaustion
+(out of memory on large molecules). A well-designed MCP server handles all of these
+gracefully.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is to raise Python exceptions (or let <code>httpx</code> raise
+<code>HTTPStatusError</code>) and rely on the MCP framework to propagate them to the
+agent. This does not work well: the agent receives a generic "internal error" message
+with no actionable detail, no error code to branch on, and no recovery suggestion.
+MCP tools should catch all expected failures and return structured JSON error objects
+(with a code, message, and details) as normal return values, reserving uncaught
+exceptions only for truly unexpected crashes.
+</p>
+</div>
+
+<pre><code class="language-python">"""Structured error handling for MCP tools."""
+import json
+from enum import Enum
+
+class ErrorCode(str, Enum):
+    INVALID_INPUT = "INVALID_INPUT"
+    NOT_FOUND = "NOT_FOUND"
+    RATE_LIMITED = "RATE_LIMITED"
+    UPSTREAM_ERROR = "UPSTREAM_ERROR"
+    COMPUTATION_ERROR = "COMPUTATION_ERROR"
+
+def tool_error(code: ErrorCode, message: str, details: dict | None = None) -> str:
+    """Create a structured error response for MCP tools.
+
+    Returns JSON that the agent can parse and act on, rather than
+    raising an exception that produces an opaque error message.
+    """
+    error = {
+        "error": True,
+        "code": code.value,
+        "message": message,
+    }
+    if details:
+        error["details"] = details
+    return json.dumps(error, indent=2)
+
+# Usage in a tool:
+@server.tool()
+async def get_compound_by_cid(cid: int) -> str:
+    """Look up a PubChem compound by its CID (compound identifier).
+
+    Args:
+        cid: PubChem Compound ID (positive integer, e.g., 2244 for aspirin).
+    """
+    if cid <= 0:
+        return tool_error(
+            ErrorCode.INVALID_INPUT,
+            f"CID must be a positive integer, got {cid}.",
+            {"parameter": "cid", "value": cid},
+        )
+
+    await pubchem_limiter.acquire()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            url = f"{PUBCHEM_BASE}/compound/cid/{cid}/property/"
+            url += "IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES/JSON"
+            resp = await client.get(url)
+
+            if resp.status_code == 404:
+                return tool_error(
+                    ErrorCode.NOT_FOUND,
+                    f"No compound found with CID {cid}.",
+                    {"cid": cid, "suggestion": "Verify the CID or use search_pubchem to find it."},
+                )
+            if resp.status_code == 429:
+                return tool_error(
+                    ErrorCode.RATE_LIMITED,
+                    "PubChem rate limit exceeded. Please wait before retrying.",
+                    {"retry_after_seconds": 5},
+                )
+            resp.raise_for_status()
+
+        except httpx.TimeoutException:
+            return tool_error(
+                ErrorCode.UPSTREAM_ERROR,
+                "PubChem API request timed out after 30 seconds.",
+                {"suggestion": "Try again or use a more specific query."},
+            )
+        except httpx.HTTPStatusError as e:
+            return tool_error(
+                ErrorCode.UPSTREAM_ERROR,
+                f"PubChem API returned HTTP {e.response.status_code}.",
+                {"status_code": e.response.status_code},
+            )
+
+    props = resp.json()["PropertyTable"]["Properties"][0]
+    return json.dumps({
+        "cid": cid,
+        "name": props.get("IUPACName", "unknown"),
+        "formula": props.get("MolecularFormula", ""),
+        "weight": props.get("MolecularWeight", 0.0),
+        "smiles": props.get("CanonicalSMILES", ""),
+        "source": "PubChem",
+    }, indent=2)
+</code></pre>
+<div class="code-caption">Structured error handling for MCP tools. Each error returns a JSON object with a machine-readable code, a human-readable message, and optional details with recovery suggestions. The agent can parse the error code and decide whether to retry, modify the query, or report the failure.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Error Recovery in Agent Loops</div>
+<p>
+When an agent receives a <code>RATE_LIMITED</code> error with
+<code>retry_after_seconds: 5</code>, a well-designed agent loop can wait and retry
+automatically. When it receives <code>NOT_FOUND</code> with a suggestion to use a
+different tool, it can switch strategies. When it receives <code>INVALID_INPUT</code>
+with details about which parameter failed, it can correct the input and retry. This
+structured error protocol transforms error handling from "something went wrong" to
+"here is what went wrong and here is what to do about it." The reasoning patterns
+behind these recovery strategies connect to the
+<a href="../../part-1-foundations/module-04-reasoning-for-discovery/index.html">reasoning for discovery</a>
+framework in Chapter 4.
+</p>
+</div>
+
+<h2>6. Combining Tools in a Single Server</h2>
+
+<p>
+A production MCP server typically combines multiple tools behind a single process.
+The server manages shared resources (HTTP connection pools, rate limiters, database
+connections) and presents a unified interface to the client. Here is the pattern for
+combining the three tool categories we built:
+</p>
+
+<pre><code class="language-python">"""Combined scientific MCP server with shared infrastructure."""
+import asyncio
+import json
+
+import httpx
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+
+# Shared infrastructure
+server = Server("science-mcp")
+_http_client: httpx.AsyncClient | None = None
+_pubchem_limiter = RateLimiter(rate=5.0, burst=5)
+_openalex_limiter = RateLimiter(rate=10.0, burst=10)
+
+async def get_http_client() -> httpx.AsyncClient:
+    """Lazy-initialize a shared HTTP client with connection pooling."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            headers={"User-Agent": "science-mcp/1.0 (research-tool)"},
+        )
+    return _http_client
+
+# Register all tools on the same server
+@server.tool()
+async def search_pubchem(query: str, search_type: str = "name", max_results: int = 5) -> str:
+    """Search PubChem for chemical compounds. [full docstring as above]"""
+    await _pubchem_limiter.acquire()
+    client = await get_http_client()
+    # ... implementation ...
+
+@server.tool()
+async def search_literature(query: str, max_results: int = 10) -> str:
+    """Search OpenAlex for scholarly papers. [full docstring as above]"""
+    await _openalex_limiter.acquire()
+    client = await get_http_client()
+    # ... implementation ...
+
+@server.tool()
+async def compute_descriptors(smiles: str) -> str:
+    """Compute molecular descriptors using RDKit. [full docstring as above]"""
+    # Local computation, no rate limiting needed
+    # ... implementation ...
+
+async def main():
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+if __name__ == "__main__":
+    asyncio.run(main())
+</code></pre>
+<div class="code-caption">Combining multiple tools in a single MCP server. Shared infrastructure (HTTP client, rate limiters) is managed at the server level. Each tool gets its own rate limiter matched to the upstream API's limits.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Autonomous Tool Composition</div>
+<p>
+Current MCP servers expose a fixed set of hand-authored tools. Recent work on
+<strong>automatic tool creation</strong> explores whether LLMs can generate new MCP tool
+implementations at runtime. CREATOR (Qian et al., 2023) showed that LLMs producing
+reusable tool functions on the fly outperform both direct prompting and retrieval from
+static tool libraries across math, tabular, and complex reasoning benchmarks. More
+recently, ToolGen (Ye et al., 2025) unified tool retrieval and invocation by embedding
+tool identifiers directly into the LLM's vocabulary, enabling the model to "generate"
+the right tool as a token prediction rather than selecting from a fixed list. Applied
+to scientific workflows, these approaches would mean an agent encountering a new
+database (say, the Protein Data Bank) could generate and validate MCP tools for it
+autonomously. The MCP specification's <code>tools/list_changed</code> notification
+already supports dynamic tool registration at the protocol level; the research
+challenge is ensuring that auto-generated tools are correct, safe, and
+scientifically valid.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Test a Minimal MCP Science Server</h4>
+<p>
+Build a working two-tool MCP server from scratch in about 30 minutes, using only
+Python and the MCP SDK (no RDKit or external API keys required).
+</p>
+<ol>
+<li><strong>Install dependencies.</strong> Run <code>pip install mcp httpx</code> in a fresh
+virtual environment. Create a file called <code>science_server.py</code>.</li>
+<li><strong>Implement a mock compound lookup tool.</strong> Write a
+<code>lookup_compound(name: str) -> str</code> tool that returns a hard-coded JSON
+dictionary for three compounds (e.g., aspirin, caffeine, ethanol) with fields for
+<code>name</code>, <code>formula</code>, <code>weight</code>, and <code>smiles</code>.
+Return a structured <code>NOT_FOUND</code> error for any other input.</li>
+<li><strong>Implement a molecular weight calculator.</strong> Write a
+<code>calc_mol_weight(formula: str) -> str</code> tool that parses a molecular formula
+string (use a regex like <code>r'([A-Z][a-z]?)(\d*)'</code>), looks up atomic weights
+from a dictionary of common elements (C: 12.011, H: 1.008, O: 15.999, N: 14.007),
+and returns the summed weight as JSON.</li>
+<li><strong>Wire up the server.</strong> Add the <code>stdio_server</code> main block from
+this section's "Combining Tools" example. Run
+<code>python science_server.py</code> and verify it starts without errors by sending
+a JSON-RPC <code>initialize</code> request on stdin.</li>
+<li><strong>Test tool chaining.</strong> Use the MCP Inspector
+(<code>npx @modelcontextprotocol/inspector</code>) to call
+<code>lookup_compound("aspirin")</code>, extract the formula from the response, and
+pass it to <code>calc_mol_weight</code>. Verify the computed weight matches the
+expected value of 180.16 Da within rounding tolerance.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual</strong>: Why does the <code>search_pubchem</code> tool echo back the
+query and search_type in its response? What problems would arise if it did not,
+particularly when an agent chains multiple search calls in a single reasoning trace?
+</li>
+<li>
+<strong>Coding</strong>: Extend the <code>compute_descriptors</code> tool to include
+Veber's rules (PSA &le; 140 &Aring;<sup>2</sup> and rotatable bonds &le; 10) alongside
+Lipinski's Rule of Five. Return a combined "oral_bioavailability" assessment that
+passes only if both rule sets are satisfied. Test with at least five drugs of
+varying sizes.
+</li>
+<li>
+<strong>Analysis</strong>: The <code>_reconstruct_abstract</code> function in the
+OpenAlex tool is $O(n \log n)$ due to sorting. For a typical abstract of 200 words,
+is this a meaningful bottleneck? At what abstract length would it matter? Propose
+an $O(n)$ alternative and measure the practical difference using Python's
+<code>timeit</code>.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have working MCP tools for three scientific domains. In
+<a href="section-12.3.html">Section 12.3: Testing and Publishing</a>, we build the
+test infrastructure that ensures these tools behave correctly under normal
+conditions and degrade gracefully under failures. We will also cover authentication,
+Docker-based sandboxing, and publishing to package registries.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-12.1.html">&#8592; 12.1 MCP Architecture</a>
+<a href="index.html">Chapter 12</a>
+<a href="section-12.3.html">12.3 Testing and Publishing &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

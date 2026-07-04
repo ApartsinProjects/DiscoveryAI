@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.2: Coordination and Human Gates. Shared state management, message passing, debate patterns, and human approval gates for multi-agent software teams." name="description"/>
+<title>Section 17.2: Coordination and Human Gates | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Multi-Agent Software Teams</a></div>
+<h1>17.2 Coordination and Human Gates</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The developer agent and the reviewer agent agreed to disagree, so they created a third agent to mediate. The mediator sided with the developer. The reviewer appealed to a fourth agent. We now have a Supreme Court of code review."</p>
+<cite>An Escalation Policy That Escalated</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the agent roles and workflow graphs from
+<a href="section-17.1.html">Section 17.1</a>. You should understand the five canonical roles,
+the four workflow topologies (sequential, parallel, conditional, cyclic), and the
+state machine formalism. Familiarity with the
+<a href="../../part-1-foundations/module-04-reasoning-for-discovery/index.html">reasoning patterns</a>
+from Chapter 4 helps for understanding debate structures.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Section 17.1 defined <em>who</em> the agents are and <em>what order</em> they execute in.
+This section tackles the harder coordination questions: How do agents share information?
+How do they resolve disagreements? When must a human step in? These are the same
+coordination challenges that real software teams face (shared repositories, design
+debates, approval workflows), translated into the language of multi-agent systems.
+The patterns here apply beyond software engineering: the debate protocols reappear in
+<a href="../../part-7-autonomous-discovery/module-54-multi-agent-discovery/index.html">Chapter 54</a>
+for scientific hypothesis evaluation, and the human gates become critical in
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">Chapter 55</a>
+where autonomous agents control physical laboratory instruments.
+</p>
+</div>
+
+<h2>1. Shared State: The Blackboard Pattern</h2>
+
+<p>
+In a multi-agent workflow, every agent needs access to the evolving state of the
+software artifact: the requirements, the design, the current code, the test results,
+the review comments. The simplest coordination pattern is the <strong>blackboard</strong>: a
+shared data structure that all agents can read and write. Each agent reads the fields
+it needs, performs its work, and writes its output back to the blackboard. The workflow
+executor passes the blackboard to each agent in sequence.
+</p>
+
+<p data-agent="02">
+A blackboard is a single mutable object (typically a dataclass or dictionary) that
+serves as the shared memory for every agent in the pipeline. It matters because without
+a common place to read and write intermediate results, agents would need explicit
+point-to-point wiring for every possible pair, which scales quadratically. The mechanism
+is simple: the workflow executor holds one blackboard instance, passes it to each agent
+in turn, and the agent mutates the fields it owns before returning control. Use a
+blackboard when your team is small (fewer than roughly ten agents) and agents need
+overlapping subsets of the state; switch to typed message channels (Section 2 below)
+when context window pressure or strict interface contracts become more important
+than implementation simplicity.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from datetime import datetime
+
+@dataclass
+class Blackboard:
+    """Shared state for a multi-agent software team.
+
+    Every agent reads from and writes to this structure.
+    The workflow executor passes it between agent invocations.
+    """
+    # input
+    issue: dict = field(default_factory=dict)
+    repository_context: dict = field(default_factory=dict)
+
+    # PM output
+    requirements: dict | None = None
+
+    # Architect output
+    design: dict | None = None
+    api_contracts: list[dict] = field(default_factory=list)
+
+    # Developer output
+    file_changes: dict[str, str] = field(default_factory=dict)
+    diff: str = ""
+
+    # Tester output
+    test_files: dict[str, str] = field(default_factory=dict)
+    test_results: dict | None = None
+
+    # Reviewer output
+    review: dict | None = None
+    approved: bool = False
+
+    # Metadata
+    iteration: int = 0
+    total_tokens: int = 0
+    history: list[dict] = field(default_factory=list)
+
+    def record_step(self, agent_name: str, tokens: int, summary: str):
+        """Log an agent execution for observability."""
+        self.history.append({
+            "agent": agent_name,
+            "iteration": self.iteration,
+            "tokens": tokens,
+            "summary": summary,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+        self.total_tokens += tokens
+</code></pre>
+<div class="code-caption">A blackboard data structure serving as shared state for the entire multi-agent team, with built-in observability logging.</div>
+
+<p>
+The blackboard pattern is simple but has a limitation: every agent sees the entire
+state, which can be overwhelming for the LLM's context window. A 200-line diff, three
+pages of requirements, an architect's design document, and 50 test results can easily
+exceed 100,000 tokens. We need a way to give each agent only the state it needs.
+</p>
+
+<h2>2. Typed Message Channels</h2>
+
+<p>
+An alternative to the monolithic blackboard is <strong>typed message passing</strong>: each
+edge in the workflow graph carries a specific message type, and each agent receives
+only the messages sent to it. This is the multi-agent analogue of function parameters:
+the developer receives a <code>DesignDocument</code>, not the entire blackboard.
+</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field
+
+class DesignMessage(BaseModel):
+    """Message from Architect to Developer."""
+    design_summary: str
+    file_changes: list[dict] = Field(
+        description="List of {path, change_type, description} dicts"
+    )
+    api_contracts: list[dict]
+    constraints: list[str] = Field(
+        description="Non-functional requirements: perf, security, etc."
+    )
+
+class CodeMessage(BaseModel):
+    """Message from Developer to Tester and Reviewer."""
+    diff: str
+    files_changed: list[str]
+    implementation_notes: str
+    known_limitations: list[str] = []
+
+class TestResultMessage(BaseModel):
+    """Message from Tester to Reviewer."""
+    tests_written: int
+    tests_passed: int
+    tests_failed: int
+    coverage_percent: float
+    failure_details: list[dict] = []
+
+class ReviewMessage(BaseModel):
+    """Message from Reviewer back to Developer (on rejection)."""
+    approved: bool
+    blockers: list[dict]       # must-fix issues
+    warnings: list[dict]       # should-fix issues
+    suggestions: list[dict]    # nice-to-have improvements
+    summary: str
+
+
+class TypedChannel:
+    """A typed communication channel between two agents."""
+
+    def __init__(self, name: str, message_type: type[BaseModel]):
+        self.name = name
+        self.message_type = message_type
+        self._messages: list[BaseModel] = []
+
+    def send(self, message: BaseModel):
+        """Validate and enqueue a message."""
+        if not isinstance(message, self.message_type):
+            raise TypeError(
+                f"Channel '{self.name}' expects {self.message_type.__name__}, "
+                f"got {type(message).__name__}"
+            )
+        self._messages.append(message)
+
+    def receive(self) -> BaseModel | None:
+        """Dequeue the next message, or None if empty."""
+        return self._messages.pop(0) if self._messages else None
+</code></pre>
+<div class="code-caption">Typed message channels enforce schema validation at every agent boundary, preventing information corruption across the pipeline.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Blackboard vs. Message Passing</div>
+<p>
+The blackboard and message-passing patterns represent a classic trade-off in
+distributed systems. The blackboard is simpler to implement and gives every agent
+full visibility, but it couples agents to a shared schema and can overwhelm context
+windows. Message passing is more modular (each agent depends only on its input
+channel type), scales better to large teams, and naturally limits context size. In
+practice, most multi-agent frameworks use a hybrid: a shared state object (like
+LangGraph's <code>TypedDict</code>) with per-agent <strong>view functions</strong> that select
+which fields each agent sees. This gives you the simplicity of a blackboard with
+the context control of message passing.
+</p>
+</div>
+
+<h2>3. View Functions: Context-Aware State Projection</h2>
+
+<p>
+A <strong>view function</strong> projects the full blackboard state into the subset that a
+specific agent needs. This is the multi-agent analogue of the context engineering
+techniques from <a href="../module-11-context-engineering/index.html">Chapter 11</a>: just as
+you select which files to include in an LLM's context window, you select which state
+fields to include in an agent's input.
+</p>
+
+<pre><code class="language-python">from typing import Callable
+
+# Each view function takes the full state and returns
+# a filtered dict for the agent's system prompt context
+ViewFunction = Callable[[Blackboard], dict]
+
+def pm_view(state: Blackboard) -> dict:
+    """PM sees only the raw issue and repository structure."""
+    return {
+        "issue": state.issue,
+        "repo_structure": state.repository_context.get("structure", {}),
+    }
+
+def architect_view(state: Blackboard) -> dict:
+    """Architect sees PM output plus repository context."""
+    return {
+        "requirements": state.requirements,
+        "repo_structure": state.repository_context.get("structure", {}),
+        "existing_patterns": state.repository_context.get("patterns", []),
+    }
+
+def developer_view(state: Blackboard) -> dict:
+    """Developer sees design, requirements, and review feedback if cycling."""
+    view = {
+        "design": state.design,
+        "requirements": state.requirements,
+        "api_contracts": state.api_contracts,
+    }
+    if state.review and not state.approved:
+        # on review rejection, include the feedback
+        view["review_feedback"] = state.review
+        view["previous_diff"] = state.diff
+    return view
+
+def reviewer_view(state: Blackboard) -> dict:
+    """Reviewer sees the diff, design, requirements, and test results."""
+    return {
+        "diff": state.diff,
+        "design": state.design,
+        "requirements": state.requirements,
+        "test_results": state.test_results,
+        "iteration": state.iteration,
+    }
+</code></pre>
+<div class="code-caption">View functions project the full blackboard into agent-specific context, controlling exactly what each agent sees.</div>
+
+<h2>4. Debate Patterns</h2>
+
+<p>
+Not every agent interaction is a handoff. Sometimes agents need to
+<strong>debate</strong>: argue for different approaches, critique each other's proposals,
+and converge on a decision. Du et al. (2023) showed that multi-agent debate improves
+factual accuracy on reasoning tasks. In software engineering, debate is useful for
+design decisions where multiple valid approaches exist.
+</p>
+
+<h3>4.1 Structured Debate Protocol</h3>
+
+<p>
+A structured debate has three phases: <strong>proposal</strong> (each agent states its
+position), <strong>critique</strong> (each agent responds to the others), and
+<strong>resolution</strong> (a judge agent or voting mechanism selects the winner). The key
+insight is that debate must be <em>structured</em> (typed proposals, explicit critique
+dimensions) rather than free-form chat. Free-form debate between LLMs tends to devolve
+into agreement: models are trained to be agreeable, so without explicit adversarial
+framing, they quickly converge on the first proposal.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of a structured debate like a competitive cooking show (such as <em>Chopped</em>).
+In round one (proposal), each chef prepares a dish independently using the same basket
+of ingredients. In round two (critique), the chefs taste each other's dishes and point
+out what works, what does not, and what they would change. In round three (resolution),
+the judges weigh the critiques and pick a winner, often suggesting the winning chef
+incorporate a technique from one of the losing dishes. The structure matters: if you
+just let the chefs talk casually, they would politely agree that everyone's dish is
+good. The timed rounds, mandatory critique, and independent judge force genuine
+evaluation, exactly as typed proposals, explicit critique dimensions, and a separate
+judge agent do for LLM debate.
+</p>
+</div>
+
+<pre><code class="language-python">from enum import Enum
+
+class DebatePhase(Enum):
+    PROPOSAL = "proposal"
+    CRITIQUE = "critique"
+    RESOLUTION = "resolution"
+
+@dataclass
+class Proposal:
+    """A design proposal from one agent."""
+    agent_name: str
+    approach: str
+    rationale: str
+    trade_offs: list[str]
+    estimated_complexity: str
+    code_sketch: str  # pseudocode or skeleton
+
+@dataclass
+class Critique:
+    """A critique of another agent's proposal."""
+    critic_name: str
+    target_proposal: str      # agent_name of the proposal being critiqued
+    strengths: list[str]
+    weaknesses: list[str]
+    questions: list[str]
+    recommendation: str       # "accept", "modify", "reject"
+
+@dataclass
+class DebateResult:
+    """The outcome of a structured debate."""
+    winning_proposal: str
+    rationale: str
+    modifications: list[str]  # changes to the winning proposal
+    dissenting_opinions: list[str]
+
+
+async def run_debate(
+    question: str,
+    debaters: list[AgentRole],
+    judge: AgentRole,
+    run_agent: Callable,
+    context: dict,
+) -> DebateResult:
+    """Run a structured three-phase debate between agents."""
+
+    # Phase 1: Proposals (parallel)
+    proposals = await asyncio.gather(*[
+        run_agent(agent, {
+            "phase": DebatePhase.PROPOSAL,
+            "question": question,
+            "context": context,
+        })
+        for agent in debaters
+    ])
+
+    # Phase 2: Critiques (each agent critiques all others, parallel)
+    critique_tasks = []
+    for i, agent in enumerate(debaters):
+        other_proposals = [p for j, p in enumerate(proposals) if j != i]
+        critique_tasks.append(
+            run_agent(agent, {
+                "phase": DebatePhase.CRITIQUE,
+                "own_proposal": proposals[i],
+                "other_proposals": other_proposals,
+                "context": context,
+            })
+        )
+    critiques = await asyncio.gather(*critique_tasks)
+
+    # Phase 3: Resolution (judge evaluates all proposals and critiques)
+    result = await run_agent(judge, {
+        "phase": DebatePhase.RESOLUTION,
+        "proposals": proposals,
+        "critiques": critiques,
+        "question": question,
+        "context": context,
+    })
+
+    return result
+</code></pre>
+<div class="code-caption">A three-phase structured debate protocol: agents propose in parallel, critique each other, then a judge resolves.</div>
+
+<h3>4.2 When to Use Debate</h3>
+
+<p>
+Debate is valuable when the design space has multiple plausible solutions and the
+cost of choosing wrong is high. Use debate for:
+</p>
+
+<ul>
+<li><strong>Architecture decisions</strong>: monolith vs. microservice, SQL vs. NoSQL, synchronous vs. asynchronous.</li>
+<li><strong>Algorithm selection</strong>: when the performance characteristics of different approaches depend on workload assumptions (see <a href="../module-15-algorithm-discovery/index.html">Chapter 15</a>).</li>
+<li><strong>Security trade-offs</strong>: convenience vs. safety, where a single agent might under-weight the security perspective.</li>
+</ul>
+
+<p>
+Do <em>not</em> use debate for routine implementation tasks where the design is already
+specified. Having three agents debate the best way to write a for-loop wastes tokens
+and time.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Database Selection Debate</div>
+<p>
+A research team needs to store 10 million molecular structures with similarity search
+capability. The PM specifies the requirements: sub-second similarity queries, batch
+import of 100K molecules per hour, and integration with the Discovery Workbench.
+Instead of letting the architect choose alone, we run a debate with two specialist
+agents: a <strong>relational advocate</strong> (proposes PostgreSQL with the RDKit cartridge for
+chemical similarity) and a <strong>vector advocate</strong> (proposes Chroma with molecular
+fingerprint embeddings). Each writes a proposal with benchmarks and trade-offs. The
+critique phase reveals that the relational approach handles exact substructure search
+better, while the vector approach handles fuzzy similarity better. The judge
+(the architect agent) resolves by recommending a hybrid: PostgreSQL for structured
+metadata and exact queries, Chroma for similarity search. Neither debater proposed
+this solution individually; it emerged from the adversarial process.
+</p>
+</div>
+
+<h2>5. Human Approval Gates</h2>
+
+<p>
+The most important coordination mechanism in a multi-agent team is not between agents;
+it is between agents and humans. <strong>Human approval gates</strong> are checkpoints where the
+workflow pauses and presents a decision to a human operator. The human can approve
+(continue), reject (halt), or modify (edit the state before continuing).
+</p>
+
+<h3>5.1 When to Gate</h3>
+
+<p>
+Not every agent output needs human review. Gates should be placed at decision points
+where the cost of a wrong decision is high relative to the cost of human review time.
+Three categories warrant gates:
+</p>
+
+<p>
+<strong>Security-critical decisions.</strong> Any action that modifies access controls,
+handles credentials, or changes security-sensitive code. The reviewer agent may flag
+a potential SQL injection, but a human must decide whether the risk is real. See
+<a href="../module-20-software-security/index.html">Chapter 20</a> for deeper treatment.
+</p>
+
+<p>
+<strong>Cost-critical decisions.</strong> Actions that incur significant cost: deploying to
+production, provisioning cloud resources, purchasing API credits. The architect might
+recommend a solution that costs $500/month in cloud compute; a human should approve
+that commitment.
+</p>
+
+<p>
+<strong>Quality-critical decisions.</strong> The final PR approval before merge. Even if the
+reviewer agent approves, a human should review the diff for a new feature that affects
+user-facing behavior. This is the "four-eyes principle" applied to AI-generated code.
+</p>
+
+<pre><code class="language-python">from enum import Enum
+from typing import Any
+
+class GateDecision(Enum):
+    APPROVE = "approve"
+    REJECT = "reject"
+    MODIFY = "modify"
+
+class GateType(Enum):
+    SECURITY = "security"
+    COST = "cost"
+    QUALITY = "quality"
+
+@dataclass
+class HumanGate:
+    """A checkpoint where the workflow pauses for human review."""
+    name: str
+    gate_type: GateType
+    description: str
+    required_fields: list[str]  # state fields to show the human
+
+    def should_trigger(self, state: Blackboard) -> bool:
+        """Determine whether this gate activates given current state."""
+        raise NotImplementedError
+
+    def format_for_review(self, state: Blackboard) -> dict:
+        """Extract and format the information the human needs to decide."""
+        return {
+            field: getattr(state, field, None)
+            for field in self.required_fields
+        }
+
+
+class PRApprovalGate(HumanGate):
+    """Gate before merging a pull request."""
+
+    def __init__(self):
+        super().__init__(
+            name="pr_approval",
+            gate_type=GateType.QUALITY,
+            description="Review the final PR before merge",
+            required_fields=["diff", "test_results", "review", "requirements"],
+        )
+
+    def should_trigger(self, state: Blackboard) -> bool:
+        # always trigger for final PR approval
+        return state.approved
+
+class SecurityReviewGate(HumanGate):
+    """Gate when security-sensitive files are modified."""
+
+    SENSITIVE_PATTERNS = [
+        "auth", "security", "password", "token", "secret",
+        "credential", "permission", "acl", "rbac",
+    ]
+
+    def __init__(self):
+        super().__init__(
+            name="security_review",
+            gate_type=GateType.SECURITY,
+            description="Security-sensitive files were modified",
+            required_fields=["diff", "file_changes", "review"],
+        )
+
+    def should_trigger(self, state: Blackboard) -> bool:
+        changed_files = list(state.file_changes.keys())
+        return any(
+            pattern in f.lower()
+            for f in changed_files
+            for pattern in self.SENSITIVE_PATTERNS
+        )
+</code></pre>
+<div class="code-caption">Human approval gates with typed categories, conditional triggering, and structured presentation of review context.</div>
+
+<h3>5.2 Gate Integration in the Workflow</h3>
+
+<p>
+Gates are nodes in the workflow graph, just like agent nodes. When the executor reaches
+a gate node, it pauses execution, formats the relevant state for human review, and
+waits for a response. The gate's output (approve, reject, modify) determines which
+edge the workflow follows next.
+</p>
+
+<pre><code class="language-python">async def execute_with_gates(
+    graph: WorkflowGraph,
+    state: Blackboard,
+    gates: list[HumanGate],
+    run_agent: Callable,
+    request_human_review: Callable,  # async fn that blocks until human responds
+) -> Blackboard:
+    """Execute a workflow graph with human approval gates."""
+    current_node = graph.entry_point
+
+    while current_node is not None:
+        # check if any gate should trigger before this node
+        for gate in gates:
+            if gate.should_trigger(state):
+                review_data = gate.format_for_review(state)
+                decision = await request_human_review(
+                    gate_name=gate.name,
+                    gate_type=gate.gate_type.value,
+                    description=gate.description,
+                    data=review_data,
+                )
+
+                if decision.action == GateDecision.REJECT:
+                    state.history.append({
+                        "event": "human_rejection",
+                        "gate": gate.name,
+                        "reason": decision.reason,
+                    })
+                    return state  # halt the workflow
+
+                if decision.action == GateDecision.MODIFY:
+                    # apply human modifications to state
+                    for key, value in decision.modifications.items():
+                        setattr(state, key, value)
+
+        # run the agent at this node
+        role = graph.nodes[current_node]
+        view_fn = graph.view_functions.get(current_node, lambda s: vars(s))
+        agent_input = view_fn(state)
+
+        result = await run_agent(role, agent_input)
+
+        # update state with agent output
+        state = update_state(state, current_node, result)
+
+        # determine next node
+        current_node = graph.get_next(current_node, result)
+
+    return state
+</code></pre>
+<div class="code-caption">Workflow executor with gate integration: gates trigger conditionally, pause for human input, and route the workflow based on the decision.</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that human gates exist only as a temporary safety net, to be
+removed once the agents "get good enough." In reality, some gates are permanent by
+design. Security-critical and cost-critical gates reflect organizational policy and
+regulatory requirements, not agent capability. Even a multi-agent team with a perfect
+track record should retain gates on actions like deploying to production or modifying
+access controls, because the gate enforces accountability and auditability, not just
+error correction.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Progressive Autonomy</div>
+<p>
+The right number of human gates depends on trust, which builds over time. A new
+multi-agent team should gate every PR, every security-sensitive change, and every
+cost decision. As the team proves reliable (measured by the fraction of human
+approvals that are rubber-stamps), you can relax gates selectively. Start with gates
+everywhere and remove them as data justifies it. This mirrors how human teams earn
+autonomy: junior developers get every PR reviewed; senior developers get
+auto-merge privileges for low-risk changes. The
+<a href="../module-23-evaluating-agents/index.html">evaluation framework</a> in Chapter 23
+provides the metrics (pass rate, revert rate, security incident rate) that drive
+these decisions.
+</p>
+</div>
+
+<h2>6. Event-Driven Coordination</h2>
+
+<p>
+In production multi-agent systems, coordination is often <strong>event-driven</strong> rather
+than graph-traversal-driven. Agents subscribe to events (new issue filed, PR created,
+test suite completed) and react asynchronously. This pattern is more flexible than a
+fixed workflow graph: it supports dynamic team composition, late-joining agents, and
+parallel independent workflows.
+</p>
+
+<pre><code class="language-python">from collections import defaultdict
+import asyncio
+
+class EventBus:
+    """A publish-subscribe event bus for agent coordination."""
+
+    def __init__(self):
+        self._subscribers: dict[str, list[Callable]] = defaultdict(list)
+
+    def subscribe(self, event_type: str, handler: Callable):
+        """Register a handler for an event type."""
+        self._subscribers[event_type].append(handler)
+
+    async def publish(self, event_type: str, payload: dict):
+        """Publish an event to all subscribers."""
+        handlers = self._subscribers.get(event_type, [])
+        await asyncio.gather(*[
+            handler(payload) for handler in handlers
+        ])
+
+
+# usage: wire agents to events
+bus = EventBus()
+
+async def on_issue_created(payload):
+    """PM agent reacts to new issues."""
+    requirements = await run_agent(pm_role, payload)
+    await bus.publish("requirements_ready", requirements)
+
+async def on_requirements_ready(payload):
+    """Architect agent reacts to completed requirements."""
+    design = await run_agent(architect_role, payload)
+    await bus.publish("design_ready", design)
+
+async def on_tests_failed(payload):
+    """Developer agent reacts to test failures."""
+    fix = await run_agent(developer_role, {
+        "task": "fix_test_failures",
+        "failures": payload["failure_details"],
+        "current_code": payload["code"],
+    })
+    await bus.publish("code_updated", fix)
+
+bus.subscribe("issue_created", on_issue_created)
+bus.subscribe("requirements_ready", on_requirements_ready)
+bus.subscribe("tests_failed", on_tests_failed)
+</code></pre>
+<div class="code-caption">Event-driven coordination with a publish-subscribe bus: agents react to events rather than following a fixed graph traversal order.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: AutoGen Conversations</div>
+<p>
+The event-driven coordination pattern we built in ~50 lines is the core abstraction
+of <a href="https://microsoft.github.io/autogen/" target="_blank">AutoGen</a>. AutoGen
+models multi-agent coordination as <strong>conversations</strong>: agents send messages to
+each other (or to a group chat), and the framework handles routing, turn-taking, and
+termination. The same PM-to-Architect-to-Developer pipeline takes about 25 lines:
+</p>
+<pre><code class="language-python">from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
+
+pm = AssistantAgent("pm", system_message="You are a product manager...")
+architect = AssistantAgent("architect", system_message="You are an architect...")
+developer = AssistantAgent("developer", system_message="You are a developer...")
+reviewer = AssistantAgent("reviewer", system_message="You are a reviewer...")
+
+# human proxy for approval gates
+human = UserProxyAgent(
+    "human",
+    human_input_mode="TERMINATE",  # ask human only at the end
+    code_execution_config={"work_dir": "workspace"},
+)
+
+group_chat = GroupChat(
+    agents=[pm, architect, developer, reviewer, human],
+    messages=[],
+    max_round=20,
+)
+manager = GroupChatManager(groupchat=group_chat)
+human.initiate_chat(manager, message="Implement CSV export for the dashboard")
+</code></pre>
+<div class="code-caption">AutoGen's GroupChat provides event-driven multi-agent coordination in ~25 lines (compared to ~50 lines for our from-scratch EventBus).</div>
+<p>
+AutoGen's strength is flexibility: agents can join and leave conversations, the
+conversation topology can change mid-execution, and the <code>UserProxyAgent</code>
+provides built-in human-in-the-loop support. The trade-off: the unstructured
+conversation format makes it harder to enforce strict workflow ordering and
+typed interfaces compared to LangGraph's graph-based approach.
+</p>
+</div>
+
+<h2>7. State Persistence and Recovery</h2>
+
+<p>
+Multi-agent workflows can take minutes to hours. If a workflow fails midway (an API
+timeout, a rate limit, a model outage), you do not want to restart from scratch.
+<strong>State persistence</strong> means checkpointing the blackboard after every agent
+execution so that the workflow can resume from the last successful step.
+</p>
+
+<pre><code class="language-python">import json
+from pathlib import Path
+
+class CheckpointManager:
+    """Persist and recover workflow state across failures."""
+
+    def __init__(self, checkpoint_dir: Path):
+        self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(self, workflow_id: str, state: Blackboard, step: str):
+        """Save a checkpoint after a successful agent step."""
+        path = self.checkpoint_dir / f"{workflow_id}_{step}.json"
+        data = {
+            "step": step,
+            "iteration": state.iteration,
+            "total_tokens": state.total_tokens,
+            "approved": state.approved,
+            "requirements": state.requirements,
+            "design": state.design,
+            "diff": state.diff,
+            "test_results": state.test_results,
+            "review": state.review,
+            "history": state.history,
+        }
+        path.write_text(json.dumps(data, indent=2, default=str))
+
+    def load_latest(self, workflow_id: str) -> tuple[str, dict] | None:
+        """Load the most recent checkpoint for a workflow."""
+        checkpoints = sorted(
+            self.checkpoint_dir.glob(f"{workflow_id}_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not checkpoints:
+            return None
+        data = json.loads(checkpoints[0].read_text())
+        return data["step"], data
+
+    def resume_from(self, workflow_id: str, graph: WorkflowGraph) -> str | None:
+        """Determine the next node to execute after a checkpoint."""
+        result = self.load_latest(workflow_id)
+        if result is None:
+            return graph.entry_point
+        last_step, state_data = result
+        # find the node after the last completed step
+        return graph.get_next(last_step, state_data)
+</code></pre>
+<div class="code-caption">Checkpoint manager for workflow recovery: saves state after every agent step, enabling resume from the last successful checkpoint.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Learned Coordination Policies</div>
+<p>
+Current multi-agent systems use hand-designed coordination protocols (fixed graphs,
+static debate rounds, manual gate placement). Recent work explores <strong>learned
+coordination</strong>: training a meta-agent that decides which agent to invoke next,
+when to trigger debate, and where to place approval gates. DyLAN (Liu et al., 2024)
+introduced dynamic agent selection that outperforms fixed topologies by 10-15%
+on code generation benchmarks. More recently, <strong>AgentVerse</strong> (Chen et al., 2024)
+demonstrated an autonomous group of LLM agents that dynamically adjust their team
+composition, communication topology, and role assignments at runtime based on task
+difficulty. On SWE-bench, AgentVerse's adaptive coordination solved 20% more issues
+than the best static multi-agent layout. Meanwhile, Anthropic's multi-agent research
+(2025) on "tool-use agents supervising tool-use agents" has shown that hierarchical
+coordination, where a planning agent delegates to and audits specialist agents with
+explicit approval checkpoints, reduces cascading errors in long-horizon coding tasks.
+These developments suggest that future coordination protocols will be partially learned
+and partially specified by policy, rather than fully hand-designed.
+</p>
+</div>
+
+<h2>8. Cost and Latency Management</h2>
+
+<p>
+Multi-agent workflows multiply both cost and latency. A five-agent sequential pipeline
+with three review rounds makes $5 + 3 \times 2 = 11$ LLM calls. If each call costs
+$0.20 and takes 15 seconds, the total is $2.20 and 2.75 minutes. For production
+systems processing hundreds of issues per day, cost management is essential.
+</p>
+
+<p>
+Three strategies keep costs under control:
+</p>
+
+<p>
+<strong>Tiered models.</strong> Not every agent needs the most capable model. The PM and
+architect benefit from a strong reasoning model (GPT-4o, Claude Sonnet); the developer
+may use a coding-specialized model (Claude Sonnet with coding prompts); and the
+tester can use a smaller, faster model for straightforward test generation. The
+reviewer, whose job is adversarial critique, benefits from a strong model.
+</p>
+
+<p>
+<strong>Early termination.</strong> If the tester finds that all tests pass on the first try,
+skip the review loop entirely (or limit it to a single pass). If the PM determines
+that the issue is a one-line typo fix, bypass the architect and route directly to the
+developer.
+</p>
+
+<p>
+<strong>Caching.</strong> If two issues require the same repository context (directory
+structure, coding patterns, test framework), cache the context extraction once and
+reuse it. LLM prompt caching (available in both OpenAI and Anthropic APIs) can reduce
+costs by 50-90% for the shared prefix portions of prompts.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Gated Two-Agent Review Pipeline</h4>
+<p>
+Build a minimal multi-agent workflow with a human approval gate using only Python and
+the <code>openai</code> library (or any LLM API client).
+</p>
+<ol>
+<li><strong>Define the blackboard.</strong> Create a Python dataclass with fields for
+<code>task_description</code> (str), <code>draft_code</code> (str), <code>review_comments</code>
+(str), and <code>approved</code> (bool). Initialize it with a small coding task such as
+"Write a function that computes the Fibonacci sequence up to n terms."</li>
+<li><strong>Implement the developer agent.</strong> Write a function that sends the
+<code>task_description</code> (and any <code>review_comments</code> from a prior round) to an
+LLM with a system prompt like "You are a Python developer. Write clean, tested code."
+Store the response in <code>draft_code</code>.</li>
+<li><strong>Implement the reviewer agent.</strong> Write a second function that sends the
+<code>draft_code</code> and <code>task_description</code> to an LLM with the system prompt
+"You are a code reviewer. List blockers, warnings, and suggestions as JSON." Parse the
+structured output and store it in <code>review_comments</code>.</li>
+<li><strong>Add a human gate.</strong> After the reviewer runs, print the review summary to the
+console and prompt the user with <code>input("Approve, reject, or modify? ")</code>. On
+"approve," set <code>approved = True</code> and exit. On "reject," halt the workflow. On
+"modify," let the user type additional instructions, append them to
+<code>review_comments</code>, and loop back to the developer agent.</li>
+<li><strong>Run and observe.</strong> Execute the pipeline end to end. Note how many iterations the
+loop takes, how many tokens each agent consumes (print the usage from the API response),
+and whether the human gate catches issues the reviewer missed. Try adding a
+<code>max_iterations = 3</code> guard to prevent runaway loops.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual</strong>: A multi-agent team processes a security-sensitive change that
+modifies the authentication module. List all the gates that should trigger, in what
+order, and what information each gate should present to the human reviewer. How does
+the gate placement change if the team has a proven track record of 500 successful
+security changes with zero incidents?
+</li>
+<li>
+<strong>Coding</strong>: Implement a <code>DebateManager</code> class that runs a two-round debate
+between three agents on a design question. In round one, each agent proposes an
+approach. In round two, each agent critiques the other two proposals. Use
+<code>asyncio.gather</code> for parallelism within each round. The manager should produce a
+structured <code>DebateResult</code> with the winning proposal and dissenting opinions.
+Test with three agents debating "REST vs. GraphQL vs. gRPC for a scientific data API."
+</li>
+<li>
+<strong>Analysis</strong>: Compare the token cost of a blackboard-based workflow (every agent
+receives the full state) vs. a message-passing workflow (each agent receives only its
+input channel) for a team processing an issue that generates a 500-line diff. Assume
+the blackboard contains 2,000 tokens of requirements, 3,000 tokens of design, the
+500-line diff (5,000 tokens), 1,500 tokens of test results, and 1,000 tokens of
+review comments. How many tokens does each agent see in each approach? What is the
+total token consumption across all five agents?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+With coordination patterns and human gates in place,
+<a href="section-17.3.html">Section 17.3: Building a Software Agent Team</a> puts
+everything together into a complete, runnable system. We implement a multi-agent team
+that takes a GitHub issue and produces a reviewed pull request, using four different
+frameworks (OpenAI Agents SDK, LangGraph, AutoGen, CrewAI) to compare their approaches
+to the same problem.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-17.1.html">&#8592; 17.1 Agent Roles and Workflows</a>
+<a href="index.html">Chapter 17</a>
+<a href="section-17.3.html">17.3 Building a Software Agent Team &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

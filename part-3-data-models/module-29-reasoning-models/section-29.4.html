@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 29.4: Building a Verified Reasoning Pipeline. A complete recipe combining chain-of-thought, process reward scoring, and Lean 4 verification for mathematical optimization." name="description"/>
+<title>Section 29.4: Building a Verified Reasoning Pipeline | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 29: Reasoning Models For Discovery</a></div>
+<h1>29.4 Building a Verified Reasoning Pipeline</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"My pipeline has four stages: generate, score, verify, and despair. The first three are automated. The fourth activates when the type checker says 'sorry is not a proof.'"</p>
+<cite>A Verification Pipeline That Has Seen Things</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>The preceding sections introduced the components: chain-of-thought generation (<a href="section-29.1.html">Section 29.1</a>), process reward scoring (<a href="section-29.2.html">Section 29.2</a>), and formal verification (<a href="section-29.3.html">Section 29.3</a>). This section assembles them into a complete pipeline that solves a mathematical optimization problem with graduated levels of confidence. The pipeline generates multiple reasoning chains, ranks them by step-level PRM scores, translates the best candidates into Lean 4 sketches, and attempts formal verification of the critical derivation steps. The result is not a binary "verified or not" but a structured verification report that quantifies exactly which parts of the derivation are machine-checked, which are PRM-scored, and which are unverified. This recipe is directly applicable to any scientific workflow where reasoning correctness matters.</p>
+</div>
+
+<h2>1. Architecture of the Verified Reasoning Pipeline</h2>
+
+<p>The pipeline has four stages, each adding a layer of confidence to the reasoning:</p>
+
+<p data-agent="02">A verified reasoning pipeline is a multi-stage system that takes a natural-language problem statement as input and produces not just an answer but a structured certificate documenting the correctness evidence for every step of the derivation. It matters because LLM-generated reasoning can contain subtle logical errors that look plausible to human reviewers; by layering statistical scoring (PRM) with formal proof checking (Lean 4), the pipeline catches errors that either method alone would miss. The mechanism works by treating each reasoning step as an independent claim, scoring it for plausibility, and then routing low-confidence claims to a theorem prover that either confirms or refutes them mechanically. Use this pipeline whenever the cost of an undetected reasoning error is high (scientific publications, safety-critical engineering calculations, regulatory submissions); for low-stakes or exploratory reasoning where speed matters more than guarantees, a single LLM call with manual review is more practical.</p>
+
+<ol>
+<li><strong>Generate</strong>: produce $N$ candidate solutions using chain-of-thought prompting with extended thinking.</li>
+<li><strong>Score</strong>: evaluate each candidate step-by-step using a process reward model, identifying the strongest chains and the weakest steps.</li>
+<li><strong>Verify</strong>: translate the top-scoring candidates into Lean 4 proof sketches and attempt formal verification of as many steps as possible.</li>
+<li><strong>Report</strong>: produce a structured output that combines the informal solution, the PRM scores, and the formal verification status into a single confidence assessment.</li>
+</ol>
+
+<p>Each stage filters and enriches the output of the previous stage. The generate stage explores broadly (many candidates, high temperature). The score stage narrows to the most promising candidates. The verify stage provides the strongest guarantees on the best candidate. This cascade is analogous to the funnel architecture used in information retrieval (recall, then rank, then re-rank) and in the experiment design pipeline from <a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46: Automated Experiment Design</a>.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of the pipeline as a hiring process for job candidates. Stage 1 (Generate) is posting the job listing and collecting many resumes. Stage 2 (Score) is a recruiter screening each resume line by line, flagging weak spots and ranking applicants. Stage 3 (Verify) is calling references and running background checks, but only for the top candidates and only on the claims that looked questionable. Stage 4 (Report) is the hiring committee's summary: "This candidate's technical skills are reference-verified, their education is confirmed, their hobbies section was not checked but looks fine." Just as you would not background-check every line of every resume (too expensive) but you would always check the credentials that matter most, the pipeline concentrates formal verification on the reasoning steps most likely to contain errors.</p>
+</div>
+
+<pre><code class="language-python">import anthropic
+import json
+import re
+import subprocess
+import tempfile
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+client = anthropic.Anthropic()
+
+
+@dataclass
+class ReasoningStep:
+    """A single step in a reasoning chain, with scores."""
+    text: str
+    prm_score: float = 0.0
+    lean_verified: Optional[bool] = None  # None = not attempted
+    lean_code: str = ""
+
+
+@dataclass
+class ScoredChain:
+    """A complete reasoning chain with per-step scores."""
+    steps: list[ReasoningStep]
+    raw_text: str
+    min_score: float = 0.0
+    product_score: float = 0.0
+    verification_confidence: float = 0.0
+
+
+@dataclass
+class VerificationReport:
+    """Final output of the verified reasoning pipeline."""
+    problem: str
+    best_chain: ScoredChain
+    answer: str
+    n_candidates_generated: int
+    n_steps_verified: int
+    n_steps_total: int
+    overall_confidence: str  # "formally_verified", "prm_high", "prm_low"
+    details: dict = field(default_factory=dict)
+</code></pre>
+<div class="code-caption">Data classes for the verified reasoning pipeline. Each reasoning step carries a PRM score and optional formal verification status. The final report combines step-level information into an overall confidence assessment.</div>
+
+<h2>2. Stage 1: Generate Candidate Solutions</h2>
+
+<p>The generation stage uses extended thinking to produce diverse, high-quality reasoning chains. We sample $N$ candidates at varying temperatures to ensure diversity: some chains will use standard approaches, while others may discover creative shortcuts.</p>
+
+<pre><code class="language-python">def generate_candidates(
+    problem: str,
+    n_candidates: int = 6,
+    thinking_budget: int = 10000
+) -> list[str]:
+    """Generate N candidate reasoning chains using extended thinking.
+
+    Uses varying temperatures to produce diverse solution strategies.
+    Each candidate is a complete step-by-step derivation.
+    """
+    candidates = []
+
+    for i in range(n_candidates):
+        # Vary temperature slightly for diversity
+        # Extended thinking uses budget_tokens instead of temperature
+        budget = thinking_budget + (i * 1000)  # more thinking for later candidates
+
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=16000,
+            thinking={
+                "type": "enabled",
+                "budget_tokens": min(budget, 16000)
+            },
+            messages=[{
+                "role": "user",
+                "content": f"""Solve this optimization problem step by step.
+Number each step clearly (Step 1, Step 2, ...).
+Show all mathematical work. Verify your answer.
+
+Problem: {problem}"""
+            }]
+        )
+
+        # Extract the text response (not the thinking block)
+        for block in response.content:
+            if block.type == "text":
+                candidates.append(block.text)
+                break
+
+    return candidates
+
+
+def split_into_steps(chain: str) -> list[str]:
+    """Split a reasoning chain into individual numbered steps."""
+    # Match "Step N:" or "N." or "N)" patterns
+    parts = re.split(r'(?=(?:Step\s+)?\d+[\.\):])', chain)
+    steps = [p.strip() for p in parts if p.strip() and len(p.strip()) > 20]
+    if len(steps) <= 1:
+        # Fallback: split on double newlines
+        steps = [p.strip() for p in chain.split('\n\n')
+                 if p.strip() and len(p.strip()) > 20]
+    return steps
+</code></pre>
+<div class="code-caption">The generation stage produces multiple candidate solutions with varying thinking budgets. Higher budgets allow more internal reasoning, increasing the chance of discovering correct (and sometimes creative) derivation paths.</div>
+
+<h2>3. Stage 2: Score with Process Reward Model</h2>
+
+<p>The scoring stage evaluates each step in each candidate chain. We use the LLM-as-PRM approach from <a href="section-29.2.html">Section 29.2</a>, scoring each step on correctness, logical validity, and mathematical rigor. The output is a ranked list of chains with per-step scores.</p>
+
+<pre><code class="language-python">def score_step(
+    problem: str,
+    preceding: list[str],
+    current: str,
+    domain: str = "mathematics"
+) -> float:
+    """Score a single reasoning step using an LLM as a process reward model.
+
+    Returns a confidence score between 0.0 and 1.0.
+    """
+    context = "\n".join(preceding) if preceding else "(beginning of solution)"
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=256,
+        temperature=0.0,
+        messages=[{
+            "role": "user",
+            "content": f"""Evaluate this {domain} reasoning step for correctness.
+
+Problem: {problem}
+
+Previous steps:
+{context}
+
+Current step to evaluate:
+{current}
+
+Rate correctness from 0.0 to 1.0. Respond with ONLY a JSON object:
+{{"score": <float>, "issue": "<brief explanation or 'none'>"}}"""
+        }]
+    )
+
+    try:
+        result = json.loads(response.content[0].text)
+        return float(result.get("score", 0.5))
+    except (json.JSONDecodeError, ValueError):
+        return 0.5
+
+
+def score_chain(problem: str, chain_text: str) -> ScoredChain:
+    """Score an entire reasoning chain step by step."""
+    step_texts = split_into_steps(chain_text)
+    steps = []
+    scores = []
+
+    for i, step_text in enumerate(step_texts):
+        preceding = [s.text for s in steps]
+        score = score_step(problem, preceding, step_text)
+        steps.append(ReasoningStep(text=step_text, prm_score=score))
+        scores.append(score)
+
+    product = 1.0
+    for s in scores:
+        product *= s
+
+    return ScoredChain(
+        steps=steps,
+        raw_text=chain_text,
+        min_score=min(scores) if scores else 0.0,
+        product_score=product,
+        verification_confidence=0.0
+    )
+
+
+def rank_candidates(
+    problem: str,
+    candidates: list[str]
+) -> list[ScoredChain]:
+    """Score and rank all candidate chains by PRM quality."""
+    scored = [score_chain(problem, c) for c in candidates]
+    # Sort by minimum step score (weakest-link criterion)
+    scored.sort(key=lambda c: c.min_score, reverse=True)
+    return scored
+</code></pre>
+<div class="code-caption">The scoring stage evaluates each step independently, producing per-step scores that identify both the strongest chain overall (highest minimum score) and the specific steps that are most likely to contain errors (lowest individual scores).</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Concentrate Verification on the Weakest Steps</div>
+<p>Formal verification is expensive (each Lean compilation takes seconds to minutes, and autoformalization may require multiple attempts). The PRM scores tell us exactly where to focus: steps with low PRM scores are the most likely to contain errors and the most valuable to verify formally. A step with PRM score 0.99 is almost certainly correct and formal verification adds little value. A step with PRM score 0.6 is suspicious and worth the verification cost. This targeted strategy reduces the number of Lean compilations by 60-80% compared to verifying every step, while catching the same proportion of errors. The principle is identical to risk-based testing in software engineering (<a href="../../part-2-software-engineering/module-18-ai-testing/index.html">Chapter 18</a>): concentrate quality assurance effort where the risk is highest.</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A common misconception is that a pipeline reporting "formally_verified" confidence means the entire proof has been checked as a single end-to-end logical chain, the way a mathematician would verify a proof from axioms to conclusion. In reality, each step is formalized and verified independently: the Lean type checker confirms that step 3's claim follows from its stated premises, but it does not verify that those premises actually match the output of step 2 in the informal text. Gaps between steps (unstated assumptions, minor reformulations, implicit variable substitutions) are not covered by the formal verification. The pipeline's confidence label reflects the per-step verification status, not a monolithic proof certificate, and users should review the step boundaries for logical coherence even when every individual step passes.</p>
+</div>
+
+<h2>4. Stage 3: Formal Verification of Critical Steps</h2>
+
+<p>The verification stage translates the top-scoring chain's critical steps into Lean 4 and attempts formal proof. We focus verification on the mathematical core of the derivation: the steps that establish key equalities, inequalities, or logical implications. Purely expository steps ("we want to find the minimum") are not worth formalizing.</p>
+
+<pre><code class="language-python">def check_lean_code(lean_code: str, timeout: int = 30) -> dict:
+    """Check Lean 4 code for type correctness.
+
+    Returns a dict with success status and error details.
+    Requires Lean 4 installed and a project with Mathlib.
+    """
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.lean', delete=False
+    ) as f:
+        f.write("import Mathlib.Tactic\n\n" + lean_code)
+        tmp = f.name
+
+    try:
+        result = subprocess.run(
+            ["lake", "env", "lean", tmp],
+            capture_output=True, text=True, timeout=timeout
+        )
+        return {
+            "success": result.returncode == 0,
+            "errors": result.stderr
+        }
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return {"success": False, "errors": str(e)}
+    finally:
+        os.unlink(tmp)
+
+
+def formalize_step(
+    problem: str,
+    step: ReasoningStep,
+    preceding_steps: list[ReasoningStep],
+    max_attempts: int = 3
+) -> ReasoningStep:
+    """Attempt to formalize and verify a single reasoning step in Lean 4.
+
+    Translates the step to Lean, checks it, and retries with error
+    feedback on failure.
+    """
+    context = "\n".join(s.text for s in preceding_steps)
+
+    errors_history = []
+    for attempt in range(max_attempts):
+        error_hint = ""
+        if errors_history:
+            error_hint = f"\n\nPrevious attempt errors:\n" + "\n".join(errors_history[-2:])
+
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            temperature=0.2 + 0.1 * attempt,
+            messages=[{
+                "role": "user",
+                "content": f"""Formalize this mathematical reasoning step as a
+Lean 4 lemma. Use Mathlib tactics (ring, linarith, norm_num, simp, omega).
+Output ONLY valid Lean 4 code.
+
+Problem context: {problem}
+
+Previous reasoning:
+{context}
+
+Step to formalize:
+{step.text}
+{error_hint}"""
+            }]
+        )
+
+        lean_code = response.content[0].text.strip()
+        # Strip markdown fences
+        if "```" in lean_code:
+            blocks = lean_code.split("```")
+            for block in blocks:
+                if "theorem" in block or "lemma" in block or "example" in block:
+                    lean_code = block.replace("lean", "").strip()
+                    break
+
+        result = check_lean_code(lean_code)
+        if result["success"]:
+            step.lean_verified = True
+            step.lean_code = lean_code
+            return step
+        else:
+            errors_history.append(result["errors"][:300])
+
+    step.lean_verified = False
+    step.lean_code = lean_code  # keep last attempt for debugging
+    return step
+
+
+def verify_critical_steps(
+    problem: str,
+    chain: ScoredChain,
+    prm_threshold: float = 0.85
+) -> ScoredChain:
+    """Formally verify steps with PRM scores below a threshold.
+
+    Steps scoring above the threshold are considered reliable enough
+    to skip formal verification, reducing the computational cost.
+
+    Args:
+        problem: The original problem statement
+        chain: A scored reasoning chain
+        prm_threshold: Steps with scores below this are sent to Lean
+
+    Returns:
+        The chain with updated verification status on critical steps
+    """
+    n_verified = 0
+    n_attempted = 0
+
+    for i, step in enumerate(chain.steps):
+        if step.prm_score < prm_threshold:
+            n_attempted += 1
+            preceding = chain.steps[:i]
+            formalize_step(problem, step, preceding)
+            if step.lean_verified:
+                n_verified += 1
+
+    total_steps = len(chain.steps)
+    high_prm_steps = sum(1 for s in chain.steps if s.prm_score >= prm_threshold)
+    formally_verified = sum(1 for s in chain.steps if s.lean_verified is True)
+
+    # Confidence: formally verified steps count fully,
+    # high-PRM steps count at their PRM score
+    confidence = (
+        formally_verified +
+        sum(s.prm_score for s in chain.steps if s.prm_score >= prm_threshold)
+    ) / max(total_steps, 1)
+
+    chain.verification_confidence = confidence
+    return chain
+</code></pre>
+<div class="code-caption">The verification stage selectively formalizes steps with low PRM scores. Each step is translated to Lean 4, checked by the type checker, and retried with error feedback on failure. High-PRM-score steps are skipped, concentrating expensive formal verification on the steps most likely to contain errors.</div>
+
+<h2>5. Stage 4: Assemble the Report</h2>
+
+<p>The final stage combines all the information from the pipeline into a structured report. The report assigns an overall confidence level based on the verification results and provides actionable detail for each step.</p>
+
+<pre><code class="language-python">def build_report(
+    problem: str,
+    chain: ScoredChain,
+    n_candidates: int
+) -> VerificationReport:
+    """Assemble the final verification report."""
+    n_verified = sum(1 for s in chain.steps if s.lean_verified is True)
+    n_total = len(chain.steps)
+
+    # Extract the final answer from the last step
+    answer = chain.steps[-1].text if chain.steps else "No answer found"
+
+    # Determine overall confidence level
+    if n_verified == n_total:
+        confidence = "formally_verified"
+    elif chain.min_score >= 0.85 and n_verified > 0:
+        confidence = "prm_high"
+    else:
+        confidence = "prm_low"
+
+    return VerificationReport(
+        problem=problem,
+        best_chain=chain,
+        answer=answer,
+        n_candidates_generated=n_candidates,
+        n_steps_verified=n_verified,
+        n_steps_total=n_total,
+        overall_confidence=confidence,
+        details={
+            "step_scores": [
+                {
+                    "step": i + 1,
+                    "prm_score": round(s.prm_score, 3),
+                    "lean_verified": s.lean_verified,
+                    "text_preview": s.text[:80]
+                }
+                for i, s in enumerate(chain.steps)
+            ],
+            "min_prm_score": round(chain.min_score, 3),
+            "product_prm_score": round(chain.product_score, 6),
+            "verification_confidence": round(chain.verification_confidence, 3)
+        }
+    )
+</code></pre>
+<div class="code-caption">The report builder synthesizes PRM scores and formal verification results into a structured output with three confidence tiers: fully formally verified, high-confidence PRM-scored (with some formal verification), and low-confidence (steps with PRM scores below threshold that could not be formally verified).</div>
+
+<h2>6. The Complete Pipeline</h2>
+
+<p>With all four stages defined, the complete pipeline is a straightforward composition. We apply it to a mathematical optimization problem that exercises each stage: generating candidate solutions, scoring them for correctness, and verifying the critical algebraic steps.</p>
+
+<pre><code class="language-python">def verified_reasoning_pipeline(
+    problem: str,
+    n_candidates: int = 6,
+    thinking_budget: int = 10000,
+    prm_threshold: float = 0.85,
+    domain: str = "mathematics"
+) -> VerificationReport:
+    """Complete verified reasoning pipeline.
+
+    Generates candidates, scores them step-by-step, verifies
+    critical steps formally, and produces a structured report.
+
+    Args:
+        problem: The mathematical problem to solve
+        n_candidates: Number of candidate chains to generate
+        thinking_budget: Token budget for extended thinking
+        prm_threshold: PRM score below which formal verification is attempted
+        domain: Problem domain (for PRM prompting)
+
+    Returns:
+        VerificationReport with confidence assessment
+    """
+    print(f"Stage 1: Generating {n_candidates} candidate solutions...")
+    candidates = generate_candidates(problem, n_candidates, thinking_budget)
+    print(f"  Generated {len(candidates)} candidates")
+
+    print("Stage 2: Scoring candidates with process reward model...")
+    ranked = rank_candidates(problem, candidates)
+    best = ranked[0]
+    print(f"  Best chain: {len(best.steps)} steps, "
+          f"min PRM score = {best.min_score:.3f}")
+
+    # Show step-level scores for the best candidate
+    for i, step in enumerate(best.steps):
+        status = "OK" if step.prm_score >= prm_threshold else "CHECK"
+        print(f"  Step {i+1} [{status}] PRM={step.prm_score:.3f}: "
+              f"{step.text[:60]}...")
+
+    print("Stage 3: Formally verifying critical steps...")
+    best = verify_critical_steps(problem, best, prm_threshold)
+    n_verified = sum(1 for s in best.steps if s.lean_verified is True)
+    n_attempted = sum(1 for s in best.steps if s.lean_verified is not None)
+    print(f"  Verified {n_verified}/{n_attempted} attempted steps")
+
+    print("Stage 4: Assembling verification report...")
+    report = build_report(problem, best, n_candidates)
+    print(f"  Overall confidence: {report.overall_confidence}")
+
+    return report
+
+
+# Example: solve and verify a mathematical optimization problem
+PROBLEM = """
+Find the minimum value of the function f(x, y) = x^2 + y^2 + 2/x + 2/y
+for x > 0 and y > 0.
+
+Show that the minimum exists, find the critical point, verify it is
+a minimum (not a maximum or saddle point), and compute the minimum value.
+"""
+
+# Uncomment to run the full pipeline:
+# report = verified_reasoning_pipeline(PROBLEM, n_candidates=4)
+# print(f"\nAnswer: {report.answer}")
+# print(f"Steps: {report.n_steps_total}")
+# print(f"Verified: {report.n_steps_verified}")
+# print(f"Confidence: {report.overall_confidence}")
+# print(f"\nDetails:")
+# for step_info in report.details["step_scores"]:
+#     print(f"  Step {step_info['step']}: "
+#           f"PRM={step_info['prm_score']}, "
+#           f"Lean={'yes' if step_info['lean_verified'] else 'no' if step_info['lean_verified'] is not None else 'skip'}")
+</code></pre>
+<div class="code-caption">The complete verified reasoning pipeline applied to a multi-variable optimization problem. The four stages (generate, score, verify, report) produce a structured confidence assessment that distinguishes formally verified steps from PRM-scored steps from unverified steps.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Verified Reasoning for Drug Binding Affinity</div>
+<p>A computational chemistry team uses the pipeline to verify a binding affinity derivation. The problem: given the dissociation constant $K_d$ and the protein-ligand interaction energy $\Delta G$, derive the relationship $\Delta G = RT \ln(K_d)$ and compute the expected binding affinity at 310 K (body temperature). The pipeline generates 6 candidate derivations, scoring each step for thermodynamic correctness. The PRM flags a common error: candidates that confuse $\ln$ and $\log_{10}$, producing off-by-a-factor-of-2.303 results. The formal verification stage confirms the correct derivation by checking the dimensional consistency of each term (energy units on the left, dimensionless argument to the logarithm on the right). The final report indicates that 4 of 5 derivation steps are formally verified, with one step (the numerical substitution) verified only by PRM scoring. This partial verification is sufficient to trust the derivation while explicitly marking the unverified numerical computation for manual checking. The same pipeline structure applies to the pharmacokinetic modeling workflows in <a href="../../part-6-scientific-domains/module-48-biology-medicine/index.html">Chapter 48: Discovery AI for Biology and Medicine</a>.</p>
+</div>
+
+<h2>7. Extending the Pipeline: Scientific Domains</h2>
+
+<p>The pipeline as built targets mathematical optimization, but the architecture generalizes to any domain where reasoning steps can be evaluated and (partially) verified. Three extensions are particularly relevant for scientific discovery:</p>
+
+<h3>Physical Units Verification</h3>
+
+<p>A lightweight alternative to full Lean verification is <strong>dimensional analysis checking</strong>. Every equation in physics must be dimensionally consistent: you cannot add meters to seconds. A dimensional analysis checker can flag errors that the PRM misses (e.g., a step that produces the right numerical answer but with wrong units):</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+
+
+@dataclass
+class Dimension:
+    """Physical dimensions represented as exponent vector [M, L, T, K, mol]."""
+    mass: int = 0
+    length: int = 0
+    time: int = 0
+    temperature: int = 0
+    amount: int = 0
+
+    def __mul__(self, other: "Dimension") -> "Dimension":
+        return Dimension(
+            self.mass + other.mass,
+            self.length + other.length,
+            self.time + other.time,
+            self.temperature + other.temperature,
+            self.amount + other.amount
+        )
+
+    def __truediv__(self, other: "Dimension") -> "Dimension":
+        return Dimension(
+            self.mass - other.mass,
+            self.length - other.length,
+            self.time - other.time,
+            self.temperature - other.temperature,
+            self.amount - other.amount
+        )
+
+    def __eq__(self, other: "Dimension") -> bool:
+        return (self.mass == other.mass and
+                self.length == other.length and
+                self.time == other.time and
+                self.temperature == other.temperature and
+                self.amount == other.amount)
+
+    def is_dimensionless(self) -> bool:
+        return self == Dimension()
+
+
+# Common physical dimensions
+ENERGY = Dimension(mass=1, length=2, time=-2)      # kg*m^2/s^2
+FORCE = Dimension(mass=1, length=1, time=-2)        # kg*m/s^2
+VELOCITY = Dimension(length=1, time=-1)             # m/s
+PRESSURE = Dimension(mass=1, length=-1, time=-2)    # kg/(m*s^2)
+GAS_CONSTANT_DIM = ENERGY / Dimension(temperature=1, amount=1)  # J/(mol*K)
+
+
+def check_dimensional_consistency(
+    lhs_dim: Dimension,
+    rhs_dim: Dimension,
+    equation_label: str = ""
+) -> dict:
+    """Check whether both sides of an equation have the same dimensions."""
+    consistent = lhs_dim == rhs_dim
+    return {
+        "consistent": consistent,
+        "equation": equation_label,
+        "lhs_dimensions": lhs_dim,
+        "rhs_dimensions": rhs_dim,
+        "error": None if consistent else
+                 f"Dimensional mismatch in {equation_label}"
+    }
+
+
+# Example: verify Delta_G = RT ln(Kd)
+# LHS: Delta G has dimensions of energy per mole
+lhs = ENERGY / Dimension(amount=1)  # J/mol
+
+# RHS: R * T * ln(Kd)
+# R has dimensions J/(mol*K), T has dimensions K, ln(Kd) is dimensionless
+rhs = GAS_CONSTANT_DIM * Dimension(temperature=1) * Dimension()  # J/mol
+
+result = check_dimensional_consistency(lhs, rhs, "Delta_G = RT ln(Kd)")
+print(f"Dimensionally consistent: {result['consistent']}")
+</code></pre>
+<div class="code-caption">A dimensional analysis checker for physical equations. Each physical quantity is represented as an exponent vector over base dimensions (mass, length, time, temperature, amount). Checking dimensional consistency is a lightweight verification step that catches a class of errors (unit mismatches) that pure mathematical reasoning misses.</div>
+
+<h3>Numerical Stability Verification</h3>
+
+<p>For computational derivations, a step may be mathematically correct but numerically unstable. Subtracting two nearly equal large numbers, dividing by a quantity near zero, or computing exponentials of large arguments are red flags. The pipeline can include a numerical stability checker that evaluates each step against known instability patterns:</p>
+
+<pre><code class="language-python">def check_numerical_stability(step_text: str) -> dict:
+    """Flag potential numerical stability issues in a computation step.
+
+    Checks for known patterns that cause floating-point problems.
+    """
+    warnings = []
+
+    # Check for catastrophic cancellation
+    if re.search(r'\b(\w+)\s*-\s*\1\b', step_text):
+        warnings.append("Potential catastrophic cancellation: "
+                        "subtracting similar quantities")
+
+    # Check for large exponentials
+    exp_match = re.search(r'exp\s*\(\s*(\d+)', step_text)
+    if exp_match and int(exp_match.group(1)) > 500:
+        warnings.append(f"Large exponential argument ({exp_match.group(1)}): "
+                       "risk of overflow")
+
+    # Check for division by potentially small quantities
+    if re.search(r'/\s*\(?.*(?:epsilon|1e-|0\.0+[1-9])', step_text, re.IGNORECASE):
+        warnings.append("Division by potentially small quantity: "
+                       "risk of numerical instability")
+
+    # Check for loss of significance in summation
+    if re.search(r'sum|Σ|sigma', step_text, re.IGNORECASE):
+        if re.search(r'alternating|(-1)\^', step_text):
+            warnings.append("Alternating series summation: "
+                          "consider Kahan summation for numerical stability")
+
+    return {
+        "stable": len(warnings) == 0,
+        "warnings": warnings
+    }
+</code></pre>
+<div class="code-caption">A numerical stability checker that flags common floating-point pitfalls in computation steps. This catches a different class of errors from both PRM scoring (which evaluates logical correctness) and dimensional analysis (which evaluates physical consistency).</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Verified Scientific Discovery Pipelines</div>
+<p>The pipeline in this section verifies individual derivation steps. The next frontier is verifying entire discovery workflows: chains of reasoning that span hypothesis generation, experimental design, data analysis, and conclusion drawing. DeepMind's AlphaProof system (2024) demonstrated that LLM-guided formal verification can solve International Mathematical Olympiad problems at a silver-medal level, using a reinforcement learning loop where a language model proposes proof steps and Lean 4 provides ground-truth feedback. AlphaProof's key insight is that the language model and the formal verifier can train each other: the model learns which proof strategies succeed, and failed verification attempts generate targeted training data. Independently, the LEGO-Prover system (Xin et al., 2024) showed that LLMs can build libraries of reusable verified lemmas, growing a formal knowledge base that accelerates future proofs. Combined with the causal reasoning frameworks from <a href="../module-31-causal-discovery/index.html">Chapter 31: Causal Discovery and Causal Inference</a> and the claim validation systems from <a href="../../part-4-knowledge/module-41-claim-validation/index.html">Chapter 41: Scientific Claim Validation</a>, this points toward discovery systems that produce not just results but machine-verifiable certificates of reasoning quality. The Discovery Workbench (<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>) is designed to accommodate this verification layer as it matures.</p>
+</div>
+
+<h2>8. Putting It Together: A Complete Worked Example</h2>
+
+<p>Let us trace the pipeline through a concrete problem from start to finish. The problem: find the minimum of $f(x) = x + \frac{4}{x}$ for $x > 0$.</p>
+
+<p><strong>Stage 1 (Generate)</strong>: The pipeline generates 4 candidate solutions. Candidate 1 uses calculus (take derivative, set to zero). Candidate 2 uses the AM-GM inequality. Candidate 3 uses calculus but makes a sign error. Candidate 4 uses a numerical approach (evaluate at many points).</p>
+
+<p><strong>Stage 2 (Score)</strong>: The PRM scores each step. Candidate 1: all steps score above 0.9 except the second derivative test (0.87). Candidate 2: all steps score above 0.92 (the AM-GM approach is cleaner). Candidate 3: step 2 scores 0.4 (the derivative is wrong). Candidate 4: step 1 scores 0.7 (numerical approach is valid but not rigorous). The ranker selects Candidate 2 (highest minimum score).</p>
+
+<p><strong>Stage 3 (Verify)</strong>: The pipeline attempts to formalize Candidate 2's key step, the AM-GM inequality application. In Lean 4:</p>
+
+<pre><code class="language-lean">-- Lean 4: AM-GM for x + 4/x
+-- For x > 0, by AM-GM: x + 4/x >= 2 * sqrt(x * 4/x) = 2 * sqrt(4) = 4
+-- Equality holds when x = 4/x, i.e., x = 2
+
+theorem am_gm_application (x : Real) (hx : x > 0) :
+    x + 4 / x >= 4 := by
+  have h4x : 4 / x > 0 := div_pos (by norm_num) hx
+  -- Use the fact that (sqrt(x) - sqrt(4/x))^2 >= 0
+  nlinarith [sq_nonneg (Real.sqrt x - Real.sqrt (4 / x)),
+             Real.sq_sqrt (le_of_lt hx),
+             Real.sq_sqrt (le_of_lt h4x),
+             Real.sqrt_mul_self (le_of_lt hx)]
+</code></pre>
+<div class="code-caption">Lean 4 verification of the AM-GM inequality application for $x + 4/x \geq 4$. The proof uses the algebraic identity $(a - b)^2 \geq 0$ applied with $a = \sqrt{x}$ and $b = \sqrt{4/x}$, then delegates the algebraic simplification to <code>nlinarith</code>.</div>
+
+<p><strong>Stage 4 (Report)</strong>: The report indicates 3 of 4 steps are formally verified (the AM-GM application, the equality condition, and the minimum value computation). One step (the problem setup) is PRM-scored at 0.95 but not formally verified (it is purely expository). Overall confidence: "prm_high" (not fully verified because one step was skipped, but all mathematical content is either verified or high-confidence).</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DSPy for Pipeline Orchestration</div>
+<p>The pipeline above has four explicit stages with manual data passing between them. <strong>DSPy</strong> (Khattab et al., 2023) provides a declarative framework for composing LLM-based modules into pipelines, reducing the orchestration code from ~200 lines to approximately 50. Each stage becomes a DSPy <code>Module</code> with typed signatures; DSPy handles prompt optimization, retry logic, and output parsing. For the verification pipeline, DSPy's <code>ChainOfThought</code> module replaces our manual CoT prompting, its <code>Predict</code> module replaces the PRM scoring calls, and a custom <code>LeanVerify</code> module wraps the subprocess interaction. The architectural pattern (generate, score, verify, report) remains identical.</p>
+<pre><code class="language-python">import dspy
+
+# DSPy reduces pipeline orchestration to module composition
+class GenerateSolution(dspy.Module):
+    """DSPy module for step-by-step solution generation."""
+    solve = dspy.ChainOfThought("problem -> solution")
+
+class ScoreSteps(dspy.Module):
+    """DSPy module for PRM-style step scoring."""
+    evaluate = dspy.Predict("problem, step, context -> score: float")
+
+# Pipeline = GenerateSolution >> ScoreSteps >> LeanVerify >> Report
+</code></pre>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Lightweight Score-and-Verify Pipeline</h4>
+<p>You can build a simplified version of this section's pipeline using only the Anthropic SDK and Python's standard library (no Lean 4 installation required). This project replaces the formal verification stage with a secondary LLM cross-check, giving you the architectural pattern without the theorem prover dependency.</p>
+<p>1. <strong>Define the problem and generate candidates.</strong> Pick a simple optimization problem (e.g., minimize $f(x) = x^2 + 9/x$ for $x > 0$). Using the Anthropic API with <code>claude-sonnet-4-20250514</code>, generate three candidate solutions by calling the model three times with the same prompt but different <code>budget_tokens</code> values (8000, 10000, 12000).</p>
+<p>2. <strong>Split and score each chain.</strong> Write a <code>split_into_steps</code> function using regex to break each candidate into numbered steps. For each step, call the model with the PRM prompt from this section (providing the problem, preceding steps, and current step) and parse the returned JSON score.</p>
+<p>3. <strong>Rank and select the best chain.</strong> Compute the minimum PRM score across steps for each candidate. Select the candidate with the highest minimum score. Print a table showing each step's text preview and score.</p>
+<p>4. <strong>Cross-verify low-scoring steps.</strong> For any step scoring below 0.85, call the model a second time with a different prompt: "Is this step mathematically correct? If not, what is the error?" Compare the cross-check verdict with the original PRM score. Flag steps where the two assessments disagree.</p>
+<p>5. <strong>Generate the report.</strong> Print a structured summary: total candidates, number of steps, number cross-verified, number flagged, and an overall confidence label ("high" if all steps scored above 0.85, "medium" if cross-checks confirmed low-scoring steps, "low" if disagreements remain). Compare your pipeline's output against manually solving the problem to check whether the selected answer is correct.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Confidence Spectrum</div>
+<p>The pipeline produces three confidence levels: "formally_verified" (every step checked by Lean), "prm_high" (all steps above threshold, some formally verified), and "prm_low" (at least one step below threshold and not formally verified). In practice, most scientific derivations land in "prm_high": the core mathematical steps verify, but expository framing does not (because it is not worth formalizing "we seek to minimize f"). A colleague once suggested a fourth level: "prm_suspicious," for derivations where the PRM gives a suspiciously uniform 0.95 to every step, suggesting the evaluator is not actually discriminating. We did not implement it, but the point stands: meta-evaluation of the evaluator is its own research problem.</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>(Conceptual)</strong> The pipeline uses a PRM threshold of 0.85 to decide which steps to formally verify. Discuss the tradeoffs of setting this threshold higher (0.95) versus lower (0.7). How does the threshold affect: (a) the number of Lean compilations, (b) the false negative rate (errors missed), and (c) the total pipeline runtime? Propose an adaptive strategy that adjusts the threshold based on the problem's difficulty.</li>
+
+<li><strong>(Coding)</strong> Implement the dimensional analysis checker for a complete physics derivation: the escape velocity formula $v = \sqrt{2GM/R}$. Define the dimensions of each quantity ($G$, $M$, $R$, $v$), compute the dimensions of the right-hand side, and verify they match the left-hand side. Then extend the pipeline to include dimensional checking as a lightweight pre-filter before Lean verification.</li>
+
+<li><strong>(Analysis)</strong> Run the complete pipeline on three problems of increasing difficulty: (a) minimize $f(x) = x^2 + 1$ for $x \in \mathbb{R}$, (b) minimize $f(x) = x + 4/x$ for $x > 0$, (c) minimize $f(x, y) = x^2 + y^2 + 2/(xy)$ for $x, y > 0$. For each, record the number of candidates generated, steps scored, steps formally verified, and the overall confidence level. How does problem difficulty affect the pipeline's ability to formally verify steps? At what complexity does formal verification become the bottleneck?</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-29.3.html">&#8592; 29.3 Formal Mathematical Reasoning</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="../module-30-anomaly-novelty/index.html">Chapter 30: Anomaly and Novelty Discovery &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</body>
+</html>

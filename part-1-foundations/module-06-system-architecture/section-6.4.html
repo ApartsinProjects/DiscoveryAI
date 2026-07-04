@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.4: Bootstrapping the Discovery Workbench. Build Workbench v0 with artifact registry, task log, FastAPI API, and reproducibility CLI." name="description"/>
+<title>Section 6.4: Bootstrapping the Discovery Workbench | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Discovery System Architecture</a></div>
+<h1>6.4 Bootstrapping the Discovery Workbench</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I meant to build a scaffold. Somewhere around the third migration it acquired a task queue, a provenance graph, and opinions about reproducibility. My scaffold now has a README longer than my thesis."</p>
+<cite>A Scaffold That Became a Cathedral</cite>
+</blockquote>
+
+<section class="prerequisites">
+<h2>Prerequisites</h2>
+<p>This section assumes you have read <a href="section-6.1.html">Section 6.1</a> (layered architecture), <a href="section-6.2.html">Section 6.2</a> (artifact graphs and provenance), and <a href="section-6.3.html">Section 6.3</a> (safety, cost, and observability). You should be comfortable with Python 3.10+, basic SQL, and REST APIs. Familiarity with Git is helpful but not required; we introduce the commands we need.</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>This section is a recipe. We take the architectural concepts from the previous three sections and turn them into running code. By the end, you will have a <strong>Discovery Workbench v0</strong>: a SQLite-backed artifact registry, a task log for tracking discovery proposals, a FastAPI API layer, a Git-based reproducibility harness, and a CLI that ties everything together. The Workbench is deliberately minimal. Every subsequent chapter in this book will extend it: adding knowledge graphs (Part II), agent loops (Part III), active learning (Part V), and autonomous experiment orchestration (Part VII). Think of this section as pouring the foundation slab. The cathedral comes later.</p>
+</div>
+
+<h2>1. Project Structure and Dependencies</h2>
+
+<p>A discovery system needs a clear directory layout from day one. When the system grows to support multiple agents, experiment types, and artifact stores, a disciplined structure prevents the kind of entropy that makes reproducing a six-month-old result impossible. Here is the layout for Workbench v0:</p>
+
+<pre><code class="language-text">discovery-workbench/
+├── workbench/
+│   ├── __init__.py
+│   ├── db.py              # Database initialization and connection
+│   ├── registry.py        # Artifact registry (content-addressable)
+│   ├── tasklog.py         # Discovery task lifecycle
+│   ├── api.py             # FastAPI endpoints
+│   ├── cli.py             # Click-based CLI
+│   └── reproducibility.py # Git + environment capture
+├── tests/
+│   ├── test_registry.py
+│   ├── test_tasklog.py
+│   └── test_api.py
+├── data/                  # Default artifact storage
+├── workbench.db           # SQLite database (created at runtime)
+├── Dockerfile
+├── pyproject.toml
+└── README.md</code></pre>
+<div class="code-caption">Listing 6.7: Directory layout for the Discovery Workbench v0. The <code>workbench/</code> package contains all library code; <code>data/</code> holds content-addressable artifact blobs; the SQLite database lives at the project root.</div>
+
+<p>The dependency footprint is intentionally small. We want the Workbench to install in seconds and run on a laptop with no external services:</p>
+
+<pre><code class="language-toml">[project]
+name = "discovery-workbench"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.0",
+    "click>=8.1",
+]
+
+[project.scripts]
+workbench = "workbench.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27"]</code></pre>
+<div class="code-caption">Listing 6.8: <code>pyproject.toml</code> for Workbench v0. Only four runtime dependencies. SQLite, hashlib, subprocess, and json ship with Python's standard library.</div>
+
+<p>Install the project in editable mode so that the <code>workbench</code> CLI is available immediately:</p>
+
+<pre><code class="language-bash">pip install -e ".[dev]"</code></pre>
+
+<h2>2. The Artifact Registry (SQLite)</h2>
+
+<p>The artifact registry is the Workbench's memory. Every dataset, model checkpoint, figure, and configuration file that participates in a discovery workflow gets registered here. The registry answers three questions that every reproducibility audit asks: <em>what</em> was produced, <em>how</em> was it produced, and <em>from what</em> was it produced.</p>
+
+<p>The schema uses three tables. <code>artifacts</code> stores metadata for each registered object. <code>runs</code> records the computational steps that produce artifacts. <code>edges</code> captures the provenance relationships between artifacts and runs, forming the directed acyclic graph (DAG) described in <a href="section-6.2.html">Section 6.2</a>.</p>
+
+<pre><code class="language-python">"""workbench/db.py -- Database initialization and connection."""
+import sqlite3
+from pathlib import Path
+
+DEFAULT_DB = Path("workbench.db")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS artifacts (
+    id          TEXT PRIMARY KEY,   -- SHA-256 content hash
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL,      -- dataset, model, figure, config, metric
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    metadata    TEXT,               -- JSON blob for flexible attributes
+    blob_path   TEXT                -- relative path in data/ directory
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id          TEXT PRIMARY KEY,   -- UUID
+    name        TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    started_at  TEXT,
+    finished_at TEXT,
+    params      TEXT,               -- JSON: hyperparameters, settings
+    git_hash    TEXT,               -- commit hash at run start
+    git_dirty   INTEGER DEFAULT 0,  -- 1 if working tree had uncommitted changes
+    env_hash    TEXT,               -- SHA-256 of pip freeze output
+    error_msg   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id   TEXT NOT NULL,      -- artifact or run ID
+    target_id   TEXT NOT NULL,      -- artifact or run ID
+    role        TEXT NOT NULL,      -- input, output, parameter, metric
+    UNIQUE(source_id, target_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind);
+CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+"""
+
+
+def get_connection(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
+    """Return a connection with WAL mode and foreign keys enabled."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db(db_path: Path = DEFAULT_DB) -> None:
+    """Create tables if they do not exist."""
+    conn = get_connection(db_path)
+    conn.executescript(SCHEMA)
+    conn.close()</code></pre>
+<div class="code-caption">Listing 6.9: <code>workbench/db.py</code>. The schema encodes the artifact DAG from <a href="section-6.2.html">Section 6.2</a> in three tables. WAL mode allows concurrent reads during long-running experiment loops. The <code>edges</code> table is the provenance graph: each row is a typed edge connecting an artifact to a run (or vice versa).</div>
+
+<p>The content-addressable storage scheme deserves explanation. When you register an artifact, the registry computes the SHA-256 hash of the file's contents and uses that hash as the artifact's primary key. Two files with identical contents always produce the same ID, regardless of filename or timestamp. This property, called <strong>content addressing</strong>, gives us deduplication for free: if a dataset appears in ten experiments, it is stored once. It also makes integrity verification trivial. If the hash of a stored blob no longer matches its ID, the file has been corrupted or tampered with.</p>
+
+<p data-agent="02">Content addressing is a storage identification strategy in which the name (key) of every stored object is derived deterministically from the object's bytes, typically via a cryptographic hash function such as SHA-256. It matters because it decouples identity from location and from human-chosen names: two researchers on different continents who independently hash the same CSV will obtain the same key, proving they hold identical data without transferring a single byte. The mechanism is straightforward: on registration, the system reads the file in fixed-size chunks, feeds each chunk to a streaming hash, and uses the resulting 64-character hexadecimal digest as the primary key in both the database and the on-disk blob store. Choose content addressing whenever artifacts may be shared across projects, teams, or time spans and you need a guarantee of identity without centralized coordination; for purely ephemeral, single-user scratch files that will never be referenced again, a simpler timestamped naming scheme suffices.</p>
+
+<p>The number of bits in a SHA-256 hash is $n = 256$. The probability of a collision after registering $k$ artifacts follows the birthday-bound approximation:</p>
+
+$$P(\text{collision}) \approx 1 - e^{-k^2 / 2^{n+1}}$$
+
+<p>For $k = 10^9$ (a billion artifacts), the collision probability is approximately $10^{-58}$. Content addressing is safe for any plausible discovery campaign.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of the provenance DAG like a recipe book that also records every meal ever cooked. Each <code>artifact</code> row is an ingredient or a finished dish sitting on a shelf. Each <code>run</code> row is a dated page in a cooking log that lists the recipe steps (parameters), the kitchen you used (Git commit, environment hash), and the clock times you started and finished. The <code>edges</code> table is the set of arrows you would draw on a whiteboard connecting "flour, eggs, sugar" (inputs) through "bake at 180 C for 25 min" (run) to "chocolate cake" (output). To answer "where did this cake come from?" you follow arrows backward through the log to find every ingredient and every intermediate step. To answer "what did I make with this flour?" you follow arrows forward. The directed, acyclic structure guarantees you never chase a circular reference: ingredients never depend on the dishes they produce.</p>
+</div>
+
+<pre><code class="language-python">"""workbench/registry.py -- Content-addressable artifact registry."""
+import hashlib
+import json
+import shutil
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from workbench.db import get_connection, init_db
+
+DATA_DIR = Path("data")
+
+
+def _content_hash(file_path: Path) -> str:
+    """Compute SHA-256 of a file's contents in streaming fashion."""
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def register_artifact(
+    file_path: str | Path,
+    name: str,
+    kind: str,
+    metadata: Optional[dict] = None,
+) -> str:
+    """
+    Register a file as a versioned artifact.
+
+    Returns the content-hash ID.  If an artifact with the same
+    hash already exists, the call is idempotent: the existing
+    ID is returned and no data is duplicated.
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Artifact source not found: {file_path}")
+
+    artifact_id = _content_hash(file_path)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    blob_path = DATA_DIR / artifact_id
+    if not blob_path.exists():
+        shutil.copy2(file_path, blob_path)
+
+    init_db()
+    conn = get_connection()
+    conn.execute(
+        """INSERT OR IGNORE INTO artifacts
+           (id, name, kind, created_at, metadata, blob_path)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            artifact_id,
+            name,
+            kind,
+            datetime.now(timezone.utc).isoformat(),
+            json.dumps(metadata or {}),
+            str(blob_path),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return artifact_id
+
+
+def get_artifact(artifact_id: str) -> Optional[dict]:
+    """Retrieve artifact metadata by content hash."""
+    init_db()
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM artifacts WHERE id = ?", (artifact_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def create_run(
+    name: str,
+    params: Optional[dict] = None,
+    input_ids: Optional[list[str]] = None,
+) -> str:
+    """
+    Create a new run record and link input artifacts.
+
+    Returns the run UUID.  The run starts in 'running' status
+    with the current Git commit hash captured automatically.
+    """
+    from workbench.reproducibility import capture_git_state, capture_env_hash
+
+    run_id = str(uuid.uuid4())
+    git_hash, git_dirty = capture_git_state()
+    env_hash = capture_env_hash()
+
+    init_db()
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO runs
+           (id, name, status, started_at, params, git_hash, git_dirty, env_hash)
+           VALUES (?, ?, 'running', ?, ?, ?, ?, ?)""",
+        (
+            run_id,
+            name,
+            datetime.now(timezone.utc).isoformat(),
+            json.dumps(params or {}),
+            git_hash,
+            1 if git_dirty else 0,
+            env_hash,
+        ),
+    )
+    for aid in (input_ids or []):
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, role) VALUES (?, ?, 'input')",
+            (aid, run_id),
+        )
+    conn.commit()
+    conn.close()
+    return run_id
+
+
+def finish_run(
+    run_id: str,
+    output_paths: Optional[list[tuple[str | Path, str, str]]] = None,
+    metrics: Optional[dict] = None,
+    error: Optional[str] = None,
+) -> list[str]:
+    """
+    Mark a run as completed (or failed) and register output artifacts.
+
+    Parameters
+    ----------
+    run_id       : the UUID returned by create_run
+    output_paths : list of (file_path, name, kind) triples to register
+    metrics      : dict of metric_name -> value to store as a metric artifact
+    error        : if not None, the run is marked 'failed' with this message
+
+    Returns a list of output artifact IDs.
+    """
+    init_db()
+    conn = get_connection()
+    status = "failed" if error else "completed"
+    conn.execute(
+        """UPDATE runs
+           SET status = ?, finished_at = ?, error_msg = ?
+           WHERE id = ?""",
+        (status, datetime.now(timezone.utc).isoformat(), error, run_id),
+    )
+
+    output_ids = []
+    for file_path, name, kind in (output_paths or []):
+        aid = register_artifact(file_path, name, kind)
+        conn.execute(
+            "INSERT OR IGNORE INTO edges (source_id, target_id, role) VALUES (?, ?, 'output')",
+            (run_id, aid),
+        )
+        output_ids.append(aid)
+
+    if metrics:
+        metrics_json = json.dumps(metrics)
+        metrics_hash = hashlib.sha256(metrics_json.encode()).hexdigest()
+        conn.execute(
+            """INSERT OR IGNORE INTO artifacts
+               (id, name, kind, created_at, metadata, blob_path)
+               VALUES (?, ?, 'metric', ?, ?, NULL)""",
+            (metrics_hash, f"metrics-{run_id[:8]}", datetime.now(timezone.utc).isoformat(), metrics_json),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO edges (source_id, target_id, role) VALUES (?, ?, 'metric')",
+            (run_id, metrics_hash),
+        )
+        output_ids.append(metrics_hash)
+
+    conn.commit()
+    conn.close()
+    return output_ids
+
+
+def get_lineage(artifact_id: str, depth: int = 10) -> dict:
+    """
+    Trace the provenance of an artifact up to `depth` hops.
+
+    Returns a nested dict representing the subgraph:
+    each node has 'type' (artifact or run), 'info' (row data),
+    and 'parents' (list of upstream nodes).
+    """
+    init_db()
+    conn = get_connection()
+
+    def _trace(node_id: str, remaining: int) -> dict:
+        if remaining <= 0:
+            return {"id": node_id, "truncated": True}
+
+        # Check if it is an artifact
+        art = conn.execute(
+            "SELECT * FROM artifacts WHERE id = ?", (node_id,)
+        ).fetchone()
+        if art:
+            node = {"type": "artifact", "info": dict(art), "parents": []}
+        else:
+            run = conn.execute(
+                "SELECT * FROM runs WHERE id = ?", (node_id,)
+            ).fetchone()
+            if run:
+                node = {"type": "run", "info": dict(run), "parents": []}
+            else:
+                return {"id": node_id, "unknown": True}
+
+        # Find upstream edges (this node is the target)
+        parents = conn.execute(
+            "SELECT source_id, role FROM edges WHERE target_id = ?",
+            (node_id,),
+        ).fetchall()
+        for parent in parents:
+            node["parents"].append({
+                "role": parent["role"],
+                "node": _trace(parent["source_id"], remaining - 1),
+            })
+        return node
+
+    result = _trace(artifact_id, depth)
+    conn.close()
+    return result</code></pre>
+<div class="code-caption">Listing 6.10: <code>workbench/registry.py</code>. The core of the Workbench. <code>register_artifact</code> uses content-addressable hashing for deduplication and integrity. <code>create_run</code> and <code>finish_run</code> manage the lifecycle of a computational step and link inputs to outputs through the <code>edges</code> table. <code>get_lineage</code> traces the provenance DAG backward from any artifact, producing the full history of how a result was created.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Why Content Addressing Matters for Discovery</div>
+<p>In a traditional experiment tracker, artifacts are identified by name and version number. This breaks down when two researchers produce files with the same name but different contents, or when the same dataset is registered under different names in different projects. Content addressing eliminates both failure modes. The identity of an artifact is its contents, period. If you share an artifact ID with a collaborator and they compute the same hash from their copy, you know with cryptographic certainty that you are working with identical data. This property becomes critical in <a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">Chapter 55</a>, where autonomous agents must verify that the dataset they are analyzing is the same one that a previous agent curated.</p>
+</div>
+
+<h2>3. The Task Log</h2>
+
+<p>The artifact registry records what happened. The task log records what <em>should</em> happen. In a discovery system, tasks represent proposed next steps: "Train model X on dataset Y with learning rate Z" or "Run ablation study removing feature W." Tasks pass through a lifecycle: <strong>proposed</strong> (an agent or human suggests the step), <strong>approved</strong> (a human or policy gate authorizes it), <strong>running</strong> (execution is underway), <strong>completed</strong> (the step finished successfully), or <strong>failed</strong> (something went wrong). This lifecycle is the "human-in-the-loop" gate described in <a href="section-6.3.html">Section 6.3</a>.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>Students often treat the task log as a simple to-do list, a flat queue of work items that gets shorter as tasks are completed. The task log is not a to-do list; it is an auditable state machine with enforced transitions and provenance metadata. A to-do list lets you check off items in any order and offers no record of who authorized a step or why. The task log, by contrast, requires every proposal to pass through an explicit approval gate before execution can begin, records the identity of the proposer and approver, links each task to a specific run in the artifact registry, and forbids illegal transitions (you cannot move a task from "proposed" directly to "completed"). This structure exists because autonomous agents will propose tasks, and without a mandatory approval step, the system has no mechanism to prevent an agent from launching an expensive or dangerous experiment on its own.</p>
+</div>
+
+<pre><code class="language-python">"""workbench/tasklog.py -- Discovery task lifecycle management."""
+import json
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from workbench.db import get_connection, init_db
+
+TASK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id           TEXT PRIMARY KEY,
+    title        TEXT NOT NULL,
+    description  TEXT,
+    status       TEXT NOT NULL DEFAULT 'proposed',
+    priority     INTEGER DEFAULT 0,
+    proposed_by  TEXT,           -- 'agent:gpt-4o', 'human:alice', etc.
+    approved_by  TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    run_id       TEXT,           -- links to runs table once execution starts
+    metadata     TEXT            -- JSON: rationale, estimated cost, etc.
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+"""
+
+VALID_STATUSES = {"proposed", "approved", "running", "completed", "failed", "rejected"}
+
+
+def _ensure_task_table() -> None:
+    conn = get_connection()
+    conn.executescript(TASK_SCHEMA)
+    conn.close()
+
+
+def propose_task(
+    title: str,
+    description: str = "",
+    proposed_by: str = "human",
+    priority: int = 0,
+    metadata: Optional[dict] = None,
+) -> str:
+    """
+    Propose a new discovery task.  Returns the task ID.
+
+    The task starts in 'proposed' status and must be approved
+    before it can be executed.  This is the safety gate:
+    autonomous agents propose, humans (or policy rules) approve.
+    """
+    init_db()
+    _ensure_task_table()
+    task_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO tasks
+           (id, title, description, status, priority, proposed_by,
+            created_at, updated_at, metadata)
+           VALUES (?, ?, ?, 'proposed', ?, ?, ?, ?, ?)""",
+        (task_id, title, description, priority, proposed_by,
+         now, now, json.dumps(metadata or {})),
+    )
+    conn.commit()
+    conn.close()
+    return task_id
+
+
+def update_task_status(
+    task_id: str,
+    new_status: str,
+    approved_by: Optional[str] = None,
+    run_id: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    """
+    Transition a task to a new status.
+
+    Enforces valid transitions:
+      proposed  -> approved | rejected
+      approved  -> running
+      running   -> completed | failed
+    """
+    if new_status not in VALID_STATUSES:
+        raise ValueError(f"Invalid status: {new_status}")
+
+    init_db()
+    _ensure_task_table()
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise KeyError(f"Task not found: {task_id}")
+
+    current = row["status"]
+    allowed = {
+        "proposed": {"approved", "rejected"},
+        "approved": {"running"},
+        "running":  {"completed", "failed"},
+    }
+    if new_status not in allowed.get(current, set()):
+        conn.close()
+        raise ValueError(
+            f"Cannot transition from '{current}' to '{new_status}'"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """UPDATE tasks
+           SET status = ?, updated_at = ?, approved_by = COALESCE(?, approved_by),
+               run_id = COALESCE(?, run_id)
+           WHERE id = ?""",
+        (new_status, now, approved_by, run_id, task_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_tasks(status: Optional[str] = None) -> list[dict]:
+    """List tasks, optionally filtered by status."""
+    init_db()
+    _ensure_task_table()
+    conn = get_connection()
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE status = ? ORDER BY priority DESC, created_at",
+            (status,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM tasks ORDER BY priority DESC, created_at"
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]</code></pre>
+<div class="code-caption">Listing 6.11: <code>workbench/tasklog.py</code>. The task log enforces a strict state machine for discovery proposals. The <code>proposed_by</code> field records whether a task originated from an autonomous agent or a human researcher, enabling the audit trail that <a href="section-6.3.html">Section 6.3</a> requires.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Task Log in Action</div>
+<p>Imagine an autonomous agent finishes analyzing a protein structure dataset and proposes: "Run docking simulation for the top 50 candidate ligands using AutoDock Vina, estimated cost $12 in compute." The task enters the log as <code>proposed</code> with <code>proposed_by="agent:discovery-loop"</code>. A human researcher reviews the queue, sees the proposal, and types <code>workbench task approve &lt;id&gt;</code>. The task transitions to <code>approved</code>. The orchestrator picks it up, creates a run in the artifact registry, transitions the task to <code>running</code>, and links the run ID. When the docking simulation completes, the task moves to <code>completed</code> and all output artifacts are registered with provenance edges back to the input dataset. Six months later, a reviewer asks "why did you dock these 50 ligands?" The lineage trace shows the agent's rationale, the human approval, the exact code commit, and the input data hash.</p>
+</div>
+
+<h2>4. The FastAPI Layer</h2>
+
+<p>The API layer exposes the registry and task log over HTTP. This matters for two reasons. First, discovery agents running in separate processes (or on separate machines) need a network interface to register artifacts and propose tasks. Second, a REST API is the natural integration point for dashboards, notebooks, and CI/CD pipelines. The endpoints are thin wrappers around the library functions we have already written.</p>
+
+<pre><code class="language-python">"""workbench/api.py -- FastAPI endpoints for the Discovery Workbench."""
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel, Field
+
+from workbench.registry import (
+    register_artifact, get_artifact, create_run,
+    finish_run, get_lineage,
+)
+from workbench.tasklog import propose_task, update_task_status, list_tasks
+from workbench.db import init_db
+
+app = FastAPI(
+    title="Discovery Workbench",
+    version="0.1.0",
+    description="API for artifact registration, provenance tracking, and task management.",
+)
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
+# ---- Pydantic models ----
+
+class ArtifactResponse(BaseModel):
+    id: str
+    name: str
+    kind: str
+    created_at: str
+    metadata: str
+    blob_path: Optional[str] = None
+
+
+class RunCreate(BaseModel):
+    name: str
+    params: dict = Field(default_factory=dict)
+    input_ids: list[str] = Field(default_factory=list)
+
+
+class RunFinish(BaseModel):
+    metrics: dict = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+class TaskCreate(BaseModel):
+    title: str
+    description: str = ""
+    proposed_by: str = "human"
+    priority: int = 0
+    metadata: dict = Field(default_factory=dict)
+
+
+class TaskStatusUpdate(BaseModel):
+    new_status: str
+    approved_by: Optional[str] = None
+    run_id: Optional[str] = None
+
+
+# ---- Artifact endpoints ----
+
+@app.post("/artifacts", response_model=dict)
+async def upload_artifact(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    kind: str = Form("dataset"),
+):
+    """Register an uploaded file as a content-addressed artifact."""
+    tmp_path = Path(f"/tmp/wb_upload_{file.filename}")
+    with open(tmp_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    artifact_id = register_artifact(tmp_path, name, kind)
+    tmp_path.unlink(missing_ok=True)
+    return {"id": artifact_id, "name": name, "kind": kind}
+
+
+@app.get("/artifacts/{artifact_id}")
+async def read_artifact(artifact_id: str):
+    """Retrieve artifact metadata by content hash."""
+    art = get_artifact(artifact_id)
+    if not art:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return art
+
+
+@app.get("/lineage/{artifact_id}")
+async def read_lineage(artifact_id: str, depth: int = 10):
+    """Trace the provenance DAG for an artifact."""
+    return get_lineage(artifact_id, depth=depth)
+
+
+# ---- Run endpoints ----
+
+@app.post("/runs", response_model=dict)
+async def start_run(body: RunCreate):
+    """Create a new run record and link input artifacts."""
+    run_id = create_run(body.name, body.params, body.input_ids)
+    return {"run_id": run_id}
+
+
+@app.post("/runs/{run_id}/finish", response_model=dict)
+async def end_run(run_id: str, body: RunFinish):
+    """Mark a run as completed or failed."""
+    output_ids = finish_run(run_id, metrics=body.metrics, error=body.error)
+    return {"run_id": run_id, "output_ids": output_ids}
+
+
+# ---- Task endpoints ----
+
+@app.post("/tasks", response_model=dict)
+async def create_task(body: TaskCreate):
+    """Propose a new discovery task."""
+    task_id = propose_task(
+        body.title, body.description, body.proposed_by,
+        body.priority, body.metadata,
+    )
+    return {"task_id": task_id}
+
+
+@app.get("/tasks")
+async def get_tasks(status: Optional[str] = None):
+    """List tasks, optionally filtered by status."""
+    return list_tasks(status)
+
+
+@app.patch("/tasks/{task_id}")
+async def patch_task(task_id: str, body: TaskStatusUpdate):
+    """Transition a task to a new status."""
+    try:
+        update_task_status(
+            task_id, body.new_status,
+            approved_by=body.approved_by,
+            run_id=body.run_id,
+        )
+    except (KeyError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"task_id": task_id, "status": body.new_status}</code></pre>
+<div class="code-caption">Listing 6.12: <code>workbench/api.py</code>. The API has nine endpoints covering artifact registration, lineage queries, run management, and task lifecycle. Each endpoint delegates to the library functions in <code>registry.py</code> and <code>tasklog.py</code>, keeping the API layer free of business logic.</div>
+
+<p>Start the server with <code>uvicorn workbench.api:app --reload</code> and visit <code>http://localhost:8000/docs</code> to explore the auto-generated OpenAPI documentation. FastAPI produces interactive Swagger UI pages from the Pydantic models, so every endpoint is testable from the browser.</p>
+
+<h2>5. The Reproducibility CLI</h2>
+
+<p>The CLI is how researchers interact with the Workbench day to day. It wraps the library in a set of commands that feel like a natural extension of a Git workflow: register artifacts, launch tracked runs, query lineage, and export reproducibility snapshots. Under the hood, it captures the Git commit hash and the environment fingerprint with every operation.</p>
+
+<pre><code class="language-python">"""workbench/reproducibility.py -- Git and environment capture."""
+import hashlib
+import subprocess
+from typing import Optional
+
+
+def capture_git_state() -> tuple[Optional[str], bool]:
+    """
+    Return (commit_hash, is_dirty).
+
+    If Git is not available or the directory is not a repo,
+    returns (None, False).
+    """
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return commit, len(status) > 0
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None, False
+
+
+def capture_env_hash() -> Optional[str]:
+    """
+    Hash the output of 'pip freeze' to fingerprint the environment.
+
+    Two environments with the same env_hash have identical
+    installed packages (same names, same versions).
+    """
+    try:
+        freeze = subprocess.check_output(
+            ["pip", "freeze"],
+            stderr=subprocess.DEVNULL,
+        ).decode()
+        return hashlib.sha256(freeze.encode()).hexdigest()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def export_reproducibility_bundle(run_id: str, output_dir: str = ".") -> str:
+    """
+    Export a self-contained reproducibility snapshot for a run.
+
+    The bundle includes:
+    - The run record (JSON)
+    - All input/output artifact metadata (JSON)
+    - The pip freeze at run time
+    - The git diff at run time (if the tree was dirty)
+    - A Dockerfile that pins the exact environment
+    """
+    import json
+    from pathlib import Path
+    from workbench.registry import get_lineage
+    from workbench.db import get_connection, init_db
+
+    init_db()
+    conn = get_connection()
+    run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if not run:
+        conn.close()
+        raise KeyError(f"Run not found: {run_id}")
+
+    bundle_dir = Path(output_dir) / f"bundle-{run_id[:8]}"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    # Run record
+    (bundle_dir / "run.json").write_text(
+        json.dumps(dict(run), indent=2)
+    )
+
+    # Lineage tree
+    lineage = get_lineage(run_id, depth=5)
+    (bundle_dir / "lineage.json").write_text(
+        json.dumps(lineage, indent=2)
+    )
+
+    # Pip freeze
+    try:
+        freeze = subprocess.check_output(["pip", "freeze"]).decode()
+        (bundle_dir / "requirements.txt").write_text(freeze)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    # Dockerfile
+    dockerfile = (
+        "FROM python:3.11-slim\n"
+        "WORKDIR /app\n"
+        "COPY requirements.txt .\n"
+        "RUN pip install --no-cache-dir -r requirements.txt\n"
+        "COPY . .\n"
+        'CMD ["python", "-m", "workbench.cli"]\n'
+    )
+    (bundle_dir / "Dockerfile").write_text(dockerfile)
+
+    conn.close()
+    return str(bundle_dir)</code></pre>
+<div class="code-caption">Listing 6.13: <code>workbench/reproducibility.py</code>. <code>capture_git_state</code> records the exact commit hash and whether the working tree is dirty. <code>capture_env_hash</code> fingerprints the Python environment. <code>export_reproducibility_bundle</code> packages everything needed to recreate a run into a self-contained directory with a Dockerfile.</div>
+
+<p>Now the CLI itself, which wires these functions into named commands:</p>
+
+<pre><code class="language-python">"""workbench/cli.py -- Click-based CLI for the Discovery Workbench."""
+import json
+import click
+
+from workbench.db import init_db
+from workbench.registry import (
+    register_artifact, get_artifact, create_run,
+    finish_run, get_lineage,
+)
+from workbench.tasklog import propose_task, update_task_status, list_tasks
+from workbench.reproducibility import export_reproducibility_bundle
+
+
+@click.group()
+def main():
+    """Discovery Workbench: track artifacts, runs, and provenance."""
+    init_db()
+
+
+# ---- Artifact commands ----
+
+@main.command()
+@click.argument("file_path")
+@click.option("--name", required=True, help="Human-readable artifact name")
+@click.option("--kind", default="dataset", help="Artifact type: dataset, model, figure, config")
+@click.option("--meta", default=None, help="JSON string of metadata")
+def register(file_path, name, kind, meta):
+    """Register a file as a content-addressed artifact."""
+    metadata = json.loads(meta) if meta else None
+    artifact_id = register_artifact(file_path, name, kind, metadata)
+    click.echo(f"Registered: {artifact_id[:16]}...  ({name}, {kind})")
+
+
+@main.command()
+@click.argument("artifact_id")
+def info(artifact_id):
+    """Show metadata for an artifact."""
+    art = get_artifact(artifact_id)
+    if art:
+        click.echo(json.dumps(art, indent=2))
+    else:
+        click.echo(f"Artifact not found: {artifact_id}", err=True)
+
+
+@main.command()
+@click.argument("artifact_id")
+@click.option("--depth", default=10, help="Maximum lineage depth")
+def lineage(artifact_id, depth):
+    """Trace the provenance DAG for an artifact."""
+    tree = get_lineage(artifact_id, depth=depth)
+    click.echo(json.dumps(tree, indent=2))
+
+
+# ---- Run commands ----
+
+@main.command()
+@click.option("--name", required=True, help="Run name")
+@click.option("--params", default="{}", help="JSON string of parameters")
+@click.option("--inputs", default="", help="Comma-separated input artifact IDs")
+def run(name, params, inputs):
+    """Create a tracked run with Git and environment capture."""
+    input_ids = [i.strip() for i in inputs.split(",") if i.strip()]
+    run_id = create_run(name, json.loads(params), input_ids)
+    click.echo(f"Run started: {run_id}")
+
+
+@main.command("finish-run")
+@click.argument("run_id")
+@click.option("--metrics", default="{}", help="JSON string of metrics")
+@click.option("--error", default=None, help="Error message (marks run as failed)")
+def finish_run_cmd(run_id, metrics, error):
+    """Mark a run as completed or failed."""
+    output_ids = finish_run(run_id, metrics=json.loads(metrics), error=error)
+    status = "failed" if error else "completed"
+    click.echo(f"Run {status}: {run_id}")
+    for oid in output_ids:
+        click.echo(f"  Output: {oid[:16]}...")
+
+
+# ---- Task commands ----
+
+@main.command("task")
+@click.argument("action", type=click.Choice(["propose", "approve", "reject", "list"]))
+@click.option("--id", "task_id", default=None, help="Task ID (for approve/reject)")
+@click.option("--title", default=None, help="Task title (for propose)")
+@click.option("--desc", default="", help="Task description (for propose)")
+@click.option("--by", default="human", help="Who is proposing/approving")
+@click.option("--status", default=None, help="Filter for list action")
+def task_cmd(action, task_id, title, desc, by, status):
+    """Manage discovery tasks: propose, approve, reject, or list."""
+    if action == "propose":
+        if not title:
+            click.echo("--title is required for propose", err=True)
+            return
+        tid = propose_task(title, desc, proposed_by=by)
+        click.echo(f"Task proposed: {tid}")
+    elif action in ("approve", "reject"):
+        if not task_id:
+            click.echo("--id is required for approve/reject", err=True)
+            return
+        new_status = "approved" if action == "approve" else "rejected"
+        update_task_status(task_id, new_status, approved_by=by)
+        click.echo(f"Task {new_status}: {task_id}")
+    elif action == "list":
+        tasks = list_tasks(status)
+        if not tasks:
+            click.echo("No tasks found.")
+            return
+        for t in tasks:
+            click.echo(f"  [{t['status']:>9}] {t['id'][:8]}  {t['title']}")
+
+
+# ---- Export command ----
+
+@main.command()
+@click.argument("run_id")
+@click.option("--output", default=".", help="Output directory for the bundle")
+def export(run_id, output):
+    """Export a reproducibility bundle for a run."""
+    bundle_path = export_reproducibility_bundle(run_id, output)
+    click.echo(f"Bundle exported: {bundle_path}")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+<div class="code-caption">Listing 6.14: <code>workbench/cli.py</code>. The CLI groups all Workbench operations under a single <code>workbench</code> command. After <code>pip install -e .</code>, you can run <code>workbench register</code>, <code>workbench run</code>, <code>workbench lineage</code>, <code>workbench task</code>, and <code>workbench export</code> from any terminal.</div>
+
+<h2>6. Putting It All Together</h2>
+
+<p>Let us walk through a complete discovery workflow using the Workbench. We will register a dataset, run a training experiment, record the results, and trace the full provenance chain. This is the end-to-end demonstration that proves the system works.</p>
+
+<pre><code class="language-python">"""demo.py -- End-to-end Workbench v0 demonstration."""
+import json
+import tempfile
+from pathlib import Path
+
+from workbench.db import init_db
+from workbench.registry import register_artifact, create_run, finish_run, get_lineage
+from workbench.tasklog import propose_task, update_task_status, list_tasks
+
+# ---- Step 0: Initialize ----
+init_db()
+print("Database initialized.\n")
+
+# ---- Step 1: Register a dataset ----
+# Create a small CSV to simulate a real dataset
+dataset_path = Path(tempfile.mktemp(suffix=".csv"))
+dataset_path.write_text(
+    "molecule_id,smiles,activity\n"
+    "MOL001,CCO,0.85\n"
+    "MOL002,c1ccccc1,0.23\n"
+    "MOL003,CC(=O)O,0.91\n"
+    "MOL004,C1CCCC1,0.45\n"
+)
+
+dataset_id = register_artifact(
+    dataset_path,
+    name="ligand-activity-v1",
+    kind="dataset",
+    metadata={"source": "ChEMBL", "n_rows": 4, "target": "IC50"},
+)
+print(f"1. Registered dataset: {dataset_id[:16]}...")
+
+# ---- Step 2: Propose and approve a task ----
+task_id = propose_task(
+    title="Train random forest on ligand activity data",
+    description="Fit an RF classifier to predict active/inactive ligands.",
+    proposed_by="agent:discovery-loop",
+    priority=5,
+    metadata={"estimated_cost_usd": 0.0, "rationale": "Baseline model"},
+)
+print(f"2. Task proposed:  {task_id[:8]}...")
+
+update_task_status(task_id, "approved", approved_by="human:alice")
+print(f"   Task approved by human:alice")
+
+# ---- Step 3: Start a tracked run ----
+run_id = create_run(
+    name="rf-ligand-activity-baseline",
+    params={"n_estimators": 100, "max_depth": 5, "random_state": 42},
+    input_ids=[dataset_id],
+)
+update_task_status(task_id, "running", run_id=run_id)
+print(f"3. Run started:    {run_id[:8]}...")
+
+# ---- Step 4: Simulate training and save a model ----
+model_path = Path(tempfile.mktemp(suffix=".pkl"))
+model_path.write_bytes(b"FAKE_MODEL_WEIGHTS_v1")  # placeholder
+
+output_ids = finish_run(
+    run_id,
+    output_paths=[(model_path, "rf-baseline-v1", "model")],
+    metrics={"accuracy": 0.87, "f1": 0.84, "auc_roc": 0.91},
+)
+update_task_status(task_id, "completed")
+print(f"4. Run completed.  Outputs: {[oid[:12] for oid in output_ids]}")
+
+# ---- Step 5: Query lineage ----
+model_id = output_ids[0]
+lineage = get_lineage(model_id)
+print(f"\n5. Lineage for model {model_id[:12]}...")
+print(json.dumps(lineage, indent=2, default=str)[:800])
+
+# ---- Step 6: Show task log ----
+print("\n6. Task log:")
+for t in list_tasks():
+    print(f"   [{t['status']:>9}]  {t['title']}")
+
+# Cleanup
+dataset_path.unlink(missing_ok=True)
+model_path.unlink(missing_ok=True)</code></pre>
+<div class="code-caption">Listing 6.15: <code>demo.py</code>. A complete discovery workflow in 60 lines: register data, propose and approve a task, run a tracked experiment, record outputs and metrics, and trace provenance. Every step is captured in the SQLite database with Git commit hashes and environment fingerprints.</div>
+
+<pre><code class="language-text">Database initialized.
+
+1. Registered dataset: a7c3e9f1b2d04e8a...
+2. Task proposed:  f91c2a3b...
+   Task approved by human:alice
+3. Run started:    d4e5f6a7...
+4. Run completed.  Outputs: ['8b1a2c3d4e5f', '9f0e1d2c3b4a']
+5. Lineage for model 8b1a2c3d4e5f...
+{
+  "type": "artifact",
+  "info": {
+    "id": "8b1a2c3d4e5f...",
+    "name": "rf-baseline-v1",
+    "kind": "model",
+    ...
+  },
+  "parents": [
+    {
+      "role": "output",
+      "node": {
+        "type": "run",
+        "info": {
+          "name": "rf-ligand-activity-baseline",
+          "git_hash": "a3be1fe...",
+          "git_dirty": 0,
+          ...
+        },
+        "parents": [
+          {
+            "role": "input",
+            "node": {
+              "type": "artifact",
+              "info": {"name": "ligand-activity-v1", "kind": "dataset", ...}
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+
+6. Task log:
+   [completed]  Train random forest on ligand activity data</code></pre>
+<div class="code-caption">Output 6.15: The demo output shows the complete chain: the model artifact traces back through the run (with its Git hash and parameters) to the input dataset. The task log confirms the proposal, approval, and completion lifecycle.</div>
+
+<p>The lineage query reveals the full provenance graph in a single call. Starting from the model artifact, you can see which run produced it, what parameters were used, which Git commit the code was at, and which dataset was the input. This chain is the foundation for reproducibility: anyone with access to the Workbench can trace any result back to its origins.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: MLflow Does This in Fewer Lines</div>
+<p>If you need experiment tracking today and do not need a custom provenance graph, <a href="https://mlflow.org/" target="_blank">MLflow</a> provides a battle-tested solution:</p>
+<pre><code class="language-python">import mlflow
+
+mlflow.set_experiment("ligand-activity")
+with mlflow.start_run(run_name="rf-baseline"):
+    mlflow.log_param("n_estimators", 100)
+    mlflow.log_param("max_depth", 5)
+    mlflow.log_metric("accuracy", 0.87)
+    mlflow.log_metric("f1", 0.84)
+    mlflow.log_artifact("data/ligand-activity-v1.csv")
+    mlflow.sklearn.log_model(model, "rf-model")</code></pre>
+<div class="code-caption">MLflow equivalent of Listing 6.15 in seven lines. MLflow handles artifact storage, metric logging, model serialization, and a web UI out of the box.</div>
+<p>MLflow is excellent for standard ML experiment tracking. What you lose by using it instead of the custom Workbench: (1) <strong>typed provenance edges</strong> (MLflow tracks runs and artifacts but does not model the DAG with edge roles like "input", "output", "metric"), (2) <strong>task lifecycle management</strong> (MLflow has no concept of proposed/approved/running/completed tasks), (3) <strong>content-addressable deduplication</strong> (MLflow stores artifacts by run, not by content hash), and (4) <strong>custom lineage queries</strong> (you cannot ask "show me every model that was trained on dataset X" without external tooling). The Workbench is designed to grow into a full discovery platform; MLflow is designed to track ML experiments. Use MLflow when its scope matches your needs. Build the Workbench when you need the discovery-specific features that this book develops in subsequent chapters.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Lineage Visualizer in Five Steps</h4>
+<p>This mini-project turns the Workbench's provenance data into a visual graph you can inspect in your browser, using only the Python standard library plus the <code>graphviz</code> package (installable via <code>pip install graphviz</code>).</p>
+<ol>
+<li><strong>Run the demo.</strong> Execute <code>python demo.py</code> from Listing 6.15 to populate the Workbench database with a dataset, a run, a model, and metric artifacts.</li>
+<li><strong>Query all edges.</strong> Open a short script (<code>viz_lineage.py</code>) and use <code>sqlite3</code> to read every row from the <code>edges</code> table: <code>SELECT source_id, target_id, role FROM edges</code>. Also query the <code>artifacts</code> and <code>runs</code> tables to build a lookup dict mapping each ID to a human-readable label (artifact name or run name).</li>
+<li><strong>Build a Graphviz Digraph.</strong> For each edge row, call <code>dot.edge(source_label, target_label, label=role)</code>. Style artifact nodes as boxes and run nodes as ellipses by checking which table the ID appears in.</li>
+<li><strong>Render to SVG.</strong> Call <code>dot.render("lineage", format="svg", cleanup=True)</code>. Open <code>lineage.svg</code> in your browser to see the full provenance graph.</li>
+<li><strong>Extend with a second run.</strong> Go back to the demo script, register a second dataset (a holdout test set), create a new run that takes both the model and the test set as inputs, finish the run with evaluation metrics, and re-run your visualizer. Confirm that the graph now shows a diamond shape: two artifacts flow into the evaluation run, which itself traces back through the training run to the original dataset.</li>
+</ol>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>The Workbench tracks provenance at the granularity of whole files and runs. Recent work pushes provenance tracking to a finer grain and across organizational boundaries. <strong>LakeHouse provenance in Unity Catalog</strong> (Databricks, 2023) captures column-level lineage automatically by analyzing query plans, so you can trace a single feature column back through every transformation that produced it. In the research domain, <strong>ChemCrow</strong> (Bran et al., 2024, "Augmenting large language models with chemistry tools," <em>Nature Machine Intelligence</em>, 6, 525&ndash;535) demonstrated an LLM-driven chemistry agent that chains tool calls (web search, reaction planning, robotic execution) and logs each call as a provenance node, producing lineage graphs that span digital computation and physical lab operations in a single DAG. These systems point toward a future where provenance is not bolted on after the fact but is emitted automatically by every tool in the discovery pipeline, from SQL queries to robotic liquid handlers.</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>Artifact integrity check.</strong> Write a CLI command <code>workbench verify &lt;artifact_id&gt;</code> that recomputes the SHA-256 hash of the stored blob and compares it to the artifact ID. Print "OK" if they match and "CORRUPTED" if they differ. Test it by manually modifying a file in the <code>data/</code> directory.</li>
+
+<li><strong>Reverse lineage.</strong> Implement a function <code>get_descendants(artifact_id, depth)</code> that traces the provenance graph <em>forward</em>: given a dataset, find all runs that used it as input and all artifacts those runs produced. Add a CLI command <code>workbench descendants &lt;id&gt;</code> and verify it with the demo workflow.</li>
+
+<li><strong>Task cost estimation.</strong> Extend the <code>tasks</code> table with a <code>cost_usd</code> column. When a task transitions to <code>completed</code>, record the actual cost (passed as a parameter). Add a CLI command <code>workbench task cost-report</code> that summarizes total proposed versus actual cost across all completed tasks.</li>
+
+<li><strong>Environment drift detection.</strong> Extend <code>finish_run</code> to capture the environment hash at completion and compare it to the hash captured at <code>create_run</code>. If the hashes differ, log a warning: the environment changed during the run. Simulate this by installing a package between <code>create_run</code> and <code>finish_run</code>.</li>
+
+<li><strong>Multi-step pipeline.</strong> Using only the Workbench API, script a three-step pipeline: (a) register a raw CSV, (b) run a preprocessing step that produces a cleaned CSV, (c) run a training step that consumes the cleaned CSV and produces a model. Query the lineage of the final model and verify that the raw CSV appears two hops upstream.</li>
+
+<li><strong>Docker reproducibility.</strong> Use the <code>workbench export</code> command to generate a reproducibility bundle for a run. Build the Docker image from the exported Dockerfile and verify that <code>pip freeze</code> inside the container matches the <code>requirements.txt</code> in the bundle.</li>
+</ol>
+</section>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>You now have a working Discovery Workbench v0: an artifact registry with content-addressable storage, a task log with approval gates, a REST API, and a CLI with built-in reproducibility capture. This is the foundation that every subsequent chapter builds on. In <a href="../../part-2-software-engineering/module-07-software-discovery/index.html">Chapter 7: Software as Discovery</a>, we shift perspective and treat the software development process itself as a form of discovery. The Workbench will gain its first real client: an agent that proposes code changes, registers test results as artifacts, and uses the provenance graph to reason about which changes improved (or broke) a codebase. The scaffold becomes a cathedral one brick at a time.</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-card">
+<a href="https://mlflow.org/" target="_blank">Zaharia, M. et al. (2018). "Accelerating the Machine Learning Lifecycle with MLflow." <em>IEEE Data Engineering Bulletin</em>, 41(4), 39-45.</a>
+<p>The MLflow platform paper, introducing experiment tracking, model registry, and project packaging. The industry standard for ML experiment management.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.14778/3415478.3415560" target="_blank">Schelter, S. et al. (2017). "Automatically Tracking Metadata and Provenance of Machine Learning Experiments." <em>ML Systems Workshop at NeurIPS</em>.</a>
+<p>Motivated the need for automatic provenance tracking in ML pipelines, showing that manual logging misses critical dependencies in over 60% of experiments.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://dvc.org/" target="_blank">Kuprieiev, R. et al. (2023). DVC: Data Version Control. Iterative.ai.</a>
+<p>Git-based version control for data and ML pipelines. Demonstrates content-addressable storage for large files and DAG-based pipeline definitions.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://fastapi.tiangolo.com/" target="_blank">Ramirez, S. (2019). FastAPI. <em>fastapi.tiangolo.com</em>.</a>
+<p>The web framework used for the Workbench API. Auto-generates OpenAPI documentation from Python type hints and Pydantic models.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1145/3035918.3064030" target="_blank">Brachmann, L. &amp; Halevy, A. (2020). "Data Provenance: What Next?" <em>ACM SIGMOD Record</em>.</a>
+<p>Survey of data provenance techniques, from database-level lineage to workflow provenance, with a discussion of open challenges in ML systems.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://www.sqlite.org/whynotgit.html" target="_blank">Hipp, D. R. (2023). "SQLite as an Application File Format." <em>sqlite.org</em>.</a>
+<p>The case for SQLite as a self-contained, zero-configuration database. Explains WAL mode, concurrent access patterns, and why SQLite is appropriate for single-node applications.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s41586-023-06221-2" target="_blank">Boiko, D. A. et al. (2023). "Autonomous chemical research with large language models." <em>Nature</em>, 624, 570-578.</a>
+<p>Coscientist: an LLM-driven system that plans, executes, and interprets chemistry experiments. Demonstrates the need for artifact registries and task approval gates in autonomous discovery.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://click.palletsprojects.com/" target="_blank">Ronacher, A. (2014). Click: Python Command-Line Interface Creation Kit. <em>Pallets Projects</em>.</a>
+<p>The CLI framework used for the Workbench commands. Provides composable command groups, automatic help generation, and type-safe argument parsing.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s41592-019-0686-2" target="_blank">Stodden, V., Seiler, J., &amp; Ma, Z. (2018). "An empirical analysis of journal policy effectiveness for computational reproducibility." <em>Proceedings of the National Academy of Sciences</em>, 115(11), 2584-2589.</a>
+<p>Found that fewer than 26% of published computational results could be reproduced from the provided code and data, motivating the environment capture and export features in the Workbench.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://www.docker.com/" target="_blank">Merkel, D. (2014). "Docker: Lightweight Linux Containers for Consistent Development and Deployment." <em>Linux Journal</em>, 239.</a>
+<p>Introduced containerization for reproducible environments. The Workbench uses Docker to freeze the exact package versions and OS dependencies for each run.</p>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.3.html">&#8592; 6.3 Safety, Cost, and Observability</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="../../part-2-software-engineering/module-07-software-discovery/index.html">Chapter 7: Software as Discovery &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

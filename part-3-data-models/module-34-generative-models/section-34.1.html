@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.1: Generative Models as Hypothesis Generators. VAEs, GANs, autoregressive models, normalizing flows, and the transition to diffusion architectures for scientific discovery." name="description"/>
+<title>Section 34.1: Generative Models as Hypothesis Generators | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Generative Models for Discovery</a></div>
+<h1>34.1 Generative Models as Hypothesis Generators</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"My discriminator says this molecule is fake. My chemist says it binds the target. One of them is wrong, and I know which one I trust more."</p>
+<cite>A GAN That Discovered Drug Candidates</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section opens Chapter 34 on generative models for scientific discovery. You should be
+comfortable with neural network training (loss functions, backpropagation, gradient descent) and
+latent space concepts from <a href="../module-26-representation-learning/index.html">Chapter 26:
+Representation Learning</a>. The probability background from
+<a href="../../appendices/appendix-a/index.html">Appendix A: Mathematical Foundations</a>
+(distributions, KL divergence, expectations) is essential for understanding the ELBO derivation.
+Familiarity with Bayesian inference from <a href="../module-32-bayesian-discovery/index.html">Chapter 32:
+Bayesian Discovery</a> will deepen your understanding but is not strictly required.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Discriminative models answer "what is this?" Generative models answer "what could exist?" In
+scientific discovery, the second question is far more powerful. A classifier trained on known
+molecules tells you whether a compound is drug-like. A generative model trained on the same data
+proposes entirely new compounds that satisfy drug-likeness constraints. This shift from
+recognition to creation transforms machine learning from an analysis tool into a hypothesis
+generator. The challenge is building generative models that produce not just plausible outputs
+but physically valid, synthesizable, and functionally useful ones. This section surveys four
+generative architectures (VAEs, GANs, autoregressive models, normalizing flows), explains why
+diffusion models displaced them for most scientific applications, and establishes the mathematical
+foundations that the rest of the chapter builds on.
+</p>
+</div>
+
+<h2>1. The Generative Modeling Problem</h2>
+
+<p>
+Given a dataset $\mathcal{D} = \{x_1, x_2, \ldots, x_N\}$ drawn from an unknown data distribution
+$p_{\text{data}}(x)$, a generative model learns an approximation $p_\theta(x)$ from which we can
+sample new data points. In scientific contexts, $x$ might represent a molecular graph, a protein
+backbone, a crystal structure, or a material composition. The quality of the generative model
+depends on two properties: <strong>coverage</strong> (can it generate all valid structures in the
+target distribution?) and <strong>precision</strong> (does every generated sample satisfy the
+validity constraints of the domain?).
+</p>
+
+<p data-agent="02">
+A generative model, precisely stated, is a parametric probability distribution $p_\theta(x)$ that
+has been fitted to observed data so that new samples drawn from $p_\theta$ are statistically
+indistinguishable from samples drawn from the true data distribution $p_{\text{data}}$. This
+matters because it converts the passive task of analyzing existing data into the active task of
+proposing candidates that have never been observed, which is the core loop of scientific
+hypothesis generation. The mechanism is density estimation: the model learns where probability
+mass concentrates in data space (for example, which regions of chemical space contain drug-like
+molecules), and sampling from that learned density produces new points in high-probability regions.
+Use a generative model instead of a discriminative one whenever your goal is to propose new
+candidates rather than classify existing ones; use retrieval or combinatorial enumeration instead
+when your search space is small enough to enumerate explicitly (fewer than roughly $10^6$
+candidates).
+</p>
+
+<p>
+The tension between coverage and precision maps directly to the discovery trade-off. A model with
+perfect coverage but low precision generates many invalid molecules alongside a few interesting ones.
+A model with perfect precision but low coverage generates valid molecules but only from a narrow
+region of chemical space, missing novel candidates. Different generative architectures manage this
+trade-off in fundamentally different ways.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that a generative model with high validity (say, 95% of outputs parse
+as valid molecules) has "learned chemistry." In reality, high validity means the model has learned
+the syntactic rules of the representation (for example, matching parentheses in SMILES strings or
+correct valence counts in molecular graphs), not the physical or biological properties of the
+generated compounds. A model can produce thousands of valid molecules that are all unstable,
+unsynthesizable, or biologically inert. Validity is a necessary floor, not evidence of scientific
+understanding.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Generative Models Invert the Data Pipeline</div>
+<p>
+In standard machine learning, the pipeline runs data $\to$ features $\to$ prediction. Generative
+models invert this: specification $\to$ latent code $\to$ data. This inversion is what makes them
+useful for discovery. Instead of asking "what properties does this molecule have?", you ask
+"generate a molecule with these properties." The mathematical machinery (latent spaces, score
+functions, denoising) all serves this inversion. When the inversion is accurate and the latent
+space is well-structured, the generative model becomes a design tool. When it is not, you get
+plausible-looking nonsense. The evaluation section in
+<a href="section-34.4.html">Section 34.4</a> explains how to tell the difference.
+</p>
+</div>
+
+<h2>2. Variational Autoencoders (VAEs)</h2>
+
+<p>
+A variational autoencoder (Kingma and Welling, 2014) introduces a latent variable $z$ and
+factorizes generation into two steps: sample $z \sim p(z)$ from a simple prior (usually a
+standard normal), then map $z$ to data space with a decoder $p_\theta(x|z)$. The marginal
+likelihood of the data is:
+</p>
+
+$$p_\theta(x) = \int p_\theta(x|z) \, p(z) \, dz$$
+
+<p>
+This integral is intractable for nonlinear decoders. The VAE sidesteps this by introducing an
+encoder $q_\phi(z|x)$ that approximates the true posterior $p_\theta(z|x)$, then optimizing
+the Evidence Lower BOund (ELBO):
+</p>
+
+$$\log p_\theta(x) \geq \mathbb{E}_{q_\phi(z|x)}[\log p_\theta(x|z)] - D_{\text{KL}}(q_\phi(z|x) \| p(z)) = \text{ELBO}(\theta, \phi; x)$$
+
+<p>
+The first term is the reconstruction loss: the decoder must reconstruct the input from the
+latent code. The second term is the KL regularization: the encoder's posterior should stay close
+to the prior. This creates a tension. Strong regularization ($D_{\text{KL}} \to 0$) makes the
+latent space smooth and interpolable but degrades reconstruction. Weak regularization gives sharp
+reconstructions but a disorganized latent space where sampling from the prior produces garbage.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the ELBO trade-off like organizing a library. The reconstruction term is the requirement
+that every book can be found from its catalog entry (the latent code). The KL term is the
+requirement that the catalog uses the Dewey Decimal System (the prior) rather than an idiosyncratic
+personal scheme. A perfectly personal catalog lets you retrieve every book flawlessly but is useless
+to anyone browsing the shelves by topic. A strictly Dewey-organized catalog lets browsers find
+related books nearby (smooth interpolation in latent space) but sometimes files a quantum physics
+textbook under "cookbooks" (reconstruction error). The $\beta$ parameter in $\beta$-VAE is how
+strictly you enforce the Dewey system: low $\beta$ lets the librarian bend the rules for accuracy,
+high $\beta$ insists on a clean, browsable organization at the cost of some mis-shelved books.
+</p>
+</div>
+
+<p>
+The <strong>reparameterization trick</strong> makes the ELBO differentiable with respect to
+$\phi$. Instead of sampling $z \sim q_\phi(z|x) = \mathcal{N}(\mu_\phi(x), \sigma_\phi^2(x))$
+directly (which blocks gradient flow), we write $z = \mu_\phi(x) + \sigma_\phi(x) \cdot \epsilon$
+where $\epsilon \sim \mathcal{N}(0, I)$. The randomness is now in $\epsilon$, independent of
+$\phi$, so gradients pass through $\mu_\phi$ and $\sigma_\phi$ normally.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MolecularVAE(nn.Module):
+    """VAE for SMILES-encoded molecules."""
+
+    def __init__(self, vocab_size: int, max_len: int, latent_dim: int = 128):
+        super().__init__()
+        self.max_len = max_len
+        self.latent_dim = latent_dim
+
+        # Encoder: 1D convolutions over SMILES characters
+        self.conv1 = nn.Conv1d(vocab_size, 64, kernel_size=9, padding=4)
+        self.conv2 = nn.Conv1d(64, 64, kernel_size=9, padding=4)
+        self.conv3 = nn.Conv1d(64, 32, kernel_size=11, padding=5)
+        self.fc_enc = nn.Linear(32 * max_len, 256)
+        self.fc_mu = nn.Linear(256, latent_dim)
+        self.fc_logvar = nn.Linear(256, latent_dim)
+
+        # Decoder: GRU over latent code
+        self.fc_dec = nn.Linear(latent_dim, 256)
+        self.gru = nn.GRU(256, 512, num_layers=3, batch_first=True)
+        self.fc_out = nn.Linear(512, vocab_size)
+
+    def encode(self, x):
+        """x: (batch, vocab_size, max_len) one-hot encoded SMILES."""
+        h = F.relu(self.conv1(x))
+        h = F.relu(self.conv2(h))
+        h = F.relu(self.conv3(h))
+        h = h.view(h.size(0), -1)
+        h = F.relu(self.fc_enc(h))
+        return self.fc_mu(h), self.fc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        """Sample z = mu + sigma * epsilon (reparameterization trick)."""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + std * eps
+
+    def decode(self, z):
+        """z: (batch, latent_dim) -> (batch, max_len, vocab_size) logits."""
+        h = F.relu(self.fc_dec(z))
+        h = h.unsqueeze(1).repeat(1, self.max_len, 1)  # repeat for each position
+        h, _ = self.gru(h)
+        return self.fc_out(h)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z)
+        return recon, mu, logvar
+
+def vae_loss(recon_logits, target, mu, logvar):
+    """ELBO loss: reconstruction (cross-entropy) + KL divergence."""
+    # Reconstruction: cross-entropy per character position
+    recon_loss = F.cross_entropy(
+        recon_logits.view(-1, recon_logits.size(-1)),
+        target.view(-1),
+        reduction='mean'
+    )
+    # KL divergence: closed form for diagonal Gaussian vs N(0,I)
+    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    return recon_loss + kl_loss</code></pre>
+<div class="code-caption">A molecular VAE operating on SMILES strings. The encoder uses 1D convolutions to compress the character sequence into a latent code; the decoder uses a GRU to autoregressively reconstruct the SMILES. The <code>reparameterize</code> method implements the reparameterization trick, enabling gradient flow through the stochastic sampling step.</div>
+
+<p>
+Molecular VAEs typically achieve 70-85% validity (fraction of generated SMILES that parse into
+valid molecules) on drug-like compound datasets. The primary failure mode is the KL-reconstruction
+trade-off: the model either memorizes training molecules (low KL) or generates diverse but
+often invalid structures (high KL). The $\beta$-VAE variant (Higgins et al., 2017) adds a
+weight $\beta$ to the KL term, letting you tune this trade-off explicitly.
+</p>
+
+<h2>3. Generative Adversarial Networks (GANs)</h2>
+
+<p>
+GANs (Goodfellow et al., 2014) take a completely different approach: train a generator $G_\theta$
+to map noise $z \sim p(z)$ to data space, while simultaneously training a discriminator $D_\phi$
+to distinguish real data from generated samples. The two networks play a minimax game:
+</p>
+
+$$\min_\theta \max_\phi \, \mathbb{E}_{x \sim p_{\text{data}}}[\log D_\phi(x)] + \mathbb{E}_{z \sim p(z)}[\log(1 - D_\phi(G_\theta(z)))]$$
+
+<p>
+At equilibrium (if it exists), the generator produces samples indistinguishable from real data.
+The theoretical appeal is that GANs do not require an explicit likelihood function, making them
+applicable to complex data types where defining $p_\theta(x)$ is difficult.
+</p>
+
+<p>
+In practice, GANs for scientific applications face two serious problems.
+<strong>Mode collapse</strong>: the generator learns to produce a small set of high-quality
+samples that fool the discriminator, ignoring most of the data distribution. For drug discovery,
+this means the model might generate 50 variants of aspirin and nothing else.
+<strong>Training instability</strong>: the generator and discriminator can oscillate rather than
+converge, requiring careful hyperparameter tuning and architectural choices. The Wasserstein
+GAN (Arjovsky et al., 2017) partially addresses both problems by replacing the Jensen-Shannon
+divergence with the Wasserstein distance, which provides smoother gradients and a meaningful
+training signal even when the generator distribution does not overlap with the data distribution.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: ORGAN for Molecular Optimization</div>
+<p>
+Guimaraes et al. (2017) introduced ORGAN (Objective-Reinforced Generative Adversarial Network),
+which augments a GAN with a reward signal for molecular properties. The generator produces SMILES
+strings; the discriminator judges chemical plausibility; and a separate reward function scores
+properties like drug-likeness (QED) and synthetic accessibility (SA). The combined objective
+balances realism and utility. In benchmarks on the ZINC dataset, ORGAN produces molecules with
+higher QED scores than the training distribution while maintaining 85% validity. The key insight
+is that the GAN provides a learned quality signal (the discriminator) while REINFORCE
+(covered in <a href="section-34.4.html">Section 34.4</a>) steers toward task-specific properties.
+</p>
+</div>
+
+<h2>4. Autoregressive Models and Normalizing Flows</h2>
+
+<p>
+<strong>Autoregressive models</strong> factorize the joint distribution as a product of
+conditionals:
+</p>
+
+$$p_\theta(x) = \prod_{i=1}^{n} p_\theta(x_i | x_1, \ldots, x_{i-1})$$
+
+<p>
+Each token (atom, bond, or SMILES character) is generated conditioned on all previous tokens.
+This is the architecture behind language models, and it transfers naturally to molecular strings.
+The advantage is exact likelihood computation and stable training. The disadvantage for
+3D scientific structures is that the sequential generation order is arbitrary: there is no
+natural "first atom" in a molecule. Graph-based autoregressive models (You et al., 2018) generate
+molecules node by node, choosing which atom to add next and where to connect it. These achieve
+higher validity (often 95%+) than SMILES-based models because each step can check chemical
+valency constraints before committing.
+</p>
+
+<p>
+<strong>Normalizing flows</strong> (Rezende and Mohamed, 2015) construct an invertible mapping
+$f_\theta: \mathbb{R}^d \to \mathbb{R}^d$ that transforms a simple base distribution (Gaussian)
+into the data distribution. The change-of-variables formula gives the exact log-likelihood:
+</p>
+
+$$\log p_\theta(x) = \log p_z(f_\theta^{-1}(x)) + \log \left| \det \frac{\partial f_\theta^{-1}}{\partial x} \right|$$
+
+<p>
+Flows provide exact likelihood and exact sampling (both forward and inverse passes are available),
+making them attractive for density estimation. However, the invertibility constraint limits
+architectural expressiveness. Continuous normalizing flows (CNFs), which parameterize the
+transformation as an ODE, relax this constraint at the cost of requiring an ODE solver during
+training. Flow matching (<a href="section-34.2.html">Section 34.2</a>) builds on this idea
+while avoiding the ODE solver bottleneck.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+from torch.distributions import Normal
+
+class AffineCouplingLayer(nn.Module):
+    """Single affine coupling layer for a normalizing flow."""
+
+    def __init__(self, dim: int, hidden_dim: int = 256):
+        super().__init__()
+        half = dim // 2
+        # Scale and translation networks
+        self.scale_net = nn.Sequential(
+            nn.Linear(half, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, dim - half), nn.Tanh()
+        )
+        self.translate_net = nn.Sequential(
+            nn.Linear(half, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, dim - half)
+        )
+
+    def forward(self, x):
+        """Forward pass: data -> latent (used for training)."""
+        x1, x2 = x.chunk(2, dim=-1)
+        s = self.scale_net(x1)       # log-scale
+        t = self.translate_net(x1)   # translation
+        y2 = x2 * torch.exp(s) + t   # affine transform
+        log_det = s.sum(dim=-1)       # log determinant of Jacobian
+        return torch.cat([x1, y2], dim=-1), log_det
+
+    def inverse(self, y):
+        """Inverse pass: latent -> data (used for sampling)."""
+        y1, y2 = y.chunk(2, dim=-1)
+        s = self.scale_net(y1)
+        t = self.translate_net(y1)
+        x2 = (y2 - t) * torch.exp(-s)
+        return torch.cat([y1, x2], dim=-1)
+
+class NormalizingFlow(nn.Module):
+    """Stack of affine coupling layers with permutations."""
+
+    def __init__(self, dim: int, n_layers: int = 6, hidden_dim: int = 256):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            AffineCouplingLayer(dim, hidden_dim) for _ in range(n_layers)
+        ])
+        self.base_dist = Normal(torch.zeros(dim), torch.ones(dim))
+        # Alternating permutation indices
+        self.perms = [torch.randperm(dim) for _ in range(n_layers)]
+
+    def log_prob(self, x):
+        """Compute exact log-likelihood via change of variables."""
+        log_det_total = 0
+        z = x
+        for layer, perm in zip(self.layers, self.perms):
+            z = z[:, perm]  # permute dimensions
+            z, log_det = layer(z)
+            log_det_total += log_det
+        log_pz = self.base_dist.log_prob(z).sum(dim=-1)
+        return log_pz + log_det_total
+
+    def sample(self, n: int):
+        """Generate samples by inverting the flow."""
+        z = self.base_dist.sample((n,))
+        x = z
+        for layer, perm in zip(reversed(self.layers), reversed(self.perms)):
+            x = layer.inverse(x)
+            inv_perm = torch.argsort(perm)
+            x = x[:, inv_perm]
+        return x</code></pre>
+<div class="code-caption">A normalizing flow with affine coupling layers. The forward pass computes exact log-likelihoods via the change-of-variables formula; the inverse pass generates samples by transforming Gaussian noise through the learned invertible mapping. Alternating permutations ensure all dimensions interact across layers.</div>
+
+<h2>5. Why Diffusion Models Won</h2>
+
+<p>
+By 2022, diffusion models had displaced VAEs, GANs, and flows as the dominant architecture
+for both image generation and scientific applications. The reasons are specific and instructive.
+</p>
+
+<p>
+<strong>Training stability.</strong> Diffusion models optimize a simple denoising objective:
+predict the noise added to a data point. There is no adversarial game (GANs), no KL-reconstruction
+trade-off (VAEs), and no architectural constraint (flows). The loss landscape is smooth, and
+training reliably converges without extensive hyperparameter tuning.
+</p>
+
+<p>
+<strong>Mode coverage.</strong> Because diffusion models are trained to denoise from every noise
+level, they see the full data distribution at every training step. This eliminates the mode
+collapse problem that plagues GANs. In molecular generation, coverage translates directly to
+chemical diversity: the model explores the full space of valid structures rather than memorizing
+a subset.
+</p>
+
+<p>
+<strong>Conditioning flexibility.</strong> Adding conditional information (target protein structure,
+desired molecular properties, binding pocket geometry) is straightforward: classifier-free
+guidance provides a general mechanism that works with any conditioning signal without
+architectural changes. <a href="section-34.4.html">Section 34.4</a> covers this in depth.
+</p>
+
+<p>
+<strong>Compositionality.</strong> Diffusion models naturally compose: you can combine multiple
+guidance signals (bind this target AND be synthesizable AND have low toxicity) at inference time
+without retraining. For discovery, where the objective is always multi-dimensional, this is
+crucial.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Discrete Diffusion for Sequences</div>
+<p>
+Classical diffusion operates on continuous data (images, 3D coordinates). Scientific sequences
+(SMILES strings, protein sequences, DNA) are discrete. Austin et al. (2021) introduced D3PM
+(Discrete Denoising Diffusion Probabilistic Models), which replaces Gaussian noise with discrete
+corruption (random token substitution, masking, or absorbing states). Campbell et al. (2024)
+extended this with continuous-time discrete diffusion using a rate matrix formulation, achieving
+competitive performance with autoregressive models on protein sequence generation while gaining
+the conditioning flexibility of diffusion. Most recently, Stark et al. (2025) introduced
+DIAMODN (Diffusion bridges for 3D molecular design), which uses a diffusion bridge process to
+generate molecules conditioned on protein binding pockets, outperforming prior pocket-conditioned
+generative models on the CrossDocked2020 benchmark by achieving state-of-the-art binding affinity
+(Vina score) while maintaining drug-likeness and synthetic accessibility. This line of work
+demonstrates that diffusion is converging with flow matching as a unified framework for both
+continuous 3D structures and discrete sequences in scientific generation.
+</p>
+</div>
+
+<h2>6. The Generative Landscape for Discovery</h2>
+
+<p>
+Each architecture occupies a niche in the current discovery landscape. VAEs remain useful when
+you need a smooth, interpretable latent space for optimization (navigating chemical space by
+interpolating latent codes). GANs persist in applications where sample quality matters more than
+diversity (generating high-resolution microscopy images for data augmentation). Autoregressive
+models dominate protein sequence generation (as in ESM-based design) because the sequential
+nature of amino acid chains maps naturally to left-to-right generation. Normalizing flows appear
+in Boltzmann generators, where exact likelihood is needed to compute free energy differences
+(see <a href="../../part-5-simulation-optimization/module-43-scientific-simulation/index.html">Chapter 43:
+Scientific Simulation</a>).
+</p>
+
+<p>
+Diffusion models and their close relative, flow matching, dominate 3D structure generation:
+molecules, proteins, crystals, and materials. Their combination of training stability, mode
+coverage, and conditioning flexibility makes them the default choice for de novo design. The
+next three sections focus on this dominant paradigm: <a href="section-34.2.html">Section 34.2</a>
+covers the mathematical foundations of score-based diffusion and flow matching;
+<a href="section-34.3.html">Section 34.3</a> extends these ideas to equivariant generation on
+3D structures; and <a href="section-34.4.html">Section 34.4</a> addresses conditioning,
+optimization, and evaluation.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Compare VAE and Autoregressive Molecular Generation</h4>
+<p>
+This mini-project lets you generate molecules with two architectures and compare their trade-offs
+using only RDKit and PyTorch. (1) Install dependencies: <code>pip install torch rdkit-pypi</code>.
+(2) Download the ZINC 250K SMILES file from the TDC (Therapeutics Data Commons) package or
+directly from <code>https://raw.githubusercontent.com/aspuru-guzik-group/chemical_vae/master/models/zinc/250k_rndm_zinc_drugs_clean_3.csv</code>,
+and tokenize the SMILES into character-level sequences with a vocabulary of about 35 tokens.
+(3) Train a minimal character-level VAE (encoder: two linear layers to $\mu$ and $\log\sigma^2$
+with latent dim 64; decoder: single-layer GRU) for 20 epochs, then sample 1,000 SMILES by
+decoding random $z \sim \mathcal{N}(0, I)$. (4) Train a minimal character-level autoregressive
+model (single-layer LSTM, teacher forcing) for 20 epochs on the same data, then sample 1,000
+SMILES by greedy or temperature-scaled decoding. (5) Use RDKit to compute three metrics for
+each model's output: validity (<code>Chem.MolFromSmiles(s) is not None</code>), uniqueness
+(number of distinct valid SMILES divided by total valid), and novelty (fraction of valid SMILES
+not in the training set). You should find that the autoregressive model achieves higher validity
+(typically 85%+ vs. 60-75% for the VAE) because it enforces sequential token dependencies, while
+the VAE offers a latent space you can interpolate for smooth property optimization.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Hugging Face Diffusers and TorchDrug</div>
+<p>
+Building a VAE or normalizing flow from scratch (as in the code above) requires 100-200 lines of
+boilerplate for training loops, noise scheduling, and sampling. The
+<a href="https://huggingface.co/docs/diffusers/" target="_blank">Hugging Face Diffusers</a>
+library provides pretrained diffusion models, noise schedulers, and training utilities in a
+unified API. For molecular generation specifically,
+<a href="https://torchdrug.ai/" target="_blank">TorchDrug</a> wraps graph-based generative models
+(GraphAF, GCPN) with dataset loading, property prediction, and evaluation metrics. Starting with
+these libraries and customizing only what your research question demands saves weeks of
+implementation time while ensuring your baselines are correct.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+The original VAE paper (Kingma and Welling, 2014) and the original GAN paper (Goodfellow et al.,
+2014) were both submitted to the same conference (ICLR 2014) within months of each other. Neither
+paper mentioned molecules or proteins. A decade later, both architectures are used daily in
+pharmaceutical companies. The lesson: fundamental mathematical ideas find applications their
+creators never imagined, which is itself a form of discovery.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Explain why mode collapse in a GAN is particularly harmful for drug
+discovery compared to image generation. What scientific consequence would it have if your molecular
+generator only produced variations of a few scaffolds?
+</li>
+<li>
+<strong>(Coding)</strong> Implement a $\beta$-VAE for molecular fingerprints (2048-dimensional
+binary vectors from RDKit Morgan fingerprints). Train on 10,000 molecules from the ZINC dataset.
+Vary $\beta \in \{0.1, 0.5, 1.0, 5.0\}$ and measure reconstruction accuracy (Tanimoto similarity
+between input and reconstructed fingerprints) and latent space smoothness (average distance between
+interpolated decodings of neighboring molecules). Plot the trade-off curve.
+</li>
+<li>
+<strong>(Analysis)</strong> Compare the sample quality (validity, uniqueness, novelty as defined in
+<a href="section-34.4.html">Section 34.4</a>) of a SMILES-based autoregressive model versus a
+graph-based autoregressive model (GraphAF from TorchDrug) on the ZINC 250K subset. Which achieves
+higher validity? Explain the result in terms of the structural constraints each representation
+enforces during generation.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+This section surveyed the generative architecture landscape and explained why diffusion models
+dominate scientific applications. <a href="section-34.2.html">Section 34.2: Score-Based Diffusion
+and Flow Matching</a> develops the mathematical core: the score function, denoising score
+matching, the DDPM forward and reverse processes, noise schedules, and the flow matching
+alternative. By the end of Section 34.2, you will have a working diffusion model in PyTorch and
+understand the continuous-time formulations (SDEs and ODEs) that unify these approaches.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1312.6114" target="_blank">Kingma, D. P. &amp; Welling, M. (2014). Auto-encoding variational Bayes. <em>ICLR 2014</em>.</a>
+<p>The foundational VAE paper introducing the ELBO and reparameterization trick.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1406.2661" target="_blank">Goodfellow, I. J., Pouget-Abadie, J., Mirza, M., Xu, B., Warde-Farley, D., Ozair, S., Courville, A., &amp; Bengio, Y. (2014). Generative adversarial nets. <em>NeurIPS 2014</em>.</a>
+<p>The original GAN paper establishing the adversarial training framework.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1505.05770" target="_blank">Rezende, D. J. &amp; Mohamed, S. (2015). Variational inference with normalizing flows. <em>ICML 2015</em>.</a>
+<p>Normalizing flows for flexible posterior approximation and generative modeling.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1701.07875" target="_blank">Arjovsky, M., Chintala, S., &amp; Bottou, L. (2017). Wasserstein generative adversarial networks. <em>ICML 2017</em>.</a>
+<p>Wasserstein distance as a training objective, addressing mode collapse and training instability in GANs.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2107.03006" target="_blank">Austin, J., Johnson, D. D., Ho, J., Tarlow, D., &amp; van den Berg, R. (2021). Structured denoising diffusion models in discrete state-spaces. <em>NeurIPS 2021</em>.</a>
+<p>D3PM: extending diffusion to discrete data, enabling sequence generation for molecular and protein applications.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&#8592; Chapter 34 Index</a>
+<a href="index.html">Chapter 34</a>
+<a href="section-34.2.html">34.2 Score-Based Diffusion and Flow Matching &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

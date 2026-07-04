@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 17.3: Building a Software Agent Team. A complete recipe implementing a multi-agent team from GitHub issue to pull request using OpenAI Agents SDK, LangGraph, AutoGen, and CrewAI." name="description"/>
+<title>Section 17.3: Building a Software Agent Team | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 17: Multi-Agent Software Teams</a></div>
+<h1>17.3 Building a Software Agent Team</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I built a four-agent team. Three of them work beautifully. The fourth keeps rewriting the other three agents' code and submitting it as its own contribution."</p>
+<cite>A Tech Lead Discovering the Free-Rider Problem</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section synthesizes everything from the chapter. You need the agent roles and
+workflow graphs from <a href="section-17.1.html">Section 17.1</a> and the coordination
+patterns, debate protocols, and human gates from
+<a href="section-17.2.html">Section 17.2</a>. You should have a working Python environment
+with access to an LLM API (OpenAI or Anthropic). Familiarity with GitHub's API
+(creating branches, committing files, opening PRs) is helpful; the
+<a href="../module-12-mcp-servers/index.html">MCP server patterns</a> from Chapter 12
+show how to wrap such APIs as agent tools.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+This section is a recipe. We build a complete multi-agent team that takes a GitHub
+issue as input and produces a reviewed pull request as output. The pipeline flows
+through four agents: a <strong>planner</strong> (combines the PM and architect roles for
+simplicity), a <strong>developer</strong>, a <strong>tester</strong>, and a <strong>reviewer</strong>, connected
+by a cyclic workflow with human approval at the end. We implement this pipeline
+four times, once in each major framework (OpenAI Agents SDK, LangGraph, AutoGen,
+CrewAI), so you can compare their programming models side by side. The recipe
+integrates with the Discovery Workbench as a reusable component that later chapters
+extend for scientific workflows.
+</p>
+</div>
+
+<h2>1. The Recipe: Issue to Pull Request</h2>
+
+<p>
+Our target pipeline handles the most common software engineering workflow: a user
+files a GitHub issue describing a bug or feature request, and the team produces a
+pull request that resolves it. The concrete steps are:
+</p>
+
+<p data-agent="02">
+A multi-agent pipeline is a sequence of specialized LLM-powered agents, each responsible for one stage of a larger task, connected by typed data contracts so the output of one agent becomes the input of the next. It matters because it lets you decompose complex, open-ended work (like resolving a GitHub issue end to end) into focused subtasks where each agent can be prompted, tooled, and evaluated independently. The mechanism is straightforward: a shared state object flows through the pipeline, each agent reads the fields it needs, calls its tools, and writes its output fields for downstream agents to consume. Use a multi-agent pipeline when the task involves distinct competencies (planning, coding, testing, reviewing) that benefit from separate prompts and tool sets; for simple, single-step tasks, a single agent with the right tools is faster and cheaper.
+</p>
+
+<ol>
+<li><strong>Plan</strong>: Read the issue, analyze the codebase, produce requirements and a technical design.</li>
+<li><strong>Implement</strong>: Write the code changes according to the plan.</li>
+<li><strong>Test</strong>: Generate tests for the new code and run them.</li>
+<li><strong>Review</strong>: Check the implementation against the plan, look for bugs, verify test coverage.</li>
+<li><strong>Revise</strong> (conditional): If the reviewer finds blockers, return to step 2 with feedback.</li>
+<li><strong>Approve</strong> (human gate): Present the final diff to a human for approval before opening the PR.</li>
+</ol>
+
+<p>
+We define the shared state that flows through all four implementations:
+</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field
+
+class IssueInput(BaseModel):
+    """Input: a GitHub issue to resolve."""
+    title: str
+    body: str
+    labels: list[str] = []
+    repo_owner: str
+    repo_name: str
+    base_branch: str = "main"
+
+class PlanOutput(BaseModel):
+    """Output from the planner agent."""
+    summary: str = Field(description="One-paragraph summary of the change")
+    requirements: list[str] = Field(description="Testable acceptance criteria")
+    files_to_modify: list[dict] = Field(
+        description="List of {path, action, description} for each file"
+    )
+    branch_name: str = Field(description="Git branch name for the PR")
+
+class ImplementOutput(BaseModel):
+    """Output from the developer agent."""
+    files: dict[str, str] = Field(description="Map of file path to new content")
+    commit_message: str
+    implementation_notes: str
+
+class TestOutput(BaseModel):
+    """Output from the tester agent."""
+    test_files: dict[str, str] = Field(description="Map of test file path to content")
+    results: list[dict] = Field(description="List of {name, passed, error} dicts")
+    all_passed: bool
+    coverage_summary: str
+
+class ReviewOutput(BaseModel):
+    """Output from the reviewer agent."""
+    approved: bool
+    blockers: list[dict] = Field(description="Must-fix issues with file, line, message")
+    warnings: list[dict] = Field(description="Should-fix issues")
+    summary: str
+
+class PRResult(BaseModel):
+    """Final output: the pull request."""
+    pr_url: str
+    pr_number: int
+    title: str
+    files_changed: int
+    iterations: int
+    total_tokens: int
+</code></pre>
+<div class="code-caption">Pydantic models defining the typed interface between every agent in the pipeline, from issue input to PR output.</div>
+
+<h2>2. Implementation: OpenAI Agents SDK</h2>
+
+<p>
+The <a href="https://openai.github.io/openai-agents-python/" target="_blank">OpenAI Agents SDK</a>
+provides a lightweight framework built around three concepts: <strong>agents</strong> (LLM
+configurations with tools), <strong>handoffs</strong> (transfer control between agents), and
+<strong>guardrails</strong> (input/output validators). The SDK uses Python's native async
+patterns and traces every agent invocation for observability.
+</p>
+
+<pre><code class="language-python">from agents import Agent, Runner, handoff, GuardrailFunctionOutput
+from agents import function_tool
+
+# --- Tools (simplified; production versions wrap MCP servers) ---
+
+@function_tool
+def read_file(path: str) -> str:
+    """Read a file from the repository."""
+    return repo.read_file(path)
+
+@function_tool
+def write_file(path: str, content: str) -> str:
+    """Write content to a file in the working branch."""
+    repo.write_file(path, content)
+    return f"Written {len(content)} bytes to {path}"
+
+@function_tool
+def run_tests(test_dir: str = "tests") -> dict:
+    """Run the test suite and return results."""
+    return repo.run_pytest(test_dir)
+
+@function_tool
+def search_code(query: str, max_results: int = 10) -> list[dict]:
+    """Search the codebase for a pattern."""
+    return repo.grep(query, max_results=max_results)
+
+# --- Agents ---
+
+planner = Agent(
+    name="planner",
+    instructions="""You are a senior tech lead. Given a GitHub issue, analyze the
+codebase and produce a structured plan with:
+1. A summary of the required change
+2. Testable acceptance criteria
+3. A list of files to modify with descriptions
+4. A git branch name
+
+Use search_code and read_file to understand the codebase.""",
+    tools=[read_file, search_code],
+    output_type=PlanOutput,
+    model="gpt-4o",
+)
+
+developer = Agent(
+    name="developer",
+    instructions="""You are a senior developer. Given a plan, implement the changes.
+Write clean, well-commented code that follows existing patterns in the codebase.
+If you received review feedback, address every blocker before resubmitting.""",
+    tools=[read_file, write_file, search_code],
+    output_type=ImplementOutput,
+    model="gpt-4o",
+)
+
+tester = Agent(
+    name="tester",
+    instructions="""You are a QA engineer. Given implementation files, write
+comprehensive tests covering:
+1. Happy path for each acceptance criterion
+2. Edge cases (empty input, large input, unicode)
+3. Error paths (invalid input, missing dependencies)
+
+Run the tests and report results.""",
+    tools=[read_file, write_file, run_tests],
+    output_type=TestOutput,
+    model="gpt-4o",
+)
+
+reviewer = Agent(
+    name="reviewer",
+    instructions="""You are a senior code reviewer. Review the implementation
+against the plan. Check for:
+1. Correctness: does the code do what the plan says?
+2. Tests: are all acceptance criteria covered?
+3. Security: any injection, path traversal, or secret exposure?
+4. Style: does it follow codebase conventions?
+
+Set approved=true ONLY if there are zero blockers.""",
+    tools=[read_file, search_code],
+    output_type=ReviewOutput,
+    model="gpt-4o",
+)
+
+# --- Handoff-based pipeline ---
+
+# the reviewer hands off back to developer if not approved
+reviewer_with_handoff = Agent(
+    name="reviewer",
+    instructions=reviewer.instructions,
+    tools=[read_file, search_code],
+    output_type=ReviewOutput,
+    handoffs=[handoff(
+        agent=developer,
+        tool_name="request_revision",
+        tool_description="Send the code back to the developer with feedback",
+    )],
+    model="gpt-4o",
+)
+
+
+async def run_issue_to_pr(issue: IssueInput) -> PRResult:
+    """Run the full pipeline using OpenAI Agents SDK."""
+    # step 1: plan
+    plan_result = await Runner.run(planner, input=issue.model_dump_json())
+    plan = plan_result.final_output_as(PlanOutput)
+
+    # step 2-4: implement -> test -> review (with cycle)
+    context = {"plan": plan.model_dump(), "issue": issue.model_dump()}
+    max_iterations = 3
+    for iteration in range(max_iterations):
+        # implement
+        impl_result = await Runner.run(developer, input=str(context))
+        impl = impl_result.final_output_as(ImplementOutput)
+
+        # test
+        test_input = {**context, "implementation": impl.model_dump()}
+        test_result = await Runner.run(tester, input=str(test_input))
+        tests = test_result.final_output_as(TestOutput)
+
+        # review
+        review_input = {
+            **context,
+            "implementation": impl.model_dump(),
+            "tests": tests.model_dump(),
+            "iteration": iteration,
+        }
+        review_result = await Runner.run(
+            reviewer_with_handoff, input=str(review_input)
+        )
+        review = review_result.final_output_as(ReviewOutput)
+
+        if review.approved:
+            break
+
+        # feed review back into context for next iteration
+        context["review_feedback"] = review.model_dump()
+
+    # step 5: create PR (after human approval in production)
+    pr = repo.create_pull_request(
+        branch=plan.branch_name,
+        title=f"Fix: {issue.title}",
+        body=plan.summary,
+        files={**impl.files, **tests.test_files},
+    )
+    return PRResult(
+        pr_url=pr["url"],
+        pr_number=pr["number"],
+        title=pr["title"],
+        files_changed=len(impl.files) + len(tests.test_files),
+        iterations=iteration + 1,
+        total_tokens=sum(r.usage.total_tokens for r in [
+            plan_result, impl_result, test_result, review_result
+        ]),
+    )
+</code></pre>
+<div class="code-caption">Complete issue-to-PR pipeline using the OpenAI Agents SDK with handoff-based review loops and structured outputs.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Handoffs vs. Orchestration</div>
+<p>
+The OpenAI Agents SDK uses <strong>handoffs</strong> to transfer control between agents. A
+handoff is a tool call that the current agent makes when it decides another agent
+should take over. This is a <em>decentralized</em> coordination model: the reviewer
+decides whether to hand off to the developer, not a central orchestrator. The
+advantage is simplicity (no separate workflow graph); the disadvantage is that
+control flow is embedded in agent behavior, making it harder to visualize, debug,
+and enforce invariants (like maximum iteration counts). For production systems,
+the centralized orchestration pattern (LangGraph, next subsection) is more
+predictable.
+</p>
+</div>
+
+<h2>3. Implementation: LangGraph</h2>
+
+<p>
+<a href="https://langchain-ai.github.io/langgraph/" target="_blank">LangGraph</a> models
+workflows as <strong>state graphs</strong>: nodes are functions that transform a typed state
+object, edges define the flow between nodes, and conditional edges enable branching.
+LangGraph provides built-in checkpointing, streaming, and graph visualization.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of a state graph like a commercial kitchen preparing a banquet dish. The typed state object is a ticket clipped to a tray: it accumulates notes as the tray moves from station to station. The prep cook (planner) writes the recipe on the ticket; the line cook (developer) adds the prepared ingredients; the garnish station (tester) plates and checks presentation; the head chef (reviewer) tastes and either sends the dish out or routes the tray back to the line cook with corrections. Conditional edges are the head chef's decision: "send it out" versus "redo the sauce." Checkpointing is the snapshot a manager takes of every tray's position so that if the kitchen loses power, service can resume from the last recorded state rather than starting every dish over.
+</p>
+</div>
+
+<pre><code class="language-python">from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from typing import TypedDict, Annotated
+import operator
+
+class TeamState(TypedDict):
+    """Typed state flowing through the LangGraph pipeline."""
+    issue: dict
+    plan: dict | None
+    implementation: dict | None
+    tests: dict | None
+    review: dict | None
+    iteration: int
+    messages: Annotated[list[str], operator.add]  # append-only log
+
+async def plan_node(state: TeamState) -> dict:
+    """Planner node: analyze issue, produce plan."""
+    result = await call_llm(
+        system="You are a senior tech lead...",
+        user=f"Issue: {state['issue']}",
+        output_type=PlanOutput,
+        tools=[read_file, search_code],
+    )
+    return {
+        "plan": result.model_dump(),
+        "messages": [f"Plan: {result.summary}"],
+    }
+
+async def implement_node(state: TeamState) -> dict:
+    """Developer node: implement the plan."""
+    context = {"plan": state["plan"]}
+    if state.get("review") and not state["review"].get("approved"):
+        context["feedback"] = state["review"]
+    result = await call_llm(
+        system="You are a senior developer...",
+        user=f"Context: {context}",
+        output_type=ImplementOutput,
+        tools=[read_file, write_file, search_code],
+    )
+    return {
+        "implementation": result.model_dump(),
+        "messages": [f"Implemented: {result.commit_message}"],
+    }
+
+async def test_node(state: TeamState) -> dict:
+    """Tester node: write and run tests."""
+    result = await call_llm(
+        system="You are a QA engineer...",
+        user=f"Implementation: {state['implementation']}",
+        output_type=TestOutput,
+        tools=[read_file, write_file, run_tests],
+    )
+    return {
+        "tests": result.model_dump(),
+        "messages": [f"Tests: {result.results}"],
+    }
+
+async def review_node(state: TeamState) -> dict:
+    """Reviewer node: review code and tests."""
+    result = await call_llm(
+        system="You are a senior code reviewer...",
+        user=f"Plan: {state['plan']}\nImpl: {state['implementation']}\n"
+             f"Tests: {state['tests']}",
+        output_type=ReviewOutput,
+        tools=[read_file, search_code],
+    )
+    return {
+        "review": result.model_dump(),
+        "iteration": state["iteration"] + 1,
+        "messages": [f"Review (round {state['iteration'] + 1}): "
+                     f"{'approved' if result.approved else 'needs revision'}"],
+    }
+
+def should_continue(state: TeamState) -> str:
+    """Conditional edge: continue revising or finish."""
+    if state["review"]["approved"]:
+        return "approved"
+    if state["iteration"] >= 3:
+        return "max_iterations"
+    return "revise"
+
+# Build the graph
+workflow = StateGraph(TeamState)
+workflow.add_node("plan", plan_node)
+workflow.add_node("implement", implement_node)
+workflow.add_node("test", test_node)
+workflow.add_node("review", review_node)
+
+workflow.set_entry_point("plan")
+workflow.add_edge("plan", "implement")
+workflow.add_edge("implement", "test")
+workflow.add_edge("test", "review")
+
+workflow.add_conditional_edges("review", should_continue, {
+    "approved": END,
+    "max_iterations": END,
+    "revise": "implement",  # cycle back
+})
+
+# Compile with checkpointing
+checkpointer = MemorySaver()
+app = workflow.compile(checkpointer=checkpointer)
+
+# Run
+async def run_langgraph_pipeline(issue: IssueInput):
+    config = {"configurable": {"thread_id": f"issue-{issue.title}"}}
+    initial_state = {
+        "issue": issue.model_dump(),
+        "plan": None,
+        "implementation": None,
+        "tests": None,
+        "review": None,
+        "iteration": 0,
+        "messages": [],
+    }
+    result = await app.ainvoke(initial_state, config=config)
+    return result
+</code></pre>
+<div class="code-caption">LangGraph implementation with typed state, conditional review loops, and automatic checkpointing for failure recovery.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Visualizing the Workflow</div>
+<p>
+LangGraph can render the compiled graph as a Mermaid diagram, which is invaluable for
+documentation and debugging. Calling <code>app.get_graph().draw_mermaid()</code> produces a
+diagram showing the four nodes (plan, implement, test, review), the forward edges, the
+conditional back-edge from review to implement, and the two terminal conditions
+(approved, max_iterations). When a production workflow hangs at the review node on its
+third iteration, the diagram immediately shows the cycle and the termination condition.
+This visual debugging connects to the
+<a href="../module-22-mlops-llmops/index.html">observability patterns</a> in Chapter 22, where
+workflow traces become a first-class monitoring concern.
+</p>
+</div>
+
+<h2>4. Implementation: CrewAI</h2>
+
+<p>
+<a href="https://docs.crewai.com/" target="_blank">CrewAI</a> takes a higher-level approach,
+modeling agents as <strong>crew members</strong> with roles, goals, and backstories. Tasks are
+assigned to crew members and executed sequentially or in parallel. CrewAI handles
+tool routing, output parsing, and delegation automatically.
+</p>
+
+<pre><code class="language-python">from crewai import Agent, Task, Crew, Process
+
+# Define crew members
+planner_agent = Agent(
+    role="Senior Tech Lead",
+    goal="Analyze GitHub issues and produce implementation plans",
+    backstory="You have 15 years of experience leading engineering teams. "
+              "You excel at breaking complex issues into clear, actionable plans.",
+    tools=[read_file_tool, search_code_tool],
+    verbose=True,
+)
+
+developer_agent = Agent(
+    role="Senior Developer",
+    goal="Implement code changes according to the technical plan",
+    backstory="You write clean, well-tested Python code. You follow existing "
+              "patterns in the codebase and never introduce unnecessary complexity.",
+    tools=[read_file_tool, write_file_tool, search_code_tool],
+    verbose=True,
+)
+
+tester_agent = Agent(
+    role="QA Engineer",
+    goal="Write comprehensive tests and verify implementation correctness",
+    backstory="You think in edge cases. Every untested branch is a future bug. "
+              "You write tests that document behavior, not just verify it.",
+    tools=[read_file_tool, write_file_tool, run_tests_tool],
+    verbose=True,
+)
+
+reviewer_agent = Agent(
+    role="Senior Code Reviewer",
+    goal="Find bugs, security issues, and design violations in code changes",
+    backstory="You are the last line of defense before code reaches production. "
+              "You have caught three critical security vulnerabilities this quarter.",
+    tools=[read_file_tool, search_code_tool],
+    verbose=True,
+)
+
+# Define tasks
+plan_task = Task(
+    description="Analyze issue '{issue_title}': {issue_body}\n"
+                "Produce a plan with acceptance criteria and files to modify.",
+    expected_output="A structured plan with summary, requirements, and file list.",
+    agent=planner_agent,
+)
+
+implement_task = Task(
+    description="Implement the changes described in the plan. "
+                "Write clean code following existing codebase patterns.",
+    expected_output="Implementation files with a commit message.",
+    agent=developer_agent,
+    context=[plan_task],  # receives planner's output
+)
+
+test_task = Task(
+    description="Write tests for the implementation. Cover happy paths, "
+                "edge cases, and error paths. Run them and report results.",
+    expected_output="Test files and pass/fail results.",
+    agent=tester_agent,
+    context=[plan_task, implement_task],
+)
+
+review_task = Task(
+    description="Review the implementation against the plan. Look for "
+                "correctness bugs, security issues, and missing test coverage.",
+    expected_output="Review with approved/rejected status and specific comments.",
+    agent=reviewer_agent,
+    context=[plan_task, implement_task, test_task],
+)
+
+# Assemble the crew
+crew = Crew(
+    agents=[planner_agent, developer_agent, tester_agent, reviewer_agent],
+    tasks=[plan_task, implement_task, test_task, review_task],
+    process=Process.sequential,
+    verbose=True,
+)
+
+# Run
+result = crew.kickoff(inputs={
+    "issue_title": "Add CSV export to dashboard",
+    "issue_body": "Users need to download experiment results as CSV files.",
+})
+</code></pre>
+<div class="code-caption">CrewAI implementation using role-playing agents with backstories, task dependencies via context, and sequential execution.</div>
+
+<h2>5. Framework Comparison</h2>
+
+<p>
+Each framework makes different trade-offs. The following comparison covers five
+dimensions that matter for production multi-agent systems:
+</p>
+
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>OpenAI Agents SDK</th>
+<th>LangGraph</th>
+<th>AutoGen</th>
+<th>CrewAI</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Coordination model</strong></td>
+<td>Handoffs (decentralized)</td>
+<td>State graph (centralized)</td>
+<td>Conversations (peer-to-peer)</td>
+<td>Task queue (sequential/hierarchical)</td>
+</tr>
+<tr>
+<td><strong>State management</strong></td>
+<td>Implicit (in conversation)</td>
+<td>Typed state dict with reducers</td>
+<td>Conversation history</td>
+<td>Task context chain</td>
+</tr>
+<tr>
+<td><strong>Cyclic workflows</strong></td>
+<td>Via handoff loops</td>
+<td>Conditional edges (first-class)</td>
+<td>Conversation turn limits</td>
+<td>Manual (not built-in)</td>
+</tr>
+<tr>
+<td><strong>Human-in-the-loop</strong></td>
+<td>Guardrails + custom</td>
+<td>Interrupt nodes</td>
+<td>UserProxyAgent (built-in)</td>
+<td>human_input=True flag</td>
+</tr>
+<tr>
+<td><strong>Observability</strong></td>
+<td>Built-in tracing</td>
+<td>LangSmith integration</td>
+<td>Logging + callbacks</td>
+<td>Verbose mode + callbacks</td>
+</tr>
+<tr>
+<td><strong>Best for</strong></td>
+<td>Simple pipelines, OpenAI ecosystem</td>
+<td>Complex stateful workflows</td>
+<td>Flexible conversations, research</td>
+<td>Rapid prototyping, role-based teams</td>
+</tr>
+</tbody>
+</table>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is assuming that splitting a task across more agents always improves output quality. In practice, each agent boundary introduces serialization overhead, potential information loss (the downstream agent only sees the upstream agent's structured output, not its full reasoning), and additional LLM calls that increase cost and latency. For straightforward, single-file changes, a single well-prompted agent with the right tools will outperform a four-agent pipeline that spends most of its token budget on inter-agent coordination rather than on solving the actual problem.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Choose by Workflow Complexity</div>
+<p>
+For a linear pipeline (plan, implement, test, review) with no cycles, any framework
+works and CrewAI or the OpenAI Agents SDK will get you there fastest. For workflows
+with conditional branches, cycles, parallel fan-out, and human gates, LangGraph's
+explicit state graph is the most maintainable choice. For research explorations where
+you want agents to freely debate and the conversation topology may change, AutoGen's
+flexible conversation model is the best fit. The choice is not permanent: most teams
+start with CrewAI for prototyping and migrate to LangGraph when the workflow becomes
+complex enough to need explicit state management and visualization.
+</p>
+</div>
+
+<h2>6. Adding Human Approval</h2>
+
+<p>
+None of the implementations above include the human approval gate from
+<a href="section-17.2.html">Section 17.2</a>. In production, the final step before opening
+a PR must be human review. LangGraph makes this cleanest with its
+<strong>interrupt</strong> mechanism:
+</p>
+
+<pre><code class="language-python">from langgraph.graph import StateGraph, END
+
+async def human_approval_node(state: TeamState) -> dict:
+    """This node is an interrupt point. LangGraph pauses here
+    and waits for external input before continuing."""
+    # in production, this sends a Slack message or email
+    # and resumes when the human responds
+    return {
+        "messages": ["Waiting for human approval..."],
+    }
+
+# add to the graph between review and END
+workflow.add_node("human_approval", human_approval_node)
+
+# modify the conditional edges
+workflow.add_conditional_edges("review", should_continue, {
+    "approved": "human_approval",  # go to human gate, not END
+    "max_iterations": "human_approval",
+    "revise": "implement",
+})
+workflow.add_edge("human_approval", END)
+
+# compile with interrupt_before to pause at the gate
+app = workflow.compile(
+    checkpointer=checkpointer,
+    interrupt_before=["human_approval"],
+)
+
+# the workflow pauses at human_approval; to resume:
+async def approve_and_continue(thread_id: str):
+    config = {"configurable": {"thread_id": thread_id}}
+    # resume from checkpoint, the human_approval node executes
+    result = await app.ainvoke(None, config=config)
+    return result
+</code></pre>
+<div class="code-caption">LangGraph interrupt mechanism: the workflow checkpoints and pauses at the human approval node, resuming only when a human triggers continuation.</div>
+
+<h2>7. Testing Multi-Agent Pipelines</h2>
+
+<p>
+Multi-agent systems are notoriously hard to test because LLM outputs are
+non-deterministic. Three strategies make testing tractable:
+</p>
+
+<p>
+<strong>Mock the LLM.</strong> Replace the LLM with deterministic functions that return
+predefined outputs. This lets you test the workflow logic (routing, state updates,
+gate triggers) without paying for API calls or dealing with stochastic outputs.
+</p>
+
+<pre><code class="language-python">import pytest
+
+class MockLLM:
+    """Deterministic LLM replacement for testing workflow logic."""
+
+    def __init__(self, responses: dict[str, dict]):
+        self.responses = responses  # agent_name -> response dict
+        self.call_log = []
+
+    async def __call__(self, agent_name: str, input_data: dict) -> dict:
+        self.call_log.append({"agent": agent_name, "input": input_data})
+        return self.responses[agent_name]
+
+
+@pytest.fixture
+def mock_team():
+    return MockLLM(responses={
+        "planner": {
+            "summary": "Add CSV export",
+            "requirements": ["Export current view as CSV"],
+            "files_to_modify": [{"path": "app/export.py", "action": "create"}],
+            "branch_name": "feat/csv-export",
+        },
+        "developer": {
+            "files": {"app/export.py": "def export_csv(): ..."},
+            "commit_message": "Add CSV export functionality",
+        },
+        "tester": {
+            "test_files": {"tests/test_export.py": "def test_csv(): ..."},
+            "results": [{"name": "test_csv", "passed": True}],
+            "all_passed": True,
+        },
+        "reviewer": {
+            "approved": True,
+            "blockers": [],
+            "summary": "LGTM",
+        },
+    })
+
+
+@pytest.mark.asyncio
+async def test_happy_path(mock_team):
+    """Test that a successful pipeline produces a PR."""
+    result = await run_pipeline(mock_team, issue={
+        "title": "Add CSV export",
+        "body": "Users need CSV export",
+    })
+    assert result["status"] == "completed"
+    assert result["iterations"] == 1  # no review cycles
+    assert len(mock_team.call_log) == 4  # all four agents called
+
+
+@pytest.mark.asyncio
+async def test_review_rejection_cycle(mock_team):
+    """Test that a review rejection triggers a developer revision."""
+    # first review rejects, second approves
+    mock_team.responses["reviewer"] = {
+        "approved": False,
+        "blockers": [{"message": "Missing input validation"}],
+        "summary": "Needs revision",
+    }
+    # override to approve on second call
+    call_count = {"reviewer": 0}
+    original_call = mock_team.__call__
+
+    async def counting_call(agent_name, input_data):
+        if agent_name == "reviewer":
+            call_count["reviewer"] += 1
+            if call_count["reviewer"] >= 2:
+                return {"approved": True, "blockers": [], "summary": "LGTM"}
+        return await original_call(agent_name, input_data)
+
+    mock_team.__call__ = counting_call
+
+    result = await run_pipeline(mock_team, issue={
+        "title": "Add CSV export",
+        "body": "Users need CSV export",
+    })
+    assert result["iterations"] == 2
+    assert call_count["reviewer"] == 2
+</code></pre>
+<div class="code-caption">Testing multi-agent workflows with mock LLMs: deterministic responses isolate workflow logic from model stochasticity.</div>
+
+<p>
+<strong>Snapshot testing.</strong> Run the pipeline once with a real LLM, save the intermediate
+state at every checkpoint, and use those snapshots as regression tests. If a framework
+upgrade or prompt change alters the workflow routing, the snapshot test catches it.
+</p>
+
+<p>
+<strong>Evaluation suites.</strong> Run the pipeline against a curated set of issues with known
+correct solutions (e.g., a subset of
+<a href="https://arxiv.org/abs/2310.06770" target="_blank">SWE-bench</a>). Measure pass rate,
+number of review iterations, total token cost, and wall-clock time. This is the
+multi-agent analogue of the evaluation techniques in
+<a href="../module-23-evaluating-agents/index.html">Chapter 23</a>.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Tracing with LangSmith and OpenAI</div>
+<p>
+Both LangGraph and the OpenAI Agents SDK provide built-in tracing. LangGraph integrates
+with <a href="https://smith.langchain.com/" target="_blank">LangSmith</a>, which captures every
+node execution, state transition, and LLM call in a visual timeline. The OpenAI Agents
+SDK provides its own tracing via <code>Runner.run()</code> that logs agent handoffs, tool
+calls, and guardrail evaluations. In either case, you get a complete audit trail of a
+multi-agent workflow in about 2 lines of configuration (compared to the 50+ lines of
+manual logging in our <code>Blackboard.record_step()</code> from Section 17.2):
+</p>
+<pre><code class="language-python"># LangSmith: set env vars and tracing is automatic
+import os
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = "ls_..."
+
+# OpenAI Agents SDK: tracing is on by default
+from agents import Runner, trace
+with trace("issue-to-pr"):
+    result = await Runner.run(planner, input=issue_json)
+</code></pre>
+<div class="code-caption">Two lines of configuration enable full workflow tracing in LangSmith or the OpenAI Agents SDK (compared to 50+ lines of manual logging).</div>
+</div>
+
+<h2>8. Integration with the Discovery Workbench</h2>
+
+<p>
+The multi-agent team pipeline becomes a component in the
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Discovery Workbench</a>
+architecture from Chapter 6. The Workbench exposes the pipeline as an
+<a href="../module-12-mcp-servers/index.html">MCP tool</a> that scientific users can invoke
+without understanding the multi-agent internals:
+</p>
+
+<pre><code class="language-python">from mcp.server import Server
+from mcp.types import Tool
+
+server = Server("software-team")
+
+@server.tool()
+async def resolve_issue(
+    repo_owner: str,
+    repo_name: str,
+    issue_number: int,
+    base_branch: str = "main",
+    max_review_rounds: int = 3,
+) -> dict:
+    """Resolve a GitHub issue by planning, implementing, testing,
+    and reviewing code changes. Returns a PR URL.
+
+    The multi-agent team handles the full software development lifecycle.
+    A human approval gate fires before the PR is created.
+    """
+    # fetch issue from GitHub
+    issue = await github.get_issue(repo_owner, repo_name, issue_number)
+
+    # run the pipeline
+    result = await run_langgraph_pipeline(IssueInput(
+        title=issue["title"],
+        body=issue["body"],
+        labels=issue.get("labels", []),
+        repo_owner=repo_owner,
+        repo_name=repo_name,
+        base_branch=base_branch,
+    ))
+
+    return {
+        "pr_url": result.get("pr_url"),
+        "iterations": result.get("iteration", 0),
+        "status": "awaiting_approval" if not result.get("pr_url") else "created",
+    }
+</code></pre>
+<div class="code-caption">Exposing the multi-agent team as an MCP tool in the Discovery Workbench, letting scientific users invoke it without understanding the agent internals.</div>
+
+<p>
+This pattern of wrapping multi-agent workflows as MCP tools is how the Discovery
+Workbench grows: each chapter adds a new capability (literature search in
+<a href="../../part-4-knowledge/module-36-literature-mining/index.html">Chapter 36</a>,
+experiment design in
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>),
+and the Workbench integrates them all behind a uniform interface. By
+<a href="../../part-7-autonomous-discovery/module-53-ai-scientists/index.html">Chapter 53</a>,
+the Workbench orchestrates multi-agent teams that build software, run experiments,
+and write papers.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Benchmarking Multi-Agent Teams</div>
+<p>
+SWE-bench (Jimenez et al., 2024) remains a foundational benchmark for AI software
+engineering, and SWE-bench Verified (Chowdhury et al., 2024) refined it with
+human-validated problem instances. More recently, CodeArena (Yang et al., 2025) introduced
+a competitive multi-agent benchmark where teams of agents collaborate on repository-level
+tasks with shared codebases, measuring not just correctness but coordination efficiency:
+how many tokens agents waste on redundant file reads, conflicting edits, and failed
+handoffs. Early CodeArena results show that teams using explicit state graphs (the
+LangGraph pattern) waste 30-40% fewer coordination tokens than teams using free-form
+conversation, confirming that structured workflows reduce overhead at scale. The frontier
+question is whether learned coordination protocols, where agents adapt their communication
+patterns based on task difficulty, can close the gap between structured and unstructured
+approaches without requiring hand-designed workflow graphs.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Two-Agent Review Pipeline</h4>
+<p>
+You can build a minimal multi-agent pipeline on your laptop using only Python and an LLM
+API key. This project takes about 30 minutes and produces a working writer-reviewer loop.
+</p>
+<p>
+1. Install dependencies: <code>pip install openai pydantic</code>. Create a file called
+<code>mini_pipeline.py</code> and define two Pydantic models: <code>DraftOutput</code> (with
+fields <code>code: str</code> and <code>explanation: str</code>) and <code>ReviewOutput</code> (with
+fields <code>approved: bool</code>, <code>feedback: str</code>).
+</p>
+<p>
+2. Write a <code>call_agent(system_prompt, user_message, output_model)</code> function that
+sends a chat completion request with <code>response_format</code> set to your Pydantic model,
+parses the JSON response, and returns the validated object.
+</p>
+<p>
+3. Implement a <code>writer_agent(task_description, feedback=None)</code> function that calls
+<code>call_agent</code> with a system prompt like "You are a Python developer. Write a
+function that satisfies the task. If feedback is provided, revise accordingly." Pass the
+task description (and any prior feedback) as the user message.
+</p>
+<p>
+4. Implement a <code>reviewer_agent(code, task_description)</code> function that calls
+<code>call_agent</code> with a system prompt like "You are a code reviewer. Check whether the
+code correctly implements the task. Set approved to true only if the code is correct and
+handles edge cases."
+</p>
+<p>
+5. Write a <code>run_pipeline(task, max_rounds=3)</code> loop: call the writer, then the
+reviewer. If approved, print the final code and exit. If not, pass the reviewer's feedback
+back to the writer and repeat. After max_rounds, print a warning. Run it with a simple
+task like "Write a function that checks whether a string is a valid email address" and
+observe how the reviewer's feedback improves the code across iterations.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual</strong>: You are tasked with adding a "documentation writer" agent to the
+team. Where should this agent appear in the workflow graph? What is its input schema
+(which agents' outputs does it read)? What is its output schema? Should it run in
+parallel with any existing agent, or must it be sequential? Justify your design with
+reference to the role design principles from Section 17.1.
+</li>
+<li>
+<strong>Coding</strong>: Implement the full issue-to-PR pipeline using one framework of your
+choice (OpenAI Agents SDK, LangGraph, AutoGen, or CrewAI). Use mock LLMs for testing.
+The pipeline should support at least two review iterations and include a human approval
+gate. Write three tests: happy path (approved on first review), one revision cycle
+(rejected then approved), and budget exceeded (max iterations reached). Bonus: add
+observability by logging every agent call with its token count and wall-clock time.
+</li>
+<li>
+<strong>Analysis</strong>: Run the same GitHub issue through a single-agent pipeline (one agent
+handles plan, implement, test, review) and a four-agent pipeline. Compare the output
+quality (correctness, test coverage, code style), token cost, and wall-clock time.
+Does the multi-agent version produce a better PR? At what issue complexity does the
+multi-agent advantage appear? Document your methodology and results; this is the kind
+of empirical evaluation you will formalize in
+<a href="../module-23-evaluating-agents/index.html">Chapter 23</a>.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+The multi-agent software team you built in this chapter is a general-purpose pattern.
+<a href="../module-18-ai-testing/index.html">Chapter 18: AI Assisted Testing and QA</a>
+takes the tester role from our pipeline and expands it into a full testing framework:
+property-based testing, mutation testing, test generation from specifications, and the
+feedback loop between test failures and code repair. The tester was one node in our
+workflow graph; Chapter 18 gives it the depth it deserves.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-17.2.html">&#8592; 17.2 Coordination and Human Gates</a>
+<a href="index.html">Chapter 17</a>
+<a href="../module-18-ai-testing/index.html">Chapter 18: AI Assisted Testing &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

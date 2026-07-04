@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 48.3: Single-Cell Genomics. scVI for data integration, scANVI for cell annotation, scGPT and Geneformer foundation models, perturbation prediction, and gene regulatory inference." name="description"/>
+<title>Section 48.3: Single-Cell Genomics | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Discovery in Scientific Domains</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 48: Discovery AI For Biology And Medicine</a></div>
+<h1>48.3 Single-Cell Genomics</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I embedded three million cells into a latent space and discovered seventeen new cell types. The biologists discovered that twelve of them were artifacts of batch effects. We are making progress."</p>
+<cite>A Variational Autoencoder With Cellular Ambitions</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Single-cell RNA sequencing (scRNA-seq) measures gene expression in individual cells,
+revealing the heterogeneity hidden by bulk measurements. A single tumor biopsy
+might contain dozens of distinct cell populations, each with different gene
+expression programs, drug sensitivities, and clinical implications. The challenge:
+scRNA-seq datasets contain millions of cells, thousands of genes per cell, severe
+technical noise (dropout, batch effects), and no ground-truth cell labels. Deep
+generative models, especially variational autoencoders, have become the standard
+computational framework for analyzing this data. This section covers the progression
+from task-specific models (scVI, scANVI) to foundation models (scGPT, Geneformer)
+that learn transferable representations of cellular biology.
+</p>
+</div>
+
+<h2>1. The Single-Cell Data Landscape</h2>
+
+<p>
+A single-cell RNA-seq experiment produces a <strong>count matrix</strong>
+$\mathbf{X} \in \mathbb{N}^{N \times G}$, where $N$ is the number of cells
+(thousands to millions) and $G$ is the number of genes (typically 20,000 to 30,000).
+Entry $x_{ng}$ represents the number of mRNA transcripts detected for gene $g$ in
+cell $n$. This matrix has three defining properties:
+</p>
+
+<p data-agent="02">
+The count matrix is the foundational data structure of single-cell genomics: a table where each row is one cell and each column is one gene, with each entry recording how many messenger RNA molecules of that gene were captured from that cell. It matters because, unlike bulk RNA-seq (which averages gene expression across millions of cells and masks cell-to-cell differences), the count matrix preserves individual cell identity, enabling researchers to discover rare cell types, trace developmental trajectories, and identify cells responding differently to a drug. The underlying mechanism is straightforward: cells are isolated (via droplet microfluidics or well plates), their mRNA is reverse-transcribed to cDNA, amplified, and sequenced, with molecular barcodes linking each read back to its cell of origin. Use scRNA-seq count matrices when biological heterogeneity within a sample is the question; use bulk RNA-seq when the goal is simply to compare average expression between conditions and the sample is homogeneous.
+</p>
+
+<ul>
+<li><strong>Sparsity</strong>: 80 to 95% of entries are zero, partly because of biological absence (the gene is not expressed) and partly because of technical dropout (the transcript was present but not captured).</li>
+<li><strong>Overdispersion</strong>: the variance of gene counts exceeds the mean, making Poisson models inadequate. The negative binomial distribution is the standard choice.</li>
+<li><strong>Batch effects</strong>: systematic differences between experiments (different labs, sequencing platforms, sample preparation protocols) can be larger than biological differences between cell types.</li>
+</ul>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that a zero in the count matrix means the gene is biologically inactive in that cell. In reality, the majority of zeros are <strong>technical dropouts</strong>: the gene was expressed, but its mRNA molecules were lost during cell lysis, reverse transcription, or amplification. Treating all zeros as true biological absence leads to spurious conclusions about gene co-expression and cell-type identity. This is precisely why models like scVI use a zero-inflated or dropout-aware likelihood rather than taking the observed counts at face value.
+</p>
+</div>
+
+<p>
+The standard data structure in the Python single-cell ecosystem is the
+<code>AnnData</code> object, which wraps the count matrix with cell-level
+metadata (observations) and gene-level metadata (variables):
+</p>
+
+<pre><code class="language-python">import scanpy as sc
+import anndata as ad
+import numpy as np
+
+def load_and_preprocess(h5ad_path: str) -> ad.AnnData:
+    """Load and preprocess a single-cell dataset.
+
+    Standard preprocessing pipeline:
+    1. Filter low-quality cells and rarely-detected genes
+    2. Normalize library sizes
+    3. Log-transform
+    4. Select highly variable genes
+    5. Scale to unit variance
+
+    The raw counts are preserved in adata.raw for downstream
+    models (scVI) that need untransformed data.
+    """
+    adata = sc.read_h5ad(h5ad_path)
+    print(f"Loaded: {adata.n_obs} cells, {adata.n_vars} genes")
+
+    # Quality control: filter cells and genes
+    sc.pp.filter_cells(adata, min_genes=200)
+    sc.pp.filter_genes(adata, min_cells=3)
+
+    # Compute QC metrics
+    adata.var["mt"] = adata.var_names.str.startswith("MT-")
+    sc.pp.calculate_qc_metrics(
+        adata, qc_vars=["mt"], percent_top=None, inplace=True
+    )
+
+    # Filter high-mitochondrial cells (likely dying/damaged)
+    adata = adata[adata.obs["pct_counts_mt"] < 20].copy()
+
+    # Preserve raw counts for scVI (needs untransformed data)
+    adata.raw = adata.copy()
+
+    # Normalize and log-transform for visualization
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+    # Select highly variable genes
+    sc.pp.highly_variable_genes(
+        adata, n_top_genes=2000, flavor="seurat_v3",
+        layer="counts" if "counts" in adata.layers else None,
+    )
+
+    print(f"After filtering: {adata.n_obs} cells, "
+          f"{sum(adata.var['highly_variable'])} HVGs")
+    return adata</code></pre>
+<div class="code-caption">Listing 48.13: Standard single-cell preprocessing with Scanpy. The pipeline filters low-quality cells (few detected genes, high mitochondrial content), normalizes library sizes, and selects the 2,000 most variable genes. Raw counts are preserved for models like scVI that require untransformed input.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+The central challenge in single-cell analysis is disentangling biological signal
+from technical noise. Two cells from the same tissue processed in different labs
+can look more different than two cells from different tissues processed together.
+Batch correction is not a preprocessing step that can be separated from the
+analysis; it must be integrated into the statistical model. This is why generative
+models (scVI) outperform ad hoc correction methods: they model the data-generating
+process, including the batch-specific components, jointly.
+</p>
+</div>
+
+<h2>2. scVI: Variational Inference for Single-Cell Data</h2>
+
+<p>
+scVI (single-cell Variational Inference) is a deep generative model that learns a
+low-dimensional latent representation of cells while accounting for library size
+variation and batch effects. The generative model assumes each cell $n$ in batch
+$s_n$ has a latent representation $\mathbf{z}_n \in \mathbb{R}^d$ (typically
+$d = 10$) and a library size factor $\ell_n$:
+</p>
+
+$$\mathbf{z}_n \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$$
+$$\ell_n \sim \text{LogNormal}(\ell_\mu, \ell_\sigma^2)$$
+
+<p>
+The expression of gene $g$ in cell $n$ follows a negative binomial distribution
+parameterized by a neural network decoder:
+</p>
+
+$$x_{ng} \sim \text{NB}\bigl(\mu_{ng},\; \theta_g\bigr)$$
+
+<p>
+where $\mu_{ng} = \ell_n \cdot f_\theta(\mathbf{z}_n, s_n)_g$ is the expected
+expression (a function of the latent code and batch identity), and $\theta_g$ is
+a gene-specific dispersion parameter. The negative binomial accommodates the
+overdispersion in count data that a Poisson model cannot capture. The model is
+trained by maximizing the evidence lower bound (ELBO), connecting to the variational
+inference framework from
+<a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32</a>:
+</p>
+
+$$\text{ELBO} = \mathbb{E}_{q(\mathbf{z}_n | \mathbf{x}_n)}\bigl[\log p(\mathbf{x}_n | \mathbf{z}_n, s_n, \ell_n)\bigr] - \text{KL}\bigl(q(\mathbf{z}_n | \mathbf{x}_n) \| p(\mathbf{z}_n)\bigr)$$
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of scVI's latent space like a seating chart at a wedding with guests from two families (batches). Each guest (cell) has a personality profile (gene expression), but their behavior is also shaped by which family's table they sit at (batch effects): the loud family talks more, the quiet family less. scVI learns to separate personality from table assignment. The encoder strips away the table effect to find each guest's true personality (latent code), and the decoder can reconstruct how any guest would behave at any table. The ELBO training objective ensures the personality descriptions are compact (the KL term, like a word limit on the seating card) while still faithfully predicting behavior (the reconstruction term, like checking the card against actual conversations). The result is a personality map where similar people sit near each other regardless of which family they arrived with.
+</p>
+</div>
+
+<pre><code class="language-python">import scvi
+import anndata as ad
+
+def train_scvi(
+    adata: ad.AnnData,
+    batch_key: str = "batch",
+    n_latent: int = 10,
+    n_layers: int = 2,
+    n_hidden: int = 128,
+    max_epochs: int = 200,
+) -> scvi.model.SCVI:
+    """Train scVI for batch-corrected latent representation.
+
+    The model learns a low-dimensional embedding that captures
+    biological variation while removing batch-specific effects.
+
+    Args:
+        adata: AnnData with raw counts in adata.X or adata.layers["counts"]
+        batch_key: column in adata.obs identifying batches
+        n_latent: dimensionality of the latent space
+        n_layers: number of hidden layers in encoder/decoder
+        n_hidden: hidden layer width
+
+    Returns: trained scVI model
+    """
+    # Register the AnnData object with scVI
+    scvi.model.SCVI.setup_anndata(
+        adata,
+        layer="counts" if "counts" in adata.layers else None,
+        batch_key=batch_key,
+    )
+
+    # Create and train the model
+    model = scvi.model.SCVI(
+        adata,
+        n_latent=n_latent,
+        n_layers=n_layers,
+        n_hidden=n_hidden,
+        gene_likelihood="nb",  # Negative binomial
+    )
+
+    model.train(
+        max_epochs=max_epochs,
+        early_stopping=True,
+        early_stopping_patience=10,
+    )
+
+    return model
+
+
+def get_latent_representation(model: scvi.model.SCVI, adata: ad.AnnData):
+    """Extract batch-corrected latent representation.
+
+    The latent space captures biological variation with batch
+    effects removed. Use for clustering, visualization, and
+    differential expression.
+    """
+    # Get latent representation (batch-corrected)
+    latent = model.get_latent_representation()
+    adata.obsm["X_scVI"] = latent
+
+    # Compute neighbors and UMAP in the scVI latent space
+    import scanpy as sc
+    sc.pp.neighbors(adata, use_rep="X_scVI")
+    sc.tl.umap(adata)
+    sc.tl.leiden(adata, resolution=0.8)
+
+    return adata
+
+
+def differential_expression(
+    model: scvi.model.SCVI,
+    adata: ad.AnnData,
+    group1: str,
+    group2: str,
+    groupby: str = "leiden",
+) -> "pd.DataFrame":
+    """Bayesian differential expression between cell groups.
+
+    scVI's DE test uses the generative model to compute
+    posterior log-fold changes and Bayes factors, avoiding
+    the distributional assumptions of t-tests or Wilcoxon tests.
+    """
+    de_results = model.differential_expression(
+        adata,
+        groupby=groupby,
+        group1=group1,
+        group2=group2,
+    )
+
+    # Filter significant genes
+    significant = de_results[
+        (de_results["is_de_fdr_0.05"]) &
+        (abs(de_results["lfc_mean"]) > 0.5)
+    ]
+
+    return significant.sort_values("lfc_mean", ascending=False)</code></pre>
+<div class="code-caption">Listing 48.14: scVI for single-cell data integration, latent space computation, and differential expression. The model handles batch correction internally through its generative model, producing a latent space where cells cluster by biology rather than by batch.</div>
+
+<h2>3. scANVI: Semi-Supervised Cell Annotation</h2>
+
+<p>
+scANVI extends scVI with a semi-supervised classification layer. Given a dataset
+where some cells have known type labels and others do not, scANVI simultaneously
+learns the latent representation and transfers labels to unlabeled cells. The
+generative model adds a discrete cell-type variable $c_n$:
+</p>
+
+$$p(\mathbf{x}_n | \mathbf{z}_n, c_n, s_n, \ell_n) = \text{NB}\bigl(\ell_n \cdot f_\theta(\mathbf{z}_n, c_n, s_n),\; \theta\bigr)$$
+
+<p>
+For labeled cells, $c_n$ is observed; for unlabeled cells, it is treated as a latent
+variable and marginalized. The classifier $q_\phi(c_n | \mathbf{z}_n)$ learns to
+predict cell types from the latent representation, enabling label transfer across
+datasets, batches, and even species.
+</p>
+
+<pre><code class="language-python">def train_scanvi(
+    adata: ad.AnnData,
+    labels_key: str = "cell_type",
+    unlabeled_category: str = "Unknown",
+    batch_key: str = "batch",
+    n_latent: int = 10,
+) -> scvi.model.SCANVI:
+    """Train scANVI for semi-supervised cell type annotation.
+
+    Uses labeled cells to learn a classifier that transfers
+    annotations to unlabeled cells, even across batches.
+    """
+    # First train scVI as initialization
+    scvi.model.SCVI.setup_anndata(
+        adata, batch_key=batch_key,
+        layer="counts" if "counts" in adata.layers else None,
+    )
+    scvi_model = scvi.model.SCVI(adata, n_latent=n_latent)
+    scvi_model.train(max_epochs=100, early_stopping=True)
+
+    # Initialize scANVI from pretrained scVI
+    scanvi_model = scvi.model.SCANVI.from_scvi_model(
+        scvi_model,
+        adata=adata,
+        labels_key=labels_key,
+        unlabeled_category=unlabeled_category,
+    )
+
+    scanvi_model.train(max_epochs=50, early_stopping=True)
+
+    # Predict labels for unlabeled cells
+    predictions = scanvi_model.predict()
+    adata.obs["predicted_cell_type"] = predictions
+
+    return scanvi_model</code></pre>
+<div class="code-caption">Listing 48.15: scANVI for semi-supervised cell annotation. The model initializes from a pretrained scVI model, then fine-tunes with label information. Unlabeled cells receive predicted annotations with associated confidence scores.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Human Cell Atlas</div>
+<p>
+The Human Cell Atlas project aims to create a comprehensive reference map of all
+human cell types. As of 2025, it has profiled over 60 million cells across 30 organs.
+scVI and scANVI are core tools in the project's computational pipeline: scVI
+integrates data from hundreds of labs with different protocols, and scANVI
+transfers cell-type annotations from well-characterized reference datasets to
+new samples. A query dataset of 100,000 cells from a patient biopsy can be mapped
+onto the atlas in minutes, automatically identifying every cell type present
+and flagging cells with unusual expression profiles as potential disease-associated
+states.
+</p>
+</div>
+
+<h2>4. scGPT: A Foundation Model for Single-Cell Biology</h2>
+
+<p>
+scGPT applies the transformer pretraining paradigm to single-cell transcriptomics.
+The model treats each cell's gene expression profile as a "sentence" where genes are
+"tokens" and expression levels are "values." Pretraining uses a masked gene expression
+prediction objective: given a subset of a cell's gene expression values, predict the
+masked genes.
+</p>
+
+<p>
+The input representation has three components per gene:
+</p>
+
+<ul>
+<li><strong>Gene token embedding</strong>: a learned vector for each gene identity.</li>
+<li><strong>Expression value embedding</strong>: the log-normalized expression value, binned into discrete levels and embedded.</li>
+<li><strong>Condition embedding</strong>: optional metadata (batch, perturbation, cell type) encoded as additional tokens.</li>
+</ul>
+
+<p>
+The model is pretrained on 33 million cells from the CELLxGENE database, learning
+representations that transfer to downstream tasks:
+</p>
+
+<pre><code class="language-python">import scgpt
+from scgpt.model import TransformerModel
+from scgpt.tokenizer import GeneVocab
+from scgpt.utils import set_seed
+import torch
+
+def finetune_scgpt_for_annotation(
+    adata_train: "ad.AnnData",
+    adata_test: "ad.AnnData",
+    pretrained_model_dir: str,
+    cell_type_key: str = "cell_type",
+    max_epochs: int = 30,
+    batch_size: int = 64,
+    learning_rate: float = 1e-4,
+) -> dict:
+    """Fine-tune scGPT for cell type annotation.
+
+    Uses a pretrained scGPT model and fine-tunes the
+    classification head on a labeled training set.
+
+    The pretrained model captures general cellular biology;
+    fine-tuning adapts it to a specific tissue or disease context.
+    """
+    set_seed(42)
+
+    # Load pretrained model and vocabulary
+    vocab = GeneVocab.from_file(f"{pretrained_model_dir}/vocab.json")
+    model_config = scgpt.load_config(f"{pretrained_model_dir}/config.json")
+
+    model = TransformerModel(
+        ntoken=len(vocab),
+        d_model=model_config["embsize"],
+        nhead=model_config["nheads"],
+        d_hid=model_config["d_hid"],
+        nlayers=model_config["nlayers"],
+        nlayers_cls=3,  # Classification head layers
+        n_cls=len(adata_train.obs[cell_type_key].unique()),
+        vocab=vocab,
+    )
+
+    # Load pretrained weights
+    model.load_pretrained(f"{pretrained_model_dir}/best_model.pt")
+    model = model.cuda()
+
+    # Prepare data loaders
+    from scgpt.data import prepare_dataloader
+    train_loader = prepare_dataloader(
+        adata_train, vocab, batch_size=batch_size,
+        cell_type_key=cell_type_key, shuffle=True,
+    )
+    test_loader = prepare_dataloader(
+        adata_test, vocab, batch_size=batch_size,
+        cell_type_key=cell_type_key, shuffle=False,
+    )
+
+    # Fine-tune with classification loss
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    best_accuracy = 0.0
+    for epoch in range(max_epochs):
+        model.train()
+        total_loss = 0.0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            output = model(batch["gene_ids"].cuda(), batch["values"].cuda())
+            loss = criterion(output["cls_output"], batch["labels"].cuda())
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        # Evaluate
+        model.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for batch in test_loader:
+                output = model(batch["gene_ids"].cuda(), batch["values"].cuda())
+                preds = output["cls_output"].argmax(dim=1)
+                correct += (preds == batch["labels"].cuda()).sum().item()
+                total += len(preds)
+
+        accuracy = correct / total
+        best_accuracy = max(best_accuracy, accuracy)
+
+    return {"best_accuracy": best_accuracy, "model": model}</code></pre>
+<div class="code-caption">Listing 48.16: Fine-tuning scGPT for cell type annotation. The pretrained model's gene expression representations transfer effectively to downstream classification, typically achieving 85 to 95% accuracy with only hundreds of labeled cells per type.</div>
+
+<h2>5. Geneformer: Transfer Learning for Network Biology</h2>
+
+<p>
+Geneformer takes a different approach to single-cell foundation modeling. Instead of
+treating expression values as continuous quantities, it <strong>rank-orders</strong>
+genes within each cell by expression level and processes this ranked list as a sequence
+of gene tokens. This rank-based representation is inherently normalized (immune to
+library size variation) and captures the relative importance of genes within a cell's
+regulatory program.
+</p>
+
+<p>
+The model uses a standard transformer encoder pretrained with masked token prediction
+on 30 million single-cell transcriptomes from the Genecorpus-30M dataset. The key
+applications are:
+</p>
+
+<ul>
+<li><strong>Gene dosage sensitivity prediction</strong>: which genes, when their expression is halved (haploinsufficiency), cause disease? Geneformer predicts this by measuring how much the model's attention patterns change when a gene is removed.</li>
+<li><strong>In silico perturbation</strong>: predict the effect of knocking out or overexpressing a gene by modifying the input token sequence and observing changes in the model's output embedding.</li>
+<li><strong>Chromatin dynamics</strong>: predict how gene regulatory states change during cell differentiation.</li>
+</ul>
+
+<pre><code class="language-python">from geneformer import InSilicoPerturber, EmbExtractor
+from geneformer import TranscriptomeTokenizer
+
+def run_in_silico_perturbation(
+    model_dir: str,
+    tokenized_dataset_path: str,
+    genes_to_perturb: list[str],
+    cell_type_col: str = "cell_type",
+) -> dict:
+    """Predict the effect of gene perturbations using Geneformer.
+
+    Simulates gene knockouts by removing genes from the ranked
+    expression list and measuring the shift in cell embeddings.
+
+    A large embedding shift indicates the gene is important for
+    maintaining the cell's identity/state.
+    """
+    # Extract baseline embeddings
+    extractor = EmbExtractor(
+        model_type="Pretrained",
+        num_classes=0,
+        emb_mode="cell",
+        filter_data={cell_type_col: ["T cell", "B cell", "Monocyte"]},
+        max_ncells=10000,
+        emb_layer=-1,
+    )
+
+    baseline_embs = extractor.extract_embs(
+        model_dir, tokenized_dataset_path, output_dir="./embeddings"
+    )
+
+    # Run in silico perturbation
+    perturber = InSilicoPerturber(
+        perturb_type="delete",  # Simulate knockout
+        perturb_rank_shift=None,
+        genes_to_perturb=genes_to_perturb,
+        model_type="Pretrained",
+        num_classes=0,
+        emb_mode="cell",
+        cell_states_to_model={
+            cell_type_col: {
+                "start": "T cell",
+                "goal": "B cell",
+                "alt": "Monocyte",
+            }
+        },
+    )
+
+    perturber.perturb_data(
+        model_dir, tokenized_dataset_path, output_dir="./perturbations"
+    )
+
+    return {"status": "complete", "output_dir": "./perturbations"}</code></pre>
+<div class="code-caption">Listing 48.17: In silico perturbation with Geneformer. The model predicts the effect of gene knockouts by removing target genes from the ranked expression input and measuring the resulting shift in cell state embeddings. Genes causing large shifts are predicted to be functionally important.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Scanpy for Standard Analysis</div>
+<p>
+For standard single-cell workflows (clustering, marker gene detection,
+trajectory analysis) without deep learning, Scanpy provides a complete pipeline
+in approximately 10 lines:
+</p>
+<pre><code class="language-python">import scanpy as sc
+
+adata = sc.read_h5ad("pbmc_10k.h5ad")
+sc.pp.normalize_total(adata)
+sc.pp.log1p(adata)
+sc.pp.highly_variable_genes(adata, n_top_genes=2000)
+sc.pp.pca(adata)
+sc.pp.neighbors(adata)
+sc.tl.umap(adata)
+sc.tl.leiden(adata, resolution=0.5)
+sc.tl.rank_genes_groups(adata, "leiden", method="wilcoxon")
+sc.pl.rank_genes_groups(adata, n_genes=10, save="markers.pdf")
+</code></pre>
+<p>
+This covers preprocessing, dimensionality reduction, clustering, and marker gene
+identification in 10 lines instead of the hundreds required to implement PCA,
+k-nearest-neighbors graph construction, UMAP, Leiden clustering, and Wilcoxon
+rank-sum tests from scratch. Use Scanpy for exploration; reach for scVI/scGPT
+when batch integration or perturbation modeling is needed.
+</p>
+</div>
+
+<h2>6. Perturbation Prediction and Gene Regulatory Networks</h2>
+
+<p>
+The most exciting application of single-cell foundation models is predicting the
+outcome of genetic perturbations before performing them. Perturb-seq experiments
+combine CRISPR gene knockouts with single-cell sequencing, measuring how each
+knockout changes the expression of all other genes. This produces a perturbation
+response matrix that captures causal regulatory relationships.
+</p>
+
+<p>
+Foundation models trained on large Perturb-seq datasets can predict perturbation
+responses for unseen gene knockouts. The prediction problem: given a cell in state
+$\mathbf{x}$ and a perturbation to gene $g$, predict the post-perturbation
+expression state $\mathbf{x}'$. This connects to the causal inference framework
+from <a href="../../part-3-data-models/module-31-causal-discovery/index.html">Chapter 31</a>:
+each perturbation is an intervention, and the response reveals causal structure
+in the gene regulatory network.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.stats import pearsonr
+
+def evaluate_perturbation_prediction(
+    predicted: np.ndarray,
+    observed: np.ndarray,
+    control: np.ndarray,
+    top_k: int = 50,
+) -> dict:
+    """Evaluate perturbation prediction quality.
+
+    Metrics:
+    - Pearson correlation on differentially expressed genes
+    - Mean squared error on top-k affected genes
+    - Direction accuracy (fraction of genes with correctly
+      predicted up/down regulation)
+
+    Args:
+        predicted: predicted post-perturbation expression (n_genes,)
+        observed: actual post-perturbation expression (n_genes,)
+        control: unperturbed control expression (n_genes,)
+    """
+    # Compute fold changes
+    pred_fc = predicted - control
+    obs_fc = observed - control
+
+    # Identify top-k most affected genes (by observed fold change)
+    top_indices = np.argsort(np.abs(obs_fc))[-top_k:]
+
+    # Pearson correlation on top-k genes
+    r, p_value = pearsonr(pred_fc[top_indices], obs_fc[top_indices])
+
+    # Mean squared error on top-k
+    mse = np.mean((pred_fc[top_indices] - obs_fc[top_indices]) ** 2)
+
+    # Direction accuracy
+    pred_direction = np.sign(pred_fc[top_indices])
+    obs_direction = np.sign(obs_fc[top_indices])
+    direction_acc = np.mean(pred_direction == obs_direction)
+
+    return {
+        "pearson_r": float(r),
+        "pearson_p": float(p_value),
+        "mse_top_k": float(mse),
+        "direction_accuracy": float(direction_acc),
+    }</code></pre>
+<div class="code-caption">Listing 48.18: Evaluating perturbation prediction quality. The key metric is Pearson correlation on the most affected genes (top-k by observed fold change), which measures whether the model correctly identifies which genes respond most strongly and in which direction.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+In 2024, the Universal Cell Embeddings (UCE) framework (Rosen et al., "Universal Cell Embeddings: A Foundation Model for Cell Biology," Nature Methods, 2024) demonstrated that a single pre-trained model can embed cells from any organism and any sequencing technology into a shared latent space without requiring gene-name alignment or species-specific fine-tuning. UCE uses protein-sequence-derived gene representations (rather than arbitrary gene IDs) as input tokens, enabling zero-shot transfer across species. On cross-species benchmarks, UCE matched or exceeded task-specific models at cell type classification, batch integration, and perturbation response prediction, all without seeing the target species during training. This points toward a truly universal cell atlas where human, mouse, zebrafish, and plant cells inhabit one coordinate system, a capability none of the models covered in this section yet achieve.
+</p>
+</div>
+
+<div class="callout connection">
+<div class="callout-title">Connection: Foundation Models and Representation Learning</div>
+<p>
+scGPT and Geneformer are domain-specific instantiations of the foundation model
+paradigm from <a href="../../part-3-data-models/module-27-foundation-models/index.html">Chapter 27</a>.
+The pretraining strategy (masked prediction on unlabeled data) is identical to
+BERT for text and MAE for images. The domain-specific contributions are the
+tokenization (gene identities and expression values as tokens), the architectural
+adaptations (handling variable-length gene lists, incorporating metadata), and
+the downstream tasks (cell annotation, perturbation prediction). The representation
+learning perspective from
+<a href="../../part-3-data-models/module-26-representation-learning/index.html">Chapter 26</a>
+frames these models as learning a cell embedding space where biological similarity
+is captured by geometric proximity.
+</p>
+</div>
+
+<h2>7. Discovery Workbench Integration</h2>
+
+<p>
+The Discovery Workbench gains a <code>SingleCellAnalyzer</code> component that
+wraps scVI for data integration, scANVI for annotation, and the perturbation
+prediction pipeline. Users provide AnnData objects from multiple experiments, and
+the component produces batch-corrected embeddings, cell-type annotations, and
+differential expression results, with all parameters and results logged to the
+experiment registry.
+</p>
+
+<pre><code class="language-python">from discovery_workbench import Analyzer, ExperimentRegistry
+
+class SingleCellAnalyzer(Analyzer):
+    """Single-cell analysis pipeline for the Discovery Workbench."""
+
+    def integrate_and_annotate(
+        self,
+        datasets: list["ad.AnnData"],
+        reference_labels: str = "cell_type",
+        batch_key: str = "dataset",
+    ) -> "ad.AnnData":
+        """Integrate multiple datasets with batch correction and annotation.
+
+        Pipeline: concatenate -> scVI integration -> scANVI annotation
+        """
+        import anndata as ad
+
+        # Concatenate datasets with batch labels
+        combined = ad.concat(datasets, label=batch_key)
+        self.registry.log("input", {
+            "n_datasets": len(datasets),
+            "total_cells": combined.n_obs,
+        })
+
+        # Train scVI for integration
+        scvi_model = train_scvi(combined, batch_key=batch_key)
+        combined = get_latent_representation(scvi_model, combined)
+
+        # Train scANVI for annotation transfer
+        scanvi_model = train_scanvi(
+            combined, labels_key=reference_labels, batch_key=batch_key
+        )
+
+        self.registry.log("integration", {
+            "n_clusters": len(combined.obs["leiden"].unique()),
+            "annotation_accuracy": scanvi_model.history["accuracy"][-1],
+        })
+
+        return combined</code></pre>
+<div class="code-caption">Listing 48.19: Discovery Workbench single-cell analyzer orchestrating multi-dataset integration with scVI and automated cell annotation with scANVI.</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Cluster and Annotate PBMC Cells with Scanpy</h4>
+<p>
+Build a complete single-cell analysis pipeline on your laptop using a publicly available peripheral blood mononuclear cell (PBMC) dataset. No GPU required.
+</p>
+<p>
+<strong>Step 1.</strong> Install dependencies: <code>pip install scanpy leidenalg</code>. Then download the 3k PBMC dataset from 10x Genomics: <code>import scanpy as sc; adata = sc.datasets.pbmc3k()</code>. This loads a 2,700-cell dataset with raw counts for ~13,000 genes.
+</p>
+<p>
+<strong>Step 2.</strong> Preprocess the data: filter cells with fewer than 200 detected genes, filter genes detected in fewer than 3 cells, normalize each cell to 10,000 total counts, log-transform, and select the top 2,000 highly variable genes with <code>sc.pp.highly_variable_genes(adata, n_top_genes=2000)</code>.
+</p>
+<p>
+<strong>Step 3.</strong> Reduce dimensions and cluster: run PCA (<code>sc.pp.pca(adata)</code>), build a k-nearest-neighbor graph (<code>sc.pp.neighbors(adata)</code>), compute UMAP (<code>sc.tl.umap(adata)</code>), and cluster with Leiden (<code>sc.tl.leiden(adata, resolution=0.5)</code>). Plot the UMAP with <code>sc.pl.umap(adata, color="leiden")</code> and verify you see 7 to 10 distinct clusters.
+</p>
+<p>
+<strong>Step 4.</strong> Identify marker genes for each cluster: run <code>sc.tl.rank_genes_groups(adata, "leiden", method="wilcoxon")</code> and inspect the top 5 markers per cluster with <code>sc.pl.rank_genes_groups(adata, n_genes=5)</code>. Look for known markers: CD3D/CD3E for T cells, CD79A/MS4A1 for B cells, LYZ/S100A8 for monocytes, NKG7/GNLY for NK cells.
+</p>
+<p>
+<strong>Step 5.</strong> Annotate clusters by assigning cell type labels based on the marker genes you identified. Create a dictionary mapping cluster IDs to cell types (<code>cluster_to_type = {"0": "CD4 T", "1": "Monocyte", ...}</code>), assign with <code>adata.obs["cell_type"] = adata.obs["leiden"].map(cluster_to_type)</code>, and plot the final annotated UMAP. Compare your annotations to the published labels in the Scanpy PBMC3k tutorial to check your accuracy.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+Single-cell genomics reveals disease mechanisms at the cellular level, but
+translating these insights into clinical outcomes requires a different toolkit.
+<a href="section-48.4.html">Section 48.4: Clinical AI</a> covers survival analysis
+with Cox proportional hazards, risk prediction from electronic health records,
+and the design of clinical trials that test the therapies that genomic and
+structural biology discoveries enable.
+</p>
+</section>
+
+</main>
+
+<footer>
+<nav class="section-nav">
+<a href="section-48.2.html">&larr; Section 48.2</a>
+<a href="section-48.4.html">Section 48.4 &rarr;</a>
+</nav>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

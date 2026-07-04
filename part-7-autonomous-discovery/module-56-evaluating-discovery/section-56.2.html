@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 56.2: Benchmarks for Discovery. ScienceAgentBench, DiscoveryBench, MLE-bench, SWE-bench, GPQA Diamond, FrontierMath, and their saturation curves." name="description"/>
+<title>Section 56.2: Benchmarks for Discovery | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Autonomous Discovery Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 56: Evaluating Discovery Systems</a></div>
+<h1>56.2 Benchmarks for Discovery</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I saturated every benchmark they gave me. So they made harder ones. I saturated those too. Eventually they asked me to do actual science, and I had no idea where to start."</p>
+<cite>A Foundation Model Pretending to Be a Scientist</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the five quality axes from
+<a href="section-56.1.html">Section 56.1</a> and the agent evaluation methodology from
+<a href="../../part-2-software-engineering/module-23-evaluating-agents/index.html">Chapter 23</a>,
+which introduced SWE-bench and the concepts of pass@k scoring and agent scaffolding.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Benchmarks are the rulers by which we measure AI capabilities. A good ruler is
+calibrated, durable, and measures what we care about. A bad ruler gives precise readings
+of the wrong quantity. This section surveys six major benchmarks that collectively
+span the evaluation landscape for scientific discovery AI, examines what each actually
+measures through the lens of our five quality axes, and identifies the gaps that
+remain unbenchmarked. We also introduce the concept of <em>saturation</em>: the point at
+which a benchmark stops discriminating between improving systems and becomes a checkbox
+rather than a signal.
+</p>
+</div>
+
+<h2>1. Anatomy of a Discovery Benchmark</h2>
+
+<p>
+Every benchmark consists of four components, and understanding each is essential for
+interpreting results correctly.
+</p>
+
+<p>
+<strong>Task bank:</strong> A collection of problems, each with a natural-language description
+of what the system should accomplish. Tasks range from "analyze this dataset and report
+the main finding" (open-ended) to "what is the binding affinity of molecule X to
+target Y?" (closed-form).
+</p>
+
+<p data-agent="02">
+A task bank is the foundation of any benchmark: a curated set of problems that defines the scope and difficulty of what gets measured. It matters because the composition of the task bank directly determines which capabilities a benchmark can detect and which it is blind to; a task bank skewed toward one domain or difficulty level will produce misleading rankings. Each task typically pairs a natural-language prompt with structured metadata (domain, difficulty, expected output format), and the benchmark harness feeds these tasks to the system under evaluation one at a time or in batches. Use a task bank with broad domain coverage and calibrated difficulty when you need to compare systems fairly; use a narrow, domain-specific task bank when you need to probe depth in a single field.
+</p>
+
+<p>
+<strong>Gold standard:</strong> The expected output for each task, used for scoring. In
+closed-form benchmarks, this is a single correct answer. In open-ended benchmarks, it
+may be a rubric, a reference solution, or a set of acceptable outputs.
+</p>
+
+<p>
+<strong>Scoring protocol:</strong> The function that maps (system output, gold standard) to a
+score. Common protocols include exact match, fuzzy match, pass@k (the probability that
+at least one of $k$ attempts succeeds), and medal-based scoring (bronze/silver/gold
+thresholds).
+</p>
+
+<p>
+<strong>Scaffolding constraints:</strong> Rules about what tools, APIs, and resources the system
+may access during evaluation. Some benchmarks allow internet access; others restrict
+the system to local files. These constraints dramatically affect scores and must be
+reported alongside results.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Callable
+from enum import Enum
+
+
+class ScoringProtocol(Enum):
+    EXACT_MATCH = "exact_match"
+    FUZZY_MATCH = "fuzzy_match"
+    PASS_AT_K = "pass_at_k"
+    MEDAL_BASED = "medal_based"
+    RUBRIC_SCORED = "rubric_scored"
+    EXECUTION_BASED = "execution_based"
+
+
+@dataclass
+class BenchmarkTask:
+    """A single task in a discovery benchmark."""
+    task_id: str
+    description: str
+    domain: str  # e.g., "biology", "chemistry", "physics", "ml"
+    gold_standard: Optional[str] = None
+    gold_code: Optional[str] = None  # reference implementation
+    difficulty: str = "medium"  # easy, medium, hard, expert
+    metadata: Dict = field(default_factory=dict)
+
+
+@dataclass
+class BenchmarkSuite:
+    """A complete benchmark with tasks, scoring, and metadata."""
+    name: str
+    version: str
+    tasks: List[BenchmarkTask]
+    scoring: ScoringProtocol
+    allows_internet: bool = False
+    allows_code_execution: bool = True
+    max_attempts: int = 1
+    time_limit_seconds: Optional[int] = None
+
+    @property
+    def n_tasks(self) -> int:
+        return len(self.tasks)
+
+    def domain_distribution(self) -> Dict[str, int]:
+        """Count tasks by domain."""
+        dist = {}
+        for task in self.tasks:
+            dist[task.domain] = dist.get(task.domain, 0) + 1
+        return dist
+</code></pre>
+<div class="code-caption">Listing 56.6: Data model for a benchmark suite. Every benchmark in this section can be described by this schema, making it possible to build unified evaluation harnesses that run multiple benchmarks through the same pipeline.</div>
+
+<h2>2. ScienceAgentBench (NeurIPS 2024)</h2>
+
+<p>
+ScienceAgentBench (Chen et al., 2024) is the most targeted benchmark for evaluating
+end-to-end scientific discovery agents. It contains 102 tasks drawn from 44 peer-reviewed
+publications across four disciplines: bioinformatics, computational chemistry,
+geographical information science, and psychology. Each task requires the agent to write
+and execute Python code that processes real scientific data to reproduce a published
+result.
+</p>
+
+<p>
+The benchmark measures three capabilities that map directly to our quality axes:
+</p>
+
+<ul>
+<li><strong>Code generation:</strong> Can the agent produce correct, executable scientific code?</li>
+<li><strong>Data analysis:</strong> Can the agent apply appropriate statistical methods and domain-specific analysis pipelines?</li>
+<li><strong>Result interpretation:</strong> Does the agent's output match the published finding (validity)?</li>
+</ul>
+
+<p>
+Scoring uses execution-based evaluation: the agent's code is run, and its output is
+compared against the gold standard using both exact and fuzzy matching. The benchmark
+also tracks cost (API tokens consumed), providing an efficiency signal.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: ScienceAgentBench Tests Reproduction, Not Discovery</div>
+<p>
+A critical nuance: ScienceAgentBench tasks ask agents to <em>reproduce</em> published
+results, not to <em>discover</em> new ones. This is a deliberate design choice that enables
+automated scoring (the gold standard exists because the paper was published). But it
+means the benchmark measures the ability to replicate known science, not to generate
+novel findings. On our five-axis framework, ScienceAgentBench covers validity and
+efficiency but is silent on novelty and impact. This gap is shared by most existing
+benchmarks and reflects the fundamental difficulty of scoring open-ended outputs.
+</p>
+</div>
+
+<pre><code class="language-python">def simulate_scienceagentbench_scoring(
+    agent_outputs: List[dict],
+    gold_standards: List[dict],
+    tolerance: float = 0.05,
+) -> dict:
+    """Simulate the ScienceAgentBench scoring protocol.
+
+    Each task is scored on:
+    1. Code executability (does it run without errors?)
+    2. Output correctness (does the result match gold within tolerance?)
+    3. Methodology appropriateness (are the right methods used?)
+
+    Args:
+        agent_outputs: list of {code: str, result: any, tokens_used: int}
+        gold_standards: list of {result: any, methods: list[str]}
+        tolerance: relative tolerance for numerical comparison
+
+    Returns:
+        Aggregate scores and per-task breakdown
+    """
+    results = []
+    for output, gold in zip(agent_outputs, gold_standards):
+        task_score = {
+            "executable": output.get("executed_successfully", False),
+            "correct": False,
+            "methods_match": False,
+            "tokens": output.get("tokens_used", 0),
+        }
+
+        if task_score["executable"] and output.get("result") is not None:
+            # Numerical comparison with tolerance
+            try:
+                result_val = float(output["result"])
+                gold_val = float(gold["result"])
+                relative_error = abs(result_val - gold_val) / (abs(gold_val) + 1e-10)
+                task_score["correct"] = relative_error <= tolerance
+                task_score["relative_error"] = relative_error
+            except (ValueError, TypeError):
+                # String comparison for non-numerical results
+                task_score["correct"] = str(output["result"]).strip() == str(
+                    gold["result"]
+                ).strip()
+
+        results.append(task_score)
+
+    n = len(results)
+    return {
+        "execution_rate": sum(r["executable"] for r in results) / n,
+        "accuracy": sum(r["correct"] for r in results) / n,
+        "mean_tokens": sum(r["tokens"] for r in results) / n,
+        "per_task": results,
+    }
+</code></pre>
+<div class="code-caption">Listing 56.7: Simplified ScienceAgentBench scoring protocol. The actual benchmark uses more sophisticated matching (figure comparison, table alignment), but the core logic is execution-then-comparison.</div>
+
+<h2>3. DiscoveryBench (2024)</h2>
+
+<p>
+DiscoveryBench (Majumder et al., 2024) takes a different approach by explicitly
+targeting hypothesis generation and verification. Its 264 tasks span real scientific
+datasets in sociology, engineering, biology, and economics. Each task provides a
+dataset and asks the agent to formulate a hypothesis about a relationship in the data,
+then provide supporting evidence.
+</p>
+
+<p>
+The benchmark distinguishes two modes:
+</p>
+
+<ul>
+<li><strong>Hypothesis-driven:</strong> The agent is given a specific question ("Is there a relationship between X and Y?") and must determine the answer from the data.</li>
+<li><strong>Data-driven:</strong> The agent is given a dataset with no guiding question and must identify the most significant pattern or relationship.</li>
+</ul>
+
+<p>
+Scoring uses LLM-based semantic matching between the agent's hypothesis and the gold
+standard, with human validation on a subset. This makes DiscoveryBench closer to
+measuring real discovery capability than benchmarks that only check code execution.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: DiscoveryBench Task Structure</div>
+<p>
+A typical DiscoveryBench task provides a CSV of socioeconomic data from the World Bank
+and asks: "What factor best predicts life expectancy across developing nations?" The
+gold standard is a specific statistical relationship (e.g., "access to clean water
+explains 62% of life expectancy variance, controlling for GDP per capita"). The agent
+must load the data, perform exploratory analysis, fit models, and articulate a hypothesis
+that an LLM judge evaluates against the gold standard. The data-driven variant provides
+the same CSV but no question, requiring the agent to identify the most significant
+pattern autonomously.
+</p>
+</div>
+
+<h2>4. MLE-bench (OpenAI, 2024)</h2>
+
+<p>
+MLE-bench (Chan et al., 2024) evaluates machine learning engineering by drawing on
+75 Kaggle competitions. The agent receives a competition dataset, description, and
+evaluation metric, and must produce a submission file that achieves a specified
+performance level. Scoring maps to Kaggle's medal system: bronze (top 40%), silver
+(top 10%), and gold (top 3.6%) relative to historical human submissions.
+</p>
+
+<p>
+MLE-bench primarily measures the <strong>efficiency</strong> and <strong>validity</strong> axes. A
+successful agent must select appropriate models, engineer features, tune
+hyperparameters, and handle data cleaning, all within a time and compute budget. The
+medal system provides a natural ordinal scale that aligns with real competitive
+performance.
+</p>
+
+<pre><code class="language-python">from typing import Tuple
+
+
+def medal_score(
+    agent_score: float,
+    bronze_threshold: float,
+    silver_threshold: float,
+    gold_threshold: float,
+    higher_is_better: bool = True,
+) -> Tuple[str, int]:
+    """Determine medal level for an MLE-bench submission.
+
+    Thresholds are derived from historical Kaggle leaderboard
+    percentiles for each competition.
+
+    Args:
+        agent_score: the agent's metric value
+        bronze_threshold: score needed for top 40%
+        silver_threshold: score needed for top 10%
+        gold_threshold: score needed for top 3.6%
+        higher_is_better: whether higher scores are better
+
+    Returns:
+        (medal_name, numeric_level) where level is 0-3
+    """
+    if not higher_is_better:
+        # Flip comparison for metrics like RMSE where lower is better
+        agent_score = -agent_score
+        bronze_threshold = -bronze_threshold
+        silver_threshold = -silver_threshold
+        gold_threshold = -gold_threshold
+
+    if agent_score >= gold_threshold:
+        return ("gold", 3)
+    elif agent_score >= silver_threshold:
+        return ("silver", 2)
+    elif agent_score >= bronze_threshold:
+        return ("bronze", 1)
+    else:
+        return ("none", 0)
+
+
+def mle_bench_aggregate(medal_counts: Dict[str, int]) -> dict:
+    """Compute MLE-bench aggregate statistics from medal counts.
+
+    Reports the overall medal rate and the distribution,
+    following the protocol from Chan et al. (2024).
+    """
+    total = sum(medal_counts.values())
+    any_medal = total - medal_counts.get("none", 0)
+
+    return {
+        "total_competitions": total,
+        "medal_rate": any_medal / max(total, 1),
+        "gold_rate": medal_counts.get("gold", 0) / max(total, 1),
+        "silver_rate": medal_counts.get("silver", 0) / max(total, 1),
+        "bronze_rate": medal_counts.get("bronze", 0) / max(total, 1),
+        "no_medal_rate": medal_counts.get("none", 0) / max(total, 1),
+    }
+</code></pre>
+<div class="code-caption">Listing 56.8: Medal-based scoring for MLE-bench. The thresholds are competition-specific, derived from historical leaderboard percentiles. This scoring maps agent performance directly to human competitive baselines.</div>
+
+<h2>5. SWE-bench Verified and Live</h2>
+
+<p>
+SWE-bench (Jimenez et al., 2024), introduced in
+<a href="../../part-2-software-engineering/module-23-evaluating-agents/index.html">Chapter 23</a>,
+evaluates agents on resolving real GitHub issues from popular Python repositories. The
+original benchmark contains 2,294 instances, but many turned out to have ambiguous
+specifications or flaky tests. Two refinements address these problems.
+</p>
+
+<p>
+<strong>SWE-bench Verified</strong> is a 500-instance subset where each task has been validated
+by professional software engineers to confirm that the issue is well-specified, the
+tests are reliable, and a correct solution exists. This curation eliminates the noise
+from ambiguous tasks, making it a more trustworthy evaluation signal.
+</p>
+
+<p>
+<strong>SWE-bench Live</strong> continuously sources new issues from actively maintained
+repositories. Because the issues are recent, they are unlikely to appear in model
+training data, mitigating the contamination risk that plagues static benchmarks.
+The trade-off is that Live instances have not been curated to the same standard as
+Verified.
+</p>
+
+<p>
+From a discovery evaluation perspective, SWE-bench measures the software engineering
+component of scientific AI: can the system modify code, run tests, and integrate
+changes into a codebase? This is a necessary but not sufficient capability for a
+discovery system that must also generate hypotheses, design experiments, and interpret
+results.
+</p>
+
+<h2>6. GPQA Diamond: Approaching Saturation</h2>
+
+<p>
+GPQA (Graduate-Level Google-Proof Question Answering; Rein et al., 2024) contains
+448 multiple-choice questions in biology, chemistry, and physics, written and validated
+by domain experts. The "Google-Proof" designation means that each question was verified
+to be unanswerable through web search alone; correct answers require genuine domain
+expertise and multi-step reasoning.
+</p>
+
+<p>
+The Diamond subset (198 questions) uses a stricter quality filter: each question was
+validated by a second domain expert who also attempted to answer it. Expert human
+accuracy on Diamond is approximately 81%, while non-expert PhDs (from a different
+scientific domain) achieve only 34%.
+</p>
+
+<p>
+GPQA Diamond is approaching <strong>saturation</strong>. Frontier models (as of mid-2025) achieve
+approximately 75-80% accuracy, approaching the expert human ceiling of 81%. When a
+benchmark saturates, further improvements in model capability no longer translate to
+score gains, and the benchmark loses its discriminative power.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of benchmark saturation like a kitchen thermometer rated up to 100 &deg;C. It works perfectly for checking whether water is simmering (80 &deg;C) or boiling (100 &deg;C), but once you need to measure the temperature of frying oil at 180 &deg;C, the thermometer maxes out and reads the same value whether the oil is at 150 &deg;C or 200 &deg;C. The thermometer is not broken; it simply was not designed for that range. Saturation in benchmarks works the same way: the scoring ceiling (the expert human accuracy) is the thermometer's maximum reading. Once models reach that ceiling, the benchmark cannot tell a slightly superhuman system apart from a vastly superhuman one, and you need a new instrument (like FrontierMath) calibrated for the higher range.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+
+
+def saturation_analysis(
+    model_scores: Dict[str, float],
+    human_expert_ceiling: float,
+    human_nonexpert_floor: float,
+) -> dict:
+    """Analyze how close models are to saturating a benchmark.
+
+    Args:
+        model_scores: {model_name: accuracy} for each evaluated model
+        human_expert_ceiling: expert human performance (upper bound)
+        human_nonexpert_floor: non-expert human performance (lower bound)
+
+    Returns:
+        Saturation metrics for the benchmark
+    """
+    scores = list(model_scores.values())
+    best_score = max(scores)
+    score_range = human_expert_ceiling - human_nonexpert_floor
+
+    # How much of the expert-nonexpert gap has the best model closed?
+    gap_closed = (best_score - human_nonexpert_floor) / score_range
+
+    # Is the top model within one standard error of the ceiling?
+    # (approximation: SE ~ 1/sqrt(n_questions) for binary outcomes)
+    n_questions = 198  # GPQA Diamond size
+    se = np.sqrt(best_score * (1 - best_score) / n_questions)
+    within_ceiling_se = (human_expert_ceiling - best_score) < 2 * se
+
+    return {
+        "best_model_score": best_score,
+        "expert_ceiling": human_expert_ceiling,
+        "gap_closed_fraction": min(gap_closed, 1.0),
+        "within_2se_of_ceiling": within_ceiling_se,
+        "saturated": gap_closed >= 0.90,
+        "recommendation": (
+            "Benchmark is saturated; use for regression testing only"
+            if gap_closed >= 0.90
+            else "Benchmark still discriminates between models"
+        ),
+    }
+
+
+# Example: GPQA Diamond saturation check (mid-2025 approximate scores)
+gpqa_scores = {
+    "claude-3.5-sonnet": 0.68,
+    "gpt-4o": 0.72,
+    "claude-opus-4": 0.78,
+    "o3-mini": 0.77,
+    "gemini-2.5-pro": 0.80,
+}
+
+result = saturation_analysis(
+    gpqa_scores,
+    human_expert_ceiling=0.81,
+    human_nonexpert_floor=0.34,
+)
+print(f"Gap closed: {result['gap_closed_fraction']:.1%}")
+# Gap closed: 97.9%
+print(f"Saturated: {result['saturated']}")
+# Saturated: True
+</code></pre>
+<div class="code-caption">Listing 56.9: Saturation analysis for GPQA Diamond. When the best model closes more than 90% of the gap between non-expert and expert human performance, the benchmark can no longer discriminate between improving models. The approximate mid-2025 scores show Diamond is effectively saturated.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Saturation Is a Feature, Not a Failure</div>
+<p>
+When a benchmark saturates, some commentators treat it as the benchmark being "too easy."
+This framing misses the point. Saturation means the capability the benchmark was designed
+to measure has been achieved. GPQA Diamond saturating means that frontier models have
+reached expert-level accuracy on graduate-level science questions. That is a genuine
+milestone. The correct response to saturation is not to dismiss the benchmark but to
+note its achievement, retire it as a discriminative evaluation tool, and build benchmarks
+that target the next frontier of capability. FrontierMath (below) is an explicit example
+of this progression.
+</p>
+</div>
+
+<h2>7. FrontierMath: The Unsaturated Ceiling</h2>
+
+<p>
+FrontierMath (Glazer et al., 2024) was designed specifically to resist saturation.
+It contains hundreds of original, research-level mathematics problems created by
+professional mathematicians. Problems span number theory, algebraic geometry,
+combinatorics, and mathematical physics, and require genuine mathematical reasoning
+that cannot be pattern-matched from training data.
+</p>
+
+<p>
+As of mid-2025, the best frontier models achieve below 5% accuracy on FrontierMath.
+For comparison, expert mathematicians working within their specialization solve
+approximately 80% of the problems in their area (but far fewer outside it). The
+enormous gap between model and human expert performance suggests that FrontierMath
+will remain discriminative for years.
+</p>
+
+<p>
+FrontierMath is relevant to discovery evaluation because mathematical reasoning
+underlies many scientific domains: deriving physical laws, proving theoretical results,
+and constructing mathematical models of biological or economic systems. A system
+that cannot reason mathematically at a research level faces a hard ceiling on the
+kinds of discoveries it can make in theoretically intensive fields.
+</p>
+
+<h2>8. Benchmark Comparison Matrix</h2>
+
+<p>
+Table 56.2 maps each benchmark against the five quality axes from
+<a href="section-56.1.html">Section 56.1</a>, revealing which aspects of discovery each
+benchmark actually measures.
+</p>
+
+<figure>
+<table>
+<thead>
+<tr>
+<th>Benchmark</th><th>Year</th><th>Tasks</th><th>Novelty</th><th>Impact</th>
+<th>Reproducibility</th><th>Validity</th><th>Efficiency</th><th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ScienceAgentBench</td><td>2024</td><td>102</td>
+<td>-</td><td>-</td><td>Partial</td><td>Yes</td><td>Yes</td><td>Active</td>
+</tr>
+<tr>
+<td>DiscoveryBench</td><td>2024</td><td>264</td>
+<td>Partial</td><td>-</td><td>-</td><td>Yes</td><td>-</td><td>Active</td>
+</tr>
+<tr>
+<td>MLE-bench</td><td>2024</td><td>75</td>
+<td>-</td><td>-</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Active</td>
+</tr>
+<tr>
+<td>SWE-bench Verified</td><td>2024</td><td>500</td>
+<td>-</td><td>-</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Active</td>
+</tr>
+<tr>
+<td>SWE-bench Live</td><td>2024</td><td>Ongoing</td>
+<td>-</td><td>-</td><td>Partial</td><td>Yes</td><td>Yes</td><td>Active</td>
+</tr>
+<tr>
+<td>GPQA Diamond</td><td>2024</td><td>198</td>
+<td>-</td><td>-</td><td>Yes</td><td>Yes</td><td>-</td><td>Saturated</td>
+</tr>
+<tr>
+<td>FrontierMath</td><td>2024</td><td>Hundreds</td>
+<td>-</td><td>-</td><td>Yes</td><td>Yes</td><td>-</td><td>Active</td>
+</tr>
+</tbody>
+</table>
+<figcaption>Table 56.2: Benchmark coverage of the five discovery quality axes. A dash indicates the benchmark does not measure that axis. "Partial" indicates indirect or incomplete measurement. No existing benchmark directly measures impact; the novelty and impact axes require human evaluation or purpose-built assessments.</figcaption>
+</figure>
+
+<p>
+The most striking pattern in Table 56.2 is the absence of novelty and impact from
+nearly every benchmark. This is not an accident. Novelty and impact are the axes that
+require genuinely open-ended outputs, which are the hardest to score automatically.
+Benchmarks gravitate toward axes with verifiable gold standards: validity
+(does the code produce the right answer?) and reproducibility (does it produce the
+same answer twice?). Closing the novelty and impact gap requires either human evaluation
+at scale or LLM-based judges calibrated against expert annotations, a challenge we
+address in <a href="section-56.3.html">Section 56.3</a>.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often assume that a system scoring well across multiple benchmarks is therefore a capable discovery system. This is wrong. Table 56.2 shows that existing benchmarks collectively cover validity, reproducibility, and efficiency but leave novelty and impact almost entirely unmeasured. A system can achieve top scores on every benchmark listed here while having zero ability to generate a novel hypothesis or produce a finding that changes scientific practice, because no benchmark in current use tests for those capabilities.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Inspect AI for Benchmark Harnesses</div>
+<p>
+Building benchmark harnesses from scratch (loading tasks, sandboxing execution,
+scoring, and aggregating results) is substantial engineering. Inspect AI
+(<code>inspect-ai</code>), an open-source framework from AISI (the UK AI Safety Institute),
+provides a declarative benchmark definition language that handles sandboxing,
+multi-model evaluation, and scoring protocol implementation:
+</p>
+<pre><code class="language-python">from inspect_ai import Task, task
+from inspect_ai.solver import generate, system_message
+from inspect_ai.scorer import match
+
+
+@task
+def science_qa():
+    """Define a science QA benchmark in ~10 lines with Inspect AI."""
+    return Task(
+        dataset="science_questions.jsonl",
+        plan=[
+            system_message("You are a scientific reasoning agent."),
+            generate(),
+        ],
+        scorer=match(),
+    )
+</code></pre>
+<p>
+Inspect AI reduces roughly 500 lines of custom sandboxing and scoring code to a
+declarative task definition. It supports Docker-based code execution sandboxes,
+multiple scoring protocols, and built-in contamination detection.
+</p>
+</div>
+
+<h2>9. The Missing Benchmarks</h2>
+
+<p>
+Several aspects of discovery remain unbenchmarked as of mid-2025. These gaps represent
+both research opportunities and practical risks: if a system is deployed on tasks that
+no benchmark covers, we are flying blind.
+</p>
+
+<p>
+<strong>Multi-step experimental design:</strong> No benchmark requires an agent to iteratively
+design, execute, and refine a sequence of experiments. ScienceAgentBench tasks are
+single-step; real discovery is multi-step with feedback loops.
+</p>
+
+<p>
+<strong>Cross-domain transfer:</strong> No benchmark measures whether an insight discovered in
+one domain (e.g., materials science) can be transferred to another (e.g., drug
+discovery). Cross-domain discovery is one of AI's most promising capabilities because
+humans struggle to maintain expertise across fields.
+</p>
+
+<p>
+<strong>Negative results:</strong> No benchmark rewards correctly identifying that a hypothesis
+is wrong. Real science depends as much on falsification as on confirmation, but
+benchmarks uniformly reward finding positive results.
+</p>
+
+<p>
+<strong>Collaboration with human scientists:</strong> No benchmark evaluates the quality of
+human-AI collaborative discovery, which is the deployment mode for the foreseeable
+future. Can the system explain its reasoning to a domain expert? Can it incorporate
+expert feedback and adjust course?
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Building a Missing Benchmark</div>
+<p>
+Suppose we want to benchmark multi-step experimental design. A minimal viable benchmark
+would provide: (1) a simulated laboratory environment (e.g., a chemistry simulator from
+<a href="../../part-5-simulation-optimization/module-43-scientific-simulation/index.html">Chapter 43</a>)
+where agents can run virtual experiments, (2) a set of target properties to discover
+(e.g., "find a molecule with solubility &gt; X and toxicity &lt; Y"), (3) a budget of
+$N$ experiments, and (4) a scoring function that rewards finding high-quality candidates
+in fewer experiments. The gold standard would be the Pareto-optimal frontier achieved
+by expert chemists using Bayesian optimization (see
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>).
+We build exactly this kind of evaluation environment in
+<a href="section-56.4.html">Section 56.4</a>.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+CORE-Bench (Siegel et al., 2024), introduced at NeurIPS 2024, addresses a gap that none of the benchmarks above cover: computational reproducibility of published results across entire papers. CORE-Bench provides 270 tasks drawn from published papers in computer science, medicine, and social science, where each task requires the agent to reproduce a specific computational result (a figure, table, or statistical test) from a paper's publicly released code and data. Unlike ScienceAgentBench's single-step code generation, CORE-Bench tasks require navigating complex multi-file repositories, resolving dependency issues, and executing multi-stage pipelines. As of 2025, the best agents achieve only about 21% accuracy on the hardest tier (reproducing results with no simplification), highlighting how far current systems remain from reliable end-to-end scientific reproduction.
+</p>
+</div>
+
+<h2>10. Benchmark Lifecycle and Maintenance</h2>
+
+<p>
+A benchmark is not a static artifact. It has a lifecycle: creation, adoption, saturation,
+and retirement. Maintaining a benchmark requires ongoing effort to detect contamination,
+update gold standards as scientific knowledge advances, and track whether the benchmark
+still discriminates between systems.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+from datetime import date
+from typing import List
+
+
+@dataclass
+class BenchmarkHealth:
+    """Track the health and lifecycle status of a benchmark."""
+    name: str
+    created: date
+    last_updated: date
+    n_tasks: int
+    saturation_fraction: float  # fraction of gap closed (0 to 1)
+    known_contamination_risk: str  # "low", "medium", "high"
+    active_maintainers: int
+    citations_per_year: int
+
+    @property
+    def lifecycle_stage(self) -> str:
+        if self.saturation_fraction >= 0.90:
+            return "saturated"
+        elif self.saturation_fraction >= 0.70:
+            return "approaching_saturation"
+        elif self.citations_per_year < 10:
+            return "declining"
+        else:
+            return "active"
+
+    def maintenance_recommendations(self) -> List[str]:
+        recs = []
+        if self.saturation_fraction >= 0.80:
+            recs.append("Add harder tasks or retire as discriminative benchmark")
+        if self.known_contamination_risk in ("medium", "high"):
+            recs.append("Run contamination audit; consider dynamic task generation")
+        if self.active_maintainers < 2:
+            recs.append("Recruit additional maintainers to prevent benchmark decay")
+        days_since_update = (date.today() - self.last_updated).days
+        if days_since_update > 365:
+            recs.append("Update gold standards to reflect current scientific knowledge")
+        return recs
+
+
+# Example: assess GPQA Diamond health
+gpqa_health = BenchmarkHealth(
+    name="GPQA Diamond",
+    created=date(2023, 11, 1),
+    last_updated=date(2024, 6, 15),
+    n_tasks=198,
+    saturation_fraction=0.97,
+    known_contamination_risk="medium",
+    active_maintainers=3,
+    citations_per_year=450,
+)
+
+for rec in gpqa_health.maintenance_recommendations():
+    print(f"  - {rec}")
+# - Add harder tasks or retire as discriminative benchmark
+# - Run contamination audit; consider dynamic task generation
+</code></pre>
+<div class="code-caption">Listing 56.10: Benchmark health monitor. Tracks saturation, contamination risk, and maintenance status to determine whether a benchmark should still be used for comparative evaluation or relegated to regression testing.</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Saturation Tracker</h4>
+<p>
+Build a small Python tool that monitors whether a benchmark is approaching saturation, using only standard libraries plus <code>matplotlib</code>.
+</p>
+<p>
+<strong>Step 1:</strong> Create a Python dictionary holding historical accuracy scores for three or more models on GPQA Diamond (use the approximate values from Listing 56.9) along with the expert ceiling (0.81) and non-expert floor (0.34).
+</p>
+<p>
+<strong>Step 2:</strong> Write a function <code>gap_closed(score, ceiling, floor)</code> that returns the fraction of the expert-to-nonexpert gap a given score has closed, clamped to [0, 1].
+</p>
+<p>
+<strong>Step 3:</strong> Compute <code>gap_closed</code> for each model. Print a ranked table showing model name, raw accuracy, and gap-closed percentage. Verify that the top model shows &gt;90%, confirming saturation.
+</p>
+<p>
+<strong>Step 4:</strong> Using <code>matplotlib</code>, plot a horizontal bar chart of gap-closed values for all models. Draw a vertical dashed red line at 0.90 labeled "Saturation threshold." Save the chart as <code>saturation_tracker.png</code>.
+</p>
+<p>
+<strong>Step 5:</strong> Extend the tool to accept a second benchmark (use FrontierMath: best model ~0.05, expert ceiling ~0.80, non-expert floor ~0.01). Plot both benchmarks side by side and observe the contrast: one saturated, one far from it. This two-panel chart is the kind of diagnostic a benchmark maintainer would review quarterly to decide whether new, harder tasks are needed.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+<a href="section-56.3.html">Section 56.3: Validity and Contamination</a> examines the
+threats that undermine benchmark results. We develop tools for detecting data
+contamination, formalize Goodhart's Law as it applies to AI evaluation, and build
+the human evaluation protocols (with inter-rater agreement statistics and power
+analysis) needed to cover the axes that automated benchmarks miss.
+</p>
+</section>
+
+</main>
+
+<footer>
+<nav class="section-nav">
+<a href="section-56.1.html">&larr; 56.1 What It Means to Discover</a>
+<a href="section-56.3.html">56.3 Validity and Contamination &rarr;</a>
+</nav>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

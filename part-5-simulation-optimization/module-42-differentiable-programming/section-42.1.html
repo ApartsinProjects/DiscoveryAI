@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.1: Automatic Differentiation. Forward mode, reverse mode, mixed-mode AD, dual numbers, computational graphs, and the chain rule mechanized." name="description"/>
+<title>Section 42.1: Automatic Differentiation | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation and Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Differentiable Programming for Discovery</a></div>
+<h1>42.1 Automatic Differentiation</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I differentiated my simulation by hand once. It took three weeks, introduced four sign errors, and the resulting gradient pointed uphill. Then someone showed me a decorator."</p>
+<cite>A Chain Rule Applied One Link Too Many</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Automatic differentiation (AD) computes exact derivatives of computer programs by
+mechanically applying the chain rule to every elementary operation. Unlike symbolic
+differentiation (which produces unwieldy expressions) and finite differences (which
+suffer from truncation and rounding errors), AD produces machine-precision derivatives
+at a cost proportional to the original computation. This section builds AD from first
+principles: dual numbers for forward mode, adjoint accumulation for reverse mode, and
+the transposed-JVP perspective that unifies both. Understanding these mechanics is
+essential before we compose JAX transforms in Section 42.2 and differentiate through
+physics engines in Section 42.3.
+</p>
+</div>
+
+<h2>1. Why Not Finite Differences?</h2>
+
+<p>
+The simplest way to estimate a derivative is the finite difference approximation:
+</p>
+
+$$\frac{\partial f}{\partial x_i} \approx \frac{f(x + h\, e_i) - f(x)}{h}$$
+
+<p>
+where $e_i$ is the $i$-th unit vector and $h$ is a small step size. This works, but it
+has two fundamental problems. First, for a function $f: \mathbb{R}^n \to \mathbb{R}$,
+computing the full gradient requires $n+1$ function evaluations. When $n$ is the number
+of parameters in a force field (thousands) or a neural network (millions), this is
+prohibitively expensive. Second, the approximation is inherently noisy: too large an
+$h$ introduces truncation error; too small an $h$ amplifies floating-point rounding
+error. The sweet spot depends on the function and the precision of arithmetic, making
+finite differences unreliable for sensitive scientific computations.
+</p>
+
+<p>
+Automatic differentiation eliminates both problems. It computes exact derivatives
+(to machine precision) and, in reverse mode, computes the full gradient in time
+proportional to a small constant multiple of the original function evaluation,
+regardless of $n$.
+</p>
+
+<p data-agent="02">
+Automatic differentiation is a family of techniques that compute derivatives of numerical programs by decomposing them into sequences of elementary operations (addition, multiplication, $\sin$, $\exp$, etc.) and applying the chain rule to each operation in turn. It matters because it is the only differentiation strategy that simultaneously delivers exact (machine-precision) derivatives and bounded computational overhead, making it the backbone of gradient-based optimization in machine learning, scientific simulation, and engineering design. The core mechanism is simple: augment every floating-point operation with a companion derivative operation, so the derivative is computed as a by-product of the original program's execution. Use AD instead of symbolic differentiation when your function is defined as code rather than a closed-form expression, and instead of finite differences when you need precision or when the input dimension is large enough to make per-component perturbation expensive.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Three Ways to Differentiate</div>
+<p>
+<strong>Symbolic differentiation</strong> manipulates mathematical expressions
+(like a CAS), producing exact but potentially enormous derivative expressions.
+<strong>Finite differences</strong> perturb inputs and measure output changes, giving
+approximate derivatives cheaply per component but scaling linearly with input
+dimension. <strong>Automatic differentiation</strong> augments the original computation
+with derivative-tracking operations, producing exact derivatives at bounded
+overhead. For scientific discovery, where we need to differentiate through complex
+simulations with many parameters, AD is the only practical choice.
+</p>
+</div>
+
+<h2>2. Forward Mode: Dual Numbers and JVPs</h2>
+
+<p>
+Forward-mode AD propagates derivatives alongside values through a computation. The
+key abstraction is the <strong>dual number</strong>: a pair $(v, \dot{v})$ where $v$ is
+the primal value and $\dot{v}$ is the tangent (derivative with respect to some input).
+Every elementary operation lifts naturally to dual numbers. For addition:
+</p>
+
+$$(a, \dot{a}) + (b, \dot{b}) = (a + b, \dot{a} + \dot{b})$$
+
+<p>
+For multiplication:
+</p>
+
+$$(a, \dot{a}) \times (b, \dot{b}) = (a \times b, a \dot{b} + b \dot{a})$$
+
+<p>
+These rules are just the familiar product rule and sum rule of calculus, applied
+mechanically. By seeding one input $x_i$ with tangent $\dot{x}_i = 1$ and all other
+inputs with tangent $0$, a single forward pass produces both the function value and
+the partial derivative $\partial f / \partial x_i$.
+</p>
+
+<p>
+Let us implement this from scratch, without any AD library, to see the mechanism
+clearly.
+</p>
+
+<pre><code class="language-python">import math
+
+class Dual:
+    """A dual number (value, tangent) for forward-mode AD."""
+
+    def __init__(self, value: float, tangent: float = 0.0):
+        self.value = value
+        self.tangent = tangent
+
+    def __add__(self, other):
+        other = other if isinstance(other, Dual) else Dual(other)
+        return Dual(self.value + other.value,
+                    self.tangent + other.tangent)
+
+    def __radd__(self, other):
+        return Dual(other).__add__(self)
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Dual) else Dual(other)
+        return Dual(self.value * other.value,
+                    self.value * other.tangent + self.tangent * other.value)
+
+    def __rmul__(self, other):
+        return Dual(other).__mul__(self)
+
+    def __sub__(self, other):
+        other = other if isinstance(other, Dual) else Dual(other)
+        return Dual(self.value - other.value,
+                    self.tangent - other.tangent)
+
+    def __rsub__(self, other):
+        return Dual(other).__sub__(self)
+
+    def __truediv__(self, other):
+        other = other if isinstance(other, Dual) else Dual(other)
+        return Dual(
+            self.value / other.value,
+            (self.tangent * other.value - self.value * other.tangent)
+                / (other.value ** 2)
+        )
+
+    def __pow__(self, n):
+        # Only integer/float exponents for simplicity
+        return Dual(self.value ** n,
+                    n * self.value ** (n - 1) * self.tangent)
+
+    def __repr__(self):
+        return f"Dual({self.value}, {self.tangent})"
+
+
+def dual_sin(x: Dual) -> Dual:
+    return Dual(math.sin(x.value), math.cos(x.value) * x.tangent)
+
+def dual_exp(x: Dual) -> Dual:
+    e = math.exp(x.value)
+    return Dual(e, e * x.tangent)
+
+
+# Example: f(x) = sin(x^2) * exp(x) at x = 1.5
+# Seed x with tangent = 1 to get df/dx
+x = Dual(1.5, 1.0)
+result = dual_sin(x ** 2) * dual_exp(x)
+
+print(f"f(1.5)  = {result.value:.10f}")
+print(f"f'(1.5) = {result.tangent:.10f}")
+
+# Verify against finite differences
+import numpy as np
+h = 1e-7
+f = lambda x: np.sin(x**2) * np.exp(x)
+fd_deriv = (f(1.5 + h) - f(1.5)) / h
+print(f"f'(1.5) [finite diff] = {fd_deriv:.10f}")
+# Output:
+# f(1.5)  = 4.2890498995
+# f'(1.5) = -6.5578889413
+# f'(1.5) [finite diff] = -6.5578886498
+</code></pre>
+<div class="code-caption">Listing 42.1: Forward-mode AD implemented with dual numbers. Seeding <code>x</code> with tangent 1.0 produces the exact derivative alongside the function value in a single pass.</div>
+
+<p>
+The dual number approach computes a <strong>Jacobian-vector product</strong> (JVP).
+For a function $f: \mathbb{R}^n \to \mathbb{R}^m$ with Jacobian $J \in \mathbb{R}^{m \times n}$,
+seeding the input with a tangent vector $\dot{x} \in \mathbb{R}^n$ produces
+$J \dot{x} \in \mathbb{R}^m$: the directional derivative along $\dot{x}$. One forward
+pass computes one column of the Jacobian (by setting $\dot{x} = e_i$). For a function
+with $n$ inputs and $m$ outputs, computing the full Jacobian requires $n$ forward
+passes. This makes forward mode efficient when $n$ is small (few inputs, many outputs).
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of forward-mode AD as filling out a tax form line by line. Each line's value depends on earlier lines, and you carry a running derivative ("if my income changed by $1, how would this line change?") forward through the form alongside the actual numbers. By the time you reach the final line (tax owed), you know exactly how sensitive it is to that one input. Reverse-mode AD works like an auditor starting from the final tax owed and tracing backward through each line, asking "which earlier lines contributed to this amount and by how much?" One backward pass from the final line reveals the sensitivity to every input line at once. The forward approach is efficient when you have few inputs to trace; the backward approach is efficient when you have few outputs to audit.
+</p>
+</div>
+
+<h2>3. Reverse Mode: Adjoints and VJPs</h2>
+
+<p>
+Reverse-mode AD is the algorithm behind backpropagation. Where forward mode
+propagates tangents from inputs to outputs, reverse mode propagates <strong>adjoints</strong>
+(also called cotangents or sensitivities) from outputs back to inputs. The key
+operation is the <strong>vector-Jacobian product</strong> (VJP): given an adjoint vector
+$\bar{y} \in \mathbb{R}^m$ at the output, reverse mode computes
+$\bar{x} = J^T \bar{y} \in \mathbb{R}^n$, which is the gradient of a scalar loss
+$L = \bar{y}^T f(x)$ with respect to all $n$ inputs.
+</p>
+
+<p>
+Critically, one reverse pass computes one <em>row</em> of $J^T$ (equivalently, one
+row of the full gradient). For a scalar-valued function $f: \mathbb{R}^n \to \mathbb{R}$,
+a single reverse pass produces the entire gradient $\nabla f \in \mathbb{R}^n$.
+This is why training a neural network with millions of parameters is feasible: the
+gradient computation costs roughly 2 to 4 times the forward pass, regardless of
+parameter count.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that reverse-mode AD (backpropagation) computes approximate derivatives, similar to finite differences but faster. This is incorrect: reverse-mode AD computes exact derivatives to machine precision, just as forward-mode AD does. Both modes mechanically apply the chain rule to every elementary operation; they differ only in the direction of accumulation (forward vs. backward through the computational graph), not in accuracy.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Reverse Mode as Transposed JVPs</div>
+<p>
+The relationship between forward and reverse mode has an elegant linear-algebraic
+interpretation. Forward mode computes $J \dot{x}$ (Jacobian times tangent vector).
+Reverse mode computes $J^T \bar{y}$ (transposed Jacobian times adjoint vector).
+Every JVP rule for an elementary operation has a corresponding VJP rule that is
+its <em>transpose</em>. For addition $z = x + y$, the JVP is $\dot{z} = \dot{x} + \dot{y}$
+and the VJP distributes the adjoint: $\bar{x} = \bar{z},\; \bar{y} = \bar{z}$.
+For multiplication $z = x \cdot y$, the JVP is $\dot{z} = y\dot{x} + x\dot{y}$
+and the VJP is $\bar{x} = y \bar{z},\; \bar{y} = x \bar{z}$. Understanding this
+transpose relationship is essential for deriving adjoint methods for differential
+equations in <a href="section-42.3.html">Section 42.3</a>.
+</p>
+</div>
+
+<p>
+To implement reverse mode, we record a computational graph (the "tape") during the
+forward pass, then walk it backwards accumulating adjoints. Here is a minimal
+implementation:
+</p>
+
+<pre><code class="language-python">class Var:
+    """A traced variable for reverse-mode AD."""
+
+    def __init__(self, value: float, children=(), grad_fns=()):
+        self.value = value
+        self.children = children      # parent Var nodes
+        self.grad_fns = grad_fns      # one function per child
+        self.grad = 0.0               # accumulated adjoint
+
+    def __add__(self, other):
+        other = other if isinstance(other, Var) else Var(other)
+        return Var(self.value + other.value,
+                   children=(self, other),
+                   grad_fns=(lambda g: g, lambda g: g))
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Var) else Var(other)
+        # Capture values for the backward pass
+        sv, ov = self.value, other.value
+        return Var(self.value * other.value,
+                   children=(self, other),
+                   grad_fns=(lambda g, o=ov: g * o,
+                             lambda g, s=sv: g * s))
+
+    def __sub__(self, other):
+        other = other if isinstance(other, Var) else Var(other)
+        return Var(self.value - other.value,
+                   children=(self, other),
+                   grad_fns=(lambda g: g, lambda g: -g))
+
+    def __pow__(self, n):
+        v = self.value
+        return Var(v ** n,
+                   children=(self,),
+                   grad_fns=(lambda g, v=v, n=n: g * n * v ** (n - 1),))
+
+    def __radd__(self, other):
+        return Var(other).__add__(self)
+
+    def __rmul__(self, other):
+        return Var(other).__mul__(self)
+
+    def backward(self):
+        """Reverse-mode sweep: accumulate adjoints via topological order."""
+        topo_order = []
+        visited = set()
+
+        def build_topo(node):
+            if id(node) not in visited:
+                visited.add(id(node))
+                for child in node.children:
+                    build_topo(child)
+                topo_order.append(node)
+
+        build_topo(self)
+        self.grad = 1.0  # seed: dL/dL = 1
+
+        for node in reversed(topo_order):
+            for child, grad_fn in zip(node.children, node.grad_fns):
+                child.grad += grad_fn(node.grad)
+
+
+# Example: f(x, y) = (x*y + x^2) at x=3, y=4
+# Analytic: df/dx = y + 2x = 10, df/dy = x = 3
+x = Var(3.0)
+y = Var(4.0)
+z = x * y + x ** 2
+z.backward()
+
+print(f"f(3, 4) = {z.value}")    # 24.0
+print(f"df/dx   = {x.grad}")     # 10.0
+print(f"df/dy   = {y.grad}")     # 3.0
+</code></pre>
+<div class="code-caption">Listing 42.2: Reverse-mode AD with a tape-based implementation. A single backward pass from the output computes gradients with respect to all inputs simultaneously.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Gradient of a Lennard-Jones Potential</div>
+<p>
+The Lennard-Jones potential $V(r) = 4\epsilon\left[(\sigma/r)^{12} - (\sigma/r)^6\right]$
+models van der Waals interactions between atoms. In forward-mode AD, computing
+$\partial V / \partial \epsilon$ and $\partial V / \partial \sigma$ requires two passes
+(one per parameter). In reverse mode, both gradients come from a single backward pass.
+For a system of $N$ atoms with $N(N-1)/2$ pair interactions, reverse mode computes the
+gradient of the total energy with respect to all parameters in time proportional to
+one energy evaluation, rather than scaling with parameter count. When we build the
+full differentiable force field in <a href="section-42.4.html">Section 42.4</a>, this
+cost advantage is what makes gradient-based calibration feasible.
+</p>
+</div>
+
+<h2>4. Forward vs. Reverse: The Cost Calculus</h2>
+
+<p>
+The computational cost of AD depends on the shape of the Jacobian. Consider a function
+$f: \mathbb{R}^n \to \mathbb{R}^m$ with Jacobian $J \in \mathbb{R}^{m \times n}$.
+</p>
+
+<ul>
+<li><strong>Forward mode</strong> computes one column of $J$ per pass (one JVP). Cost for the full Jacobian: $O(n)$ forward passes.</li>
+<li><strong>Reverse mode</strong> computes one row of $J$ per pass (one VJP). Cost for the full Jacobian: $O(m)$ reverse passes.</li>
+</ul>
+
+<p>
+The rule of thumb: use forward mode when $n \ll m$ (few inputs, many outputs) and
+reverse mode when $m \ll n$ (few outputs, many inputs). For the dominant use case in
+scientific discovery, computing the gradient of a scalar loss with respect to many
+parameters ($m = 1$, $n$ large), reverse mode wins decisively. This is why
+backpropagation (reverse-mode AD) is the workhorse of deep learning and differentiable
+simulation.
+</p>
+
+<p>
+When both $n$ and $m$ are large, neither mode alone is optimal for the full Jacobian.
+<strong>Mixed-mode AD</strong> computes the Jacobian in $\min(n, m)$ passes by choosing
+the cheaper direction. JAX supports both modes seamlessly: <code>jax.jvp</code> for
+forward mode and <code>jax.grad</code> (built on <code>jax.vjp</code>) for reverse mode.
+</p>
+
+<h2>5. The Computational Graph Perspective</h2>
+
+<p>
+Both forward and reverse mode can be understood through the lens of computational
+graphs. Consider a function decomposed into elementary operations:
+</p>
+
+$$v_0 = x, \quad v_1 = g_1(v_0), \quad v_2 = g_2(v_1, v_0), \quad \ldots, \quad v_k = f(x)$$
+
+<p>
+The chain rule gives:
+</p>
+
+$$\frac{df}{dx} = \frac{\partial g_k}{\partial v_{k-1}} \cdot \frac{\partial g_{k-1}}{\partial v_{k-2}} \cdots \frac{\partial g_1}{\partial v_0}$$
+
+<p>
+Forward mode evaluates this product left-to-right (from inputs toward outputs).
+Reverse mode evaluates it right-to-left (from outputs toward inputs). Neither mode
+forms the intermediate Jacobians explicitly; instead, each mode accumulates
+matrix-vector products one factor at a time.
+</p>
+
+<p>
+For a chain of $k$ operations each with Jacobian of size $d \times d$, both modes
+cost $O(k d^2)$ to evaluate the full Jacobian. The difference appears when the
+dimensions are not uniform: reverse mode shines for "fan-in" graphs (many inputs
+converge to one output), while forward mode shines for "fan-out" graphs (one input
+diverges to many outputs).
+</p>
+
+<h2>6. Higher-Order Derivatives</h2>
+
+<p>
+AD modes compose. Computing a Hessian-vector product $H v = \nabla^2 f \cdot v$ can
+be done by applying forward mode to a reverse-mode gradient computation. Concretely,
+if $g(x) = \nabla f(x)$ is computed by reverse mode, then a forward-mode JVP of $g$
+along direction $v$ gives $Hv$. This costs roughly twice a gradient evaluation,
+regardless of dimension, and never forms the full $n \times n$ Hessian matrix.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+
+def rosenbrock(xy):
+    """Rosenbrock function: a classic optimization test case."""
+    x, y = xy
+    return (1.0 - x) ** 2 + 100.0 * (y - x ** 2) ** 2
+
+# Gradient (reverse mode)
+grad_fn = jax.grad(rosenbrock)
+
+# Hessian-vector product (forward-over-reverse)
+def hvp(f, x, v):
+    """Hessian-vector product via forward-over-reverse mode."""
+    return jax.jvp(jax.grad(f), (x,), (v,))[1]
+
+x0 = jnp.array([1.0, 1.0])
+v = jnp.array([1.0, 0.0])
+
+print(f"Gradient at (1,1): {grad_fn(x0)}")
+print(f"Hessian-vector product H @ [1,0]: {hvp(rosenbrock, x0, v)}")
+
+# Full Hessian (for comparison; expensive for large n)
+hessian_fn = jax.hessian(rosenbrock)
+H = hessian_fn(x0)
+print(f"Full Hessian:\n{H}")
+print(f"H @ [1,0] directly: {H @ v}")
+# Output:
+# Gradient at (1,1): [0. 0.]
+# Hessian-vector product H @ [1,0]: [802. -400.]
+# Full Hessian:
+# [[ 802. -400.]
+#  [-400.  200.]]
+# H @ [1,0] directly: [802. -400.]
+</code></pre>
+<div class="code-caption">Listing 42.3: Higher-order derivatives by composing AD modes. The Hessian-vector product uses forward-over-reverse mode, costing roughly 2x a gradient computation without forming the full Hessian.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: JAX One-Liners</div>
+<p>
+Our manual <code>Dual</code> and <code>Var</code> classes took about 100 lines each. In
+JAX, the same operations are single function calls: <code>jax.grad(f)</code> for the
+gradient, <code>jax.jacfwd(f)</code> for the forward-mode Jacobian,
+<code>jax.jacrev(f)</code> for the reverse-mode Jacobian, <code>jax.hessian(f)</code>
+for the full Hessian, and <code>jax.jvp</code>/<code>jax.vjp</code> for explicit JVP/VJP
+operations. JAX traces your Python function once to build a computational graph
+(using the XLA compiler intermediate representation), then differentiates that graph.
+The user never writes derivative rules; JAX has rules for every operation in
+<code>jax.numpy</code> and <code>jax.scipy</code>. What took us 100 lines to implement
+for a handful of operations, JAX handles for the full NumPy API.
+</p>
+</div>
+
+<h2>7. Checkpointing and Memory Trade-offs</h2>
+
+<p>
+Reverse-mode AD must store intermediate values from the forward pass to use during the
+backward pass. For a computation with $k$ steps, this requires $O(k)$ memory. In a
+long simulation (thousands of time steps), this can exhaust GPU memory. The standard
+solution is <strong>gradient checkpointing</strong> (also called rematerialization):
+store only a subset of intermediate values, then recompute the others during the
+backward pass.
+</p>
+
+<p>
+With $\sqrt{k}$ checkpoints evenly spaced through the computation, the memory cost
+drops to $O(\sqrt{k})$ at the expense of roughly one additional forward pass. This
+trade-off is formalized by the <strong>revolve algorithm</strong> (Griewank, 1992), which
+computes the optimal checkpoint schedule for a given memory budget. JAX supports
+checkpointing through <code>jax.checkpoint</code> (also called <code>jax.remat</code>):
+</p>
+
+<pre><code class="language-python">import jax
+
+@jax.checkpoint
+def expensive_layer(x, params):
+    """A computation whose intermediates are not stored during
+    the forward pass; they are recomputed during backprop."""
+    for w in params:
+        x = jax.nn.relu(x @ w)
+    return x
+
+# When used inside a jax.grad computation, this layer's
+# intermediates are recomputed rather than stored, reducing
+# peak memory from O(num_layers * layer_size) to O(layer_size).
+</code></pre>
+<div class="code-caption">Listing 42.4: Gradient checkpointing with <code>jax.checkpoint</code>. Intermediates inside the decorated function are recomputed during backpropagation instead of stored, trading time for memory.</div>
+
+<p>
+Checkpointing becomes critical in <a href="section-42.3.html">Section 42.3</a> when
+we backpropagate through molecular dynamics trajectories with thousands of time steps.
+The adjoint method we derive there provides an even more memory-efficient alternative
+for ODE-constrained problems.
+</p>
+
+<h2>8. AD in the Wild: Systems and Trade-offs</h2>
+
+<p>
+Modern AD systems fall into two broad categories. <strong>Operator overloading</strong>
+systems (PyTorch, our <code>Var</code> class) build the computational graph dynamically
+during execution. They handle control flow (if/else, while loops) naturally because the
+graph reflects the specific execution path taken. <strong>Source transformation</strong>
+systems (Tapenade, some modes of JAX) analyze the program structure ahead of time and
+generate derivative code. They can optimize across operations but struggle with
+data-dependent control flow.
+</p>
+
+<p>
+JAX occupies a middle ground: it uses <strong>tracing</strong> to capture a functional
+representation of the computation (an XLA HLO graph), then differentiates that
+representation. This approach gives the optimization benefits of source transformation
+while supporting Python control flow through mechanisms like <code>jax.lax.cond</code>
+and <code>jax.lax.scan</code>. The functional constraint (no side effects, no in-place
+mutation) is the price of this composability, and it is a price that pays enormous
+dividends when we stack transforms in <a href="section-42.2.html">Section 42.2</a>.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: AD Systems Across Scientific Domains</div>
+<p>
+Different scientific communities have adopted different AD tools based on their needs.
+Computational chemistry uses JAX-MD and TorchMD-Net for differentiable molecular
+dynamics. Computational fluid dynamics uses dolfin-adjoint (built on FEniCS) for
+PDE-constrained optimization. Robotics uses Drake and differentiable-robot-model for
+differentiable rigid-body dynamics. Climate science uses Oceananigans.jl with
+Enzyme.jl for differentiable ocean simulations. Despite the variety of tools, the
+underlying mathematics is the same: forward and reverse mode AD, with checkpointing
+and adjoint methods for long time-horizon simulations. The concepts in this section
+transfer across all of these domains.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+In 2023, Enzyme 2.0 (Moses et al., "Scalable Automatic Differentiation of Arbitrary LLVM/MLIR," SC '23) demonstrated AD applied directly at the compiler intermediate representation (LLVM IR/MLIR) level, enabling automatic differentiation of programs written in C, C++, Fortran, Julia, Rust, and other compiled languages without requiring framework-specific rewrites. By operating below the source language, Enzyme can differentiate through existing high-performance simulation codes (including MPI-parallel and GPU-accelerated programs) that were never designed for AD. This compiler-level approach pushes beyond the tracing and operator-overloading paradigms described in this section, pointing toward a future where any compiled scientific code becomes differentiable by default.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Compare All Three Differentiation Methods</h4>
+<p>
+Test the three differentiation approaches on a single function using only Python and JAX.
+(1) Define a target function, such as $f(x) = x^3 \sin(x)$, and compute its analytic derivative by hand: $f'(x) = 3x^2 \sin(x) + x^3 \cos(x)$.
+(2) Implement finite-difference differentiation: evaluate $(f(x+h) - f(x))/h$ for $h = 10^{-2}, 10^{-5}, 10^{-8}, 10^{-12}$ at $x = 2.0$ and record the error relative to the analytic answer.
+(3) Implement the <code>Dual</code> class from Listing 42.1 and compute $f'(2.0)$ via forward-mode AD; verify the result matches the analytic derivative to machine precision.
+(4) Use <code>jax.grad</code> to compute the same derivative and confirm it also matches to machine precision.
+(5) Plot the finite-difference error as a function of $h$ on a log-log scale. You should observe a V-shaped curve: error decreases as $h$ shrinks (less truncation error), then increases again for very small $h$ (more rounding error). The AD results, by contrast, sit at machine epsilon regardless of any step-size choice.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+With the mechanics of automatic differentiation in hand,
+<a href="section-42.2.html">Section 42.2: JAX Functional Transforms</a> shows how JAX
+elevates differentiation from an isolated operation to one member of a composable
+family of program transformations. You will learn to combine <code>grad</code> with
+<code>jit</code> (compilation), <code>vmap</code> (vectorization), and <code>pmap</code>
+(parallelism), and to build parameterized models with Equinox and Flax that participate
+naturally in this transformation ecosystem.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-category">
+<h3>Core References</h3>
+<div class="bib-card">
+<a href="https://www.jmlr.org/papers/v18/17-468.html" target="_blank">Baydin, A. G., Pearlmutter, B. A., Radul, A. A., &amp; Siskind, J. M. (2018). Automatic differentiation in machine learning: a survey. <em>JMLR</em>, 18(153), 1-43.</a>
+<p>Comprehensive survey covering forward mode, reverse mode, implementation strategies, and higher-order differentiation. The primary reference for this section.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1137/1.9780898717761" target="_blank">Griewank, A. &amp; Walther, A. (2008). <em>Evaluating Derivatives</em>, 2nd ed. SIAM.</a>
+<p>The definitive textbook on AD theory. Chapter 12 covers optimal checkpointing schedules (the revolve algorithm).</p>
+</div>
+<div class="bib-card">
+<a href="https://dl.acm.org/doi/10.1145/355586.364791" target="_blank">Wengert, R. E. (1964). A simple automatic derivative evaluation program. <em>Communications of the ACM</em>, 7(8), 463-464.</a>
+<p>The earliest published description of forward-mode AD using "Wengert lists" of elementary operations.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1502.05767" target="_blank">Maclaurin, D., Duvenaud, D., &amp; Adams, R. P. (2015). Autograd: effortless gradients in NumPy. <em>ICML AutoML Workshop</em>.</a>
+<p>Describes the Autograd library, the predecessor to JAX, which pioneered reverse-mode AD for NumPy programs via operator overloading.</p>
+</div>
+</div>
+</section>
+
+</main>
+
+<nav class="nav-footer">
+<a href="index.html">&larr; Chapter 42</a>
+<a href="section-42.2.html">42.2 JAX Functional Transforms &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 22.3: Building a Lifecycle Dashboard. A complete recipe integrating MLflow experiments, prompt evaluation, agent traces, and drift detection into a unified Discovery Workbench component." name="description"/>
+<title>Section 22.3: Building a Lifecycle Dashboard | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 22: MLOps, LLMOps, and AgentOps</a></div>
+<h1>22.3 Building a Lifecycle Dashboard</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I built separate dashboards for experiments, prompts, traces, and drift alerts. Then I spent more time switching between dashboards than actually fixing problems. The real insight was that all four are views of the same lifecycle."</p>
+<cite>A Platform Engineer Who Unified the Panes of Glass</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section brings together every component from the previous two sections: the experiment
+tracking and drift detection from <a href="section-22.1.html">Section 22.1</a>, and the
+prompt evaluation, cost tracking, and agent tracing from <a href="section-22.2.html">Section 22.2</a>.
+You should also be familiar with the Discovery Workbench architecture from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>,
+as this dashboard becomes a new Workbench component. Basic knowledge of FastAPI for serving
+endpoints and HTML/CSS for rendering is assumed; the
+<a href="../module-21-devops/index.html">Chapter 21</a> observability patterns provide
+useful context.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The previous sections built four operational subsystems: experiment tracking (which model
+version is best?), prompt management (which prompt version is active?), agent tracing
+(what happened during this agent run?), and drift detection (has the production data
+changed?). Each subsystem answers a different question, but in practice these questions
+arise together. A production alert fires: predictions are degrading. Is it model drift?
+A prompt regression? An agent tool failure? A data pipeline bug? The lifecycle dashboard
+integrates all four views into a single interface, letting you diagnose the root cause
+without switching between tools. This is the operational nervous system of a production
+AI platform.
+</p>
+</div>
+
+<h2>1. Dashboard Architecture</h2>
+
+<p>
+The lifecycle dashboard follows a three-layer architecture: a <strong>data layer</strong>
+that collects metrics from MLflow, the prompt registry, the agent tracer, and the drift
+monitor; an <strong>aggregation layer</strong> that computes summary statistics and
+detects anomalies; and a <strong>presentation layer</strong> that exposes the data through
+a REST API suitable for integration with the Discovery Workbench UI or any frontend.
+</p>
+
+<p>
+The key design decision is to treat all four subsystems as <em>event sources</em> that
+emit structured records into a unified timeline. An experiment run, a prompt evaluation,
+an agent trace, and a drift check are all events that happened at a point in time, with
+associated metrics and metadata. The dashboard aggregates these events by time window,
+model version, and component, producing a holistic view of system health.
+</p>
+
+<p data-agent="02">
+A <strong>unified event timeline</strong> is a single, chronologically ordered data store
+that normalizes heterogeneous operational signals (training metrics, prompt scores, agent
+spans, drift statistics) into a common schema so they can be queried, correlated, and
+visualized together. It matters because production incidents rarely have a single cause:
+a drift alert and an agent tool failure may coincide, and only a timeline that contains
+both event types lets you see that they share a timestamp and a model version. The mechanism
+is straightforward: each subsystem emits a structured record with a fixed set of fields
+(timestamp, severity, metrics, tags), and the dashboard indexes those records into one
+queryable collection. Use a unified timeline whenever you operate more than one AI
+subsystem in production; if you run only a single model with no agent layer, a subsystem-specific
+dashboard (such as MLflow's built-in UI) is sufficient.
+</p>
+
+<pre><code class="language-python">"""
+Lifecycle Dashboard: unified data model for experiments,
+evaluations, traces, and drift events.
+"""
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any
+import json
+
+class EventType(Enum):
+    EXPERIMENT_RUN = "experiment_run"
+    PROMPT_EVAL = "prompt_eval"
+    AGENT_TRACE = "agent_trace"
+    DRIFT_CHECK = "drift_check"
+    MODEL_PROMOTION = "model_promotion"
+    COST_ALERT = "cost_alert"
+
+@dataclass
+class LifecycleEvent:
+    """A single event in the unified lifecycle timeline."""
+    event_type: EventType
+    timestamp: str
+    source: str           # Which subsystem produced this
+    summary: str           # Human-readable one-liner
+    metrics: dict[str, float] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    severity: str = "info"  # info, warning, critical
+    model_version: str = ""
+    tags: list[str] = field(default_factory=list)
+
+class LifecycleStore:
+    """In-memory event store for the lifecycle dashboard."""
+
+    def __init__(self):
+        self.events: list[LifecycleEvent] = []
+
+    def add(self, event: LifecycleEvent) -> None:
+        """Add an event to the store."""
+        self.events.append(event)
+
+    def query(
+        self,
+        event_type: EventType | None = None,
+        since: datetime | None = None,
+        severity: str | None = None,
+        model_version: str | None = None,
+        limit: int = 100
+    ) -> list[LifecycleEvent]:
+        """Query events with filters."""
+        results = self.events
+        if event_type:
+            results = [e for e in results
+                       if e.event_type == event_type]
+        if since:
+            since_str = since.isoformat()
+            results = [e for e in results
+                       if e.timestamp >= since_str]
+        if severity:
+            results = [e for e in results
+                       if e.severity == severity]
+        if model_version:
+            results = [e for e in results
+                       if e.model_version == model_version]
+        return sorted(
+            results, key=lambda e: e.timestamp, reverse=True
+        )[:limit]
+
+    def summary(self, hours: int = 24) -> dict:
+        """Compute summary statistics for the dashboard."""
+        since = datetime.now() - timedelta(hours=hours)
+        recent = self.query(since=since, limit=10000)
+
+        by_type = {}
+        for evt_type in EventType:
+            typed = [e for e in recent
+                     if e.event_type == evt_type]
+            by_type[evt_type.value] = {
+                "count": len(typed),
+                "warnings": sum(
+                    1 for e in typed if e.severity == "warning"
+                ),
+                "critical": sum(
+                    1 for e in typed if e.severity == "critical"
+                ),
+            }
+
+        # Aggregate key metrics
+        experiment_runs = [
+            e for e in recent
+            if e.event_type == EventType.EXPERIMENT_RUN
+        ]
+        best_f1 = max(
+            (e.metrics.get("f1", 0) for e in experiment_runs),
+            default=0
+        )
+
+        drift_checks = [
+            e for e in recent
+            if e.event_type == EventType.DRIFT_CHECK
+        ]
+        drift_alerts = sum(
+            1 for e in drift_checks if e.severity != "info"
+        )
+
+        cost_events = [
+            e for e in recent
+            if e.event_type == EventType.AGENT_TRACE
+        ]
+        total_cost = sum(
+            e.metrics.get("cost", 0) for e in cost_events
+        )
+
+        return {
+            "time_window_hours": hours,
+            "total_events": len(recent),
+            "by_type": by_type,
+            "highlights": {
+                "best_experiment_f1": round(best_f1, 4),
+                "drift_alerts": drift_alerts,
+                "total_agent_cost": round(total_cost, 4),
+                "active_warnings": sum(
+                    1 for e in recent if e.severity == "warning"
+                ),
+                "active_critical": sum(
+                    1 for e in recent if e.severity == "critical"
+                ),
+            }
+        }</code></pre>
+<div class="code-caption">Unified lifecycle data model with typed events, queryable storage, and time-windowed summary statistics. All four operational subsystems (experiments, evaluations, traces, drift) emit events into the same store.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the collector layer as a hospital's central nursing station. Each ward (cardiology,
+neurology, radiology, the pharmacy) generates its own vital-sign readings and lab reports
+in its own format: heart rate on one chart, brain scans in another system, blood panels on
+a third. The nursing station does not replace any ward's equipment. Instead, it translates
+every ward's output into a single patient timeline, so a nurse who sees a simultaneous
+blood-pressure spike and an abnormal lab result can correlate them instantly rather than
+walking between four different wards. The collector adapters in the lifecycle dashboard
+work the same way: each one reads from one subsystem (MLflow, the drift monitor, the agent
+tracer, the prompt evaluator) and writes a normalized event into a shared timeline, enabling
+cross-subsystem correlation that no single tool provides on its own.
+</p>
+</div>
+
+
+<h2>2. Collector: Bridging Subsystems to the Dashboard</h2>
+
+<p>
+Each subsystem produces data in its own format. The collector layer translates subsystem
+outputs into <code>LifecycleEvent</code> records. This is a classic adapter pattern:
+each collector knows how to read from one subsystem and write to the unified store.
+</p>
+
+<pre><code class="language-python">"""
+Collectors: adapters that bridge MLflow, prompt evaluation,
+agent tracing, and drift monitoring into the unified store.
+"""
+from datetime import datetime
+
+class MLflowCollector:
+    """Collect experiment runs from MLflow into the lifecycle store."""
+
+    def __init__(self, store: LifecycleStore,
+                 mlflow_tracking_uri: str = "http://localhost:5000"):
+        self.store = store
+        self.tracking_uri = mlflow_tracking_uri
+
+    def collect_recent_runs(self, experiment_name: str,
+                            hours: int = 24) -> int:
+        """Pull recent MLflow runs and emit lifecycle events."""
+        from mlflow.tracking import MlflowClient
+        import mlflow
+
+        mlflow.set_tracking_uri(self.tracking_uri)
+        client = MlflowClient()
+        experiment = client.get_experiment_by_name(experiment_name)
+        if not experiment:
+            return 0
+
+        # Query runs from the last N hours
+        runs = client.search_runs(
+            experiment_ids=[experiment.experiment_id],
+            order_by=["start_time DESC"],
+            max_results=50
+        )
+
+        count = 0
+        for run in runs:
+            metrics = run.data.metrics
+            params = run.data.params
+
+            # Determine severity based on metric thresholds
+            f1 = metrics.get("f1", 0)
+            severity = "info"
+            if f1 < 0.7:
+                severity = "warning"
+            if f1 < 0.5:
+                severity = "critical"
+
+            self.store.add(LifecycleEvent(
+                event_type=EventType.EXPERIMENT_RUN,
+                timestamp=datetime.fromtimestamp(
+                    run.info.start_time / 1000
+                ).isoformat(),
+                source="mlflow",
+                summary=(
+                    f"Run {run.info.run_id[:8]}: "
+                    f"F1={f1:.3f}, AUC={metrics.get('roc_auc', 0):.3f}"
+                ),
+                metrics=dict(metrics),
+                metadata=dict(params),
+                severity=severity,
+                model_version=params.get("model_version", ""),
+                tags=["experiment", experiment_name]
+            ))
+            count += 1
+        return count
+
+
+class DriftCollector:
+    """Collect drift check results into the lifecycle store."""
+
+    def __init__(self, store: LifecycleStore):
+        self.store = store
+
+    def record_check(self, drift_report: dict,
+                     model_version: str = "") -> None:
+        """Convert a DriftMonitor report to a lifecycle event."""
+        drifted = drift_report.get("drifted_features", [])
+        mmd = drift_report.get("overall_mmd", 0)
+
+        if not drifted and mmd < 0.01:
+            severity = "info"
+            summary = "No significant drift detected"
+        elif len(drifted) <= 2 and mmd < 0.05:
+            severity = "warning"
+            summary = f"Moderate drift in: {', '.join(drifted)}"
+        else:
+            severity = "critical"
+            summary = (
+                f"Significant drift in {len(drifted)} features, "
+                f"MMD={mmd:.4f}"
+            )
+
+        self.store.add(LifecycleEvent(
+            event_type=EventType.DRIFT_CHECK,
+            timestamp=datetime.now().isoformat(),
+            source="drift_monitor",
+            summary=summary,
+            metrics={
+                "overall_mmd": mmd,
+                "n_drifted_features": len(drifted),
+                **{f"psi_{k}": v["psi"]
+                   for k, v in drift_report.get(
+                       "feature_psi", {}
+                   ).items()}
+            },
+            metadata={"drifted_features": drifted},
+            severity=severity,
+            model_version=model_version,
+            tags=["drift", "monitoring"]
+        ))
+
+
+class TraceCollector:
+    """Collect agent traces into the lifecycle store."""
+
+    def __init__(self, store: LifecycleStore):
+        self.store = store
+
+    def record_trace(self, trace: dict) -> None:
+        """Convert an AgentTracer trace to a lifecycle event."""
+        stats = trace.get("stats", {})
+        duration = trace.get("duration_ms", 0)
+
+        # Cost estimation from token usage
+        input_tokens = stats.get("total_input_tokens", 0)
+        output_tokens = stats.get("total_output_tokens", 0)
+        estimated_cost = (input_tokens * 3 + output_tokens * 15) / 1e6
+
+        # Determine severity
+        severity = "info"
+        if stats.get("errors", 0) > 0:
+            severity = "warning"
+        if trace.get("status") == "failed":
+            severity = "critical"
+        if duration > 30000:  # Over 30 seconds
+            severity = max(severity, "warning")
+
+        self.store.add(LifecycleEvent(
+            event_type=EventType.AGENT_TRACE,
+            timestamp=datetime.fromtimestamp(
+                trace.get("start_time", 0)
+            ).isoformat(),
+            source="agent_tracer",
+            summary=(
+                f"Agent '{trace.get('name', 'unknown')}': "
+                f"{stats.get('llm_calls', 0)} LLM calls, "
+                f"{stats.get('tool_calls', 0)} tool calls, "
+                f"{duration:.0f}ms"
+            ),
+            metrics={
+                "duration_ms": duration,
+                "llm_calls": stats.get("llm_calls", 0),
+                "tool_calls": stats.get("tool_calls", 0),
+                "errors": stats.get("errors", 0),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost": estimated_cost,
+            },
+            severity=severity,
+            tags=["agent", trace.get("name", "unknown")]
+        ))
+
+
+class EvalCollector:
+    """Collect prompt evaluation results into the lifecycle store."""
+
+    def __init__(self, store: LifecycleStore):
+        self.store = store
+
+    def record_eval(self, prompt_name: str, version: int,
+                    eval_results: dict) -> None:
+        """Convert evaluation batch results to a lifecycle event."""
+        overall = eval_results.get("overall_mean", 0)
+        n_cases = eval_results.get("n_cases", 0)
+
+        severity = "info"
+        if overall < 0.7:
+            severity = "warning"
+        if overall < 0.5:
+            severity = "critical"
+
+        criteria_scores = {
+            k: v["mean"]
+            for k, v in eval_results.get("criteria", {}).items()
+        }
+
+        self.store.add(LifecycleEvent(
+            event_type=EventType.PROMPT_EVAL,
+            timestamp=datetime.now().isoformat(),
+            source="prompt_evaluator",
+            summary=(
+                f"Prompt '{prompt_name}' v{version}: "
+                f"score={overall:.3f} over {n_cases} cases"
+            ),
+            metrics={
+                "overall_score": overall,
+                "n_cases": n_cases,
+                **criteria_scores
+            },
+            metadata={
+                "prompt_name": prompt_name,
+                "prompt_version": version,
+                "auto_check_pass_rates": eval_results.get(
+                    "auto_check_pass_rate", {}
+                )
+            },
+            severity=severity,
+            tags=["evaluation", prompt_name]
+        ))</code></pre>
+<div class="code-caption">Four collector adapters translate subsystem-specific outputs (MLflow runs, drift reports, agent traces, prompt evaluations) into unified lifecycle events with consistent severity classification.</div>
+
+
+<h2>3. Dashboard API</h2>
+
+<p>
+The dashboard exposes its data through a FastAPI service that the Discovery Workbench
+(or any frontend) can query. The API provides three endpoint families: a summary
+endpoint for the overview panel, a timeline endpoint for the event feed, and detail
+endpoints for drilling into specific events.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is treating the lifecycle dashboard as a passive visualization layer
+that simply renders charts from raw subsystem data. The dashboard is not a skin on top
+of MLflow plus a tracing UI; it is an <em>aggregation and correlation engine</em> that
+computes cross-subsystem summaries (such as "drift alert count vs. agent error rate in
+the same time window") and assigns severity levels that no individual subsystem can
+determine on its own. If you skip the aggregation layer and just embed four iframes
+side by side, you lose the ability to correlate events across subsystems, which is the
+entire reason the dashboard exists.
+</p>
+</div>
+
+<pre><code class="language-python">"""
+Lifecycle Dashboard API: FastAPI service that exposes
+the unified lifecycle data to the Discovery Workbench UI.
+"""
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timedelta
+from typing import Optional
+import json
+
+app = FastAPI(
+    title="Discovery AI Lifecycle Dashboard",
+    description="Unified MLOps, LLMOps, and AgentOps monitoring",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Restrict in production
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+# Initialize the store and collectors
+store = LifecycleStore()
+mlflow_collector = MLflowCollector(store)
+drift_collector = DriftCollector(store)
+trace_collector = TraceCollector(store)
+eval_collector = EvalCollector(store)
+
+
+@app.get("/api/v1/summary")
+async def get_summary(hours: int = Query(default=24, ge=1, le=168)):
+    """
+    Dashboard summary: key metrics and alert counts
+    for the specified time window.
+    """
+    summary = store.summary(hours=hours)
+    return {
+        "status": "healthy" if summary["highlights"]["active_critical"] == 0
+                  else "degraded",
+        **summary
+    }
+
+
+@app.get("/api/v1/timeline")
+async def get_timeline(
+    hours: int = Query(default=24, ge=1, le=168),
+    event_type: Optional[str] = None,
+    severity: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=500)
+):
+    """
+    Event timeline: chronological feed of lifecycle events,
+    filterable by type and severity.
+    """
+    since = datetime.now() - timedelta(hours=hours)
+    evt_type = EventType(event_type) if event_type else None
+
+    events = store.query(
+        event_type=evt_type,
+        since=since,
+        severity=severity,
+        limit=limit
+    )
+
+    return {
+        "count": len(events),
+        "events": [
+            {
+                "type": e.event_type.value,
+                "timestamp": e.timestamp,
+                "summary": e.summary,
+                "severity": e.severity,
+                "metrics": e.metrics,
+                "tags": e.tags,
+            }
+            for e in events
+        ]
+    }
+
+
+@app.get("/api/v1/models/{model_version}/health")
+async def get_model_health(model_version: str):
+    """
+    Model health: aggregated view of a specific model version
+    combining experiment metrics, drift status, and agent performance.
+    """
+    # Gather all events for this model version
+    all_events = store.query(model_version=model_version, limit=1000)
+
+    # Latest experiment metrics
+    experiments = [
+        e for e in all_events
+        if e.event_type == EventType.EXPERIMENT_RUN
+    ]
+    latest_metrics = experiments[0].metrics if experiments else {}
+
+    # Latest drift status
+    drift_events = [
+        e for e in all_events
+        if e.event_type == EventType.DRIFT_CHECK
+    ]
+    latest_drift = drift_events[0] if drift_events else None
+
+    # Agent performance statistics
+    traces = [
+        e for e in all_events
+        if e.event_type == EventType.AGENT_TRACE
+    ]
+    avg_latency = (
+        sum(e.metrics.get("duration_ms", 0) for e in traces) / len(traces)
+        if traces else 0
+    )
+    error_rate = (
+        sum(1 for e in traces if e.metrics.get("errors", 0) > 0) / len(traces)
+        if traces else 0
+    )
+
+    return {
+        "model_version": model_version,
+        "experiment_metrics": latest_metrics,
+        "drift_status": {
+            "severity": latest_drift.severity if latest_drift else "unknown",
+            "summary": latest_drift.summary if latest_drift else "No checks",
+            "mmd": (latest_drift.metrics.get("overall_mmd", 0)
+                    if latest_drift else None),
+        },
+        "agent_performance": {
+            "total_traces": len(traces),
+            "avg_latency_ms": round(avg_latency, 1),
+            "error_rate": round(error_rate, 3),
+            "total_cost": round(
+                sum(e.metrics.get("cost", 0) for e in traces), 4
+            ),
+        }
+    }
+
+
+@app.get("/api/v1/cost/breakdown")
+async def get_cost_breakdown(hours: int = Query(default=24, ge=1, le=168)):
+    """
+    Cost breakdown: token usage and spend by agent, step, and model.
+    """
+    since = datetime.now() - timedelta(hours=hours)
+    traces = store.query(
+        event_type=EventType.AGENT_TRACE,
+        since=since,
+        limit=10000
+    )
+
+    by_agent = {}
+    for t in traces:
+        agent = next(
+            (tag for tag in t.tags if tag != "agent"), "unknown"
+        )
+        if agent not in by_agent:
+            by_agent[agent] = {
+                "total_cost": 0, "n_traces": 0,
+                "total_input_tokens": 0, "total_output_tokens": 0
+            }
+        by_agent[agent]["total_cost"] += t.metrics.get("cost", 0)
+        by_agent[agent]["n_traces"] += 1
+        by_agent[agent]["total_input_tokens"] += t.metrics.get(
+            "input_tokens", 0
+        )
+        by_agent[agent]["total_output_tokens"] += t.metrics.get(
+            "output_tokens", 0
+        )
+
+    total_cost = sum(v["total_cost"] for v in by_agent.values())
+    return {
+        "time_window_hours": hours,
+        "total_cost": round(total_cost, 4),
+        "by_agent": {
+            k: {**v, "total_cost": round(v["total_cost"], 4),
+                "pct_of_total": round(v["total_cost"] / total_cost * 100, 1)
+                if total_cost > 0 else 0}
+            for k, v in sorted(
+                by_agent.items(),
+                key=lambda x: x[1]["total_cost"],
+                reverse=True
+            )
+        }
+    }</code></pre>
+<div class="code-caption">FastAPI lifecycle dashboard with four endpoint families: summary (overview), timeline (event feed), model health (per-version drill-down), and cost breakdown (spend attribution by agent and step).</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Dashboard Is the Discovery Workbench's Immune System</div>
+<p>
+The Discovery Workbench, introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>
+and extended throughout the book, is a platform for running scientific discovery workflows.
+The lifecycle dashboard is its immune system: the subsystem that detects when something is
+going wrong (drift), diagnoses what is wrong (trace analysis), and suggests remediation
+(retrain the model, roll back the prompt, disable the failing tool). Without this immune
+system, the Workbench is a powerful machine with no self-awareness. With it, the Workbench
+can maintain its own operational health, which is a prerequisite for the autonomous discovery
+systems of <a href="../../part-7-autonomous-discovery/module-53-ai-scientists/index.html">Part VII</a>.
+</p>
+</div>
+
+
+<h2>4. Putting It All Together: End-to-End Lifecycle Run</h2>
+
+<p>
+Let us walk through a complete lifecycle scenario that exercises every component. A research
+team deploys a molecular activity classifier, monitors it for drift, evaluates their
+literature review agent's prompts, tracks agent execution costs, and uses the dashboard
+to diagnose and resolve a production issue.
+</p>
+
+<pre><code class="language-python">"""
+End-to-end lifecycle scenario: from model training through
+production monitoring, drift detection, and remediation.
+"""
+import numpy as np
+from datetime import datetime
+
+def run_lifecycle_demo():
+    """
+    Complete lifecycle demonstration integrating all components
+    from Sections 22.1 and 22.2.
+    """
+    # ---- Phase 1: Train and Track ----
+    # (Using the MLflow tracking from Section 22.1)
+    print("Phase 1: Training model with experiment tracking...")
+
+    # Simulate training metrics for two model versions
+    store = LifecycleStore()
+    eval_coll = EvalCollector(store)
+    drift_coll = DriftCollector(store)
+    trace_coll = TraceCollector(store)
+
+    # Record experiment runs
+    store.add(LifecycleEvent(
+        event_type=EventType.EXPERIMENT_RUN,
+        timestamp=datetime.now().isoformat(),
+        source="mlflow",
+        summary="Run abc123: F1=0.87, AUC=0.93",
+        metrics={"f1": 0.87, "roc_auc": 0.93, "cv_std": 0.03},
+        model_version="v1.0",
+        severity="info",
+        tags=["experiment", "molecule_activity"]
+    ))
+
+    store.add(LifecycleEvent(
+        event_type=EventType.MODEL_PROMOTION,
+        timestamp=datetime.now().isoformat(),
+        source="model_registry",
+        summary="Model v1.0 promoted to Production",
+        metadata={"from_stage": "Staging", "to_stage": "Production"},
+        model_version="v1.0",
+        severity="info",
+        tags=["promotion"]
+    ))
+
+    # ---- Phase 2: Monitor for Drift ----
+    print("Phase 2: Running drift detection...")
+
+    # Simulate: first check is clean
+    drift_coll.record_check({
+        "overall_mmd": 0.003,
+        "feature_psi": {
+            "mol_weight": {"psi": 0.05, "status": "ok"},
+            "logp": {"psi": 0.03, "status": "ok"},
+            "tpsa": {"psi": 0.04, "status": "ok"}
+        },
+        "drifted_features": [],
+        "action_required": False
+    }, model_version="v1.0")
+
+    # Simulate: second check detects drift
+    drift_coll.record_check({
+        "overall_mmd": 0.035,
+        "feature_psi": {
+            "mol_weight": {"psi": 0.42, "status": "drift"},
+            "logp": {"psi": 0.08, "status": "ok"},
+            "tpsa": {"psi": 0.31, "status": "drift"}
+        },
+        "drifted_features": ["mol_weight", "tpsa"],
+        "action_required": True
+    }, model_version="v1.0")
+
+    # ---- Phase 3: Evaluate Prompt Changes ----
+    print("Phase 3: Evaluating prompt versions...")
+
+    eval_coll.record_eval("paper_summarizer", 1, {
+        "overall_mean": 0.72,
+        "n_cases": 50,
+        "criteria": {
+            "factual_accuracy": {"mean": 0.75},
+            "completeness": {"mean": 0.68},
+            "conciseness": {"mean": 0.85}
+        },
+        "auto_check_pass_rate": {
+            "has_hypothesis": 0.82,
+            "length_ok": 0.96
+        }
+    })
+
+    eval_coll.record_eval("paper_summarizer", 2, {
+        "overall_mean": 0.84,
+        "n_cases": 50,
+        "criteria": {
+            "factual_accuracy": {"mean": 0.81},
+            "completeness": {"mean": 0.89},
+            "conciseness": {"mean": 0.83}
+        },
+        "auto_check_pass_rate": {
+            "has_hypothesis": 0.96,
+            "length_ok": 0.94
+        }
+    })
+
+    # ---- Phase 4: Track Agent Execution ----
+    print("Phase 4: Recording agent traces...")
+
+    trace_coll.record_trace({
+        "trace_id": "trace_001",
+        "name": "research_agent",
+        "start_time": datetime.now().timestamp(),
+        "duration_ms": 4500,
+        "status": "completed",
+        "final_output": "Found 15 relevant papers...",
+        "stats": {
+            "total_spans": 5,
+            "llm_calls": 3,
+            "tool_calls": 2,
+            "errors": 0,
+            "total_input_tokens": 12000,
+            "total_output_tokens": 2500,
+            "total_llm_latency_ms": 3200,
+            "total_tool_latency_ms": 1100,
+        }
+    })
+
+    # Agent trace with errors (tool failure)
+    trace_coll.record_trace({
+        "trace_id": "trace_002",
+        "name": "research_agent",
+        "start_time": datetime.now().timestamp(),
+        "duration_ms": 15000,
+        "status": "completed",
+        "final_output": "Partial results (PubMed unavailable)...",
+        "stats": {
+            "total_spans": 8,
+            "llm_calls": 5,
+            "tool_calls": 3,
+            "errors": 2,
+            "total_input_tokens": 25000,
+            "total_output_tokens": 4000,
+            "total_llm_latency_ms": 8000,
+            "total_tool_latency_ms": 6500,
+        }
+    })
+
+    # ---- Phase 5: Dashboard Summary ----
+    print("\nPhase 5: Dashboard summary")
+    summary = store.summary(hours=24)
+    print(json.dumps(summary, indent=2))
+
+    # ---- Phase 6: Respond to Drift Alert ----
+    print("\nPhase 6: Drift response")
+    critical_events = store.query(severity="critical")
+    for event in critical_events:
+        print(f"  CRITICAL: {event.summary}")
+        if event.event_type == EventType.DRIFT_CHECK:
+            print("  Action: Trigger model retraining pipeline")
+            print(f"  Drifted features: "
+                  f"{event.metadata.get('drifted_features', [])}")
+
+    return store
+
+
+# Run the complete lifecycle demonstration
+# demo_store = run_lifecycle_demo()</code></pre>
+<div class="code-caption">End-to-end lifecycle scenario exercising all four subsystems: experiment tracking records model performance, drift detection flags distribution changes, prompt evaluation compares versions, and agent tracing captures execution details. The dashboard summary surfaces actionable alerts.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Diagnosing a Production Degradation</div>
+<p>
+Monday morning, the research team's Discovery Workbench shows a "degraded" status on the
+lifecycle dashboard. The summary endpoint reports two critical events. Drilling in, they
+find: (1) a drift alert showing PSI = 0.42 on molecular weight and PSI = 0.31 on TPSA,
+triggered because the medicinal chemistry team submitted a new compound series over the
+weekend; (2) an agent trace showing the research agent's PubMed tool failed twice,
+causing the agent to retry with higher token usage ($0.12 per request instead of the
+usual $0.04). The cost breakdown endpoint confirms a 3x cost spike in the "research_agent"
+category. The team responds on two fronts: they trigger a model retraining pipeline that
+includes the new compound series (resolving the drift alert within 2 hours), and they
+check the PubMed API status page (discovering a scheduled maintenance window, explaining
+the tool failures). By noon, the dashboard shows "healthy" status across all four
+subsystems. Without the unified dashboard, these two independent issues would have
+appeared as a single mysterious "predictions are wrong" complaint, requiring hours of
+investigation across separate tools.
+</p>
+</div>
+
+
+<h2>5. Scheduling and Automation</h2>
+
+<p>
+A dashboard that requires manual refresh is a dashboard that nobody checks. The lifecycle
+dashboard becomes truly useful only when its collectors run automatically on a schedule.
+Drift checks run hourly against the latest production data. Experiment collectors poll
+MLflow every 15 minutes. Agent traces stream in real time. Prompt evaluations trigger
+on every prompt version change.
+</p>
+
+<pre><code class="language-python">"""
+Scheduled lifecycle monitoring: automated collection
+and alerting for continuous operational awareness.
+"""
+import asyncio
+from datetime import datetime
+
+class LifecycleScheduler:
+    """Run lifecycle checks on configurable schedules."""
+
+    def __init__(self, store: LifecycleStore):
+        self.store = store
+        self.drift_coll = DriftCollector(store)
+        self.trace_coll = TraceCollector(store)
+        self._running = False
+
+    async def run_drift_check(
+        self,
+        reference_data,
+        current_data_fn,
+        feature_names: list[str],
+        model_version: str,
+        interval_seconds: int = 3600
+    ):
+        """Periodically check for distribution shift."""
+        monitor = DriftMonitor(reference_data, feature_names)
+
+        while self._running:
+            try:
+                current = current_data_fn()  # Fetch latest data
+                report = monitor.check_drift(current)
+                self.drift_coll.record_check(report, model_version)
+
+                if report["action_required"]:
+                    await self._send_alert(
+                        f"Drift detected in model {model_version}",
+                        report
+                    )
+            except Exception as e:
+                self.store.add(LifecycleEvent(
+                    event_type=EventType.DRIFT_CHECK,
+                    timestamp=datetime.now().isoformat(),
+                    source="scheduler",
+                    summary=f"Drift check failed: {str(e)}",
+                    severity="critical",
+                    tags=["scheduler_error"]
+                ))
+
+            await asyncio.sleep(interval_seconds)
+
+    async def run_cost_monitor(
+        self,
+        cost_tracker,
+        alert_threshold: float = 0.8,
+        interval_seconds: int = 900
+    ):
+        """Monitor cost budgets and alert on overruns."""
+        while self._running:
+            budget_status = cost_tracker.check_budget()
+
+            if budget_status["exceeded"]:
+                self.store.add(LifecycleEvent(
+                    event_type=EventType.COST_ALERT,
+                    timestamp=datetime.now().isoformat(),
+                    source="cost_monitor",
+                    summary=(
+                        f"Budget exceeded: "
+                        f"${budget_status['spent_today']:.2f} / "
+                        f"${budget_status['daily_budget']:.2f}"
+                    ),
+                    metrics=budget_status,
+                    severity="critical",
+                    tags=["cost", "budget"]
+                ))
+                await self._send_alert(
+                    "Daily cost budget exceeded", budget_status
+                )
+            elif budget_status["warning"]:
+                self.store.add(LifecycleEvent(
+                    event_type=EventType.COST_ALERT,
+                    timestamp=datetime.now().isoformat(),
+                    source="cost_monitor",
+                    summary=(
+                        f"Budget warning: "
+                        f"{budget_status['utilization']:.0%} utilized"
+                    ),
+                    metrics=budget_status,
+                    severity="warning",
+                    tags=["cost", "budget"]
+                ))
+
+            await asyncio.sleep(interval_seconds)
+
+    async def _send_alert(self, title: str, details: dict):
+        """Send alert via configured channels (Slack, email, etc.)."""
+        # In production, integrate with PagerDuty, Slack, or email
+        print(f"ALERT: {title}")
+        print(f"  Details: {json.dumps(details, indent=2, default=str)}")
+
+    def start(self):
+        """Start all scheduled monitors."""
+        self._running = True
+
+    def stop(self):
+        """Stop all scheduled monitors."""
+        self._running = False</code></pre>
+<div class="code-caption">Automated lifecycle scheduling with periodic drift checks, cost budget monitoring, and alerting. The scheduler runs continuously, feeding events into the unified store and sending alerts when thresholds are breached.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+The lifecycle dashboard monitors your AI systems, but who monitors the dashboard? In
+production, the answer is "another monitoring system." The dashboard's own health (API
+latency, collector failures, missed schedules) should be tracked by your infrastructure
+monitoring (Prometheus, Datadog, or the observability stack from
+<a href="../module-21-devops/index.html">Chapter 21</a>). This is the operational equivalent
+of <em>quis custodiet ipsos custodes</em>, and the answer is always "another layer of
+monitoring, all the way down."
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+Current lifecycle dashboards detect problems and alert humans, but the frontier is moving
+toward <strong>closed-loop autonomous remediation</strong>. In 2024, Shankar et al. introduced
+<em>ARES</em> (Automated Root-cause and Evaluation System), a framework where an LLM agent
+monitors its own trace logs, identifies degradation patterns, and triggers corrective actions
+(prompt rollback, retrieval-index rebuild, or model retraining) without human approval for
+pre-authorized action classes. Similarly, the 2024 <em>AgentOps</em> framework from
+Anthropic and industry collaborators formalized the notion of "operational guardrails" that
+let an agent observe its own drift metrics and decide whether to continue serving, fall back
+to a cached response, or escalate to a human operator. These systems push beyond the
+detect-and-alert loop built in this section toward dashboards that are themselves agents,
+capable of diagnosing and resolving a subset of production incidents autonomously. The key
+open challenge is bounding the remediation authority: which actions can the system take
+without human confirmation, and how do you audit those decisions after the fact?
+</p>
+</div>
+
+
+<h2>6. Discovery Workbench Integration</h2>
+
+<p>
+The lifecycle dashboard becomes a first-class component of the Discovery Workbench by
+registering its API endpoints with the Workbench's plugin system. The integration follows
+the same pattern established in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>:
+a plugin descriptor declares the component's capabilities, endpoints, and UI panels.
+</p>
+
+<pre><code class="language-python">"""
+Discovery Workbench plugin descriptor for the lifecycle dashboard.
+Registers the dashboard as a Workbench component with
+configurable panels and alert routing.
+"""
+
+WORKBENCH_PLUGIN = {
+    "name": "lifecycle-dashboard",
+    "version": "1.0.0",
+    "description": "Unified MLOps, LLMOps, and AgentOps monitoring",
+    "category": "operations",
+
+    "endpoints": {
+        "summary": "/api/v1/summary",
+        "timeline": "/api/v1/timeline",
+        "model_health": "/api/v1/models/{model_version}/health",
+        "cost_breakdown": "/api/v1/cost/breakdown",
+    },
+
+    "panels": [
+        {
+            "id": "lifecycle-overview",
+            "title": "System Health",
+            "type": "status_grid",
+            "endpoint": "summary",
+            "refresh_interval_seconds": 60,
+            "layout": {"row": 0, "col": 0, "width": 12}
+        },
+        {
+            "id": "lifecycle-timeline",
+            "title": "Event Timeline",
+            "type": "event_feed",
+            "endpoint": "timeline",
+            "refresh_interval_seconds": 30,
+            "filters": ["event_type", "severity"],
+            "layout": {"row": 1, "col": 0, "width": 8}
+        },
+        {
+            "id": "lifecycle-cost",
+            "title": "Cost Breakdown",
+            "type": "bar_chart",
+            "endpoint": "cost_breakdown",
+            "refresh_interval_seconds": 300,
+            "layout": {"row": 1, "col": 8, "width": 4}
+        },
+    ],
+
+    "alerts": {
+        "channels": ["workbench_notification", "slack"],
+        "rules": [
+            {
+                "name": "drift_detected",
+                "condition": "event.type == 'drift_check' "
+                             "and event.severity == 'critical'",
+                "action": "notify",
+                "cooldown_minutes": 60
+            },
+            {
+                "name": "budget_exceeded",
+                "condition": "event.type == 'cost_alert' "
+                             "and event.severity == 'critical'",
+                "action": "notify",
+                "cooldown_minutes": 30
+            },
+            {
+                "name": "agent_error_spike",
+                "condition": "event.type == 'agent_trace' "
+                             "and event.metrics.errors > 3",
+                "action": "notify",
+                "cooldown_minutes": 15
+            }
+        ]
+    },
+
+    "dependencies": [
+        "mlflow>=2.10",
+        "fastapi>=0.110",
+        "anthropic>=0.40",
+    ]
+}</code></pre>
+<div class="code-caption">Discovery Workbench plugin descriptor for the lifecycle dashboard. The descriptor registers API endpoints, configurable UI panels with auto-refresh, and alert routing rules that trigger notifications on drift, budget overruns, and agent error spikes.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Managed Platforms</div>
+<p>
+The lifecycle dashboard we built from scratch totals roughly 500 lines of Python. Managed
+platforms compress this significantly.
+<a href="https://docs.arize.com/phoenix" target="_blank">Arize Phoenix</a> (open-source)
+provides trace visualization, evaluation, and drift detection in a single UI, deployable
+with <code>pip install arize-phoenix &amp;&amp; phoenix serve</code>.
+<a href="https://docs.smith.langchain.com/" target="_blank">LangSmith</a> adds managed
+hosting, team collaboration, and evaluation dataset management.
+<a href="https://mlflow.org/" target="_blank">MLflow</a> handles experiment tracking and
+model registry. In practice, production teams often combine these: MLflow for experiment
+tracking, Phoenix or LangSmith for LLM/agent tracing, and a custom aggregation layer
+(like our dashboard API) to unify the views. The from-scratch implementation in this
+section teaches the architecture; the libraries provide the production implementation.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Lifecycle Dashboard in 30 Minutes</h4>
+<p>
+1. <strong>Set up the data model.</strong> Create a file called <code>lifecycle_dashboard.py</code>
+and copy the <code>EventType</code>, <code>LifecycleEvent</code>, and <code>LifecycleStore</code>
+classes from this section. Verify the store works by instantiating it, adding three events
+of different types, and calling <code>store.summary(hours=1)</code> to confirm the counts
+are correct.
+2. <strong>Write two collectors.</strong> Implement a <code>DriftCollector</code> and a
+<code>TraceCollector</code> (skip MLflow; use synthetic data). Generate 10 synthetic drift
+reports with <code>numpy.random</code> (varying <code>overall_mmd</code> between 0.001 and 0.08)
+and 10 synthetic agent traces (varying <code>duration_ms</code> between 500 and 45000 and
+<code>errors</code> between 0 and 5). Feed all 20 through your collectors.
+3. <strong>Serve the API.</strong> Install FastAPI and Uvicorn
+(<code>pip install fastapi uvicorn</code>), add the <code>/api/v1/summary</code> and
+<code>/api/v1/timeline</code> endpoints, and start the server with
+<code>uvicorn lifecycle_dashboard:app --reload</code>.
+4. <strong>Query and inspect.</strong> Open your browser to
+<code>http://localhost:8000/api/v1/summary?hours=1</code> and verify that the response
+includes correct counts for <code>drift_check</code> and <code>agent_trace</code> events.
+Then query <code>/api/v1/timeline?severity=critical</code> and confirm only the high-severity
+events appear.
+5. <strong>Add a severity histogram.</strong> Create a new endpoint
+<code>/api/v1/severity_counts</code> that returns
+<code>{"info": N, "warning": N, "critical": N}</code> for the last hour. Test it after
+injecting a few more events with varied severities. This completes your working prototype
+of the unified lifecycle pattern.
+</p>
+</div>
+
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> The lifecycle dashboard treats experiments, evaluations,
+traces, and drift checks as events in a unified timeline. What other types of events
+would you add to make the dashboard more useful for a team running scientific discovery
+workflows? Propose at least three additional event types with their severity classification
+rules.
+</li>
+<li>
+<strong>(Coding)</strong> Extend the dashboard API with a <code>/api/v1/trends</code>
+endpoint that computes time-series trends for key metrics (average F1 score, daily cost,
+drift frequency, agent error rate) over configurable time windows. Implement a simple
+anomaly detection that flags metric values more than two standard deviations from the
+rolling 7-day average.
+</li>
+<li>
+<strong>(Analysis)</strong> Deploy the complete lifecycle dashboard locally (using
+<code>uvicorn</code> to serve the FastAPI app). Populate it with at least 20 synthetic
+events across all four event types. Use the summary and timeline endpoints to diagnose
+a simulated production issue where both drift and agent tool failures occur simultaneously.
+Write a post-mortem document describing the root cause, impact, and remediation steps.
+</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-22.2.html">&larr; 22.2 LLMOps and AgentOps</a>
+<a href="index.html">Chapter 22</a>
+<a href="../module-23-evaluating-agents/index.html">Chapter 23: Evaluating AI Coding Agents &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

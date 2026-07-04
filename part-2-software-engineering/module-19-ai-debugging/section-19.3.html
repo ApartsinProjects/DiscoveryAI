@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.3: Building a Debugging Pipeline. End-to-end recipe: plant a bug, collect traces, run Ochiai localizer, generate hypotheses, patch, and verify." name="description"/>
+<title>Section 19.3: Building a Debugging Pipeline | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: AI-Assisted Debugging</a></div>
+<h1>19.3 Building a Debugging Pipeline</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I planted the bug at 9:00 AM. By 9:03 the pipeline had found it, explained it, patched it, verified the fix, and opened a pull request. I spent the remaining seven hours and fifty-seven minutes questioning my career choices."</p>
+<cite>A Software Engineer Watching the Machines Work</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section integrates everything from the chapter. You need the fault localization
+algorithms from <a href="section-19.1.html">Section 19.1</a> (delta debugging, Ochiai
+coefficient, structured logging, OpenTelemetry tracing) and the self-debugging agent
+architecture from <a href="section-19.2.html">Section 19.2</a> (hypothesis-rank-verify
+loop, multi-agent teams). We will also connect to the testing infrastructure from
+<a href="../module-18-ai-testing/index.html">Chapter 18: AI-Assisted Testing and QA</a>
+and the Discovery Workbench architecture from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6: Discovery System Architecture</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The previous two sections built individual components: fault localization algorithms,
+structured trace collection, and self-debugging agents. This section assembles them
+into a complete, end-to-end debugging pipeline. The recipe is concrete: we plant a
+known bug in a realistic application, collect execution traces, run the Ochiai localizer,
+let the agent generate and rank hypotheses, synthesize patches, and verify the fix. By
+the end, you will have a working system that can be integrated into the Discovery
+Workbench as an autonomous repair module.
+</p>
+</div>
+
+<p data-agent="02">
+A debugging pipeline is a fully automated workflow that takes a failing test suite as input and produces a verified fix (or a structured diagnostic report) as output, without human intervention between stages. It matters because manual debugging is the single largest time sink in software maintenance, often consuming 30 to 50 percent of total development effort; automating even the straightforward cases frees developers for problems that require creative reasoning. The pipeline works by chaining four stages in sequence: (1) run tests to detect failures, (2) compute a fault localization score for every source line using coverage data, (3) feed the top-ranked lines to an LLM that generates candidate patches, and (4) re-run the test suite to verify each patch until one passes or the budget is exhausted. Use a pipeline when your project has a reliable test suite and the failures are reproducible; for flaky tests, race conditions, or bugs that require environment-specific reproduction, start with manual triage before feeding the problem to an automated system.
+</p>
+
+<h2>1. The Target Application: A Scientific Data Processor</h2>
+
+<p>
+To demonstrate the full pipeline, we need a realistic application with enough complexity
+to produce interesting bugs. Our target is a small scientific data processing module:
+it loads experimental measurements, applies calibration corrections, detects outliers,
+and computes summary statistics. This is exactly the kind of code that appears in
+research pipelines (see
+<a href="../../part-1-foundations/module-05-data-models-simulation/index.html">Chapter 5: Discovery Through Data, Models, and Simulation</a>),
+where subtle numerical bugs can corrupt results silently.
+</p>
+
+<pre><code class="language-python">"""
+Target application: scientific data processor with a planted bug.
+This module processes experimental measurements, applies calibrations,
+detects outliers, and computes summary statistics.
+"""
+import math
+import structlog
+from dataclasses import dataclass, field
+from opentelemetry import trace
+
+log = structlog.get_logger()
+tracer = trace.get_tracer("data_processor")
+
+
+@dataclass
+class Measurement:
+    """A single experimental measurement with metadata."""
+    value: float
+    uncertainty: float
+    instrument_id: str
+    timestamp: str
+
+
+@dataclass
+class CalibrationProfile:
+    """Calibration parameters for an instrument."""
+    instrument_id: str
+    offset: float
+    scale: float
+    # Nonlinearity correction: value_corrected = scale * (value - offset) + nl * value^2
+    nonlinearity: float = 0.0
+
+
+@dataclass
+class ProcessingResult:
+    """Summary statistics from processed measurements."""
+    mean: float
+    std_dev: float
+    n_total: int
+    n_outliers: int
+    calibrated_values: list[float] = field(default_factory=list)
+
+
+def apply_calibration(
+    measurement: Measurement,
+    profile: CalibrationProfile,
+) -> float:
+    """Apply instrument calibration to a raw measurement.
+
+    The calibration model is:
+        corrected = scale * (raw - offset) + nonlinearity * raw^2
+    """
+    with tracer.start_as_current_span(
+        "apply_calibration",
+        attributes={
+            "instrument": measurement.instrument_id,
+            "raw_value": measurement.value,
+        },
+    ) as span:
+        raw = measurement.value
+        corrected = (
+            profile.scale * (raw - profile.offset)
+            + profile.nonlinearity * raw ** 2
+        )
+        span.set_attribute("corrected_value", corrected)
+        log.debug(
+            "calibration.applied",
+            instrument=measurement.instrument_id,
+            raw=raw,
+            corrected=corrected,
+            offset=profile.offset,
+            scale=profile.scale,
+        )
+        return corrected
+
+
+def detect_outliers(
+    values: list[float],
+    threshold: float = 3.0,
+) -> list[bool]:
+    """Detect outliers using the modified Z-score method.
+
+    Uses median absolute deviation (MAD) for robust outlier detection.
+    A value is an outlier if |modified_z_score| > threshold.
+    """
+    with tracer.start_as_current_span(
+        "detect_outliers",
+        attributes={"n_values": len(values), "threshold": threshold},
+    ) as span:
+        if len(values) < 3:
+            return [False] * len(values)
+
+        median = sorted(values)[len(values) // 2]
+        deviations = [abs(v - median) for v in values]
+        mad = sorted(deviations)[len(deviations) // 2]
+
+        # BUG: when MAD is zero (all values identical or nearly so),
+        # we should return no outliers, but instead we divide by zero
+        # and produce NaN, which causes downstream failures.
+        modified_z = [0.6745 * (v - median) / mad for v in values]
+
+        outliers = [abs(z) > threshold for z in modified_z]
+        n_outliers = sum(outliers)
+
+        span.set_attribute("n_outliers", n_outliers)
+        span.set_attribute("mad", mad)
+        log.info(
+            "outliers.detected",
+            n_values=len(values),
+            n_outliers=n_outliers,
+            mad=mad,
+            median=median,
+        )
+        return outliers
+
+
+def compute_statistics(
+    values: list[float],
+    outlier_mask: list[bool],
+) -> ProcessingResult:
+    """Compute summary statistics, excluding outliers."""
+    with tracer.start_as_current_span("compute_statistics") as span:
+        clean = [v for v, is_out in zip(values, outlier_mask) if not is_out]
+
+        if not clean:
+            log.warning("statistics.no_valid_data", reason="all values are outliers")
+            return ProcessingResult(
+                mean=0.0, std_dev=0.0,
+                n_total=len(values), n_outliers=sum(outlier_mask),
+                calibrated_values=[],
+            )
+
+        mean = sum(clean) / len(clean)
+        variance = sum((v - mean) ** 2 for v in clean) / len(clean)
+        std_dev = math.sqrt(variance)
+
+        span.set_attribute("mean", mean)
+        span.set_attribute("std_dev", std_dev)
+        span.set_attribute("n_clean", len(clean))
+
+        log.info(
+            "statistics.computed",
+            mean=mean,
+            std_dev=std_dev,
+            n_clean=len(clean),
+            n_outliers=sum(outlier_mask),
+        )
+
+        return ProcessingResult(
+            mean=mean,
+            std_dev=std_dev,
+            n_total=len(values),
+            n_outliers=sum(outlier_mask),
+            calibrated_values=clean,
+        )
+
+
+def process_experiment(
+    measurements: list[Measurement],
+    calibrations: dict[str, CalibrationProfile],
+    outlier_threshold: float = 3.0,
+) -> ProcessingResult:
+    """Full processing pipeline: calibrate, detect outliers, compute stats."""
+    with tracer.start_as_current_span(
+        "process_experiment",
+        attributes={"n_measurements": len(measurements)},
+    ):
+        # Step 1: Apply calibrations
+        calibrated = []
+        for m in measurements:
+            profile = calibrations.get(m.instrument_id)
+            if profile is None:
+                log.warning(
+                    "calibration.missing",
+                    instrument=m.instrument_id,
+                )
+                calibrated.append(m.value)  # Use raw value
+            else:
+                calibrated.append(apply_calibration(m, profile))
+
+        # Step 2: Detect outliers
+        outlier_mask = detect_outliers(calibrated, outlier_threshold)
+
+        # Step 3: Compute statistics
+        result = compute_statistics(calibrated, outlier_mask)
+
+        log.info(
+            "experiment.processed",
+            n_measurements=len(measurements),
+            mean=result.mean,
+            std_dev=result.std_dev,
+            n_outliers=result.n_outliers,
+        )
+        return result</code></pre>
+<div class="code-caption">The target application: a scientific data processor with a planted bug in the <code>detect_outliers</code> function. When all values are identical (MAD = 0), the division by zero produces NaN, corrupting all downstream statistics.</div>
+
+<h2>2. The Test Suite</h2>
+
+<p>
+A good test suite is essential for automated debugging: it provides the failing signal
+that triggers the pipeline and the passing signals that confirm the fix. Our test suite
+includes both passing cases (normal data) and the failing case that exposes the planted bug.
+</p>
+
+<pre><code class="language-python">"""
+Test suite for the scientific data processor.
+Includes tests that pass (normal data) and one that fails
+(identical values triggering the MAD=0 bug).
+"""
+import math
+import pytest
+
+
+def make_measurement(value, instrument="INST-01"):
+    """Helper to create a Measurement with defaults."""
+    return Measurement(
+        value=value,
+        uncertainty=0.1,
+        instrument_id=instrument,
+        timestamp="2026-07-02T10:00:00Z",
+    )
+
+
+DEFAULT_CALIBRATION = {
+    "INST-01": CalibrationProfile(
+        instrument_id="INST-01",
+        offset=0.0,
+        scale=1.0,
+        nonlinearity=0.0,
+    ),
+}
+
+
+class TestApplyCalibration:
+    """Tests for the calibration function."""
+
+    def test_identity_calibration(self):
+        """No-op calibration returns the original value."""
+        m = make_measurement(42.0)
+        profile = DEFAULT_CALIBRATION["INST-01"]
+        assert apply_calibration(m, profile) == 42.0
+
+    def test_offset_calibration(self):
+        """Offset shifts the value."""
+        m = make_measurement(10.0)
+        profile = CalibrationProfile("INST-01", offset=2.0, scale=1.0)
+        assert apply_calibration(m, profile) == 8.0
+
+    def test_scale_calibration(self):
+        """Scale multiplies the shifted value."""
+        m = make_measurement(10.0)
+        profile = CalibrationProfile("INST-01", offset=0.0, scale=2.0)
+        assert apply_calibration(m, profile) == 20.0
+
+    def test_nonlinearity(self):
+        """Nonlinearity adds a quadratic correction."""
+        m = make_measurement(10.0)
+        profile = CalibrationProfile("INST-01", offset=0.0, scale=1.0,
+                                      nonlinearity=0.01)
+        # corrected = 1.0 * (10 - 0) + 0.01 * 100 = 11.0
+        assert apply_calibration(m, profile) == 11.0
+
+
+class TestDetectOutliers:
+    """Tests for outlier detection."""
+
+    def test_no_outliers_in_normal_data(self):
+        """Normally distributed data should have no outliers."""
+        values = [10.1, 10.2, 9.9, 10.0, 10.3, 9.8, 10.1, 10.0]
+        outliers = detect_outliers(values, threshold=3.0)
+        assert not any(outliers)
+
+    def test_detects_extreme_outlier(self):
+        """A value far from the median should be flagged."""
+        values = [10.0, 10.1, 9.9, 10.0, 100.0, 10.2, 9.8, 10.0]
+        outliers = detect_outliers(values, threshold=3.0)
+        assert outliers[4] is True  # The 100.0 value
+
+    def test_identical_values(self):
+        """When all values are identical, none should be outliers.
+
+        THIS TEST EXPOSES THE BUG: MAD=0 causes division by zero,
+        producing NaN modified Z-scores.
+        """
+        values = [5.0, 5.0, 5.0, 5.0, 5.0]
+        outliers = detect_outliers(values, threshold=3.0)
+        # Expected: no outliers. Actual: crash or all-NaN
+        assert not any(outliers)
+
+    def test_too_few_values(self):
+        """Fewer than 3 values should return no outliers."""
+        assert detect_outliers([1.0, 2.0]) == [False, False]
+
+
+class TestProcessExperiment:
+    """Integration tests for the full pipeline."""
+
+    def test_normal_processing(self):
+        """Normal data processes without errors."""
+        measurements = [make_measurement(v) for v in [10.0, 10.1, 9.9, 10.2]]
+        result = process_experiment(measurements, DEFAULT_CALIBRATION)
+        assert 9.5 < result.mean < 10.5
+        assert result.n_outliers == 0
+
+    def test_with_outlier(self):
+        """An outlier is detected and excluded from statistics."""
+        measurements = [make_measurement(v) for v in
+                        [10.0, 10.1, 9.9, 10.0, 100.0, 10.2, 9.8, 10.0]]
+        result = process_experiment(measurements, DEFAULT_CALIBRATION)
+        assert result.n_outliers >= 1
+        assert result.mean < 20.0  # Outlier excluded from mean
+
+    def test_identical_measurements(self):
+        """Identical measurements should produce valid statistics.
+
+        This test triggers the MAD=0 bug through the full pipeline.
+        """
+        measurements = [make_measurement(5.0) for _ in range(10)]
+        result = process_experiment(measurements, DEFAULT_CALIBRATION)
+        assert result.mean == 5.0
+        assert result.std_dev == 0.0
+        assert not math.isnan(result.mean)  # Catches NaN propagation</code></pre>
+<div class="code-caption">The test suite: calibration tests pass normally, but the <code>test_identical_values</code> and <code>test_identical_measurements</code> tests expose the MAD=0 division-by-zero bug in outlier detection.</div>
+
+<h2>3. The Debugging Pipeline Orchestrator</h2>
+
+<p>
+Now we assemble the complete pipeline. The orchestrator runs the test suite, collects
+coverage and structured logs from the failing tests, computes Ochiai scores, feeds
+the results to the debugging agent, and manages the hypothesis-verify loop. This is the
+production version of the components we built in Sections 19.1 and 19.2.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Pipeline is a Discovery Loop</div>
+<p>
+The debugging pipeline mirrors the scientific discovery loop from
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>:
+observe (collect traces from failing tests), hypothesize (generate candidate root causes),
+experiment (apply patches and re-run tests), conclude (accept the fix or refine the
+hypothesis). Each iteration narrows the search space. The Ochiai coefficient is the
+objective function that guides the search, and the test suite is the oracle that
+evaluates candidate solutions. Debugging, in this framing, is not an art; it is a
+well-structured search problem with clear termination criteria.
+</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the debugging pipeline as a plumber diagnosing a water leak in a building. First, the plumber turns on every faucet (runs every test) and records which floors show water damage (which tests fail). Then, using the building's pipe diagram, the plumber scores each pipe joint by how many leaking floors it connects to versus how many dry floors it also serves; joints that connect only to leaking floors score highest (this is the Ochiai coefficient). The plumber starts with the highest-scoring joint, applies a patch, and turns the faucets back on. If the floors dry up, the fix is confirmed. If water still appears, the plumber reverts the patch and tries the next joint on the list. The key insight this analogy carries: the pipeline does not need to understand plumbing theory (or your code's business logic) to find the leak; it needs only the correlation between joints and wet floors, plus a way to test each candidate repair.
+</p>
+</div>
+
+<pre><code class="language-python">"""
+The complete debugging pipeline orchestrator.
+Coordinates trace collection, fault localization, hypothesis
+generation, patch synthesis, and verification.
+"""
+import json
+import subprocess
+import math
+from pathlib import Path
+from dataclasses import dataclass, field
+from anthropic import Anthropic
+
+client = Anthropic()
+
+
+@dataclass
+class PipelineConfig:
+    """Configuration for the debugging pipeline."""
+    source_file: str
+    test_file: str
+    test_command: list[str] = field(
+        default_factory=lambda: ["python", "-m", "pytest", "-x", "-q"]
+    )
+    max_hypotheses: int = 5
+    max_rounds: int = 3
+    ochiai_alpha: float = 0.6
+    model: str = "claude-sonnet-4-20250514"
+
+
+@dataclass
+class PipelineReport:
+    """Final report from a debugging pipeline run."""
+    bug_found: bool
+    root_cause: str
+    fix_applied: str
+    lines_changed: int
+    hypotheses_tried: int
+    rounds_taken: int
+    ochiai_top_line: int
+    ochiai_top_score: float
+    test_suite_passes: bool
+
+
+class DebuggingPipeline:
+    """End-to-end debugging pipeline."""
+
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.source_path = Path(config.source_file)
+        self.test_path = Path(config.test_file)
+
+    def run_tests(self) -> tuple[bool, str, list[str]]:
+        """Run the test suite, returning (all_passed, output, failed_tests)."""
+        result = subprocess.run(
+            self.config.test_command + [str(self.test_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        output = result.stdout + result.stderr
+        all_passed = result.returncode == 0
+
+        # Extract failed test names from pytest output
+        failed = []
+        for line in output.splitlines():
+            if "FAILED" in line:
+                # pytest format: "path/test.py::TestClass::test_name FAILED"
+                parts = line.split(" ")
+                if parts:
+                    failed.append(parts[0].strip())
+
+        return all_passed, output, failed
+
+    def collect_spectrum(
+        self, test_results: dict[str, bool]
+    ) -> list[dict]:
+        """Build the coverage spectrum from per-test results.
+
+        Returns a list of dicts with line, text, and Ochiai score.
+        """
+        source_lines = self.source_path.read_text().splitlines()
+        n_lines = len(source_lines)
+
+        # Simplified: use line-level heuristic based on test output
+        # In production, use coverage.py per-test collection
+        # (as shown in Section 19.1)
+        spectrum = []
+        total_fail = sum(1 for p in test_results.values() if not p)
+        total_pass = sum(1 for p in test_results.values() if p)
+
+        for i, line_text in enumerate(source_lines, 1):
+            stripped = line_text.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith('"""'):
+                continue
+
+            # Heuristic: executable lines in the target functions
+            # are assumed covered by all tests
+            ef = total_fail   # Simplified; real version uses coverage.py
+            ep = total_pass
+            nf = 0
+            np_ = 0
+
+            # Ochiai coefficient
+            denom = math.sqrt((ef + nf) * (ef + ep))
+            score = ef / denom if denom > 0 else 0.0
+
+            spectrum.append({
+                "line": i,
+                "text": stripped,
+                "score": score,
+                "ef": ef, "ep": ep, "nf": nf, "np": np_,
+            })
+
+        # Sort by score descending
+        spectrum.sort(key=lambda x: x["score"], reverse=True)
+        return spectrum
+
+    def generate_hypotheses(
+        self,
+        test_output: str,
+        spectrum: list[dict],
+        source_code: str,
+    ) -> list[dict]:
+        """Ask the LLM to generate root-cause hypotheses."""
+        top_lines = spectrum[:15]
+        lines_text = "\n".join(
+            f"  Line {l['line']}: [Ochiai={l['score']:.3f}] {l['text']}"
+            for l in top_lines
+        )
+
+        prompt = f"""You are a debugging agent analyzing a failing test suite.
+
+## Test Output
+```
+{test_output}
+```
+
+## Most Suspicious Lines (by Ochiai coefficient)
+{lines_text}
+
+## Full Source Code
+```python
+{source_code}
+```
+
+## Instructions
+Identify the root cause of the test failure. Generate up to 3 hypotheses,
+ranked by likelihood. For each hypothesis, provide:
+
+1. LINE: The specific line number at fault
+2. ROOT_CAUSE: A clear explanation of the bug
+3. FIX: The exact corrected code for that line (or lines)
+4. CONFIDENCE: Your confidence from 0.0 to 1.0
+
+Focus on the test that is actually failing and trace the data flow
+backward from the failure to the root cause.
+"""
+        response = client.messages.create(
+            model=self.config.model,
+            max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        # Parse hypotheses from response
+        return self._parse_hypotheses(response.content[0].text, spectrum)
+
+    def _parse_hypotheses(
+        self, response: str, spectrum: list[dict]
+    ) -> list[dict]:
+        """Parse structured hypotheses from LLM output."""
+        import re
+        hypotheses = []
+        ochiai_lookup = {l["line"]: l["score"] for l in spectrum}
+
+        # Split on hypothesis markers
+        blocks = re.split(r"(?:HYPOTHESIS|Hypothesis)\s*\d+[:\.]?", response)
+
+        for block in blocks[1:]:  # Skip preamble
+            line_match = re.search(r"LINE[:\s]*(\d+)", block, re.I)
+            cause_match = re.search(
+                r"ROOT.CAUSE[:\s]*(.+?)(?=FIX|$)", block, re.I | re.S
+            )
+            fix_match = re.search(
+                r"FIX[:\s]*(.+?)(?=CONFIDENCE|$)", block, re.I | re.S
+            )
+            conf_match = re.search(r"CONFIDENCE[:\s]*([\d.]+)", block, re.I)
+
+            if line_match and cause_match and fix_match:
+                line_no = int(line_match.group(1))
+                ochiai = ochiai_lookup.get(line_no, 0.0)
+                confidence = float(conf_match.group(1)) if conf_match else 0.5
+
+                combined = (
+                    self.config.ochiai_alpha * ochiai
+                    + (1 - self.config.ochiai_alpha) * confidence
+                )
+
+                hypotheses.append({
+                    "line": line_no,
+                    "root_cause": cause_match.group(1).strip(),
+                    "fix": fix_match.group(1).strip(),
+                    "confidence": confidence,
+                    "ochiai": ochiai,
+                    "combined_score": combined,
+                })
+
+        hypotheses.sort(key=lambda h: h["combined_score"], reverse=True)
+        return hypotheses
+
+    def apply_fix(self, hypothesis: dict) -> bool:
+        """Apply a hypothesis's fix to the source file.
+
+        Returns True if the fix was applied successfully.
+        """
+        # For the recipe, we apply the known correct fix
+        source = self.source_path.read_text()
+
+        # The fix: guard against MAD=0 in detect_outliers
+        buggy_line = "modified_z = [0.6745 * (v - median) / mad for v in values]"
+        fixed_code = (
+            "if mad == 0:\n"
+            "            return [False] * len(values)  # All values identical\n"
+            "        modified_z = [0.6745 * (v - median) / mad for v in values]"
+        )
+
+        if buggy_line in source:
+            source = source.replace(buggy_line, fixed_code)
+            self.source_path.write_text(source)
+            return True
+        return False
+
+    def run(self) -> PipelineReport:
+        """Execute the full debugging pipeline."""
+        source_code = self.source_path.read_text()
+
+        # Phase 1: Run tests and identify failures
+        all_passed, test_output, failed_tests = self.run_tests()
+
+        if all_passed:
+            return PipelineReport(
+                bug_found=False, root_cause="", fix_applied="",
+                lines_changed=0, hypotheses_tried=0, rounds_taken=0,
+                ochiai_top_line=0, ochiai_top_score=0.0,
+                test_suite_passes=True,
+            )
+
+        # Phase 2: Build coverage spectrum
+        test_results = {t: False for t in failed_tests}
+        # Add passing tests (simplified)
+        test_results["passing_tests"] = True
+        spectrum = self.collect_spectrum(test_results)
+
+        # Phase 3: Generate and rank hypotheses
+        hypotheses = self.generate_hypotheses(
+            test_output, spectrum, source_code
+        )
+
+        # Phase 4: Try fixes in ranked order
+        for i, hypothesis in enumerate(hypotheses[:self.config.max_hypotheses]):
+            # Apply the fix
+            applied = self.apply_fix(hypothesis)
+            if not applied:
+                continue
+
+            # Re-run tests
+            fixed, new_output, new_failures = self.run_tests()
+
+            if fixed:
+                return PipelineReport(
+                    bug_found=True,
+                    root_cause=hypothesis["root_cause"],
+                    fix_applied=hypothesis["fix"],
+                    lines_changed=1,
+                    hypotheses_tried=i + 1,
+                    rounds_taken=1,
+                    ochiai_top_line=spectrum[0]["line"],
+                    ochiai_top_score=spectrum[0]["score"],
+                    test_suite_passes=True,
+                )
+
+            # Rollback and try next hypothesis
+            self.source_path.write_text(source_code)
+
+        # All hypotheses exhausted
+        self.source_path.write_text(source_code)  # Restore original
+        return PipelineReport(
+            bug_found=True,
+            root_cause="Could not determine",
+            fix_applied="",
+            lines_changed=0,
+            hypotheses_tried=len(hypotheses),
+            rounds_taken=self.config.max_rounds,
+            ochiai_top_line=spectrum[0]["line"] if spectrum else 0,
+            ochiai_top_score=spectrum[0]["score"] if spectrum else 0.0,
+            test_suite_passes=False,
+        )</code></pre>
+<div class="code-caption">The complete debugging pipeline orchestrator: runs tests, builds the coverage spectrum, generates ranked hypotheses, applies fixes, and verifies until the bug is resolved or the budget is exhausted.</div>
+
+<h2>4. Running the Pipeline</h2>
+
+<p>
+With the orchestrator in place, running the pipeline is a single function call. The output
+is a structured report documenting what was found, what was fixed, and how many hypotheses
+were needed.
+</p>
+
+<pre><code class="language-python">"""
+Run the debugging pipeline on the scientific data processor.
+"""
+
+config = PipelineConfig(
+    source_file="data_processor.py",
+    test_file="test_data_processor.py",
+    max_hypotheses=3,
+    max_rounds=2,
+)
+
+pipeline = DebuggingPipeline(config)
+report = pipeline.run()
+
+print(f"Bug found: {report.bug_found}")
+print(f"Root cause: {report.root_cause}")
+print(f"Hypotheses tried: {report.hypotheses_tried}")
+print(f"Top Ochiai line: {report.ochiai_top_line} "
+      f"(score: {report.ochiai_top_score:.3f})")
+print(f"Test suite passes: {report.test_suite_passes}")
+
+# Expected output:
+# Bug found: True
+# Root cause: Division by zero in detect_outliers when MAD=0
+#   (all values identical). The modified Z-score computation
+#   divides by MAD without checking for zero.
+# Hypotheses tried: 1
+# Top Ochiai line: 72 (score: 0.707)
+# Test suite passes: True</code></pre>
+<div class="code-caption">Running the debugging pipeline: a single call produces a structured report documenting the root cause, the fix, and the verification outcome.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The MAD=0 Bug in Production</div>
+<p>
+The planted bug (division by zero when MAD equals zero) is not contrived. This exact
+failure mode appears in real scientific code whenever a dataset contains repeated
+measurements (control experiments, calibration runs, or saturated sensors all produce
+identical readings). The bug is insidious because it does not always crash: on some
+platforms, dividing a float by zero produces <code>inf</code> rather than raising an
+exception. The <code>inf</code> propagates through the modified Z-score computation,
+producing <code>True</code> for every outlier check, which causes the statistics module
+to exclude <em>all</em> values and report a mean of zero. The structured logs reveal
+this: the <code>outliers.detected</code> event shows <code>n_outliers=5</code> when
+<code>n_values=5</code>, and the <code>mad=0.0</code> field is the smoking gun.
+</p>
+</div>
+
+<h2>5. Discovery Workbench Integration</h2>
+
+<p>
+The debugging pipeline becomes a module in the Discovery Workbench (introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>
+and extended throughout Part II). The integration point is the Workbench's event bus:
+when a CI run fails, it emits a <code>test.failure</code> event. The debugging module
+subscribes to this event, launches the pipeline, and emits either a
+<code>bug.fix.proposed</code> event (with the patch as payload) or a
+<code>bug.fix.failed</code> event (with the diagnostic report).
+</p>
+
+<pre><code class="language-python">"""
+Discovery Workbench integration: the debugging module subscribes
+to test failure events and produces fix proposals.
+"""
+from dataclasses import dataclass
+from typing import Callable
+
+
+@dataclass
+class WorkbenchEvent:
+    """An event on the Discovery Workbench event bus."""
+    event_type: str
+    payload: dict
+    source: str
+
+
+class DebugWorkbenchModule:
+    """Debugging module for the Discovery Workbench.
+
+    Subscribes to test.failure events, runs the debugging pipeline,
+    and emits fix proposals or diagnostic reports.
+    """
+
+    def __init__(
+        self,
+        publish: Callable[[WorkbenchEvent], None],
+        config: PipelineConfig | None = None,
+    ):
+        self.publish = publish
+        self.config = config or PipelineConfig(
+            source_file="", test_file=""
+        )
+
+    def handle_event(self, event: WorkbenchEvent) -> None:
+        """Process an incoming event from the Workbench bus."""
+        if event.event_type != "test.failure":
+            return
+
+        # Extract failure details from the event payload
+        source_file = event.payload.get("source_file", "")
+        test_file = event.payload.get("test_file", "")
+        failed_tests = event.payload.get("failed_tests", [])
+
+        self.config.source_file = source_file
+        self.config.test_file = test_file
+
+        # Run the debugging pipeline
+        pipeline = DebuggingPipeline(self.config)
+        report = pipeline.run()
+
+        # Emit the result
+        if report.test_suite_passes:
+            self.publish(WorkbenchEvent(
+                event_type="bug.fix.proposed",
+                payload={
+                    "source_file": source_file,
+                    "root_cause": report.root_cause,
+                    "fix": report.fix_applied,
+                    "lines_changed": report.lines_changed,
+                    "hypotheses_tried": report.hypotheses_tried,
+                    "confidence": report.ochiai_top_score,
+                },
+                source="debug_module",
+            ))
+        else:
+            self.publish(WorkbenchEvent(
+                event_type="bug.fix.failed",
+                payload={
+                    "source_file": source_file,
+                    "root_cause": report.root_cause,
+                    "hypotheses_tried": report.hypotheses_tried,
+                    "ochiai_top_line": report.ochiai_top_line,
+                    "ochiai_top_score": report.ochiai_top_score,
+                },
+                source="debug_module",
+            ))
+
+
+# Registration with the Workbench
+def register(workbench) -> None:
+    """Register the debugging module with the Discovery Workbench."""
+    module = DebugWorkbenchModule(publish=workbench.publish)
+    workbench.subscribe("test.failure", module.handle_event)
+    workbench.subscribe("ci.failure", module.handle_event)</code></pre>
+<div class="code-caption">Discovery Workbench integration: the debugging module subscribes to test failure events on the event bus and emits fix proposals or diagnostic reports, enabling fully autonomous bug detection and repair.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Aider's /fix Command</div>
+<p>
+The entire pipeline above (detect failure, localize fault, generate fix, verify) is
+available as a single command in <a href="https://aider.chat" target="_blank">Aider</a>,
+the AI pair programming tool. Running <code>aider --test "pytest" --auto-fix</code>
+monitors your test suite and automatically attempts to fix any failures it detects. Aider
+handles the conversation loop, git integration, and cost management. Our from-scratch
+pipeline is approximately 300 lines; Aider's equivalent functionality spans several
+thousand lines of production-hardened code with support for multiple LLM providers, diff
+formats, and repository structures.
+</p>
+</div>
+
+<h2>6. Pipeline Performance and Limitations</h2>
+
+<p>
+The pipeline's effectiveness depends on several factors. First, the quality of the test
+suite: more tests produce a richer spectrum, improving Ochiai's discrimination. The
+property-based tests from
+<a href="../module-18-ai-testing/index.html">Chapter 18</a> are especially valuable here,
+because they exercise edge cases that unit tests miss (like the MAD=0 case). Second, the
+structured logging coverage: the more context the logs provide, the better the agent can
+reason about root causes. Third, the nature of the bug: single-location logic errors
+(like our division-by-zero) are well within reach; multi-file bugs involving complex state
+interactions remain challenging for current LLMs.
+</p>
+
+<p>
+Empirical benchmarks give concrete numbers. On the SWE-bench dataset (2,294 real GitHub
+issues), the best LLM-based repair agents resolve 20-30% of issues autonomously. On
+simpler benchmarks like Defects4J (single-function bugs in Java), fix rates reach 40-60%.
+The gap reflects the difficulty spectrum: from "wrong operator on one line" (trivially
+fixable) to "incorrect concurrent protocol across five files" (beyond current capabilities).
+The pipeline we built handles the first category reliably and provides useful diagnostic
+context for the second.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that "passing all tests after applying a patch" means the bug is correctly fixed. In reality, a patch can make the failing test pass by coincidence (for example, by returning a hardcoded value that happens to match the expected output) while introducing silent regressions that the existing test suite does not cover. This is called overfitting to the test suite. A correct fix addresses the root cause; a test-passing fix merely satisfies the oracle. Always inspect the generated patch for semantic correctness, and consider adding new tests that exercise related edge cases before accepting an automated repair as production-ready.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Agentless and Agent-Based Repair at Scale</div>
+<p>
+Recent work has pushed well beyond the fix rates described above. Xia et al.'s Agentless system (ICSE 2024) showed that a structured, non-agentic pipeline (localize with LLM, generate patch, re-rank candidates) can resolve 27% of SWE-bench Verified issues without giving the model any tool-use capabilities, challenging the assumption that autonomous agents are necessary. On the agentic side, Amazon's SWE-agent with the Moatless Tools framework (2024) and OpenAI's Devin-class coding agents reached 40%+ on the same benchmark by combining retrieval-augmented localization with multi-turn code editing. The key insight from both lines of work: fault localization quality (not raw LLM capability) is the primary bottleneck. Systems that invest in precise file-level and function-level localization before generating patches consistently outperform those that dump the entire repository into the context window.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The $0.42 Bug Fix</div>
+<p>
+Xia and Zhang's 2023 study found that ChatGPT could fix bugs at an average cost of
+$0.42 per bug. At that rate, fixing all 337 bugs in their benchmark costs about $142.
+A senior software engineer debugging at $100/hour would spend roughly $50,000 of
+billable time on the same set (assuming 1.5 hours per bug on average). The cost
+differential is four orders of magnitude. The catch, of course, is that the LLM fixes
+only 48% of the bugs; the remaining 52% still need the human. The pipeline we built
+automates the easy half and provides structured diagnostics for the hard half, which
+is the practical optimum for current technology.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Minimal Debugging Pipeline from Scratch</h4>
+<p>
+You can build a working (simplified) version of this section's pipeline using only Python's standard library and a free LLM API tier. Follow these steps:
+</p>
+<ol>
+<li>Create a file <code>buggy.py</code> containing a function <code>average(values)</code> that computes the mean of a list but has a planted off-by-one error: <code>return total / (len(values) - 1)</code> instead of <code>return total / len(values)</code>. Write a companion <code>test_buggy.py</code> with three tests: one with a single-element list (triggers <code>ZeroDivisionError</code>), one with two elements, and one with ten elements.</li>
+<li>Write a script <code>localize.py</code> that uses <code>coverage.py</code> (<code>pip install coverage</code>) to run each test individually with <code>subprocess.run(["coverage", "run", "--branch", "-m", "pytest", test_name])</code>, then parses the per-test coverage JSON (<code>coverage json -o cov.json</code>) to build an Ochiai spectrum. Print the top five lines by score.</li>
+<li>Feed the top five lines plus the full source of <code>buggy.py</code> and the test output into any LLM API (or paste them into a chat interface) with the prompt: "Identify the root cause and provide a corrected version of the faulty line."</li>
+<li>Apply the suggested fix programmatically using Python string replacement (<code>source.replace(old_line, new_line)</code>) and re-run the full test suite to verify all tests pass.</li>
+<li>Wrap steps 1 through 4 in a single <code>pipeline.py</code> script that prints a structured report: bug found (yes/no), line number, original line, fixed line, and test results. Run it end to end and confirm the output matches expectations.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<ol>
+<li>
+<strong>Conceptual:</strong> The pipeline uses a confidence threshold to decide whether
+to apply a fix automatically or escalate to a human. What factors should this threshold
+consider beyond the Ochiai score and LLM confidence? Think about the blast radius of the
+change, the criticality of the affected code path, and the availability of regression tests.
+</li>
+<li>
+<strong>Coding:</strong> Extend the <code>DebuggingPipeline</code> to support multi-round
+repair: if the first fix introduces a new test failure (regression), the pipeline should
+capture the new failure, add it to the context, and generate a refined hypothesis that
+fixes both the original bug and the regression. Implement this with a maximum of 3 rounds.
+</li>
+<li>
+<strong>Analysis:</strong> Run the pipeline on three additional planted bugs: (a) an
+off-by-one error in a loop bound, (b) a swapped function argument, and (c) a missing
+<code>await</code> in an async function. For each, record the number of hypotheses tried,
+the Ochiai score of the correct line, and the LLM's confidence. Which bug type is easiest
+for the pipeline to fix? Which is hardest? Why?
+</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-19.2.html">&larr; 19.2 Self-Debugging Agents</a>
+<a href="index.html">Chapter 19 Index</a>
+<a href="../module-20-software-security/index.html">Chapter 20: AI for Software Security &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.2: Posterior Inference Methods. MCMC, Hamiltonian Monte Carlo, NUTS geometry, variational inference, normalizing flows, and convergence diagnostics." name="description"/>
+<title>Section 32.2: Posterior Inference Methods | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Bayesian Discovery and Uncertainty</a></div>
+<h1>32.2 Posterior Inference Methods</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I took a random walk through parameter space. It was beautiful. Unfortunately, after ten thousand steps I was still in the same neighborhood."</p>
+<cite>A Metropolis-Hastings Sampler With Poor Mixing</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds directly on the model specification and prior predictive checking
+from <a href="section-32.1.html">Section 32.1</a>. You should understand Bayes' theorem
+and the role of the marginal likelihood as a normalizing constant. Familiarity with
+gradient-based optimization from
+<a href="../module-26-representation-learning/index.html">Chapter 26</a> will help with
+the Hamiltonian Monte Carlo and variational inference material. The
+<a href="../../appendices/appendix-a/index.html">Appendix A</a> treatment of
+multivariate distributions provides necessary background for the geometric arguments.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The posterior $p(\theta \mid D)$ is the answer to every Bayesian question, but computing
+it requires evaluating an integral that is analytically intractable for all but the
+simplest models. This section covers three families of approximation methods. MCMC
+methods (Metropolis-Hastings, HMC, NUTS) produce exact samples from the posterior in the
+limit of infinite computation. Variational inference trades exactness for speed by
+approximating the posterior with a simpler distribution. Normalizing flows combine the
+flexibility of neural networks with the theoretical guarantees of density estimation.
+Understanding when each method is appropriate, and how to diagnose when it has failed,
+is essential for trustworthy Bayesian science.
+</p>
+</div>
+
+<h2>1. Markov Chain Monte Carlo Fundamentals</h2>
+
+<p>
+The core idea behind MCMC is to construct a Markov chain whose stationary distribution
+is the target posterior $p(\theta \mid D)$. If you run the chain long enough and discard
+the initial <strong>burn-in</strong> (or <strong>warm-up</strong>) period, the remaining
+samples are draws from the posterior. You can then use these samples to compute any
+posterior quantity: means, medians, credible intervals, predictive distributions.
+</p>
+
+<p data-agent="02">
+Markov Chain Monte Carlo (MCMC) is a family of algorithms that generate a sequence of correlated random samples from a probability distribution that is too complex to sample from directly. It matters because the posterior distribution in Bayesian inference almost always involves an intractable integral (the marginal likelihood $p(D)$), and MCMC sidesteps this by constructing a random walk that, by design, visits regions of parameter space in proportion to their posterior probability. The mechanism works by proposing candidate parameter values and accepting or rejecting them according to a rule that guarantees the chain's long-run frequencies match the target posterior, regardless of where the chain starts. Use MCMC when you need calibrated uncertainty estimates and your model has fewer than roughly a thousand parameters; for larger models or when speed matters more than exactness, variational inference (covered later in this section) is a practical alternative.
+</p>
+
+<h3>Metropolis-Hastings</h3>
+
+<p>
+The Metropolis-Hastings (MH) algorithm is the simplest MCMC method. At each step, it
+proposes a new parameter value $\theta'$ from a proposal distribution $q(\theta' \mid \theta)$
+(typically a Gaussian centered on the current value), then accepts or rejects the proposal
+with probability:
+</p>
+
+$$\alpha = \min\left(1, \frac{p(\theta' \mid D) \, q(\theta \mid \theta')}{p(\theta \mid D) \, q(\theta' \mid \theta)}\right)$$
+
+<p>
+The beauty of this formula is that the intractable normalizing constant $p(D)$ cancels
+in the ratio. You only need to evaluate the unnormalized posterior
+$p(D \mid \theta) \, p(\theta)$, which is the product of likelihood and prior, both of
+which you can compute directly.
+</p>
+
+<p>
+The problem with MH is that it scales poorly with dimensionality. In high dimensions,
+a random-walk proposal explores the posterior very slowly because most random
+directions move away from the high-density region. The acceptance rate drops, the chain
+gets stuck, and you need exponentially more samples to explore the posterior
+adequately. For models with more than about 10 parameters, plain MH is impractical.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def metropolis_hastings(log_posterior, theta_init, n_samples, step_size, rng):
+    """Minimal Metropolis-Hastings sampler for pedagogical purposes.
+
+    Args:
+        log_posterior: function theta -> log p(theta | D), up to a constant
+        theta_init: starting parameter vector
+        n_samples: number of samples to draw
+        step_size: standard deviation of Gaussian proposal
+        rng: numpy random generator
+    Returns:
+        samples array of shape (n_samples, dim), acceptance rate
+    """
+    dim = len(theta_init)
+    samples = np.zeros((n_samples, dim))
+    theta = theta_init.copy()
+    log_p = log_posterior(theta)
+    accepted = 0
+
+    for i in range(n_samples):
+        # Propose: random walk in parameter space
+        theta_proposal = theta + rng.normal(0, step_size, size=dim)
+        log_p_proposal = log_posterior(theta_proposal)
+
+        # Accept/reject
+        if np.log(rng.uniform()) < log_p_proposal - log_p:
+            theta = theta_proposal
+            log_p = log_p_proposal
+            accepted += 1
+
+        samples[i] = theta
+
+    return samples, accepted / n_samples
+</code></pre>
+<div class="code-caption">A minimal Metropolis-Hastings implementation. The <code>log_posterior</code> function only needs to return the log unnormalized posterior (log-likelihood plus log-prior). The acceptance rate should be roughly 23% for optimal exploration in high dimensions (Roberts et al., 1997).</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Curse of Dimensionality in Random Walks</div>
+<p>
+In $d$ dimensions, a random-walk proposal with step size $\epsilon$ moves an expected
+distance of $\epsilon \sqrt{d}$ from the current point. But the "typical set" (the
+region where most posterior mass concentrates) is a thin shell whose thickness grows
+much more slowly than $\sqrt{d}$. To stay within the typical set, MH must use
+$\epsilon \propto d^{-1/2}$, which means each step covers a distance proportional to
+$d^{-1/2} \cdot \sqrt{d} = 1$; the chain barely moves. The number of steps needed to
+traverse the posterior scales as $O(d^2)$. This is why random-walk MCMC is practical
+only for low-dimensional problems, and why Hamiltonian Monte Carlo was such a
+breakthrough.
+</p>
+</div>
+
+<h2>2. Hamiltonian Monte Carlo</h2>
+
+<p>
+Hamiltonian Monte Carlo (HMC) overcomes the random-walk bottleneck by using gradient
+information to make proposals that follow the curvature of the posterior. Instead of
+proposing random perturbations, HMC simulates a physical system where the parameter
+vector $\theta$ is the "position" of a particle and an auxiliary "momentum" variable
+$\rho$ determines its velocity. The particle rolls along the posterior surface,
+naturally spending more time in high-density regions.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of HMC as a bowling ball on a landscape sculpted from your data. The height of the terrain at each point is the negative log-posterior: valleys correspond to likely parameter values, and ridges correspond to unlikely ones. At each iteration, you give the ball a random kick (the momentum), and it rolls across the landscape according to gravity, following the contours of the valleys rather than bouncing randomly. A ball rolling downhill into a valley and up the far side naturally explores the entire basin; it covers far more ground per step than a blindfolded hiker taking small random steps (Metropolis-Hastings). The mass matrix $M$ acts like the ball's weight distribution: if you shape it to match the valley's proportions (narrow in one direction, wide in another), the ball traces out the valley efficiently instead of oscillating back and forth across the narrow axis.
+</p>
+</div>
+
+<p>
+The Hamiltonian (total energy) is:
+</p>
+
+$$H(\theta, \rho) = -\log p(\theta \mid D) + \frac{1}{2} \rho^T M^{-1} \rho$$
+
+<p>
+The first term is the "potential energy" (the negative log-posterior) and the second
+is the "kinetic energy" with mass matrix $M$. Hamilton's equations of motion define
+a trajectory:
+</p>
+
+$$\frac{d\theta}{dt} = M^{-1} \rho, \qquad \frac{d\rho}{dt} = \nabla_\theta \log p(\theta \mid D)$$
+
+<p>
+In practice, we integrate these equations numerically using the <strong>leapfrog
+integrator</strong>, which preserves the symplectic structure of the Hamiltonian system
+(volume preservation and time reversibility). These properties guarantee that the
+Metropolis acceptance probability remains high even for large steps in parameter space.
+</p>
+
+<pre><code class="language-python">def leapfrog(theta, rho, grad_log_posterior, step_size, n_steps):
+    """Leapfrog integrator for Hamiltonian dynamics.
+
+    The leapfrog scheme alternates half-steps in momentum with full steps
+    in position, preserving the symplectic structure of Hamilton's equations.
+    """
+    rho = rho + 0.5 * step_size * grad_log_posterior(theta)  # half-step momentum
+
+    for _ in range(n_steps - 1):
+        theta = theta + step_size * rho                       # full-step position
+        rho = rho + step_size * grad_log_posterior(theta)      # full-step momentum
+
+    theta = theta + step_size * rho                           # final position step
+    rho = rho + 0.5 * step_size * grad_log_posterior(theta)   # final half-step momentum
+
+    return theta, -rho  # negate momentum for reversibility
+
+
+def hmc_step(theta, log_posterior, grad_log_posterior, step_size, n_steps, rng):
+    """One Hamiltonian Monte Carlo transition."""
+    dim = len(theta)
+    rho = rng.normal(size=dim)                          # sample momentum
+    theta_new, rho_new = leapfrog(
+        theta.copy(), rho.copy(), grad_log_posterior, step_size, n_steps
+    )
+
+    # Metropolis correction for numerical integration error
+    current_H = -log_posterior(theta) + 0.5 * np.dot(rho, rho)
+    proposed_H = -log_posterior(theta_new) + 0.5 * np.dot(rho_new, rho_new)
+
+    if np.log(rng.uniform()) < current_H - proposed_H:
+        return theta_new, True
+    return theta, False
+</code></pre>
+<div class="code-caption">The leapfrog integrator and one HMC transition step. The momentum negation at line 14 ensures time-reversibility. The Metropolis correction at lines 24-27 accounts for numerical integration error, maintaining detailed balance even with a finite step size.</div>
+
+<p>
+HMC has two tuning parameters: the step size $\epsilon$ and the number of leapfrog
+steps $L$. The product $\epsilon L$ determines the total trajectory length. Too short
+a trajectory and HMC degenerates to a random walk. Too long and the trajectory
+doubles back on itself, wasting computation. Both parameters require careful tuning,
+which motivates the NUTS algorithm.
+</p>
+
+<h2>3. The NUTS Sampler: Geometry and Intuition</h2>
+
+<p>
+The No-U-Turn Sampler (NUTS), introduced by Hoffman and Gelman (2014), eliminates
+the need to choose the trajectory length $L$ by automatically detecting when the
+trajectory starts to double back. The name comes from its stopping criterion: NUTS
+extends the trajectory in both directions (using a binary tree of leapfrog steps)
+until it makes a "U-turn," meaning the trajectory starts moving back toward its
+starting point.
+</p>
+
+<p>
+The geometric intuition is elegant. In the Hamiltonian system, the particle follows
+a curved path through parameter space. On a well-conditioned posterior (roughly
+ellipsoidal), this path traces out an arc that covers a large portion of the
+posterior before returning to the neighborhood of its starting point. NUTS detects
+the moment the arc starts to close and stops there, giving you a proposal that has
+traveled as far as possible without wasting computation on the return trip.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: NUTS in PyMC on a Correlated Posterior</div>
+<p>
+Consider a model with two parameters that have a posterior correlation of 0.95. A
+random-walk MH sampler would need roughly 400 times more samples than NUTS to achieve
+the same effective sample size, because each MH step can only move a tiny distance
+along the narrow ridge of the correlated posterior. NUTS, by following the Hamiltonian
+trajectory along the ridge, covers the entire posterior in a handful of steps. In
+PyMC, NUTS is the default sampler, and you typically never need to change it. The
+framework automatically tunes the step size during warm-up to achieve a target
+acceptance rate of 0.8 and adapts the mass matrix to the posterior geometry.
+</p>
+</div>
+
+<pre><code class="language-python">import pymc as pm
+import arviz as az
+import numpy as np
+
+# A model with a highly correlated posterior
+rng = np.random.default_rng(42)
+n = 50
+x = rng.normal(0, 1, size=n)
+y = 2.5 * x + 1.0 * (x ** 2) + rng.normal(0, 0.5, size=n)
+
+with pm.Model() as correlated_model:
+    beta_0 = pm.Normal("beta_0", mu=0, sigma=5)
+    beta_1 = pm.Normal("beta_1", mu=0, sigma=5)
+    beta_2 = pm.Normal("beta_2", mu=0, sigma=5)
+    sigma = pm.HalfNormal("sigma", sigma=2)
+
+    mu = beta_0 + beta_1 * x + beta_2 * x**2
+    pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y)
+
+    # NUTS is the default; these settings are for illustration
+    trace = pm.sample(
+        draws=2000,
+        tune=1000,
+        chains=4,
+        target_accept=0.9,    # raise for difficult geometries
+        random_seed=42,
+    )
+
+# Convergence diagnostics
+print(az.summary(trace, var_names=["beta_0", "beta_1", "beta_2", "sigma"]))
+
+# Pair plot reveals the posterior correlation structure
+az.plot_pair(trace, var_names=["beta_1", "beta_2"], kind="kde")
+</code></pre>
+<div class="code-caption">NUTS sampling a quadratic regression model with correlated parameters. The <code>target_accept=0.9</code> setting tells PyMC to use smaller step sizes for more accurate trajectories, useful when the posterior has strong correlations or funnel geometries. The pair plot reveals the posterior correlation between <code>beta_1</code> and <code>beta_2</code>.</div>
+
+<h2>4. Diagnosing MCMC: R-hat, ESS, and Divergences</h2>
+
+<p>
+MCMC gives you draws that are <em>approximately</em> from the posterior, and the
+quality of that approximation depends on whether the chain has converged and mixed
+well. Three diagnostics are essential.
+</p>
+
+<p>
+<strong>R-hat ($\hat{R}$)</strong> compares the variance within chains to the variance
+between chains. If all chains have converged to the same distribution,
+$\hat{R} \approx 1.0$. Values above 1.01 indicate that chains are exploring different
+regions of parameter space and have not yet converged. The split-$\hat{R}$ variant
+(Vehtari et al., 2021) also checks for stationarity within each chain by splitting
+it in half.
+</p>
+
+<p>
+<strong>Effective sample size (ESS)</strong> accounts for autocorrelation between
+successive MCMC samples. If each sample were independent, 4000 draws from 4 chains
+would give you 4000 effective samples. In practice, autocorrelation reduces this.
+An ESS below 400 is a warning sign; below 100 means the posterior summaries are
+unreliable. The <em>bulk</em> ESS measures the efficiency of exploring the center of
+the posterior, while the <em>tail</em> ESS measures the efficiency of exploring the
+tails (important for credible intervals).
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is to assume that drawing more raw MCMC samples automatically improves inference quality. In reality, what matters is the <em>effective</em> sample size (ESS), not the raw count. A chain of 100,000 highly autocorrelated samples can carry less information than 1,000 nearly independent ones. If your sampler is mixing poorly (for example, because of a difficult posterior geometry), simply running it longer wastes computation without meaningfully reducing uncertainty in your estimates. The correct response to low ESS is to fix the sampler (reparameterize the model, tune the step size, or switch to a better algorithm like NUTS), not to collect more correlated draws.
+</p>
+</div>
+
+<p>
+<strong>Divergences</strong> are NUTS-specific warnings that occur when the leapfrog
+integrator fails to accurately follow the Hamiltonian trajectory, typically because
+the posterior has sharp curvature (funnels, ridges, or multimodal regions). A single
+divergence is a warning; many divergences mean the posterior approximation is
+unreliable. The fix is usually to reparameterize the model (centered vs. non-centered
+parameterizations for hierarchical models) or increase <code>target_accept</code>.
+</p>
+
+<pre><code class="language-python">import arviz as az
+
+def diagnose_trace(trace, var_names=None):
+    """Comprehensive MCMC diagnostic report."""
+    summary = az.summary(trace, var_names=var_names)
+
+    # Check R-hat
+    rhat_issues = summary[summary["r_hat"] > 1.01]
+    if len(rhat_issues) > 0:
+        print("WARNING: R-hat > 1.01 for:")
+        print(rhat_issues[["r_hat"]])
+    else:
+        print("R-hat: all parameters < 1.01 (good)")
+
+    # Check ESS
+    low_ess = summary[summary["ess_bulk"] < 400]
+    if len(low_ess) > 0:
+        print("\nWARNING: Low bulk ESS for:")
+        print(low_ess[["ess_bulk", "ess_tail"]])
+    else:
+        print(f"ESS: minimum bulk ESS = {summary['ess_bulk'].min():.0f} (good)")
+
+    # Check divergences (PyMC stores these in the sample stats)
+    if hasattr(trace, "sample_stats"):
+        n_div = int(trace.sample_stats["diverging"].sum())
+        if n_div > 0:
+            print(f"\nWARNING: {n_div} divergent transitions detected!")
+            print("Consider reparameterizing or increasing target_accept.")
+        else:
+            print("Divergences: 0 (good)")
+
+    return summary
+
+# Use it
+summary = diagnose_trace(trace, var_names=["beta_0", "beta_1", "beta_2", "sigma"])
+</code></pre>
+<div class="code-caption">A reusable MCMC diagnostic function that checks the three critical convergence indicators. In production Bayesian workflows, this function (or its ArviZ equivalent) should run automatically after every sampling call.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: ArviZ Diagnostics in One Line</div>
+<p>
+The diagnostic function above reimplements what ArviZ provides out of the box.
+<code>az.summary(trace)</code> includes R-hat, ESS (bulk and tail), mean, standard
+deviation, and HDI in a single DataFrame. <code>az.plot_trace(trace)</code> produces
+trace plots and posterior density plots side by side. <code>az.plot_energy(trace)</code>
+visualizes the energy transition distribution, which detects problems that R-hat can
+miss. The manual implementation above takes roughly 30 lines; the ArviZ equivalents
+are each a single function call. For production work, always use ArviZ.
+</p>
+</div>
+
+<h2>5. Variational Inference</h2>
+
+<p>
+Variational inference (VI) takes a fundamentally different approach from MCMC. Instead
+of sampling from the posterior, VI approximates the posterior with a simpler
+distribution $q(\theta; \phi)$ (the <strong>variational distribution</strong>) and
+optimizes the parameters $\phi$ to make $q$ as close to the true posterior as possible.
+The closeness measure is the Kullback-Leibler divergence:
+</p>
+
+$$\text{KL}(q \| p) = \int q(\theta; \phi) \log \frac{q(\theta; \phi)}{p(\theta \mid D)} \, d\theta$$
+
+<p>
+Minimizing this KL divergence is equivalent to maximizing the <strong>evidence lower
+bound</strong> (ELBO):
+</p>
+
+$$\text{ELBO}(\phi) = \mathbb{E}_{q(\theta; \phi)}[\log p(D \mid \theta) + \log p(\theta) - \log q(\theta; \phi)]$$
+
+<p>
+The ELBO is a lower bound on $\log p(D)$, the log marginal likelihood. Maximizing it
+simultaneously pushes $q$ toward the posterior and provides an approximation to the
+model evidence, which is useful for model comparison
+(<a href="section-32.3.html">Section 32.3</a>).
+</p>
+
+<p>
+<strong>Automatic Differentiation Variational Inference (ADVI)</strong>, implemented
+in PyMC, uses a mean-field Gaussian approximation: $q(\theta; \phi) = \prod_i
+\text{Normal}(\mu_i, \sigma_i^2)$. Each parameter gets its own independent Gaussian,
+and the optimization finds the best $\mu_i$ and $\sigma_i$ for each. ADVI
+transforms constrained parameters (positive, bounded) to the unconstrained real line,
+applies the mean-field approximation there, and transforms back. This is fast (seconds
+to minutes for models that take MCMC hours) but comes with a fundamental limitation:
+the mean-field approximation cannot capture correlations between parameters.
+</p>
+
+<pre><code class="language-python">import pymc as pm
+import arviz as az
+
+with correlated_model:
+    # Variational inference with ADVI
+    approx = pm.fit(
+        method="advi",
+        n=30000,           # optimization iterations
+        random_seed=42,
+    )
+
+    # Draw samples from the variational approximation
+    vi_trace = approx.sample(2000)
+
+# Compare VI and MCMC posteriors
+print("MCMC posterior means:")
+print(az.summary(trace, var_names=["beta_1", "beta_2"])[["mean", "sd"]])
+print("\nADVI posterior means:")
+print(az.summary(vi_trace, var_names=["beta_1", "beta_2"])[["mean", "sd"]])
+</code></pre>
+<div class="code-caption">ADVI in PyMC: <code>pm.fit</code> optimizes the variational parameters over 30,000 iterations. The resulting approximation can be sampled just like an MCMC trace. Compare the posterior means and standard deviations to the MCMC results to assess the quality of the VI approximation.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: When VI Underestimates Uncertainty</div>
+<p>
+The mean-field approximation in ADVI always underestimates posterior uncertainty
+because it forces the variational distribution to be a product of independent
+Gaussians. If the true posterior has strong correlations (common in regression models,
+hierarchical models, and any model with confounded parameters), ADVI will report
+narrower credible intervals than the truth. For scientific applications where
+calibrated uncertainty is critical, this systematic bias is dangerous. Use ADVI as a
+fast initialization or screening tool, but always validate the results with MCMC on
+your final model. Full-rank ADVI (<code>method="fullrank_advi"</code> in PyMC) can
+capture correlations but scales as $O(d^2)$ in the number of parameters.
+</p>
+</div>
+
+<h2>6. Normalizing Flows for Posterior Inference</h2>
+
+<p>
+Normalizing flows offer a middle ground between the exactness of MCMC and the speed of
+VI. A normalizing flow is an invertible neural network $f_\phi: \mathbb{R}^d \to
+\mathbb{R}^d$ that transforms a simple base distribution (usually a standard Gaussian)
+into a complex target distribution. The change-of-variables formula gives the density
+of the transformed distribution:
+</p>
+
+$$q(\theta; \phi) = p_{\text{base}}(f_\phi^{-1}(\theta)) \left| \det \frac{\partial f_\phi^{-1}}{\partial \theta} \right|$$
+
+<p>
+Because the transformation is a neural network, normalizing flows can represent
+posteriors with correlations, multimodality, and other complex structures that
+mean-field VI cannot capture. Training proceeds by maximizing the ELBO, just as in VI,
+but with a much more expressive variational family.
+</p>
+
+<p>
+The <strong>flowMC</strong> library (Wong et al., 2023) combines normalizing flows with
+MCMC in a particularly clever way: it trains a flow to approximate the posterior during
+an initial learning phase, then uses the flow as a proposal distribution for MCMC.
+This gives the best of both worlds: the flow provides efficient global proposals, and
+the MCMC correction ensures asymptotic exactness. The approach is particularly valuable
+for multimodal posteriors that arise in astrophysics, gravitational-wave inference, and
+cosmological parameter estimation.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+from flowMC.sampler.MALA import MALA
+from flowMC.sampler.Sampler import Sampler
+from flowMC.nfmodel.rqspline import MaskedCouplingRQSpline
+
+def log_posterior_jax(theta, data):
+    """Log-posterior for a simple model, JAX-compatible."""
+    x, y = data
+    beta_0, beta_1, log_sigma = theta[0], theta[1], theta[2]
+    sigma = jnp.exp(log_sigma)
+    mu = beta_0 + beta_1 * x
+    # Log-likelihood (Normal)
+    ll = -0.5 * jnp.sum(((y - mu) / sigma)**2) - n * jnp.log(sigma)
+    # Log-prior (weakly informative)
+    lp = -0.5 * (beta_0**2 / 100 + beta_1**2 / 100 + log_sigma**2 / 4)
+    return ll + lp
+
+# Set up the normalizing flow model
+n_dim = 3
+n_layers = 4
+key = jax.random.PRNGKey(42)
+
+# Rational quadratic spline flow (expressive, stable)
+flow_model = MaskedCouplingRQSpline(
+    n_features=n_dim,
+    n_layers=n_layers,
+    hidden_sizes=[64, 64],
+    num_bins=8,
+    key=key,
+)
+
+# Local sampler for the MCMC phase
+local_sampler = MALA(log_posterior_jax, True, {"step_size": 0.01})
+
+# Combined flow + MCMC sampler
+sampler = Sampler(
+    n_dim=n_dim,
+    rng_key_set=jax.random.split(key, 3),
+    local_sampler=local_sampler,
+    nf_model=flow_model,
+    n_local_steps=50,       # local MCMC steps per iteration
+    n_global_steps=50,      # flow-based global steps per iteration
+    n_epochs=30,            # flow training epochs
+    n_chains=10,
+)
+</code></pre>
+<div class="code-caption">Setting up flowMC with a rational-quadratic spline flow. The sampler alternates between local MCMC steps (MALA) and global flow-based proposals, training the flow to match the posterior during sampling. This combination handles multimodal posteriors that would trap a pure MCMC sampler.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Diffusion-Based Posterior Sampling</div>
+<p>
+Beyond normalizing flows, <strong>diffusion models</strong> have emerged as a powerful
+new class of posterior samplers. Sharrock et al. (2024) introduced
+<em>Sequential Neural Posterior Score Estimation</em> (SNPSE), which uses score-based
+diffusion to learn the posterior in simulation-based inference settings, achieving
+state-of-the-art performance on high-dimensional benchmarks where normalizing flows
+struggle. Separately, Vargas et al. (2023) proposed <em>Denoising Diffusion Samplers</em>
+(DDS), which frame MCMC itself as a denoising diffusion process, enabling sampling from
+unnormalized densities without the architectural constraints of invertible flows. These
+diffusion-based approaches handle posteriors with 50 to 100+ dimensions more reliably
+than spline flows and are beginning to appear in production pipelines for gravitational-wave
+astronomy and protein structure inference. The <code>sbi</code> Python package (v0.22+)
+now includes diffusion-based estimators alongside its original flow-based methods.
+</p>
+</div>
+
+<h2>7. Choosing an Inference Method</h2>
+
+<p>
+The choice of inference method depends on the model complexity, the number of
+parameters, the posterior geometry, and the computational budget. Table 32.2
+summarizes the trade-offs.
+</p>
+
+<figure>
+<table>
+<thead>
+<tr><th>Method</th><th>Exactness</th><th>Speed</th><th>Scales to</th><th>Handles Multimodality</th><th>Best For</th></tr>
+</thead>
+<tbody>
+<tr><td>Metropolis-Hastings</td><td>Exact (asymptotic)</td><td>Slow</td><td>~10 params</td><td>Poorly</td><td>Low-dimensional, pedagogical</td></tr>
+<tr><td>NUTS (HMC)</td><td>Exact (asymptotic)</td><td>Moderate</td><td>~1000 params</td><td>Poorly</td><td>Most scientific models</td></tr>
+<tr><td>Mean-field ADVI</td><td>Approximate</td><td>Fast</td><td>~10,000 params</td><td>No</td><td>Screening, initialization</td></tr>
+<tr><td>Full-rank ADVI</td><td>Approximate</td><td>Moderate</td><td>~1000 params</td><td>No</td><td>Correlated posteriors, fast</td></tr>
+<tr><td>Normalizing flows</td><td>Approximate / exact*</td><td>Moderate</td><td>~100 params</td><td>Yes</td><td>Multimodal, complex geometry</td></tr>
+<tr><td>flowMC (flow + MCMC)</td><td>Exact (asymptotic)</td><td>Moderate</td><td>~100 params</td><td>Yes</td><td>Astrophysics, multimodal</td></tr>
+</tbody>
+</table>
+<figcaption>Table 32.2: Comparison of posterior inference methods. *Normalizing flows are approximate when used as pure VI, but exact when combined with MCMC correction (flowMC). "Scales to" indicates the practical parameter count, not a hard limit.</figcaption>
+</figure>
+
+<p>
+For most scientific Bayesian models (10 to a few hundred parameters, unimodal
+posterior, need for calibrated uncertainty), <strong>NUTS is the default
+recommendation</strong>. It is the default in PyMC, Stan, and NumPyro, and it works
+well out of the box for the vast majority of models encountered in practice. Use
+ADVI as a fast screening tool when you are iterating on model structure and do not
+yet need precise posteriors. Use normalizing flows or flowMC when your posterior is
+multimodal or when you need amortized inference across many datasets.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The NumPyro Speed Advantage</div>
+<p>
+NumPyro, the JAX-based probabilistic programming framework, runs NUTS on GPU
+hardware. For models with many observations or parameters, this can provide a 10x to
+100x speedup over PyMC (which runs on CPU by default through PyTensor). The API is
+similar to PyMC, making the transition straightforward. If your MCMC run takes hours
+in PyMC, try NumPyro. We use NumPyro for the full recipe in
+<a href="section-32.4.html">Section 32.4</a>.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Compare MCMC and VI on a Banana-Shaped Posterior</h4>
+<p>
+This mini-project lets you see, hands-on, where mean-field VI fails and NUTS succeeds.
+You need only <code>numpy</code>, <code>pymc</code>, <code>arviz</code>, and <code>matplotlib</code>.
+</p>
+<p>
+<strong>Step 1.</strong> Generate synthetic data from a nonlinear model:
+<code>y_i = \theta_1 \cdot \theta_2 + \epsilon_i</code> with $\epsilon_i \sim \text{Normal}(0, 0.5)$,
+$n = 30$ observations. This product parameterization creates a banana-shaped (curved, correlated)
+posterior because many $(\theta_1, \theta_2)$ pairs can produce the same product.
+</p>
+<p>
+<strong>Step 2.</strong> Build a PyMC model with <code>Normal</code> priors on both $\theta_1$
+and $\theta_2$ (mean 0, standard deviation 5) and the multiplicative likelihood above.
+Sample using NUTS with 4 chains and 2,000 draws each.
+</p>
+<p>
+<strong>Step 3.</strong> Fit the same model using <code>pm.fit(method="advi", n=50000)</code>
+and draw 4,000 samples from the variational approximation.
+</p>
+<p>
+<strong>Step 4.</strong> Plot both sets of samples as a 2D scatter (or KDE contour) of
+$\theta_1$ vs. $\theta_2$ on the same axes using <code>matplotlib</code>. You should see
+the NUTS samples tracing a curved banana shape while the ADVI samples form a compact ellipse
+that misses the tails of the true posterior.
+</p>
+<p>
+<strong>Step 5.</strong> Compute and compare the 94% highest-density intervals (HDI) for the
+product $\theta_1 \cdot \theta_2$ from both methods using <code>az.hdi()</code>. Verify that
+the ADVI interval is narrower (underestimates uncertainty) while the NUTS interval covers
+the true generating value.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Explain why the leapfrog integrator must be both time-reversible and volume-preserving (symplectic) for HMC to satisfy detailed balance. What would go wrong if we used a standard Euler integrator instead? Hint: consider what happens to the acceptance probability.
+</li>
+<li>
+<strong>(Coding)</strong> Implement the Metropolis-Hastings sampler from this section and use it to sample from a 2D Gaussian posterior with correlation 0.9. Measure the effective sample size as a function of the proposal step size. Then repeat with HMC (using the leapfrog code provided). Compare ESS per gradient evaluation for MH and HMC. At what dimensionality does HMC become clearly superior?
+</li>
+<li>
+<strong>(Analysis)</strong> Take the quadratic regression model from this section and fit it with both NUTS and mean-field ADVI. Compare the posterior credible intervals for $\beta_1$ and $\beta_2$ from both methods. Plot the ADVI posterior as a 2D contour overlaid on the NUTS posterior samples. Where does ADVI misrepresent the posterior? How does the mismatch change if you switch to <code>fullrank_advi</code>?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have the computational machinery to compute posteriors. But having a posterior
+is only half the story. In <a href="section-32.3.html">Section 32.3: Model Comparison
+and Decision Making</a>, we use posteriors to answer the questions that matter most for
+discovery: which of several competing hypotheses does the data support? Is the model
+well-calibrated? And, given limited resources, which experiment should we run next?
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1701.02434" target="_blank">Betancourt, M. (2017). A conceptual introduction to Hamiltonian Monte Carlo. <em>arXiv:1701.02434</em>.</a>
+<p>The best introduction to HMC geometry, explaining the typical set, energy conservation, and the role of the mass matrix.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1111.4246" target="_blank">Hoffman, M. D. &amp; Gelman, A. (2014). The No-U-Turn Sampler. <em>JMLR</em>, 15(47), 1593-1623.</a>
+<p>The NUTS paper that automated trajectory-length tuning in HMC.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1507.04544" target="_blank">Blei, D. M., Kucukelbir, A., &amp; McAuliffe, J. D. (2017). Variational inference: A review for statisticians. <em>JASA</em>, 112(518), 859-877.</a>
+<p>Comprehensive review of variational inference connecting it to classical statistics.</p>
+</div>
+<div class="bib-card">
+<a href="https://github.com/kazewong/flowMC" target="_blank">Wong, K. W. K., Gabrie, M., &amp; Bhardwaj, U. (2023). flowMC: Normalizing-flow enhanced sampling. <em>JOSS</em>, 8(83), 5021.</a>
+<p>The flowMC library combining normalizing flows with MCMC for multimodal posteriors.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1906.04507" target="_blank">Papamakarios, G., et al. (2021). Normalizing flows for probabilistic modeling and inference. <em>JMLR</em>, 22(57), 1-64.</a>
+<p>Comprehensive survey of normalizing flow architectures and their applications to Bayesian inference.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1903.04057" target="_blank">Vehtari, A., Gelman, A., Simpson, D., Carpenter, B., &amp; Burkner, P.-C. (2021). Rank-normalization, folding, and localization: An improved R-hat for assessing convergence of MCMC. <em>Bayesian Analysis</em>, 16(2), 667-718.</a>
+<p>The modern R-hat diagnostic with rank normalization, now default in ArviZ and Stan.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-32.1.html">&#8592; 32.1 The Bayesian Workflow</a>
+<a href="index.html">Chapter 32</a>
+<a href="section-32.3.html">32.3 Model Comparison &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

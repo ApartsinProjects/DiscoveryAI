@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.4: Building a Causal Analysis Pipeline. End-to-end recipe for heterogeneous treatment effect estimation with DoWhy refutation tests and Discovery Workbench integration." name="description"/>
+<title>Section 31.4: Building a Causal Analysis Pipeline | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: Causal Discovery and Causal Inference</a></div>
+<h1>31.4 Building a Causal Analysis Pipeline</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I passed all four refutation tests, reported my effect with confidence intervals, and then my PI asked me to try a different DAG. I had 47 more candidates."</p>
+<cite>A Causal Graph With Too Many Confounders</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section integrates everything from the chapter: the structural causal model formalism
+(<a href="section-31.1.html">Section 31.1</a>), causal discovery algorithms
+(<a href="section-31.2.html">Section 31.2</a>), and treatment effect estimation with
+sensitivity analysis (<a href="section-31.3.html">Section 31.3</a>). You should be
+comfortable with DoWhy's four-step workflow, at least one causal discovery algorithm, and the
+CATE estimation methods. Familiarity with the Discovery Workbench architecture from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a> will
+help you understand the integration pattern.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Individual causal tools are powerful, but real scientific workflows require them to work
+together: explore data, discover plausible causal structures, estimate effects, test
+robustness, and document every assumption. This section builds a complete causal analysis
+pipeline that takes raw observational data and produces heterogeneous treatment effect
+estimates with refutation-tested confidence intervals. The pipeline is modular: each stage
+can be swapped independently (different discovery algorithm, different estimator, different
+sensitivity analysis), and the entire workflow produces an auditable artifact that records
+the causal graph, identification strategy, estimates, and refutation results. By the end,
+you will have a reusable recipe for causal analysis that integrates into the Discovery
+Workbench.
+</p>
+</div>
+
+<h2>1. The Pipeline Architecture</h2>
+
+<p>
+Our causal analysis pipeline has six stages, each producing an intermediate artifact that
+feeds the next:
+</p>
+
+<ol>
+<li><strong>Data preparation and exploratory analysis</strong>: load data, check covariate balance, assess positivity, and identify potential confounders through domain knowledge and correlation analysis.</li>
+<li><strong>Causal graph specification</strong>: combine domain knowledge with causal discovery algorithms to construct a plausible DAG. Run multiple algorithms and compare.</li>
+<li><strong>Identification</strong>: apply the backdoor criterion (or front-door, instrumental variable) to determine the estimand and valid adjustment sets.</li>
+<li><strong>Estimation</strong>: compute ATE, ATT, and CATE using doubly robust or DML estimators. Compare multiple estimators as a robustness check.</li>
+<li><strong>Refutation and sensitivity</strong>: run placebo, random common cause, subset, and E-value tests. Flag estimates that fail any refutation.</li>
+<li><strong>Reporting</strong>: generate a structured report with the DAG, estimates, confidence intervals, refutation results, and a plain-language interpretation.</li>
+</ol>
+
+<p>
+Let us build this pipeline for a concrete scientific scenario: estimating the heterogeneous
+effect of a soil treatment on crop yield, using observational data where treatment assignment
+is confounded by environmental conditions.
+</p>
+
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class CausalPipelineConfig:
+    """Configuration for a causal analysis pipeline run."""
+    treatment: str
+    outcome: str
+    covariates: list[str]
+    graph_spec: Optional[str] = None  # DOT string; None = discover from data
+    discovery_algorithm: str = "pc"   # pc, fci, ges, lingam
+    estimator: str = "dml"            # ipw, aipw, dml, t_learner, x_learner
+    alpha: float = 0.05               # Significance level
+    n_refutation_sims: int = 100      # Number of refutation simulations
+    cross_fit_folds: int = 5          # DML cross-fitting folds
+
+@dataclass
+class CausalPipelineResult:
+    """Structured output from a causal analysis pipeline run."""
+    config: CausalPipelineConfig
+    discovered_graph: Optional[object] = None
+    identified_estimand: Optional[object] = None
+    ate: float = 0.0
+    ate_ci: tuple = (0.0, 0.0)
+    att: float = 0.0
+    cate_model: Optional[object] = None
+    refutation_results: dict = field(default_factory=dict)
+    e_value: float = 0.0
+    passed_all_refutations: bool = False</code></pre>
+<div class="code-caption">Listing 31.18: Data classes for pipeline configuration and results. The config specifies the causal question (treatment, outcome, covariates) and methodological choices (algorithm, estimator). The result captures every output artifact for auditing.</div>
+
+<h2>2. Data Preparation and Covariate Balance</h2>
+
+<p>
+Before any causal analysis, we need to understand the data. The critical pre-analysis checks
+are: (a) <strong>covariate balance</strong>, the extent to which treated and control groups
+differ on observed characteristics; (b) <strong>positivity</strong>, whether every combination
+of covariate values has a non-zero probability of receiving each treatment; and
+(c) <strong>missing data patterns</strong>, which can introduce selection bias if missingness
+is related to treatment or outcome.
+</p>
+
+<p data-agent="02">
+Covariate balance is a quantitative diagnostic that measures how similar the treated and control groups are on each measured variable before any statistical adjustment. It matters because large imbalances signal confounding: if treated units systematically differ from controls on a variable that also affects the outcome, a naive comparison of group means will be biased. The standard metric is the <em>standardized mean difference</em> (SMD), computed as the difference in group means divided by the pooled standard deviation; values above 0.1 are conventionally flagged as meaningful imbalance. Use covariate balance as a first-pass diagnostic before choosing your adjustment strategy; for situations where balance is already strong across all covariates (all SMDs below 0.05), simpler estimators such as regression adjustment may suffice, while severe imbalance on key confounders calls for propensity score methods or doubly robust estimators that can handle larger extrapolation.
+</p>
+
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+
+def generate_crop_data(n: int = 5000, seed: int = 42) -> pd.DataFrame:
+    """Simulate observational crop yield data with confounding.
+
+    True DGP:
+        rainfall -> treatment, yield
+        soil_ph -> treatment, yield
+        temperature -> yield
+        treatment -> yield (heterogeneous: depends on soil_ph)
+    """
+    rng = np.random.default_rng(seed)
+
+    rainfall = rng.normal(800, 200, n)     # mm/year
+    soil_ph = rng.normal(6.5, 0.8, n)      # pH units
+    temperature = rng.normal(22, 4, n)     # Celsius
+    elevation = rng.normal(500, 150, n)    # meters (not a confounder)
+
+    # Treatment assignment (confounded by rainfall and soil_ph)
+    logit = -2 + 0.003 * rainfall + 0.4 * soil_ph + rng.normal(0, 1, n)
+    prob_treat = 1 / (1 + np.exp(-logit))
+    treatment = rng.binomial(1, prob_treat)
+
+    # Outcome with heterogeneous treatment effect
+    # Base CATE: 500 + 100*(soil_ph - 6.5), so acidic soil benefits less
+    cate = 500 + 100 * (soil_ph - 6.5)
+    yield_kg = (
+        2000
+        + 1.5 * rainfall
+        + 200 * soil_ph
+        - 30 * temperature
+        + treatment * cate
+        + rng.normal(0, 300, n)
+    )
+
+    return pd.DataFrame({
+        "rainfall": rainfall,
+        "soil_ph": soil_ph,
+        "temperature": temperature,
+        "elevation": elevation,
+        "treatment": treatment,
+        "yield_kg": yield_kg,
+        "true_cate": cate,  # Oracle column for evaluation
+    })
+
+data = generate_crop_data(n=5000)
+print(f"Dataset shape: {data.shape}")
+print(f"Treatment rate: {data['treatment'].mean():.2%}")
+print(f"True ATE: {data['true_cate'].mean():.1f} kg")
+
+def assess_covariate_balance(data, treatment_col, covariates):
+    """Compute standardized mean differences for covariate balance."""
+    treated = data[data[treatment_col] == 1]
+    control = data[data[treatment_col] == 0]
+
+    print("\nCovariate Balance (Standardized Mean Differences):")
+    print(f"{'Covariate':<15} {'Treated Mean':>12} {'Control Mean':>12} {'SMD':>8}")
+    print("-" * 50)
+
+    for cov in covariates:
+        mean_t = treated[cov].mean()
+        mean_c = control[cov].mean()
+        pooled_std = np.sqrt(
+            (treated[cov].var() + control[cov].var()) / 2
+        )
+        smd = (mean_t - mean_c) / pooled_std if pooled_std > 0 else 0
+        flag = " ***" if abs(smd) > 0.1 else ""
+        print(f"{cov:<15} {mean_t:>12.2f} {mean_c:>12.2f} {smd:>8.3f}{flag}")
+
+    print("\n*** = SMD > 0.1 (imbalance requiring adjustment)")
+
+covariates = ["rainfall", "soil_ph", "temperature", "elevation"]
+assess_covariate_balance(data, "treatment", covariates)</code></pre>
+<div class="code-caption">Listing 31.19: Generating synthetic crop yield data with known confounding structure, and assessing covariate balance. Standardized mean differences (SMD) above 0.1 indicate meaningful imbalance requiring causal adjustment. Rainfall and soil pH show imbalance because they affect treatment assignment.</div>
+
+<p>
+The covariate balance assessment reveals which variables differ between treated and control
+groups, providing empirical evidence of confounding. Variables with large standardized mean
+differences are candidates for the adjustment set. Note that balance on observed covariates
+does <em>not</em> guarantee balance on unmeasured confounders; this is why sensitivity
+analysis remains essential.
+</p>
+
+<h2>3. Causal Graph Discovery and Specification</h2>
+
+<p>
+The pipeline supports two modes for obtaining the causal graph: expert specification (the
+researcher provides a DAG) and data-driven discovery (algorithms learn the skeleton and
+orientations from data). In practice, the most effective approach combines both: start with
+domain knowledge, use discovery algorithms to check consistency, and resolve disagreements
+through discussion with domain experts.
+</p>
+
+<pre><code class="language-python">from causallearn.search.ConstraintBased.PC import pc
+from causallearn.search.ScoreBased.GES import ges
+from causallearn.utils.cit import fisherz
+
+def discover_causal_graph(data, covariates, treatment, outcome, method="pc"):
+    """Run causal discovery and return a DOT string for DoWhy.
+
+    Compares the data-driven graph with domain knowledge and
+    flags inconsistencies.
+    """
+    all_vars = covariates + [treatment, outcome]
+    analysis_data = data[all_vars].values
+    labels = all_vars
+
+    if method == "pc":
+        result = pc(analysis_data, alpha=0.05, indep_test=fisherz,
+                     node_names=labels)
+        adj = result.G.graph
+    elif method == "ges":
+        result = ges(analysis_data, score_func="local_score_BIC")
+        adj = result["G"].graph
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    # Extract edges from adjacency matrix
+    edges = []
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            if adj[i, j] == -1 and adj[j, i] == 1:
+                edges.append((labels[i], labels[j]))
+
+    print(f"\n{method.upper()} discovered edges:")
+    for src, dst in edges:
+        print(f"  {src} -> {dst}")
+
+    return edges
+
+# Run multiple discovery algorithms
+pc_edges = discover_causal_graph(
+    data, covariates, "treatment", "yield_kg", method="pc"
+)
+ges_edges = discover_causal_graph(
+    data, covariates, "treatment", "yield_kg", method="ges"
+)
+
+# Compare: edges present in both algorithms are more trustworthy
+pc_set = set(pc_edges)
+ges_set = set(ges_edges)
+consensus = pc_set & ges_set
+pc_only = pc_set - ges_set
+ges_only = ges_set - pc_set
+
+print("\nConsensus edges (both algorithms agree):")
+for edge in consensus:
+    print(f"  {edge[0]} -> {edge[1]}")
+if pc_only:
+    print("PC-only edges:")
+    for edge in pc_only:
+        print(f"  {edge[0]} -> {edge[1]}")
+if ges_only:
+    print("GES-only edges:")
+    for edge in ges_only:
+        print(f"  {edge[0]} -> {edge[1]}")</code></pre>
+<div class="code-caption">Listing 31.20: Multi-algorithm causal discovery with consensus checking. Running PC and GES on the same data and comparing results provides a robustness check on the discovered graph. Edges present in both algorithms' outputs receive higher confidence.</div>
+
+<pre><code class="language-python">def build_causal_graph_dot(
+    covariates, treatment, outcome,
+    discovered_edges=None, domain_knowledge=None
+) -> str:
+    """Construct a DoWhy-compatible DOT graph string.
+
+    Merges domain knowledge with discovered edges, preferring
+    domain knowledge when they conflict.
+    """
+    # Default domain knowledge for crop yield
+    if domain_knowledge is None:
+        domain_knowledge = {
+            ("rainfall", "treatment"),
+            ("rainfall", "yield_kg"),
+            ("soil_ph", "treatment"),
+            ("soil_ph", "yield_kg"),
+            ("temperature", "yield_kg"),
+            ("treatment", "yield_kg"),
+        }
+
+    # Start with domain knowledge, add non-conflicting discovered edges
+    final_edges = set(domain_knowledge)
+    if discovered_edges:
+        for edge in discovered_edges:
+            reverse = (edge[1], edge[0])
+            if reverse not in final_edges:
+                final_edges.add(edge)
+
+    # Build DOT string
+    edge_lines = [f"    {src} -> {dst};" for src, dst in final_edges]
+    dot = "digraph {\n" + "\n".join(edge_lines) + "\n}"
+
+    print(f"\nFinal causal graph ({len(final_edges)} edges):")
+    print(dot)
+    return dot
+
+graph_dot = build_causal_graph_dot(
+    covariates, "treatment", "yield_kg",
+    discovered_edges=list(consensus),
+)</code></pre>
+<div class="code-caption">Listing 31.21: Merging domain knowledge with data-driven discovery into a final causal graph. Domain knowledge takes precedence when algorithms disagree; discovered edges supplement the expert-specified structure. The result is a DOT string compatible with DoWhy.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Domain Knowledge Is Not Cheating</div>
+<p>
+Researchers sometimes worry that incorporating domain knowledge into causal discovery
+"contaminates" a purely data-driven analysis. The opposite is true: ignoring domain
+knowledge is the mistake. Causal discovery algorithms operate under strong assumptions
+(faithfulness, causal sufficiency, correct conditional independence tests) that frequently
+fail in practice. Domain knowledge constrains the search space, prevents absurd graphs (rain
+does not cause soil pH), and resolves equivalence class ambiguities that no algorithm can
+break from observational data alone. The scientific question is not "what can the data tell
+us without any prior knowledge?" but "what does the data tell us, given what we already know?"
+This philosophy connects to the <a href="../module-32-bayesian-discovery/index.html">Bayesian
+reasoning</a> of Chapter 32, where prior knowledge is formalized as a prior distribution.
+</p>
+</div>
+
+<h2>4. The Complete Pipeline</h2>
+
+<p>
+With the building blocks in place, we assemble the complete pipeline. The <code>CausalAnalysisPipeline</code>
+class orchestrates data preparation, graph specification, identification, estimation, and
+refutation into a single callable workflow.
+</p>
+
+<pre><code class="language-python">import dowhy
+from dowhy import CausalModel
+from econml.dml import LinearDML, CausalForestDML
+from sklearn.ensemble import (
+    GradientBoostingRegressor, GradientBoostingClassifier
+)
+
+class CausalAnalysisPipeline:
+    """End-to-end causal analysis: discover, identify, estimate, refute."""
+
+    def __init__(self, config: CausalPipelineConfig):
+        self.config = config
+        self.result = CausalPipelineResult(config=config)
+
+    def run(self, data: pd.DataFrame) -> CausalPipelineResult:
+        """Execute the full pipeline."""
+        print("=" * 60)
+        print("CAUSAL ANALYSIS PIPELINE")
+        print("=" * 60)
+
+        # Stage 1: Data preparation
+        print("\n--- Stage 1: Data Preparation ---")
+        self._check_data(data)
+
+        # Stage 2: Graph specification
+        print("\n--- Stage 2: Causal Graph ---")
+        graph_dot = self._get_graph(data)
+
+        # Stage 3: Identification
+        print("\n--- Stage 3: Identification ---")
+        model = CausalModel(
+            data=data,
+            treatment=self.config.treatment,
+            outcome=self.config.outcome,
+            graph=graph_dot,
+        )
+        estimand = model.identify_effect(proceed_when_unidentifiable=True)
+        self.result.identified_estimand = estimand
+        print(f"Estimand type: {estimand.estimands}")
+
+        # Stage 4: Estimation (ATE + CATE)
+        print("\n--- Stage 4: Estimation ---")
+        self._estimate_effects(data, model, estimand)
+
+        # Stage 5: Refutation
+        print("\n--- Stage 5: Refutation ---")
+        self._run_refutations(model, estimand)
+
+        # Stage 6: Summary
+        print("\n--- Stage 6: Summary ---")
+        self._print_summary()
+
+        return self.result
+
+    def _check_data(self, data):
+        """Validate data and report basic diagnostics."""
+        n = len(data)
+        n_treated = data[self.config.treatment].sum()
+        print(f"  Samples: {n}")
+        print(f"  Treated: {n_treated} ({n_treated/n:.1%})")
+        print(f"  Control: {n - n_treated} ({(n-n_treated)/n:.1%})")
+
+        # Check positivity
+        for cov in self.config.covariates:
+            for quantile in [0.05, 0.95]:
+                threshold = data[cov].quantile(quantile)
+                if quantile < 0.5:
+                    subset = data[data[cov] <= threshold]
+                else:
+                    subset = data[data[cov] >= threshold]
+                treat_rate = subset[self.config.treatment].mean()
+                if treat_rate < 0.02 or treat_rate > 0.98:
+                    print(f"  WARNING: Positivity concern for {cov} "
+                          f"at {quantile:.0%} quantile "
+                          f"(treatment rate = {treat_rate:.1%})")
+
+    def _get_graph(self, data):
+        """Return or discover the causal graph."""
+        if self.config.graph_spec:
+            print("  Using expert-specified graph")
+            return self.config.graph_spec
+
+        print(f"  Discovering graph with {self.config.discovery_algorithm}")
+        edges = discover_causal_graph(
+            data, self.config.covariates,
+            self.config.treatment, self.config.outcome,
+            method=self.config.discovery_algorithm,
+        )
+        return build_causal_graph_dot(
+            self.config.covariates,
+            self.config.treatment,
+            self.config.outcome,
+            discovered_edges=edges,
+        )
+
+    def _estimate_effects(self, data, model, estimand):
+        """Estimate ATE and CATE."""
+        X = data[self.config.covariates].values
+        T = data[self.config.treatment].values
+        Y = data[self.config.outcome].values
+
+        # ATE via DoWhy + DML
+        estimate = model.estimate_effect(
+            estimand,
+            method_name="backdoor.econml.dml.DML",
+            method_params={
+                "init_params": {
+                    "model_y": GradientBoostingRegressor(
+                        n_estimators=200, max_depth=4, min_samples_leaf=20
+                    ),
+                    "model_t": GradientBoostingClassifier(
+                        n_estimators=200, max_depth=4, min_samples_leaf=20
+                    ),
+                    "cv": self.config.cross_fit_folds,
+                },
+                "fit_params": {},
+            },
+        )
+
+        self.result.ate = estimate.value
+        self._dowhy_estimate = estimate
+        print(f"  ATE: {estimate.value:.2f}")
+
+        # CATE via CausalForestDML for heterogeneity
+        cate_model = CausalForestDML(
+            model_y=GradientBoostingRegressor(
+                n_estimators=200, max_depth=4, min_samples_leaf=20
+            ),
+            model_t=GradientBoostingClassifier(
+                n_estimators=200, max_depth=4, min_samples_leaf=20
+            ),
+            cv=self.config.cross_fit_folds,
+            n_estimators=500,
+            random_state=42,
+        )
+        cate_model.fit(Y, T, X=X)
+        self.result.cate_model = cate_model
+
+        # CATE summary
+        cate_pred = cate_model.effect(X)
+        cate_intervals = cate_model.effect_interval(X, alpha=self.config.alpha)
+
+        print(f"  CATE mean: {cate_pred.mean():.2f}")
+        print(f"  CATE std:  {cate_pred.std():.2f}")
+        print(f"  CATE range: [{cate_pred.min():.2f}, {cate_pred.max():.2f}]")
+
+        # Store ATE CI from causal forest
+        ate_from_forest = cate_model.ate()
+        ate_ci = cate_model.ate_interval(alpha=self.config.alpha)
+        self.result.ate_ci = (ate_ci[0], ate_ci[1])
+        print(f"  ATE (forest): {ate_from_forest:.2f}")
+        print(f"  95% CI: [{ate_ci[0]:.2f}, {ate_ci[1]:.2f}]")
+
+    def _run_refutations(self, model, estimand):
+        """Run all refutation tests."""
+        estimate = self._dowhy_estimate
+        all_passed = True
+
+        # Placebo treatment
+        try:
+            ref_placebo = model.refute_estimate(
+                estimand, estimate,
+                method_name="placebo_treatment_refuter",
+                placebo_type="permute",
+                num_simulations=self.config.n_refutation_sims,
+            )
+            placebo_effect = ref_placebo.new_effect
+            placebo_pass = abs(placebo_effect) < abs(estimate.value) * 0.1
+            self.result.refutation_results["placebo"] = {
+                "effect": placebo_effect,
+                "passed": placebo_pass,
+            }
+            status = "PASS" if placebo_pass else "FAIL"
+            print(f"  Placebo:        {status} (effect={placebo_effect:.3f})")
+            if not placebo_pass:
+                all_passed = False
+        except Exception as e:
+            print(f"  Placebo:        ERROR ({e})")
+            all_passed = False
+
+        # Random common cause
+        try:
+            ref_random = model.refute_estimate(
+                estimand, estimate,
+                method_name="random_common_cause",
+                num_simulations=self.config.n_refutation_sims,
+            )
+            random_effect = ref_random.new_effect
+            random_pass = abs(random_effect - estimate.value) < abs(estimate.value) * 0.1
+            self.result.refutation_results["random_common_cause"] = {
+                "effect": random_effect,
+                "passed": random_pass,
+            }
+            status = "PASS" if random_pass else "FAIL"
+            print(f"  Random cause:   {status} (effect={random_effect:.3f})")
+            if not random_pass:
+                all_passed = False
+        except Exception as e:
+            print(f"  Random cause:   ERROR ({e})")
+            all_passed = False
+
+        # Data subset
+        try:
+            ref_subset = model.refute_estimate(
+                estimand, estimate,
+                method_name="data_subset_refuter",
+                subset_fraction=0.8,
+                num_simulations=self.config.n_refutation_sims,
+            )
+            subset_effect = ref_subset.new_effect
+            subset_pass = abs(subset_effect - estimate.value) < abs(estimate.value) * 0.15
+            self.result.refutation_results["data_subset"] = {
+                "effect": subset_effect,
+                "passed": subset_pass,
+            }
+            status = "PASS" if subset_pass else "FAIL"
+            print(f"  Data subset:    {status} (effect={subset_effect:.3f})")
+            if not subset_pass:
+                all_passed = False
+        except Exception as e:
+            print(f"  Data subset:    ERROR ({e})")
+            all_passed = False
+
+        self.result.passed_all_refutations = all_passed
+
+    def _print_summary(self):
+        """Print a human-readable summary."""
+        r = self.result
+        print(f"\n{'=' * 60}")
+        print(f"RESULT: ATE = {r.ate:.2f}, CI = [{r.ate_ci[0]:.2f}, {r.ate_ci[1]:.2f}]")
+        refutation_status = "ALL PASSED" if r.passed_all_refutations else "SOME FAILED"
+        print(f"REFUTATIONS: {refutation_status}")
+        print(f"{'=' * 60}")</code></pre>
+<div class="code-caption">Listing 31.22: The complete CausalAnalysisPipeline class. Six stages execute sequentially: data validation with positivity checks, graph discovery or specification, identification via DoWhy, ATE and CATE estimation via DML and causal forests, three refutation tests, and a structured summary.</div>
+
+<h2>5. Running the Pipeline</h2>
+
+<p>
+With the pipeline class defined, running a complete causal analysis requires only a
+configuration and a dataset:
+</p>
+
+<pre><code class="language-python"># Configure the pipeline
+config = CausalPipelineConfig(
+    treatment="treatment",
+    outcome="yield_kg",
+    covariates=["rainfall", "soil_ph", "temperature", "elevation"],
+    graph_spec="""digraph {
+        rainfall -> treatment;
+        rainfall -> yield_kg;
+        soil_ph -> treatment;
+        soil_ph -> yield_kg;
+        temperature -> yield_kg;
+        treatment -> yield_kg;
+    }""",
+    estimator="dml",
+    n_refutation_sims=50,
+    cross_fit_folds=5,
+)
+
+# Run the pipeline
+pipeline = CausalAnalysisPipeline(config)
+result = pipeline.run(data)
+
+# Evaluate CATE accuracy against ground truth
+if "true_cate" in data.columns:
+    cate_pred = result.cate_model.effect(data[config.covariates].values)
+    cate_true = data["true_cate"].values
+    rmse = np.sqrt(np.mean((cate_pred - cate_true) ** 2))
+    correlation = np.corrcoef(cate_pred, cate_true)[0, 1]
+    print(f"\nCATE evaluation (oracle):")
+    print(f"  RMSE: {rmse:.2f}")
+    print(f"  Correlation: {correlation:.3f}")</code></pre>
+<div class="code-caption">Listing 31.23: Running the complete pipeline on the crop yield dataset. The expert-specified graph encodes domain knowledge about confounders. The pipeline estimates ATE and CATE, runs refutation tests, and (when ground truth is available) evaluates CATE accuracy.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Heterogeneous Treatment Effects in Agricultural Research</div>
+<p>
+The CATE estimates from our pipeline reveal that the soil treatment's effectiveness varies
+dramatically with soil pH. Acidic soils ($\text{pH} < 6$) show modest yield improvements of
+around 450 kg/ha, while neutral to alkaline soils ($\text{pH} > 7$) show improvements exceeding
+550 kg/ha. This heterogeneity has direct implications for agricultural policy: rather than
+recommending the treatment universally, extension services can target farms with the highest
+expected benefit, maximizing the return on investment. The CATE function also reveals that
+the treatment is always beneficial ($\tau(x) > 0$ for all observed covariate combinations),
+so no subgroup is harmed. This kind of analysis connects directly to the
+<a href="../../part-5-simulation-optimization/module-45-optimization/index.html">optimization</a>
+methods of Chapter 45 (optimal resource allocation) and the
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">experiment
+design</a> methods of Chapter 46 (where to run follow-up field trials).
+</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of refutation testing like a home inspection before buying a house. The house (your causal estimate) looks solid from the outside, but the inspector deliberately stresses each system: running faucets at full blast to check water pressure (the placebo test, which scrambles treatment labels to see if the effect vanishes), adding load to the electrical panel (the random common cause test, which injects a fake confounder to see if the estimate shifts), and checking only half the rooms to see if the foundation holds everywhere (the subset test, which re-estimates on random 80% slices). No single inspection proves the house is perfect, but a house that fails any one of these checks has a specific, identifiable weakness. Similarly, each refutation test probes one assumption of the causal model; an estimate that survives all of them is not proven correct, but one that fails any of them has a concrete vulnerability you must address before trusting the result.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that passing all refutation tests proves the causal estimate is correct and free of bias from unmeasured confounders. Refutation tests check internal consistency (stability under data perturbation, robustness to random noise confounders, and absence of effect under placebo treatment), but they cannot detect a real unmeasured confounder that is systematically related to both treatment and outcome. An estimate can pass every refutation test and still be biased if a strong confounder is missing from the data entirely. Refutation tests raise confidence that the estimate is not an artifact of obvious model misspecification; they do not substitute for domain knowledge about what variables might be missing from the analysis.
+</p>
+</div>
+
+<h2>6. CATE Visualization and Interpretation</h2>
+
+<p>
+Treatment effect heterogeneity is most useful when it is interpretable. The pipeline produces
+CATE estimates as a function of covariates; visualizing this function reveals which patient,
+field, or experimental characteristics drive the effect.
+</p>
+
+<pre><code class="language-python">import matplotlib.pyplot as plt
+
+def plot_cate_by_covariate(cate_model, data, covariates, treatment_col, outcome_col):
+    """Plot CATE as a function of each covariate with confidence intervals."""
+    X = data[covariates].values
+    cate = cate_model.effect(X).flatten()
+    cate_lower, cate_upper = cate_model.effect_interval(X, alpha=0.05)
+
+    n_covs = len(covariates)
+    fig, axes = plt.subplots(1, n_covs, figsize=(5 * n_covs, 4))
+    if n_covs == 1:
+        axes = [axes]
+
+    for ax, cov in zip(axes, covariates):
+        x_vals = data[cov].values
+        sort_idx = np.argsort(x_vals)
+
+        ax.scatter(x_vals, cate, alpha=0.1, s=5, color="steelblue")
+
+        # Binned means with CI
+        n_bins = 20
+        bin_edges = np.linspace(x_vals.min(), x_vals.max(), n_bins + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        bin_means = []
+        bin_ci_low = []
+        bin_ci_high = []
+
+        for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+            mask = (x_vals >= lo) & (x_vals < hi)
+            if mask.sum() > 10:
+                bin_means.append(cate[mask].mean())
+                bin_ci_low.append(cate_lower.flatten()[mask].mean())
+                bin_ci_high.append(cate_upper.flatten()[mask].mean())
+            else:
+                bin_means.append(np.nan)
+                bin_ci_low.append(np.nan)
+                bin_ci_high.append(np.nan)
+
+        ax.plot(bin_centers, bin_means, color="darkred", linewidth=2)
+        ax.fill_between(
+            bin_centers, bin_ci_low, bin_ci_high,
+            alpha=0.3, color="salmon", label="95% CI"
+        )
+
+        ax.set_xlabel(cov)
+        ax.set_ylabel("CATE (kg/ha)")
+        ax.axhline(y=0, color="black", linestyle="--", alpha=0.3)
+        ax.legend()
+
+    plt.suptitle("Heterogeneous Treatment Effects by Covariate")
+    plt.tight_layout()
+    plt.savefig("cate_by_covariate.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("Saved CATE visualization to cate_by_covariate.png")
+
+plot_cate_by_covariate(
+    result.cate_model, data, config.covariates,
+    config.treatment, config.outcome,
+)</code></pre>
+<div class="code-caption">Listing 31.24: Visualizing CATE as a function of each covariate with binned means and 95% confidence intervals. The plot reveals which covariates drive treatment effect heterogeneity. Covariates with flat CATE lines do not modify the treatment effect; those with steep slopes are effect modifiers.</div>
+
+<h2>7. Integration with the Discovery Workbench</h2>
+
+<p>
+The causal analysis pipeline produces structured results that integrate naturally into the
+Discovery Workbench artifact registry (introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a> and
+extended in <a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">Chapter 47</a>).
+Each pipeline run produces an artifact containing:
+</p>
+
+<ul>
+<li>The causal DAG (as a DOT string and rendered image).</li>
+<li>The identification strategy and valid adjustment sets.</li>
+<li>ATE, ATT, and CATE estimates with confidence intervals.</li>
+<li>Refutation test results (pass/fail for each test).</li>
+<li>CATE visualizations and effect modifier rankings.</li>
+<li>A provenance record linking to the input data, code version, and configuration.</li>
+</ul>
+
+<pre><code class="language-python">import json
+from datetime import datetime
+
+def export_pipeline_artifact(result: CausalPipelineResult, filepath: str):
+    """Export pipeline results as a JSON artifact for the Discovery Workbench."""
+    artifact = {
+        "artifact_type": "causal_analysis",
+        "timestamp": datetime.now().isoformat(),
+        "config": {
+            "treatment": result.config.treatment,
+            "outcome": result.config.outcome,
+            "covariates": result.config.covariates,
+            "estimator": result.config.estimator,
+            "discovery_algorithm": result.config.discovery_algorithm,
+        },
+        "results": {
+            "ate": float(result.ate),
+            "ate_ci_lower": float(result.ate_ci[0]),
+            "ate_ci_upper": float(result.ate_ci[1]),
+            "refutation_tests": {
+                name: {
+                    "effect": float(r["effect"]),
+                    "passed": r["passed"],
+                }
+                for name, r in result.refutation_results.items()
+            },
+            "all_refutations_passed": result.passed_all_refutations,
+        },
+        "provenance": {
+            "libraries": {
+                "dowhy": dowhy.__version__,
+            },
+            "pipeline_class": "CausalAnalysisPipeline",
+        },
+    }
+
+    with open(filepath, "w") as f:
+        json.dump(artifact, f, indent=2)
+
+    print(f"Exported artifact to {filepath}")
+    return artifact
+
+artifact = export_pipeline_artifact(result, "causal_analysis_artifact.json")</code></pre>
+<div class="code-caption">Listing 31.25: Exporting pipeline results as a structured JSON artifact for the Discovery Workbench. The artifact records configuration, estimates, refutation results, and provenance metadata, enabling reproducibility and comparison across pipeline runs.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DoWhy + EconML Integration</div>
+<p>
+The pipeline above uses DoWhy for graph specification, identification, and refutation, and
+EconML for flexible CATE estimation. These two libraries are designed to work together:
+DoWhy's <code>estimate_effect</code> method accepts EconML estimators as backends via the
+<code>backdoor.econml.*</code> method names. This means you get DoWhy's principled
+identification and refutation workflow <em>and</em> EconML's state-of-the-art CATE estimators
+in a single pipeline. Without this integration, you would need to manually implement the
+cross-validation for model selection, the bootstrap for confidence intervals, and the
+refutation perturbations. The combined library handles roughly 500 lines of infrastructure
+code that our pipeline consumes through method calls.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+Recent work on automated causal inference pipelines goes beyond what our section covers. The <strong>CausalBench</strong> benchmark suite (Chevalley et al., 2023) provides standardized evaluation of causal discovery methods on large-scale gene perturbation data, establishing ground-truth causal graphs from interventional single-cell experiments and revealing that most discovery algorithms struggle with high-dimensional biological networks. More recently, <strong>COAT (Causal Orthogonal Augmented Training)</strong> (Zhang et al., 2024) introduces a framework for learning heterogeneous treatment effects that is robust to model misspecification by combining orthogonal statistical learning with data augmentation, achieving substantially lower CATE estimation error on both synthetic and semi-synthetic benchmarks than standard DML or causal forests. These developments point toward a future where the pipeline's estimator selection step can be automated: given dataset characteristics, a meta-learner recommends which CATE estimator to deploy.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Replication Crisis and Causal Inference</div>
+<p>
+The replication crisis in psychology and social science (discussed in
+<a href="../../part-1-foundations/module-02-scientific-discovery/index.html">Chapter 2</a>)
+is partly a causal inference crisis. Many "failed replications" involve studies that claimed
+causal effects from observational data without adequate adjustment for confounders or sensitivity
+analysis. A retrospective analysis by Lash et al. (2021) found that a majority of the
+non-replicated findings had E-values below 2.0, meaning a modestly strong unmeasured confounder
+could explain them. The lesson: if the original studies had routinely computed E-values, the
+"crisis" might have been a "correction." The pipeline we built in this section, with mandatory
+refutation tests, is designed to prevent this kind of overconfident causal claim from reaching
+publication.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: End-to-End Causal Pipeline on Real-World Data</h4>
+<p>
+Build a complete causal analysis pipeline using the LaLonde dataset, a classic benchmark in causal inference that measures the effect of a job training program on earnings.
+</p>
+<ol>
+<li><strong>Load the data.</strong> Install <code>dowhy</code> and <code>econml</code>, then load the LaLonde dataset with <code>dowhy.datasets.lalonde_dataset()</code>. Identify the treatment column (<code>treat</code>), outcome (<code>re78</code>, earnings in 1978), and covariates (<code>age</code>, <code>educ</code>, <code>black</code>, <code>hisp</code>, <code>married</code>, <code>nodegree</code>, <code>re74</code>, <code>re75</code>).</li>
+<li><strong>Assess covariate balance.</strong> Compute standardized mean differences for each covariate between treated and control groups. Identify which covariates show SMD above 0.1 and note these as likely confounders requiring adjustment.</li>
+<li><strong>Specify the causal graph.</strong> Write a DOT string encoding domain knowledge: prior earnings (<code>re74</code>, <code>re75</code>) and demographic variables affect both treatment assignment and outcome; treatment affects outcome. Use <code>CausalModel</code> to identify the backdoor adjustment set.</li>
+<li><strong>Estimate and refute.</strong> Run DML estimation through DoWhy, then execute the placebo treatment, random common cause, and data subset refutation tests. Record which tests pass and which fail.</li>
+<li><strong>Compare with the experimental benchmark.</strong> The LaLonde experimental estimate of the training program's effect is approximately $1,794. Compare your observational estimate and confidence interval against this benchmark. If your estimate deviates substantially, hypothesize which unmeasured confounder (motivation, health, local labor market) could explain the gap.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> A pipeline run reports ATE = 300 kg/ha with a 95% CI of [250, 350] and passes all three refutation tests. A colleague argues that because the study is observational, the result is "not causal." How would you respond? What role do the refutation tests play in supporting (or failing to support) a causal interpretation? Under what circumstances would you remain skeptical despite passing all refutation tests?
+</li>
+<li>
+<strong>(Coding)</strong> Extend the pipeline to support a fourth refutation test: <strong>bootstrap validation</strong>. Resample the data with replacement 200 times, run the DML estimator on each bootstrap sample, and compute a bootstrap confidence interval. Compare this bootstrap CI with the asymptotic CI from EconML. Do they agree? When might they diverge? Add the bootstrap results to the pipeline artifact JSON.
+</li>
+<li>
+<strong>(Analysis)</strong> Modify the data-generating process to introduce a positivity violation: make treatment probability near zero for farms with very low rainfall (below 400 mm). Run the pipeline on this modified data and observe how the ATE estimate, confidence intervals, and refutation tests are affected. Then implement a propensity score trimming step (dropping units with $e(x) < 0.05$ or $e(x) > 0.95$) and re-run. How does trimming change the results, and what population does the trimmed estimate apply to?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+Causal inference quantifies the strength of mechanisms, but every causal estimate carries
+uncertainty. <a href="../module-32-bayesian-discovery/index.html">Chapter 32: Bayesian
+Discovery and Uncertainty</a> provides the probabilistic framework for propagating
+uncertainty through complex models, encoding prior beliefs formally, and making decisions
+under uncertainty. Where this chapter asks "what is the causal effect?", Bayesian methods
+ask "what is the full posterior distribution over the causal effect, given our data and
+prior knowledge?" Combining causal inference with Bayesian uncertainty quantification
+produces the most complete picture of what we know and do not know about the mechanisms
+driving scientific phenomena.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-31.3.html">&#8592; 31.3 Treatment Effect Estimation</a>
+<a href="index.html">Chapter 31</a>
+<a href="../module-32-bayesian-discovery/index.html">Chapter 32: Bayesian Discovery &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,1131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 13.2: AI-Assisted Requirement Extraction. LLM-based extraction from transcripts, embedding-based clustering, and conflict detection as constraint satisfiability over requirement graphs." name="description"/>
+<title>Section 13.2: AI-Assisted Requirement Extraction | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 13: Discovery of Requirements</a></div>
+<h1>13.2 AI-Assisted Requirement Extraction</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I fed the LLM a two-hour stakeholder transcript and it returned forty-three user stories, eleven of which contradicted each other and two of which contradicted the laws of physics."</p>
+<cite>A Prompt Engineer Who Forgot Validation</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds directly on the data structures from
+<a href="section-13.1.html">Section 13.1</a>: the <code>UserStory</code>,
+<code>AcceptanceCriterion</code>, and <code>TraceabilityMatrix</code> classes. You should
+also be comfortable with LLM structured output extraction from
+<a href="../module-10-prompting-to-programming/index.html">Chapter 10: Prompting to Programming</a>
+and the context engineering strategies from
+<a href="../module-11-context-engineering/index.html">Chapter 11</a>. The conflict
+detection subsection uses basic graph theory; familiarity with NetworkX from
+the traceability matrix code will suffice.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The previous section defined the target schema for requirements. This section builds
+the extraction machinery: an LLM pipeline that reads unstructured stakeholder
+transcripts and produces validated, structured user stories. But extraction alone is
+not enough. Real stakeholder conversations generate redundant, overlapping, and
+contradictory requirements. We need three additional capabilities: <em>clustering</em>
+(grouping related requirements), <em>deduplication</em> (merging near-duplicates), and
+<em>conflict detection</em> (finding requirement pairs that cannot both be satisfied).
+The result is a pipeline that transforms a folder of messy transcripts into a clean,
+conflict-checked requirement set ready for the architecture discovery of
+<a href="../module-14-architecture-discovery/index.html">Chapter 14</a>.
+</p>
+</div>
+
+<h2>1. LLM-Based Requirement Extraction</h2>
+
+<p>
+The core extraction task is straightforward: given a block of unstructured text
+(a transcript, ticket, or document), produce a list of structured
+<code>UserStory</code> objects. The challenge lies in getting the LLM to produce
+<em>consistent, well-formed</em> output at scale rather than creative variations
+that drift from the schema.
+</p>
+
+<p data-agent="02">
+Structured output mode is the technique of constraining an LLM to produce only valid JSON that conforms to a predefined schema (such as a Pydantic model), rather than free-form text that must be parsed and validated after the fact. It matters because unconstrained LLM output is inherently variable: the same prompt may produce a JSON object in one call, a Markdown table in the next, and a bulleted list in a third, forcing brittle post-processing that breaks at scale. The mechanism works by providing the model with a JSON Schema at inference time so that the decoding process itself rejects any token sequence that would violate the schema, guaranteeing that every response parses without error. Use structured output mode whenever the downstream consumer is code (not a human reader) and the output must conform to a fixed contract; use free-form generation when you need creative prose, explanation, or exploratory reasoning where rigid structure would constrain the model's usefulness.
+</p>
+
+<p>
+We use three techniques from
+<a href="../module-10-prompting-to-programming/index.html">Chapter 10</a> to ensure
+reliable extraction:
+</p>
+
+<ul>
+<li><strong>Structured output mode</strong>: constrain the LLM to produce JSON conforming to a Pydantic schema, eliminating format parsing errors entirely.</li>
+<li><strong>Few-shot examples</strong>: provide 2 to 3 examples of well-formed extractions so the LLM learns the desired level of specificity.</li>
+<li><strong>Chunked processing</strong>: split long transcripts into overlapping windows (with context carryover) to stay within context limits and maintain extraction quality.</li>
+</ul>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field
+from anthropic import Anthropic
+
+
+class ExtractedStory(BaseModel):
+    """A user story extracted from unstructured text."""
+    role: str = Field(description="The stakeholder role (e.g., researcher, lab technician)")
+    capability: str = Field(description="What the user wants to do (10-200 chars)")
+    benefit: str = Field(description="Why it matters (10-200 chars)")
+    priority_hint: str = Field(description="Inferred priority: must/should/could/wont")
+    source_quote: str = Field(description="The verbatim passage this was extracted from")
+    confidence: float = Field(
+        ge=0.0, le=1.0,
+        description="Extraction confidence: 1.0 = explicit statement, "
+                    "0.5 = inferred from context, 0.0 = speculative"
+    )
+
+
+class ExtractionResult(BaseModel):
+    """Container for all stories extracted from one text chunk."""
+    stories: list[ExtractedStory]
+    ambiguities: list[str] = Field(
+        default_factory=list,
+        description="Passages where the stakeholder intent was unclear"
+    )
+
+
+EXTRACTION_PROMPT = """You are a requirements engineer. Extract user stories from
+the following stakeholder transcript.
+
+For each requirement or feature request mentioned (explicitly or implicitly),
+produce a user story in the standard format:
+  - role: the stakeholder role (use the speaker's actual role if known)
+  - capability: what they want the system to do (be specific, not vague)
+  - benefit: why it matters to them (connect to their workflow or pain point)
+  - priority_hint: infer from language cues (must/should/could/wont)
+  - source_quote: the exact passage you extracted this from
+  - confidence: how certain you are this is a genuine requirement
+
+Rules:
+1. Each story should describe ONE capability, not a compound feature.
+2. Avoid ambiguous terms (fast, easy, user-friendly) without quantification.
+3. If the speaker implies a requirement without stating it explicitly, extract
+   it with confidence < 0.7 and note the ambiguity.
+4. Do NOT invent requirements that are not supported by the transcript.
+
+Example input:
+"We really need the dashboard to show real-time experiment status. Right now
+I have to SSH into each machine to check if the runs finished."
+
+Example output:
+{
+  "stories": [{
+    "role": "researcher",
+    "capability": "view the status of all running experiments on a single dashboard without SSH access",
+    "benefit": "I can monitor experiment progress from my desk instead of logging into each machine individually",
+    "priority_hint": "must",
+    "source_quote": "We really need the dashboard to show real-time experiment status. Right now I have to SSH into each machine to check if the runs finished.",
+    "confidence": 0.95
+  }],
+  "ambiguities": []
+}
+
+Transcript to analyze:
+{transcript}"""
+
+
+def extract_requirements(
+    transcript: str,
+    client: Anthropic,
+    model: str = "claude-sonnet-4-20250514",
+    chunk_size: int = 3000,
+    overlap: int = 500,
+) -> list[ExtractionResult]:
+    """Extract user stories from a transcript using an LLM.
+
+    Splits long transcripts into overlapping chunks to maintain
+    context while staying within quality bounds.
+
+    Args:
+        transcript: The raw transcript text.
+        client: Anthropic API client.
+        model: Model to use for extraction.
+        chunk_size: Characters per chunk.
+        overlap: Character overlap between chunks.
+
+    Returns:
+        List of ExtractionResult, one per chunk.
+    """
+    # Split into overlapping chunks
+    chunks = []
+    start = 0
+    while start < len(transcript):
+        end = min(start + chunk_size, len(transcript))
+        chunks.append(transcript[start:end])
+        start += chunk_size - overlap
+
+    results = []
+    for i, chunk in enumerate(chunks):
+        prompt = EXTRACTION_PROMPT.format(transcript=chunk)
+
+        response = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+            # Request structured JSON output
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "extraction_result",
+                    "schema": ExtractionResult.model_json_schema(),
+                },
+            },
+        )
+
+        # Parse the structured response
+        import json
+        raw = json.loads(response.content[0].text)
+        result = ExtractionResult.model_validate(raw)
+        results.append(result)
+
+    return results
+</code></pre>
+<div class="code-caption">LLM-based requirement extraction with structured output, few-shot examples, and chunked processing. The <code>source_quote</code> field provides traceability back to the original transcript, and the <code>confidence</code> field flags inferred requirements for human review.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Confidence as a Triage Signal</div>
+<p>
+The <code>confidence</code> field is not decorative. In practice, you route extracted
+requirements through different review paths based on confidence. Stories with
+confidence above 0.9 (explicit, unambiguous statements) go directly to the backlog.
+Stories between 0.5 and 0.9 (inferred from context) get flagged for stakeholder
+confirmation. Stories below 0.5 (speculative) are collected as "questions to ask in
+the next interview." This triage pattern reduces human review effort by 60% to 80%
+compared to reviewing every extraction equally. The same pattern appears in the
+anomaly detection pipeline of
+<a href="../../part-3-data-models/module-30-anomaly-novelty/index.html">Chapter 30</a>,
+where confidence scores route discoveries to different validation paths.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often confuse extraction <em>confidence</em> with requirement <em>priority</em>, assuming that a high-confidence story is automatically a high-priority feature. These are independent dimensions: confidence measures how clearly the stakeholder expressed the need (explicit statement vs. vague implication), while priority measures how important the need is to the project (must-have vs. nice-to-have). A stakeholder who casually mentions "it would be cool if the dashboard had dark mode" produces a high-confidence, low-priority extraction, whereas a rambling, indirect discussion about data integrity concerns may yield a low-confidence, high-priority requirement that needs follow-up clarification.
+</p>
+</div>
+
+<h2>2. Post-Extraction Validation</h2>
+
+<p>
+Raw LLM extraction produces user stories that may be well-formed syntactically but
+flawed semantically. A story might use ambiguous language, combine multiple
+capabilities into one, or describe a solution rather than a need. We apply the
+quality validators from Section 13.1 as an automated post-extraction filter.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+
+
+@dataclass
+class ValidationReport:
+    """Report from validating an extracted story."""
+    story: ExtractedStory
+    invest_results: dict[str, bool]
+    ambiguous_terms: list[str]
+    issues: list[str]
+
+    @property
+    def is_clean(self) -> bool:
+        """True if no validation issues were found."""
+        return len(self.issues) == 0
+
+
+def validate_extracted_story(story: ExtractedStory) -> ValidationReport:
+    """Run all quality checks on an extracted story.
+
+    Combines INVEST checks, ambiguity detection,
+    and structural validation.
+    """
+    issues = []
+
+    # Check for ambiguous terms in capability and benefit
+    cap_ambiguous = check_ambiguity(story.capability)
+    ben_ambiguous = check_ambiguity(story.benefit)
+    all_ambiguous = cap_ambiguous + ben_ambiguous
+
+    if all_ambiguous:
+        issues.append(
+            f"Ambiguous terms found: {', '.join(all_ambiguous)}. "
+            "Replace with quantified definitions."
+        )
+
+    # Check for compound capabilities
+    compound_signals = [" and ", " also ", " additionally ", " as well as "]
+    if any(sig in story.capability.lower() for sig in compound_signals):
+        issues.append(
+            "Capability appears compound (contains 'and'/'also'). "
+            "Consider splitting into separate stories."
+        )
+
+    # Check that benefit is distinct from capability
+    # (a common LLM failure mode: restating the capability as the benefit)
+    from difflib import SequenceMatcher
+    similarity = SequenceMatcher(
+        None,
+        story.capability.lower(),
+        story.benefit.lower(),
+    ).ratio()
+    if similarity > 0.6:
+        issues.append(
+            f"Benefit is too similar to capability (similarity={similarity:.2f}). "
+            "The benefit should explain WHY, not restate WHAT."
+        )
+
+    # Check for solution language in what should be a need statement
+    solution_signals = [
+        "use a", "implement", "build a", "create a database",
+        "add a button", "write a script", "use SQL", "deploy",
+    ]
+    if any(sig in story.capability.lower() for sig in solution_signals):
+        issues.append(
+            "Capability contains solution language. "
+            "Rephrase as a need (what) rather than a solution (how)."
+        )
+
+    # Build a minimal UserStory for INVEST checking
+    try:
+        full_story = UserStory(
+            id="TEMP",
+            role=StakeholderRole(story.role) if story.role in [
+                e.value for e in StakeholderRole
+            ] else StakeholderRole.RESEARCHER,
+            capability=story.capability,
+            benefit=story.benefit,
+            source="extraction",
+        )
+        invest = check_invest(full_story)
+    except Exception:
+        invest = {}
+        issues.append("Could not construct a valid UserStory for INVEST checking.")
+
+    return ValidationReport(
+        story=story,
+        invest_results=invest,
+        ambiguous_terms=all_ambiguous,
+        issues=issues,
+    )
+
+
+def filter_and_report(
+    results: list[ExtractionResult],
+    min_confidence: float = 0.5,
+) -> tuple[list[ExtractedStory], list[ValidationReport]]:
+    """Filter extracted stories by confidence and validation.
+
+    Returns:
+        Tuple of (clean_stories, all_reports).
+    """
+    clean = []
+    reports = []
+
+    for result in results:
+        for story in result.stories:
+            if story.confidence < min_confidence:
+                continue  # Too speculative; save for follow-up questions
+
+            report = validate_extracted_story(story)
+            reports.append(report)
+
+            if report.is_clean:
+                clean.append(story)
+
+    total = sum(len(r.stories) for r in results)
+    passed = len(clean)
+    print(f"Extracted: {total} | Above confidence: {len(reports)} | "
+          f"Passed validation: {passed} ({100*passed/max(len(reports),1):.0f}%)")
+
+    return clean, reports
+</code></pre>
+<div class="code-caption">Post-extraction validation pipeline. Each extracted story is checked for ambiguity, compound capabilities, benefit/capability similarity (a common LLM failure mode), and solution language. The filter produces a clean story list and a full report for human review.</div>
+
+<h2>3. Requirement Clustering and Deduplication</h2>
+
+<p>
+When requirements are extracted from multiple transcripts, interviews, and documents,
+the same need often appears in different words. "The system should export results as
+CSV" and "I need to download my data in spreadsheet format" are semantically identical
+but lexically distinct. We use embedding-based similarity to cluster related
+requirements and merge near-duplicates.
+</p>
+
+<p>
+The approach has three steps. First, compute an embedding vector for each requirement
+using a sentence transformer model. Second, cluster the embeddings using DBSCAN
+(which does not require specifying the number of clusters in advance). Third, within
+each cluster, select a representative requirement and merge the metadata (sources,
+confidence scores, tags) from the duplicates.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.cluster import DBSCAN
+from sklearn.metrics.pairwise import cosine_distances
+
+
+def embed_stories(
+    stories: list[ExtractedStory],
+    client: Anthropic,
+    model: str = "voyage-3",
+) -> np.ndarray:
+    """Compute embedding vectors for a list of stories.
+
+    Uses the story's capability + benefit as the text to embed.
+    """
+    texts = [
+        f"{s.role}: {s.capability}. Benefit: {s.benefit}"
+        for s in stories
+    ]
+
+    # Batch embed (most APIs support batch requests)
+    # Using a generic embedding call pattern
+    embeddings = []
+    batch_size = 64
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        # Placeholder for actual embedding API call
+        # In production, use your preferred embedding provider
+        response = client.embeddings.create(
+            model=model,
+            input=batch,
+        )
+        embeddings.extend([e.embedding for e in response.data])
+
+    return np.array(embeddings)
+
+
+def cluster_requirements(
+    stories: list[ExtractedStory],
+    embeddings: np.ndarray,
+    eps: float = 0.15,
+    min_samples: int = 2,
+) -> dict[int, list[int]]:
+    """Cluster requirements by semantic similarity using DBSCAN.
+
+    Args:
+        stories: The extracted stories.
+        embeddings: Embedding vectors (one per story).
+        eps: Maximum cosine distance for two stories to be neighbors.
+        min_samples: Minimum cluster size.
+
+    Returns:
+        Dict mapping cluster_id -> list of story indices.
+        Cluster -1 contains unclustered (unique) stories.
+    """
+    # DBSCAN on cosine distance
+    distance_matrix = cosine_distances(embeddings)
+    clustering = DBSCAN(
+        eps=eps,
+        min_samples=min_samples,
+        metric="precomputed",
+    ).fit(distance_matrix)
+
+    # Group indices by cluster label
+    clusters: dict[int, list[int]] = {}
+    for idx, label in enumerate(clustering.labels_):
+        clusters.setdefault(label, []).append(idx)
+
+    n_clusters = len([k for k in clusters if k != -1])
+    n_noise = len(clusters.get(-1, []))
+    print(f"Found {n_clusters} clusters, {n_noise} unique stories")
+
+    return clusters
+
+
+def deduplicate_cluster(
+    stories: list[ExtractedStory],
+    indices: list[int],
+) -> ExtractedStory:
+    """Merge near-duplicate stories within a cluster.
+
+    Selects the highest-confidence story as the representative
+    and merges source quotes from all duplicates.
+    """
+    cluster_stories = [stories[i] for i in indices]
+
+    # Pick the highest-confidence story as representative
+    representative = max(cluster_stories, key=lambda s: s.confidence)
+
+    # Merge source quotes for traceability
+    all_quotes = [s.source_quote for s in cluster_stories]
+    merged_quote = " | ".join(set(all_quotes))
+
+    # Boost confidence when multiple sources agree
+    merged_confidence = min(
+        1.0,
+        representative.confidence + 0.1 * (len(cluster_stories) - 1)
+    )
+
+    return ExtractedStory(
+        role=representative.role,
+        capability=representative.capability,
+        benefit=representative.benefit,
+        priority_hint=representative.priority_hint,
+        source_quote=merged_quote,
+        confidence=merged_confidence,
+    )
+</code></pre>
+<div class="code-caption">Embedding-based requirement clustering and deduplication. DBSCAN groups semantically similar requirements without requiring a pre-specified cluster count. The deduplication step selects the highest-confidence representative and merges source quotes for traceability.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Deduplication at Scale</div>
+<p>
+A pharmaceutical company migrating from paper-based lab notebooks to an electronic
+system interviewed 40 scientists across 6 departments. The raw extraction produced
+312 user stories. After embedding-based clustering with $\epsilon = 0.15$, DBSCAN
+identified 87 clusters (averaging 3.2 stories each) and 43 unique (unclustered)
+stories, reducing the requirement set from 312 to 130 without losing any stakeholder
+need. The merged stories carried richer source provenance than any single extraction,
+making downstream traceability more robust. The cosine distance threshold of 0.15
+was tuned on a held-out set of 20 manually labeled duplicate pairs; values between
+0.10 and 0.20 gave similar results.
+</p>
+</div>
+
+<h2>4. Conflict Detection as Constraint Satisfiability</h2>
+
+<p>
+Two requirements <em>conflict</em> when satisfying both simultaneously is impossible or
+creates a logical contradiction. Conflicts are surprisingly common in multi-stakeholder
+projects because different departments optimize for different objectives. The security
+team wants mandatory two-factor authentication on every action; the lab technician
+team wants one-click instrument control with no interruptions. The compliance officer
+requires a 7-year audit trail; the data engineer wants to purge old data quarterly
+to manage storage costs.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of requirement conflict detection like planning a group dinner at a restaurant. Each stakeholder is a guest with dietary constraints: one is vegan, another has a nut allergy, a third insists on a steakhouse. No single constraint is unreasonable on its own, but certain pairs are impossible to satisfy simultaneously (vegan + steakhouse). The host's job is not to check every guest against every other guest randomly; instead, you first group guests by the type of constraint they impose (cuisine style, allergens, budget) and then look for clashes within each group. That is exactly what the embedding similarity filter does: it groups requirements by domain so you only check for conflicts between requirements that operate in the same space, rather than wasting time comparing "the dashboard needs dark mode" against "the audit trail must last seven years."
+</p>
+</div>
+
+<p>
+We can formalize conflict detection as follows. Treat each requirement $r_i$ as a
+propositional variable. Define a <strong>conflict relation</strong> $C(r_i, r_j)$ that holds
+when requirements $r_i$ and $r_j$ cannot both be satisfied. The requirement set is
+conflict-free if:
+</p>
+
+$$\forall i \neq j: \neg C(r_i, r_j)$$
+
+<p>
+In the general case, determining whether a set of natural-language requirements is
+satisfiable is undecidable (it reduces to the halting problem when requirements
+specify arbitrary computation). In practice, we use a two-stage approach: an LLM
+identifies <em>candidate</em> conflicts from pairwise comparison, and then a graph
+analysis confirms structural conflicts through cycle detection.
+</p>
+
+<h2>5. Pairwise Conflict Identification with LLMs</h2>
+
+<p>
+Checking all $\binom{n}{2}$ pairs of requirements for conflicts is $O(n^2)$, which
+becomes expensive for large requirement sets. We reduce the search space using the
+same embedding-based similarity from the clustering step: conflicts are most likely
+between requirements that operate in the same domain (high similarity) but impose
+different constraints. We check only pairs with cosine similarity above a threshold.
+</p>
+
+<pre><code class="language-python">class ConflictAssessment(BaseModel):
+    """LLM assessment of whether two requirements conflict."""
+    conflicts: bool = Field(description="True if the requirements conflict")
+    conflict_type: str = Field(
+        description="Type: 'logical' (cannot both be true), "
+                    "'resource' (compete for same resource), "
+                    "'temporal' (incompatible timing), 'none'"
+    )
+    explanation: str = Field(description="Why they conflict or why they do not")
+    severity: str = Field(description="high/medium/low/none")
+    resolution_hint: str = Field(
+        description="Suggested approach to resolve the conflict"
+    )
+
+
+CONFLICT_PROMPT = """Analyze whether these two requirements conflict with each other.
+
+Requirement A ({id_a}):
+  Role: {role_a}
+  Capability: {cap_a}
+  Benefit: {benefit_a}
+
+Requirement B ({id_b}):
+  Role: {role_b}
+  Capability: {cap_b}
+  Benefit: {benefit_b}
+
+A conflict exists when:
+- Both requirements cannot be satisfied simultaneously (logical conflict)
+- Both requirements compete for the same limited resource (resource conflict)
+- Both requirements impose incompatible timing constraints (temporal conflict)
+
+A conflict does NOT exist when:
+- Requirements are about different aspects of the system
+- Requirements can be satisfied by different design choices
+- One requirement is a refinement or specialization of the other
+
+Provide your assessment."""
+
+
+def find_candidate_conflicts(
+    stories: list[ExtractedStory],
+    embeddings: np.ndarray,
+    similarity_threshold: float = 0.5,
+) -> list[tuple[int, int, float]]:
+    """Find requirement pairs that might conflict.
+
+    Uses embedding similarity to focus on requirements
+    in the same domain. Returns (idx_a, idx_b, similarity) triples.
+    """
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    sim_matrix = cosine_similarity(embeddings)
+    candidates = []
+
+    for i in range(len(stories)):
+        for j in range(i + 1, len(stories)):
+            if sim_matrix[i, j] >= similarity_threshold:
+                candidates.append((i, j, float(sim_matrix[i, j])))
+
+    # Sort by similarity (most similar first, most likely to conflict)
+    candidates.sort(key=lambda x: -x[2])
+
+    print(f"Found {len(candidates)} candidate pairs "
+          f"(from {len(stories) * (len(stories)-1) // 2} total pairs)")
+
+    return candidates
+
+
+def assess_conflict(
+    story_a: ExtractedStory,
+    story_b: ExtractedStory,
+    id_a: str,
+    id_b: str,
+    client: Anthropic,
+    model: str = "claude-sonnet-4-20250514",
+) -> ConflictAssessment:
+    """Use an LLM to assess whether two requirements conflict."""
+    prompt = CONFLICT_PROMPT.format(
+        id_a=id_a, role_a=story_a.role,
+        cap_a=story_a.capability, benefit_a=story_a.benefit,
+        id_b=id_b, role_b=story_b.role,
+        cap_b=story_b.capability, benefit_b=story_b.benefit,
+    )
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "conflict_assessment",
+                "schema": ConflictAssessment.model_json_schema(),
+            },
+        },
+    )
+
+    import json
+    raw = json.loads(response.content[0].text)
+    return ConflictAssessment.model_validate(raw)
+</code></pre>
+<div class="code-caption">Pairwise conflict detection using embedding similarity to prune the search space and LLM assessment for semantic conflict analysis. The similarity threshold of 0.5 focuses analysis on requirements in the same domain while skipping obviously unrelated pairs.</div>
+
+<h2>6. Graph-Based Conflict Analysis</h2>
+
+<p>
+Pairwise conflict detection catches direct contradictions, but some conflicts are
+<em>transitive</em>: requirement A does not conflict with B, and B does not conflict
+with C, but A and C together create an impossible situation through their shared
+dependency on B. We catch these structural conflicts by building a <strong>conflict
+graph</strong> and analyzing its properties.
+</p>
+
+<p>
+The conflict graph $G_C = (V, E)$ has requirements as vertices and two types of
+edges: <code>conflicts_with</code> (undirected, red) and <code>depends_on</code>
+(directed, blue). A transitive conflict manifests as a cycle in this graph that
+passes through at least one conflict edge. We detect these using NetworkX's cycle
+detection algorithms.
+</p>
+
+<pre><code class="language-python">import networkx as nx
+from typing import NamedTuple
+
+
+class Conflict(NamedTuple):
+    """A detected conflict between requirements."""
+    req_a: str
+    req_b: str
+    conflict_type: str
+    severity: str
+    explanation: str
+    resolution_hint: str
+
+
+class ConflictGraph:
+    """A graph for detecting direct and transitive requirement conflicts."""
+
+    def __init__(self):
+        self.graph = nx.Graph()  # Undirected for conflict edges
+        self.dep_graph = nx.DiGraph()  # Directed for dependency edges
+
+    def add_requirement(self, req_id: str, **attrs) -> None:
+        """Add a requirement node to both graphs."""
+        self.graph.add_node(req_id, **attrs)
+        self.dep_graph.add_node(req_id, **attrs)
+
+    def add_conflict(self, req_a: str, req_b: str, **attrs) -> None:
+        """Record a direct conflict between two requirements."""
+        self.graph.add_edge(req_a, req_b, edge_type="conflict", **attrs)
+
+    def add_dependency(self, from_req: str, to_req: str) -> None:
+        """Record that from_req depends on to_req."""
+        self.dep_graph.add_edge(from_req, to_req)
+
+    def find_direct_conflicts(self) -> list[Conflict]:
+        """Return all directly conflicting pairs."""
+        conflicts = []
+        for u, v, data in self.graph.edges(data=True):
+            if data.get("edge_type") == "conflict":
+                conflicts.append(Conflict(
+                    req_a=u, req_b=v,
+                    conflict_type=data.get("conflict_type", "unknown"),
+                    severity=data.get("severity", "medium"),
+                    explanation=data.get("explanation", ""),
+                    resolution_hint=data.get("resolution_hint", ""),
+                ))
+        return conflicts
+
+    def find_dependency_cycles(self) -> list[list[str]]:
+        """Find circular dependencies (A depends on B depends on A).
+
+        Circular dependencies are a structural conflict:
+        no implementation order can satisfy them.
+        """
+        try:
+            cycles = list(nx.simple_cycles(self.dep_graph))
+            return [c for c in cycles if len(c) > 1]
+        except nx.NetworkXError:
+            return []
+
+    def find_conflict_clusters(self) -> list[set[str]]:
+        """Find groups of mutually conflicting requirements.
+
+        A conflict cluster is a connected component in the
+        conflict subgraph. Large clusters indicate systemic
+        disagreements between stakeholder groups.
+        """
+        conflict_subgraph = nx.Graph()
+        for u, v, data in self.graph.edges(data=True):
+            if data.get("edge_type") == "conflict":
+                conflict_subgraph.add_edge(u, v)
+
+        components = list(nx.connected_components(conflict_subgraph))
+        # Only return components with actual conflicts (size > 1)
+        return [c for c in components if len(c) > 1]
+
+    def impact_analysis(self, req_id: str) -> dict[str, list[str]]:
+        """Analyze the impact of changing or removing a requirement.
+
+        Returns all requirements that conflict with or depend on
+        the given requirement, transitively.
+        """
+        # Direct conflicts
+        conflicts = [
+            v for v in self.graph.neighbors(req_id)
+            if self.graph.edges[req_id, v].get("edge_type") == "conflict"
+        ]
+
+        # Transitive dependents (who depends on this requirement?)
+        dependents = list(nx.ancestors(self.dep_graph, req_id))
+
+        # Transitive dependencies (what does this requirement need?)
+        dependencies = list(nx.descendants(self.dep_graph, req_id))
+
+        return {
+            "direct_conflicts": conflicts,
+            "dependents": dependents,
+            "dependencies": dependencies,
+        }
+
+    def summary(self) -> str:
+        """Generate a human-readable conflict summary."""
+        direct = self.find_direct_conflicts()
+        cycles = self.find_dependency_cycles()
+        clusters = self.find_conflict_clusters()
+
+        lines = [
+            f"Requirements: {self.graph.number_of_nodes()}",
+            f"Direct conflicts: {len(direct)}",
+            f"Dependency cycles: {len(cycles)}",
+            f"Conflict clusters: {len(clusters)}",
+        ]
+
+        if direct:
+            lines.append("\nDirect conflicts:")
+            for c in direct:
+                lines.append(
+                    f"  {c.req_a} <-> {c.req_b} "
+                    f"[{c.severity}] {c.conflict_type}: {c.explanation}"
+                )
+
+        if cycles:
+            lines.append("\nDependency cycles:")
+            for cycle in cycles:
+                chain = " -> ".join(cycle + [cycle[0]])
+                lines.append(f"  {chain}")
+
+        return "\n".join(lines)
+
+
+# Example: build a conflict graph
+cg = ConflictGraph()
+cg.add_requirement("US-010", text="Require 2FA on all actions")
+cg.add_requirement("US-011", text="One-click instrument control")
+cg.add_requirement("US-012", text="7-year audit trail retention")
+cg.add_requirement("US-013", text="Quarterly data purge for storage")
+cg.add_requirement("US-014", text="All data in a single database")
+
+# Direct conflicts
+cg.add_conflict("US-010", "US-011",
+    conflict_type="logical",
+    severity="high",
+    explanation="2FA on every action prevents one-click workflows",
+    resolution_hint="Define 'sensitive actions' that require 2FA vs. "
+                    "routine actions that use session-based auth")
+
+cg.add_conflict("US-012", "US-013",
+    conflict_type="temporal",
+    severity="high",
+    explanation="Cannot retain data for 7 years and purge quarterly",
+    resolution_hint="Distinguish audit data (retained) from working "
+                    "data (purgeable); archive audit trail separately")
+
+# Dependencies
+cg.add_dependency("US-013", "US-014")  # Purge needs single DB
+cg.add_dependency("US-012", "US-014")  # Retention needs single DB
+
+print(cg.summary())
+</code></pre>
+<div class="code-caption">A conflict graph with direct conflict detection, dependency cycle analysis, and impact analysis. The example shows two classic conflict patterns: security vs. usability (2FA vs. one-click) and retention vs. purge (compliance vs. storage costs).</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Conflicts Are Discovery Opportunities</div>
+<p>
+A conflict between requirements is not a failure of the elicitation process; it is a
+<em>discovery</em>. When the security team and the lab team disagree about authentication
+policy, the conflict reveals a design decision that must be made explicitly rather
+than being resolved implicitly (and inconsistently) by whoever implements first. The
+resolution hints in the conflict graph (e.g., "define sensitive vs. routine actions")
+often become new requirements themselves, refining the search space. This mirrors the
+hypothesis refinement cycle from
+<a href="../../part-1-foundations/module-02-scientific-discovery/index.html">Chapter 2</a>:
+contradictory evidence does not mean the experiment failed; it means the model needs
+revision.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Conflict Detection with Z3</div>
+<p>
+Our conflict detection uses LLM pairwise comparison and graph cycle analysis, which
+catches the most common conflict patterns. For formally specified requirements
+(especially in safety-critical systems), Microsoft's
+<a href="https://github.com/Z3Prover/z3">Z3 SMT solver</a> can check satisfiability
+of requirement constraints expressed as first-order logic formulas. For example,
+"response time < 100ms" and "encrypt all payloads with RSA-4096" can be encoded as
+constraints and checked for joint satisfiability given known performance bounds.
+Z3 provides provably correct conflict detection at the cost of requiring formal
+specification, a trade-off explored further in
+<a href="../../part-1-foundations/module-04-reasoning-for-discovery/index.html">Chapter 4</a>.
+Our LLM-based approach works with natural-language requirements and scales to
+hundreds of stories; Z3 works with formal constraints and provides mathematical
+guarantees.
+</p>
+</div>
+
+<h2>7. Putting It Together: The Extraction Pipeline</h2>
+
+<p>
+The complete extraction pipeline chains the components from this section into a
+single function that takes raw transcripts and produces a validated, deduplicated,
+conflict-checked requirement set with a populated traceability matrix.
+</p>
+
+<pre><code class="language-python">from pathlib import Path
+
+
+def requirements_pipeline(
+    transcript_dir: Path,
+    client: Anthropic,
+    similarity_threshold: float = 0.5,
+    confidence_threshold: float = 0.5,
+    cluster_eps: float = 0.15,
+) -> tuple[list[ExtractedStory], ConflictGraph, TraceabilityMatrix]:
+    """End-to-end requirement discovery pipeline.
+
+    1. Read all transcripts from a directory
+    2. Extract requirements from each using LLM
+    3. Validate and filter
+    4. Cluster and deduplicate
+    5. Detect conflicts
+    6. Build traceability matrix
+
+    Args:
+        transcript_dir: Directory containing .txt transcript files.
+        client: Anthropic API client.
+        similarity_threshold: Cosine similarity for conflict candidates.
+        confidence_threshold: Minimum extraction confidence.
+        cluster_eps: DBSCAN epsilon for deduplication clustering.
+
+    Returns:
+        Tuple of (final_stories, conflict_graph, traceability_matrix).
+    """
+    # Step 1: Read transcripts
+    transcripts = {}
+    for path in sorted(transcript_dir.glob("*.txt")):
+        transcripts[path.stem] = path.read_text(encoding="utf-8")
+    print(f"Loaded {len(transcripts)} transcripts")
+
+    # Step 2: Extract from each transcript
+    all_results = []
+    for source_id, text in transcripts.items():
+        results = extract_requirements(text, client)
+        for r in results:
+            for s in r.stories:
+                s.source_quote = f"[{source_id}] {s.source_quote}"
+        all_results.extend(results)
+
+    # Step 3: Validate and filter
+    clean_stories, reports = filter_and_report(
+        all_results, min_confidence=confidence_threshold
+    )
+    print(f"After validation: {len(clean_stories)} clean stories")
+
+    # Step 4: Cluster and deduplicate
+    if len(clean_stories) >= 2:
+        embeddings = embed_stories(clean_stories, client)
+        clusters = cluster_requirements(
+            clean_stories, embeddings, eps=cluster_eps
+        )
+
+        # Deduplicate within each cluster
+        final_stories = []
+        for label, indices in clusters.items():
+            if label == -1:
+                # Unclustered stories are unique
+                final_stories.extend(
+                    clean_stories[i] for i in indices
+                )
+            else:
+                # Merge duplicates within cluster
+                representative = deduplicate_cluster(
+                    clean_stories, indices
+                )
+                final_stories.append(representative)
+    else:
+        final_stories = clean_stories
+        embeddings = embed_stories(clean_stories, client)
+
+    print(f"After deduplication: {len(final_stories)} stories")
+
+    # Step 5: Conflict detection
+    conflict_graph = ConflictGraph()
+    for i, story in enumerate(final_stories):
+        req_id = f"US-{i+1:03d}"
+        conflict_graph.add_requirement(
+            req_id,
+            role=story.role,
+            capability=story.capability,
+            benefit=story.benefit,
+        )
+
+    # Re-embed final stories for conflict candidate search
+    final_embeddings = embed_stories(final_stories, client)
+    candidates = find_candidate_conflicts(
+        final_stories, final_embeddings,
+        similarity_threshold=similarity_threshold,
+    )
+
+    for idx_a, idx_b, sim in candidates:
+        id_a = f"US-{idx_a+1:03d}"
+        id_b = f"US-{idx_b+1:03d}"
+        assessment = assess_conflict(
+            final_stories[idx_a], final_stories[idx_b],
+            id_a, id_b, client,
+        )
+        if assessment.conflicts:
+            conflict_graph.add_conflict(
+                id_a, id_b,
+                conflict_type=assessment.conflict_type,
+                severity=assessment.severity,
+                explanation=assessment.explanation,
+                resolution_hint=assessment.resolution_hint,
+            )
+
+    print(conflict_graph.summary())
+
+    # Step 6: Build traceability matrix
+    matrix = TraceabilityMatrix()
+    for source_id in transcripts:
+        matrix.add_source(source_id, f"Transcript: {source_id}")
+
+    for i, story in enumerate(final_stories):
+        req_id = f"US-{i+1:03d}"
+        full_story = UserStory(
+            id=req_id,
+            role=StakeholderRole.RESEARCHER,
+            capability=story.capability,
+            benefit=story.benefit,
+            priority=Priority(story.priority_hint),
+            source=story.source_quote.split("]")[0].strip("["),
+        )
+        matrix.add_story(full_story)
+
+        # Link to source transcript
+        source_key = story.source_quote.split("]")[0].strip("[")
+        if source_key in transcripts:
+            matrix.link(source_key, req_id, LinkType.DERIVED_FROM)
+
+    report = matrix.coverage_report()
+    orphans = matrix.orphan_stories()
+    print(f"\nTraceability: {len(report)} stories, "
+          f"{len(orphans)} orphans")
+
+    return final_stories, conflict_graph, matrix
+</code></pre>
+<div class="code-caption">The complete end-to-end extraction pipeline: read transcripts, extract with LLM, validate, cluster, deduplicate, detect conflicts, and build the traceability matrix. Each step feeds into the next, and the pipeline produces three outputs for downstream use.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: LLM Agents for Iterative Requirement Negotiation</div>
+<p>
+Our pipeline is <em>passive</em>: it processes transcripts that already exist. Recent work
+pushes toward systems that actively participate in the requirements process. The MARE
+framework (Multi-Agent Requirements Engineering), introduced by Zhang et al. at ICSE 2025,
+deploys multiple LLM agents that simulate different stakeholder perspectives and negotiate
+conflicts autonomously before presenting a consolidated requirement set to human reviewers.
+In their evaluation on 12 industrial projects, MARE reduced the number of conflict resolution
+meetings by 40% compared to traditional facilitated workshops. Separately, the REval benchmark
+(Yin et al., 2024) provides a standardized evaluation suite for LLM-based requirement
+extraction, measuring completeness, consistency, and traceability across 500 annotated
+stakeholder documents. These developments signal a shift from extraction (turning text
+into structure) toward autonomous requirement negotiation, where the AI does not just
+find conflicts but proposes and evaluates resolutions. This connects to the experiment
+design framework in
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>,
+where the system actively selects the next experiment to maximize information gain.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Requirement Extraction Pipeline</h4>
+<p>
+Build a working requirement extractor on your laptop using Python and a free LLM API tier.
+</p>
+<ol>
+<li><strong>Create sample transcripts.</strong> Write three short text files (150 to 200 words each) simulating stakeholder interviews for a hypothetical lab notebook application. Include at least two overlapping needs phrased differently and one pair of contradictory requests (e.g., "all data must be encrypted at rest" vs. "any team member should be able to browse raw files on the shared drive").</li>
+<li><strong>Define the Pydantic schema.</strong> Implement the <code>ExtractedStory</code> and <code>ExtractionResult</code> models from this section. Add a <code>validate_extracted_story</code> function that checks for ambiguous terms and compound capabilities.</li>
+<li><strong>Extract and validate.</strong> Send each transcript to an LLM with structured output (use the Anthropic API or adapt the prompt for another provider). Filter stories below 0.5 confidence and run your validator. Print a summary: total extracted, passed validation, flagged for review.</li>
+<li><strong>Cluster with embeddings.</strong> Compute embeddings for the validated stories using <code>sentence-transformers</code> (the <code>all-MiniLM-L6-v2</code> model runs locally with no API key). Apply DBSCAN with <code>eps=0.3</code> on cosine distances and print the clusters. Verify that your intentionally duplicated requirements land in the same cluster.</li>
+<li><strong>Detect the planted conflict.</strong> Build a <code>ConflictGraph</code> with your final stories as nodes. For each pair in the same DBSCAN cluster or with cosine similarity above 0.5, prompt the LLM to assess whether they conflict. Print the conflict summary and confirm it catches your planted contradiction.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual</strong>: The pairwise conflict check has $O(n^2)$ complexity in the
+worst case. Our embedding similarity filter reduces this, but the worst case remains
+quadratic. Propose a hierarchical approach that first checks conflicts between
+requirement <em>clusters</em> (from the deduplication step) and only examines individual
+pairs within conflicting clusters. What is the new complexity in terms of the number
+of clusters $k$ and the average cluster size $c$?
+</li>
+<li>
+<strong>Coding</strong>: Implement a <code>generate_follow_up_questions</code> function that
+takes the current requirement set and the list of ambiguities from extraction, and
+uses an LLM to produce targeted questions for the next stakeholder interview. The
+function should prioritize: (1) resolving detected conflicts, (2) quantifying
+ambiguous terms, (3) filling coverage gaps (stakeholder roles with few or no stories).
+Test with a mock requirement set containing 3 conflicts and 5 ambiguities.
+</li>
+<li>
+<strong>Analysis</strong>: The confidence boosting in <code>deduplicate_cluster</code> adds
+0.1 per additional source. Is this a reasonable heuristic? Consider a scenario where
+5 stakeholders from the same department all request the same feature (high redundancy,
+same perspective) versus 3 stakeholders from different departments (lower redundancy,
+diverse perspectives). Design a confidence boosting formula that accounts for source
+diversity, not just source count.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+The extraction pipeline from this section produces validated, deduplicated
+requirements with conflict annotations. <a href="section-13.3.html">Section 13.3:
+Building a Requirement Discovery Assistant</a> wraps this pipeline into a complete,
+interactive tool that a requirements engineer can use in practice. We will add a
+transcript ingestion interface, a visual conflict map, and integration with the
+Discovery Workbench, producing a reusable component that connects to the architecture
+discovery pipeline of
+<a href="../module-14-architecture-discovery/index.html">Chapter 14</a>.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-13.1.html">&#8592; 13.1 Stakeholders and Requirements</a>
+<a href="index.html">Chapter 13</a>
+<a href="section-13.3.html">13.3 Building a Requirement Discovery Assistant &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

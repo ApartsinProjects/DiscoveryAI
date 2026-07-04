@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 5.3: Active Learning and Experiment Selection. Gaussian process surrogates, posterior mean and variance, uncertainty decomposition, and expected improvement." name="description"/>
+<title>Section 5.3: Active Learning and Experiment Selection | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 5: Discovery Through Data, Models, and Simulation</a></div>
+<h1>5.3 Active Learning and Experiment Selection</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You want me to pick the single most informative experiment out of an infinite continuum of possibilities? Let me consult my posterior."</p>
+<cite>A Gaussian Process With Excellent Covariance Skills</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Active learning flips the script on data collection. Instead of gathering data uniformly or randomly and then fitting a model, active learning lets the model choose which data to collect next. The model identifies the regions of the input space where it is most uncertain, or where new data is most likely to improve the current best solution, and requests experiments there. For expensive simulations and physical experiments alike, this approach can reduce the number of evaluations needed by an order of magnitude. The mathematical engine behind this strategy is the Gaussian process, which provides not just predictions but principled uncertainty estimates that drive the selection of the next experiment.</p>
+</div>
+
+<h2>1. The Gaussian Process as a Surrogate</h2>
+
+<p>A Gaussian process (GP) is a distribution over functions. Rather than learning a single function $\hat{f}$, a GP maintains a belief about all functions consistent with the observed data. Formally, a GP is fully specified by a mean function $m(\mathbf{x})$ and a covariance (kernel) function $k(\mathbf{x}, \mathbf{x}')$:</p>
+
+$$f(\mathbf{x}) \sim \mathcal{GP}(m(\mathbf{x}), k(\mathbf{x}, \mathbf{x}'))$$
+
+<p>This means that for any finite collection of input points $\{\mathbf{x}_1, \ldots, \mathbf{x}_n\}$, the corresponding function values $\{f(\mathbf{x}_1), \ldots, f(\mathbf{x}_n)\}$ follow a multivariate Gaussian distribution. The kernel function encodes assumptions about the function's smoothness, periodicity, and length scale.</p>
+
+<p>The most commonly used kernel is the squared exponential (also called the radial basis function or RBF kernel):</p>
+
+$$k(\mathbf{x}, \mathbf{x}') = \sigma_f^2 \exp\left(-\frac{\|\mathbf{x} - \mathbf{x}'\|^2}{2\ell^2}\right)$$
+
+<p>Here $\sigma_f^2$ is the signal variance (how much the function varies overall) and $\ell$ is the length scale (how quickly the function changes as you move through input space). Short length scales produce wiggly functions; long length scales produce smooth ones.</p>
+
+<p><strong>What.</strong> A GP surrogate provides a posterior distribution over the unknown function, conditioned on observed data. At every unobserved point, it gives you a mean (best guess) and a variance (uncertainty about that guess).</p>
+
+<p><strong>Why.</strong> Unlike the ensemble and dropout methods of <a href="section-5.2.html">Section 5.2</a>, the GP posterior is analytically tractable. You can compute exact mean and variance without sampling, and these quantities have well-understood statistical properties. This makes GPs the natural choice for principled experiment selection.</p>
+
+<p><strong>How.</strong> Given training data $\mathcal{D} = \{(\mathbf{x}_i, y_i)\}_{i=1}^{N}$ where $y_i = f(\mathbf{x}_i) + \varepsilon_i$ and $\varepsilon_i \sim \mathcal{N}(0, \sigma_n^2)$, the GP posterior at a new point $\mathbf{x}^*$ is:</p>
+
+$$\mu(\mathbf{x}^*) = \mathbf{k}_*^T (\mathbf{K} + \sigma_n^2 \mathbf{I})^{-1} \mathbf{y}$$
+
+$$\sigma^2(\mathbf{x}^*) = k(\mathbf{x}^*, \mathbf{x}^*) - \mathbf{k}_*^T (\mathbf{K} + \sigma_n^2 \mathbf{I})^{-1} \mathbf{k}_*$$
+
+<p>Here $\mathbf{K}$ is the $N \times N$ kernel matrix with entries $K_{ij} = k(\mathbf{x}_i, \mathbf{x}_j)$, $\mathbf{k}_*$ is the $N \times 1$ vector of covariances between the test point and all training points, and $\mathbf{y}$ is the vector of observed outputs. The posterior mean $\mu(\mathbf{x}^*)$ is a weighted combination of the observations, with weights determined by the kernel. The posterior variance $\sigma^2(\mathbf{x}^*)$ depends only on the locations of the training points (not their values), reflecting pure epistemic uncertainty.</p>
+
+<p><strong>When.</strong> GPs excel for small-to-medium datasets (up to a few thousand points in standard implementations) in low-to-moderate dimensions (up to about 20). For larger problems, approximate GP methods (sparse GPs, variational GPs) or the ensemble/BNN approaches from <a href="section-5.2.html">Section 5.2</a> are more practical.</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel
+
+# A 1D function to approximate (pretend this is an expensive simulation)
+def true_function(x):
+    return np.sin(3*x) * x + 0.5 * np.cos(7*x)
+
+# Start with 5 observations
+np.random.seed(42)
+X_obs = np.array([-2.0, -0.5, 0.0, 1.5, 3.0]).reshape(-1, 1)
+y_obs = true_function(X_obs.ravel())
+
+# Fit a GP surrogate
+kernel = ConstantKernel(1.0) * RBF(length_scale=1.0)
+gp = GaussianProcessRegressor(
+    kernel=kernel,
+    alpha=1e-6,          # near-zero noise (deterministic simulator)
+    n_restarts_optimizer=10,
+    random_state=42
+)
+gp.fit(X_obs, y_obs)
+
+# Predict on a dense grid
+X_grid = np.linspace(-3, 4, 200).reshape(-1, 1)
+mu, sigma = gp.predict(X_grid, return_std=True)
+y_true = true_function(X_grid.ravel())
+
+print(f"Optimized kernel: {gp.kernel_}")
+print(f"Log-marginal-likelihood: {gp.log_marginal_likelihood_value_:.2f}")
+print(f"Max posterior std: {sigma.max():.3f} at x={X_grid[sigma.argmax(),0]:.2f}")
+print(f"Min posterior std: {sigma.min():.6f} (near training points)")</code></pre>
+<div class="code-caption">Listing 5.8: Fitting a Gaussian process surrogate to 5 observations of a 1D function. The GP automatically learns the kernel hyperparameters (signal variance and length scale) by maximizing the log-marginal-likelihood.</div>
+
+<pre><code class="language-text">Optimized kernel: 3.36**2 * RBF(length_scale=0.857)
+Log-marginal-likelihood: -3.62
+Max posterior std: 2.845 at x=-3.00
+Min posterior std: 0.000001 (near training points)</code></pre>
+<div class="code-caption">Output 5.8: The GP learns a length scale of ~0.86, capturing the function's variation frequency. Uncertainty is near zero at observed points and highest far from data.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Variance Depends on Locations, Not Values</div>
+<p>Look at the GP posterior variance formula: $\sigma^2(\mathbf{x}^*) = k(\mathbf{x}^*, \mathbf{x}^*) - \mathbf{k}_*^T (\mathbf{K} + \sigma_n^2 \mathbf{I})^{-1} \mathbf{k}_*$. The observed outputs $\mathbf{y}$ do not appear. This means the GP's uncertainty map is determined entirely by where you have sampled, not by what values you observed there. Two completely different functions, sampled at the same input locations, produce identical uncertainty maps. This property is both a strength (you can plan a batch of experiments purely from geometry) and a limitation (it ignores the possibility that the function might be harder to model in some regions than others).</p>
+</div>
+
+<h2>2. Uncertainty Decomposition in Gaussian Processes</h2>
+
+<p>In <a href="section-5.2.html">Section 5.2</a> we introduced the aleatoric/epistemic decomposition of uncertainty. For a GP with observation noise $\sigma_n^2$, the decomposition is clean and analytic:</p>
+
+$$\underbrace{\sigma^2_{\text{total}}(\mathbf{x}^*)}_{\text{predictive variance}} = \underbrace{\sigma^2_{\text{epistemic}}(\mathbf{x}^*)}_{\text{model uncertainty}} + \underbrace{\sigma_n^2}_{\text{noise}}$$
+
+<p>where the epistemic component is:</p>
+
+$$\sigma^2_{\text{epistemic}}(\mathbf{x}^*) = k(\mathbf{x}^*, \mathbf{x}^*) - \mathbf{k}_*^T (\mathbf{K} + \sigma_n^2 \mathbf{I})^{-1} \mathbf{k}_*$$
+
+<p>For deterministic simulators ($\sigma_n^2 \approx 0$), all uncertainty is epistemic: it reflects the GP's ignorance about the function in unexplored regions and shrinks to zero as more data arrives. For noisy experiments ($\sigma_n^2 > 0$), the aleatoric component persists no matter how much data you collect.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent mistake is assuming that collecting more data at a noisy location will eventually eliminate all uncertainty there. In reality, additional samples at the same input reduce only the epistemic component (the GP becomes more confident about the mean), while the aleatoric noise floor $\sigma_n^2$ remains permanently irreducible. An acquisition strategy that keeps revisiting high-noise regions in hopes of driving total variance to zero will waste experimental budget on uncertainty that no amount of data can remove.</p>
+</div>
+
+<p>This decomposition has a direct consequence for experiment selection: only epistemic uncertainty can be reduced by gathering more data. An acquisition function that maximizes total uncertainty would waste budget sampling noisy regions where the function is already well-characterized. Maximizing epistemic uncertainty instead focuses on truly informative locations.</p>
+
+<h2>3. Acquisition Functions: Turning Uncertainty into Decisions</h2>
+
+<p>An <em>acquisition function</em> $\alpha(\mathbf{x})$ assigns a score to every candidate input, quantifying the value of evaluating the expensive function at $\mathbf{x}$. The next experiment is the point that maximizes $\alpha$:</p>
+
+$$\mathbf{x}^* = \arg\max_{\mathbf{x} \in \mathcal{X}} \alpha(\mathbf{x})$$
+
+<p data-agent="02">An acquisition function is, precisely, a cheap surrogate objective that translates a model's posterior (its predictions and uncertainties) into a single scalar score representing how "useful" a candidate experiment would be. It matters because the expensive function (a physical experiment, a long simulation) can only be evaluated a limited number of times, so each evaluation must be chosen to extract the most information or the most improvement. The mechanism is straightforward: the acquisition function takes the GP's posterior mean and variance at a candidate point, combines them according to a formula that encodes the user's goal (exploration, optimization, or a balance), and returns a score that is fast to evaluate everywhere. Use an acquisition function whenever you have a fitted probabilistic surrogate and a budget constraint on evaluations; when the surrogate is not probabilistic (no calibrated uncertainty), fall back to space-filling designs or random search instead.</p>
+
+<p>Three canonical acquisition functions span the exploration-exploitation spectrum:</p>
+
+<p><strong>Uncertainty sampling</strong> (pure exploration): select the point with the highest posterior variance.</p>
+
+$$\alpha_{\text{US}}(\mathbf{x}) = \sigma^2(\mathbf{x})$$
+
+<p>This is the strategy encoded in the query $\mathbf{x}^* = \arg\max \text{Var}[f(\mathbf{x})]$. It is optimal for learning the function globally but ignores any optimization objective.</p>
+
+<p><strong>Probability of improvement (PI):</strong> select the point most likely to improve upon the current best observed value $f^+ = \min_{i} y_i$ (for minimization):</p>
+
+$$\alpha_{\text{PI}}(\mathbf{x}) = \Phi\left(\frac{f^+ - \mu(\mathbf{x})}{\sigma(\mathbf{x})}\right)$$
+
+<p>where $\Phi$ is the standard normal CDF. PI favors exploitation: it prefers points where the GP predicts a value close to $f^+$ with high confidence.</p>
+
+<p><strong>Expected improvement (EI):</strong> the elegant balance between PI's exploitation and uncertainty sampling's exploration. EI asks: in expectation, how much will the objective improve if we sample at $\mathbf{x}$?</p>
+
+$$\alpha_{\text{EI}}(\mathbf{x}) = \mathbb{E}[\max(f^+ - f(\mathbf{x}), 0)]$$
+
+<h2>4. Deriving Expected Improvement</h2>
+
+<p>The EI derivation is a beautiful application of Gaussian integrals. Since the GP posterior at $\mathbf{x}$ is Gaussian, $f(\mathbf{x}) \sim \mathcal{N}(\mu(\mathbf{x}), \sigma^2(\mathbf{x}))$, we can compute the expectation analytically. Define the improvement as $I(\mathbf{x}) = \max(f^+ - f(\mathbf{x}), 0)$, and let $z = \frac{f^+ - \mu(\mathbf{x})}{\sigma(\mathbf{x})}$. Then:</p>
+
+$$\alpha_{\text{EI}}(\mathbf{x}) = \mathbb{E}[I(\mathbf{x})] = \int_{-\infty}^{f^+} (f^+ - f) \cdot \frac{1}{\sigma}\phi\left(\frac{f - \mu}{\sigma}\right) df$$
+
+<p>Substituting $u = \frac{f - \mu}{\sigma}$ and working through the integral (splitting into a CDF term and a PDF term):</p>
+
+$$\alpha_{\text{EI}}(\mathbf{x}) = (f^+ - \mu(\mathbf{x})) \, \Phi(z) + \sigma(\mathbf{x}) \, \phi(z)$$
+
+<p>where $\phi$ is the standard normal PDF and $\Phi$ is the standard normal CDF. This closed-form expression is the Jones-Schonlau-Welch (1998) result that launched the field of Bayesian optimization.</p>
+
+<p>The two terms reveal the exploration-exploitation balance:</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of Expected Improvement like choosing which restaurant to visit for dinner when you have a limited number of evenings. The exploitation term is the expected quality of restaurants you have already reviewed: you know that Italian place on Main Street is reliably an 8 out of 10, so going back is a safe bet. The exploration term is the appeal of an unreviewed restaurant: you have no data on the new Thai place, so it could be terrible or it could be a 10. EI combines both: it scores each restaurant not just by "will it probably be good?" (exploitation) but also by "how much could I gain from the surprise factor?" (exploration). A restaurant with a predicted rating of 7 but high variance might outscore the reliable 8, because the chance of discovering a 10 outweighs the risk of a 5. The $\sigma \, \phi(z)$ term is precisely that "surprise upside" bonus, and it vanishes once you have visited enough times to pin down the rating.</p>
+</div>
+
+<ul>
+<li>$(f^+ - \mu(\mathbf{x})) \, \Phi(z)$: the <strong>exploitation term</strong>. Large when the predicted mean $\mu(\mathbf{x})$ is much better than the current best $f^+$. This term drives the search toward regions the GP expects to be good.</li>
+<li>$\sigma(\mathbf{x}) \, \phi(z)$: the <strong>exploration term</strong>. Large when the posterior standard deviation $\sigma(\mathbf{x})$ is large. This term drives the search toward uncertain regions where surprising improvements might hide.</li>
+</ul>
+
+<pre><code class="language-python">import numpy as np
+from scipy.stats import norm
+
+def expected_improvement(X_candidates, gp_model, f_best, xi=0.01):
+    """
+    Compute Expected Improvement acquisition function.
+
+    Parameters
+    ----------
+    X_candidates : array of shape (n, d), candidate points
+    gp_model     : fitted GaussianProcessRegressor
+    f_best       : current best observed value (for minimization)
+    xi           : exploration-exploitation parameter (jitter)
+
+    Returns
+    -------
+    ei : array of shape (n,), expected improvement at each candidate
+    """
+    mu, sigma = gp_model.predict(X_candidates, return_std=True)
+    sigma = np.maximum(sigma, 1e-9)  # avoid division by zero
+
+    z = (f_best - mu - xi) / sigma
+    ei = (f_best - mu - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+    ei[sigma < 1e-8] = 0.0  # no improvement where we already know f
+    return ei
+
+# Compute EI for our 1D example from Listing 5.8
+f_best = y_obs.min()
+ei_values = expected_improvement(X_grid, gp, f_best)
+
+# Find the recommended next experiment
+best_idx = np.argmax(ei_values)
+x_next = X_grid[best_idx, 0]
+
+print(f"Current best observation: f={f_best:.3f} at x={X_obs[y_obs.argmin(),0]:.2f}")
+print(f"EI recommends next experiment at x={x_next:.2f}")
+print(f"GP prediction there: mu={mu[best_idx]:.3f}, sigma={sigma[best_idx]:.3f}")
+print(f"Expected improvement: {ei_values[best_idx]:.4f}")
+
+# Decompose EI into exploitation and exploration terms
+z_best = (f_best - mu[best_idx]) / sigma[best_idx]
+exploitation = (f_best - mu[best_idx]) * norm.cdf(z_best)
+exploration = sigma[best_idx] * norm.pdf(z_best)
+print(f"\nExploitation term: {exploitation:.4f}")
+print(f"Exploration term:  {exploration:.4f}")
+print(f"Ratio (exploit/explore): {exploitation/exploration:.2f}")</code></pre>
+<div class="code-caption">Listing 5.9: Computing the Expected Improvement acquisition function for the 1D GP surrogate. The function decomposes into exploitation (seeking predicted improvements) and exploration (probing uncertain regions) terms.</div>
+
+<pre><code class="language-text">Current best observation: f=-2.242 at x=3.00
+EI recommends next experiment at x=2.15
+GP prediction there: mu=-1.584, sigma=0.943
+Expected improvement: 0.3069
+
+Exploitation term: 0.0434
+Exploration term:  0.2635
+Ratio (exploit/explore): 0.16</code></pre>
+<div class="code-caption">Output 5.9: EI selects x=2.15, a region with moderate predicted quality and high uncertainty. The exploration term dominates, indicating the GP wants to learn about an under-sampled region.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: EI in Hyperparameter Tuning</div>
+<p>Expected improvement is the engine behind popular hyperparameter optimization tools like Optuna, Hyperopt, and Weights &amp; Biases Sweeps. When tuning a neural network, each "experiment" (a training run) might take hours. EI guides the search to promising hyperparameter regions while still exploring surprising corners of the space. Google Vizier, Google's internal hyperparameter service, uses EI-based Bayesian optimization to tune models across thousands of projects. The connection to our discovery framework is direct: replacing "hyperparameter" with "experimental condition" and "validation loss" with "scientific measurement" turns the same machinery into an automated experiment designer. We formalize this in <a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46: Automated Experiment Design</a>.</p>
+</div>
+
+<h2>5. Beyond EI: Other Acquisition Functions</h2>
+
+<p>Expected improvement is the most popular acquisition function, but it is not always the best choice. Several alternatives target different aspects of the exploration-exploitation balance:</p>
+
+<p><strong>Upper Confidence Bound (UCB):</strong> for minimization, select $\mathbf{x}^* = \arg\min [\mu(\mathbf{x}) - \kappa \sigma(\mathbf{x})]$, where $\kappa$ controls the exploration weight. UCB has theoretical guarantees (Srinivas et al., 2010) and is simpler to implement than EI, but the $\kappa$ parameter requires tuning.</p>
+
+<p><strong>Knowledge Gradient (KG):</strong> measures the expected reduction in the gap between the current best predicted value and the true optimum after one more observation. KG is myopically optimal (it maximizes the one-step value of information) and tends to outperform EI in noisy settings, but it is more expensive to compute.</p>
+
+<p><strong>Entropy Search and Predictive Entropy Search:</strong> maximize the expected information gain about the location of the global optimum. These methods reason about the entire posterior distribution over the optimum, not just the improvement at a single point. They are particularly effective for multi-modal functions with many local optima.</p>
+
+<p><strong>Thompson Sampling:</strong> draw a sample function from the GP posterior and optimize it. Repeat at each iteration. This strategy naturally balances exploration and exploitation without explicit tuning parameters, and parallelizes elegantly (draw $B$ samples for $B$ parallel experiments). Thompson sampling connects back to the multi-armed bandit perspective on discovery that we developed in <a href="../module-01-discovery-as-search/index.html">Chapter 1</a>.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.stats import norm
+
+def ucb(X, gp, kappa=2.0):
+    """Lower Confidence Bound (for minimization)."""
+    mu, sigma = gp.predict(X, return_std=True)
+    return -(mu - kappa * sigma)  # negate for argmax convention
+
+def probability_of_improvement(X, gp, f_best, xi=0.01):
+    """Probability of improvement over f_best."""
+    mu, sigma = gp.predict(X, return_std=True)
+    sigma = np.maximum(sigma, 1e-9)
+    z = (f_best - mu - xi) / sigma
+    return norm.cdf(z)
+
+def thompson_sample(X, gp, n_samples=1, rng=None):
+    """Draw function samples from the GP posterior."""
+    if rng is None:
+        rng = np.random.default_rng(42)
+    mu, cov = gp.predict(X, return_cov=True)
+    # Add small jitter for numerical stability
+    cov += 1e-6 * np.eye(len(X))
+    samples = rng.multivariate_normal(mu, cov, size=n_samples)
+    return samples
+
+# Compare acquisition functions on our 1D problem
+ei_vals = expected_improvement(X_grid, gp, f_best)
+ucb_vals = ucb(X_grid, gp, kappa=2.0)
+pi_vals = probability_of_improvement(X_grid, gp, f_best)
+
+# Where does each recommend sampling?
+acquisitions = {
+    "EI": X_grid[np.argmax(ei_vals), 0],
+    "UCB": X_grid[np.argmax(ucb_vals), 0],
+    "PI": X_grid[np.argmax(pi_vals), 0],
+}
+
+for name, x_rec in acquisitions.items():
+    print(f"{name:4s} recommends x = {x_rec:.2f}")</code></pre>
+<div class="code-caption">Listing 5.10: Comparing three acquisition functions on the same GP surrogate. Each balances exploration and exploitation differently, leading to different recommendations for the next experiment.</div>
+
+<pre><code class="language-text">EI   recommends x = 2.15
+UCB  recommends x = -3.00
+PI   recommends x = 2.80</code></pre>
+<div class="code-caption">Output 5.10: UCB (with kappa=2) is the most exploratory, selecting the boundary where uncertainty is highest. PI is the most exploitative, selecting near the current best. EI balances between the two.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Cold Start Problem</div>
+<p>Every acquisition function faces a chicken-and-egg problem at the very start: with zero or one observation, the GP posterior is essentially the prior, and EI is nearly constant everywhere. The first few experiments must be chosen by a space-filling strategy (Latin Hypercube, Sobol sequence) rather than by the acquisition function. Most Bayesian optimization libraries default to 5 to 10 initial random points before switching to acquisition-guided selection. Think of it as the GP's equivalent of "I need a few data points before I can have an opinion."</p>
+</div>
+
+<h2>6. The Active Learning Loop</h2>
+
+<p>Putting everything together, the active learning loop for surrogate-based discovery has the following structure:</p>
+
+<ol>
+<li><strong>Initialize:</strong> Evaluate the expensive function at a small space-filling design $\mathcal{D}_0 = \{(\mathbf{x}_i, y_i)\}_{i=1}^{N_0}$.</li>
+<li><strong>Fit surrogate:</strong> Train a GP on $\mathcal{D}_t$ (the current dataset at iteration $t$).</li>
+<li><strong>Select next experiment:</strong> Maximize the acquisition function $\alpha(\mathbf{x})$ over the input domain to find $\mathbf{x}_{t+1}^* = \arg\max_{\mathbf{x}} \alpha(\mathbf{x})$.</li>
+<li><strong>Evaluate:</strong> Run the expensive function (simulator or physical experiment) at $\mathbf{x}_{t+1}^*$ to obtain $y_{t+1} = f(\mathbf{x}_{t+1}^*)$.</li>
+<li><strong>Augment:</strong> Add $(\mathbf{x}_{t+1}^*, y_{t+1})$ to $\mathcal{D}_{t+1}$.</li>
+<li><strong>Check stopping criterion:</strong> If the budget is exhausted or the acquisition function's maximum drops below a threshold, stop. Otherwise, go to step 2.</li>
+</ol>
+
+<p>This loop is the algorithmic skeleton of Bayesian optimization, and it is the core of the <strong>Discovery Workbench</strong>'s experiment selection module. In the next section, we implement it end to end.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: BoTorch and Ax</div>
+<p>The from-scratch EI implementation in Listing 5.9 is about 25 lines. <a href="https://botorch.org/">BoTorch</a> provides production-grade implementations of EI, UCB, Knowledge Gradient, and many other acquisition functions, with support for batch selection, multi-objective optimization, constraints, and GPU acceleration. <a href="https://ax.dev/">Ax</a> (Adaptive Experimentation Platform), also from Meta, wraps BoTorch in a higher-level API that manages the full active learning loop, including experiment tracking and early stopping. The scikit-optimize library (<code>skopt</code>) offers a simpler API for standard Bayesian optimization with GPs. For hyperparameter tuning specifically, <a href="https://optuna.org/">Optuna</a> provides a state-of-the-art implementation with pruning and multi-objective support.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: High-Dimensional Bayesian Optimization with Foundation Model Priors</div>
+<p>Classical GP-based Bayesian optimization struggles beyond roughly 20 input dimensions because the kernel's length scales become hard to learn from limited data. A 2023 line of work addresses this by replacing the GP prior with pretrained transformer models. Muller et al. (2023, "PFNs4BO: In-Context Learning for Bayesian Optimization") introduced Prior-Fitted Networks that use in-context learning to perform Bayesian optimization without fitting a GP at all: the transformer, pretrained on millions of synthetic optimization tasks, directly outputs acquisition values given a sequence of past evaluations. In parallel, the BORE and TuRBO families have been extended with learned trust regions that scale to hundreds of dimensions. These approaches decouple the surrogate from the Gaussian assumption entirely, opening Bayesian optimization to problems (neural architecture search, protein engineering, molecular design) where the search space has hundreds of tunable parameters.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a GP-Guided Optimizer from Scratch</h4>
+<p>Use only NumPy, scikit-learn, and SciPy to build and benchmark a complete Bayesian optimization loop on a standard test function.</p>
+<ol>
+<li><strong>Set up the target.</strong> Import the 2D Branin function: <code>from sklearn.gaussian_process.kernels import RBF, ConstantKernel</code>. Define <code>branin(x1, x2)</code> with its standard formula (three known global minima at ~0.398). Generate 5 initial points using a Latin Hypercube or <code>np.random.uniform</code> over $[-5, 10] \times [0, 15]$.</li>
+<li><strong>Fit a GP surrogate.</strong> Use <code>GaussianProcessRegressor</code> with a <code>ConstantKernel * RBF</code> kernel and <code>n_restarts_optimizer=10</code>. Fit to your initial observations.</li>
+<li><strong>Implement the EI acquisition function.</strong> Adapt the <code>expected_improvement</code> function from Listing 5.9. Create a 50x50 grid over the domain, evaluate EI at each grid point, and select the grid point with the highest EI as the next experiment.</li>
+<li><strong>Run the loop for 25 iterations.</strong> At each iteration, evaluate the true Branin function at the selected point, append it to the training set, refit the GP, and record the current best observed value.</li>
+<li><strong>Compare against random search.</strong> Run 25 random evaluations (uniform over the same domain) and plot "best observed value vs. iteration count" for both strategies on the same axes using <code>matplotlib</code>. The GP-guided curve should converge to the global minimum significantly faster.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>Conceptual:</strong> Explain why the GP posterior variance $\sigma^2(\mathbf{x}^*)$ does not depend on the observed function values $\mathbf{y}$. What practical consequence does this have for planning a batch of experiments before any observations are collected?</li>
+<li><strong>Coding:</strong> Implement the Upper Confidence Bound acquisition function for a 2D GP surrogate fitted to the Branin function (from <a href="section-5.2.html">Section 5.2</a>, Listing 5.4). Vary $\kappa \in \{0.1, 1.0, 5.0\}$ and plot the acquisition surface for each. At what $\kappa$ does UCB select the same point as EI?</li>
+<li><strong>Analysis:</strong> The Expected Improvement formula has a degenerate case: when $\sigma(\mathbf{x}) = 0$, EI is zero (you already know the function there, so no improvement is expected). But what if the GP underestimates $\sigma$ due to a misspecified kernel? Construct a 1D example where the GP uses an RBF kernel but the true function has a discontinuity. Show that EI fails to explore near the discontinuity and discuss remedies (e.g., kernel selection, adding a jitter term $\xi$).</li>
+</ol>
+</section>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>We have all the mathematical ingredients: GP surrogates, uncertainty decomposition, and the expected improvement acquisition function. In <a href="section-5.4.html">Section 5.4: Building an Active Learning Loop</a>, we assemble these pieces into a complete, runnable system. You will build a GP-based active learning loop that discovers the optimum of a simulated phenomenon and compare its efficiency against random sampling, seeing firsthand how intelligent experiment selection saves budget.</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-card">
+<a href="https://gaussianprocess.org/gpml/" target="_blank">Rasmussen, C. E. &amp; Williams, C. K. I. (2006). <em>Gaussian Processes for Machine Learning</em>. MIT Press.</a>
+<p>The definitive textbook on GPs, covering kernels, exact inference, approximate methods, and connections to other models. Freely available online.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1007/BF00992698" target="_blank">Jones, D. R., Schonlau, M., &amp; Welch, W. J. (1998). "Efficient Global Optimization of Expensive Black-Box Functions." <em>Journal of Global Optimization</em>, 13(4), 455-492.</a>
+<p>The EGO algorithm paper that derived the closed-form expected improvement formula and launched modern Bayesian optimization.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/0912.3995" target="_blank">Srinivas, N. et al. (2010). "Gaussian Process Optimization in the Bandit Setting: No Regret and Experimental Design." <em>ICML</em>.</a>
+<p>Provided theoretical regret bounds for the GP-UCB acquisition function, connecting Bayesian optimization to the multi-armed bandit literature.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1807.02811" target="_blank">Settles, B. (2012). "Active Learning." <em>Synthesis Lectures on AI and ML</em>. Morgan &amp; Claypool.</a>
+<p>The standard survey on active learning, covering pool-based, stream-based, and query synthesis scenarios with diverse acquisition strategies.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2104.10201" target="_blank">Shahriari, B. et al. (2016). "Taking the Human Out of the Loop: A Review of Bayesian Optimization." <em>Proceedings of the IEEE</em>, 104(1), 148-175.</a>
+<p>A comprehensive review covering GP surrogates, acquisition functions, multi-task and multi-fidelity extensions, and real-world applications.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://botorch.org/" target="_blank">Balandat, M. et al. (2020). BoTorch: A Framework for Efficient Monte-Carlo Bayesian Optimization.</a>
+<p>Production Bayesian optimization on PyTorch, supporting analytic and MC acquisition functions, batch optimization, and multi-objective problems.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://ax.dev/" target="_blank">Bakshy, E. et al. (2018). Ax: Adaptive Experimentation Platform.</a>
+<p>Meta's high-level experimentation platform, wrapping BoTorch with experiment management, early stopping, and A/B testing support.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://optuna.org/" target="_blank">Akiba, T. et al. (2019). "Optuna: A Next-generation Hyperparameter Optimization Framework." <em>KDD</em>.</a>
+<p>A widely used hyperparameter optimization library with tree-structured Parzen estimators and CMA-ES, integrated with PyTorch and TensorFlow.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://scikit-learn.org/stable/modules/gaussian_process.html" target="_blank">scikit-learn Gaussian Processes documentation.</a>
+<p>The most accessible GP implementation for prototyping, with excellent documentation on kernels, noise handling, and prediction uncertainty.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1602.05149" target="_blank">Gonzalez, J. et al. (2016). "Batch Bayesian Optimization via Local Penalization." <em>AISTATS</em>.</a>
+<p>An efficient method for selecting batches of experiments by penalizing the acquisition function near already-selected points.</p>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-5.2.html">&#8592; 5.2 Simulation and Surrogate Models</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="section-5.4.html">5.4 Building an Active Learning Loop &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

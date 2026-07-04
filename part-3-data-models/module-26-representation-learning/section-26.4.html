@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.4: Building a Domain Embedding Model. Recipe for fine-tuning a contrastive embedding model on scientific abstracts using sentence-transformers, with data curation, hard negative mining, and evaluation." name="description"/>
+<title>Section 26.4: Building a Domain Embedding Model | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Representation Learning</a></div>
+<h1>26.4 Building a Domain Embedding Model</h1>
+</header>
+
+<main class="content">
+
+<blockquote class="epigraph">
+<p>"They fine-tuned me on a million abstracts, and now I finally understand the difference between 'expression' in molecular biology and 'expression' in mathematics. Context is everything."</p>
+<cite>A Sentence Embedding That Found Its Domain</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>General-purpose embedding models like all-MiniLM or E5 produce solid representations for everyday text, but they struggle with scientific language. "Expression" means one thing in a gene regulation paper and another in a mathematics paper. "Binding" in chemistry is unrelated to "binding" in contract law. Domain-specific embedding models resolve these ambiguities by fine-tuning on scientific text with contrastive objectives, producing representations where proximity in embedding space reflects scientific relatedness. This section provides a complete, end-to-end recipe: curating training data from scientific abstracts, constructing training pairs with hard negative mining, fine-tuning with sentence-transformers, evaluating on domain retrieval benchmarks, and integrating the result into the Discovery Workbench for downstream use in <a href="../../part-4-knowledge/module-37-rag-discovery/index.html">Chapter 37</a> and <a href="../../part-4-knowledge/module-36-literature-mining/index.html">Chapter 36</a>.</p>
+</div>
+
+<h2>1. Why General Models Fall Short</h2>
+
+<p>General-purpose text embedding models are trained on web text: Wikipedia, Common Crawl, Reddit, news articles. They learn that "bank" relates to "river" and "finance," that "apple" connects to both fruit and technology, and that "running" can be exercise or a process. This general knowledge is valuable, but it misses the specialized semantic relationships that matter in science.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent misconception is that domain fine-tuning simply teaches the model new vocabulary (scientific jargon, acronyms, chemical formulas). In reality, the base pretrained model already knows most scientific tokens from its pretraining corpus; what it lacks is the correct similarity structure between them. Fine-tuning does not add words to the vocabulary; it rewires the geometry of the embedding space so that "BRCA1 expression" lands near "tumor suppressor pathways" instead of near "artistic expression," even though the model could tokenize all of these terms before fine-tuning.</p>
+</div>
+
+<p><strong>What.</strong> Domain-specific embedding models are text encoders fine-tuned with contrastive objectives on scientific text, producing representations where semantic similarity reflects scientific relatedness rather than general linguistic similarity.</p>
+
+<p><strong>Why.</strong> Scientific retrieval, clustering, and classification require embeddings that capture domain-specific relationships. A general model might rank a genetics paper about "BRCA1 expression in breast tissue" as similar to a paper about "artistic expression in breast cancer awareness campaigns" because they share surface tokens. A domain model learns that the first paper relates to papers about tumor suppressors and DNA repair, not to papers about public health communication.</p>
+
+<p><strong>How.</strong> By fine-tuning a pretrained language model on pairs of related scientific texts (title-abstract, citation pairs, co-cited papers) using contrastive losses that pull related papers together and push unrelated ones apart.</p>
+
+<p><strong>When.</strong> When your retrieval or clustering pipeline operates on scientific text and you observe that general embedding models conflate domain-specific terms, miss relevant papers, or produce clusters that do not align with scientific categories.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of contrastive training like organizing a spice rack by smell rather than by label. If you sort alphabetically, "cumin" lands next to "curry powder" by coincidence of spelling, and "paprika" sits far from "cayenne" despite their shared heat. Sorting by smell (the contrastive objective) groups spices that actually taste similar: smoked paprika near chipotle, cumin near coriander seed. The "hard negatives" are spices whose labels look alike but smell completely different (ground ginger vs. ginger ale flavoring). Forcing yourself to distinguish those tricky pairs is what builds a genuinely useful arrangement. In the same way, contrastive fine-tuning reorganizes the embedding space so that scientific texts cluster by meaning, not by surface vocabulary.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Transfer Then Specialize</div>
+<p>We do not train from scratch. Starting from a pretrained model (SciBERT, PubMedBERT, or a general sentence-transformer) gives us general linguistic competence: grammar, word relationships, sentence structure. The contrastive fine-tuning adds domain specialization on top: scientific vocabulary, field-specific semantic relationships, and the particular notion of similarity that matters for scientific discovery. This two-stage approach is far more data-efficient than training from scratch, because the general linguistic features transfer directly and the fine-tuning focuses the model's capacity on the domain-specific distinctions. This mirrors the SSL pretraining philosophy from <a href="section-26.1.html">Section 26.1</a>: use abundant general data for broad features, then specialize with targeted domain data.</p>
+</div>
+
+<h2>2. Data Curation: Building a Training Corpus</h2>
+
+<p>The quality of your domain embedding model depends critically on the quality of your training pairs. A pair of texts should be "positive" (semantically related) only if they share scientific meaning, not just surface tokens. The most reliable sources of scientific positive pairs are:</p>
+
+<ul>
+<li><strong>Title-abstract pairs:</strong> A paper's title summarizes its abstract. This is a natural positive pair that captures the paper's core contribution. Available for millions of papers from Semantic Scholar, PubMed, and arXiv.</li>
+<li><strong>Citation pairs:</strong> If paper A cites paper B, their abstracts are likely related. The citation context (the sentence in paper A that cites paper B) is an even stronger positive signal.</li>
+<li><strong>Co-citation pairs:</strong> If papers A and B are frequently cited together by other papers, they address related topics.</li>
+<li><strong>Same-MeSH-heading pairs:</strong> For biomedical text, papers sharing Medical Subject Headings (MeSH) terms address similar topics.</li>
+</ul>
+
+<pre><code class="language-python">"""Data curation pipeline for scientific abstract training pairs."""
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+
+@dataclass
+class TrainingPair:
+    """A positive pair for contrastive training."""
+    anchor: str        # e.g., paper title or abstract
+    positive: str      # e.g., related abstract
+    source: str        # provenance: 'title-abstract', 'citation', etc.
+
+def load_title_abstract_pairs(jsonl_path: str,
+                               max_pairs: int = 100_000
+                               ) -> list[TrainingPair]:
+    """Load title-abstract pairs from a Semantic Scholar dump.
+
+    Each line is: {"title": "...", "abstract": "...", "year": ...}
+    Filters: non-empty title and abstract, English, after 2015.
+    """
+    pairs = []
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if len(pairs) >= max_pairs:
+                break
+            record = json.loads(line)
+            title = record.get('title', '').strip()
+            abstract = record.get('abstract', '').strip()
+
+            # Quality filters
+            if not title or not abstract:
+                continue
+            if len(abstract.split()) < 50:  # skip very short abstracts
+                continue
+            if record.get('year', 0) < 2015:
+                continue
+
+            pairs.append(TrainingPair(
+                anchor=title,
+                positive=abstract,
+                source='title-abstract'
+            ))
+    return pairs
+
+def load_citation_pairs(citations_path: str,
+                         abstracts: dict[str, str],
+                         max_pairs: int = 100_000
+                         ) -> list[TrainingPair]:
+    """Build pairs from citation relationships.
+
+    citations_path: JSONL with {"citing_id": ..., "cited_id": ...}
+    abstracts: dict mapping paper_id -> abstract text
+    """
+    pairs = []
+    with open(citations_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if len(pairs) >= max_pairs:
+                break
+            record = json.loads(line)
+            citing = record['citing_id']
+            cited = record['cited_id']
+
+            if citing in abstracts and cited in abstracts:
+                pairs.append(TrainingPair(
+                    anchor=abstracts[citing],
+                    positive=abstracts[cited],
+                    source='citation'
+                ))
+    return pairs
+
+def build_training_dataset(data_dir: str) -> list[TrainingPair]:
+    """Combine multiple pair sources into a training set."""
+    data_dir = Path(data_dir)
+
+    # Load from multiple sources
+    ta_pairs = load_title_abstract_pairs(
+        str(data_dir / 'papers.jsonl'), max_pairs=200_000
+    )
+    print(f"Title-abstract pairs: {len(ta_pairs)}")
+
+    # Combine and shuffle
+    all_pairs = ta_pairs  # add citation pairs, etc.
+    random.shuffle(all_pairs)
+
+    print(f"Total training pairs: {len(all_pairs)}")
+    print(f"Sources: { {s: sum(1 for p in all_pairs if p.source == s)
+                        for s in set(p.source for p in all_pairs)} }")
+    return all_pairs</code></pre>
+<div class="code-caption">Listing 26.16: Data curation pipeline for building contrastive training pairs from scientific literature. Title-abstract pairs provide high-quality positive pairs at scale. Citation pairs capture semantic relatedness between different papers. Quality filters ensure minimum abstract length and recency.</div>
+
+<h2>3. Hard Negative Mining for Scientific Text</h2>
+
+<p>As we discussed in <a href="section-26.2.html">Section 26.2</a>, hard negatives are critical for learning fine-grained distinctions. For scientific text, the most useful hard negatives are papers that share surface-level vocabulary but address different scientific questions. A paper about "CRISPR delivery in plant cells" and a paper about "CRISPR ethics in human gene therapy" share the term CRISPR but are scientifically distinct; they make an excellent hard negative pair.</p>
+
+<p data-agent="02">Hard negative mining is the process of deliberately selecting negative examples that are difficult for the current model to distinguish from true positives, rather than relying on randomly sampled negatives. It matters because random negatives (e.g., a paper on Renaissance art paired against a molecular biology query) are trivially distinguishable and provide almost zero gradient signal; the model already separates them correctly, so it learns nothing from them. The mechanism works by using a pretrained embedding model to find corpus items whose embeddings fall close to the anchor but are not semantically related to the positive, then including these "near-miss" items as explicit negatives during training. Use hard negative mining when your model plateaus with in-batch negatives alone, or when your domain contains many subfields that share vocabulary (e.g., "binding" in chemistry vs. immunology vs. computer science); for small, well-separated corpora where random negatives already yield strong gradients, in-batch negatives from <code>MultipleNegativesRankingLoss</code> may suffice without explicit mining.</p>
+
+<p>The sentence-transformers library supports several negative mining strategies through its loss functions. The most effective for scientific text is the <code>MultipleNegativesRankingLoss</code>, which treats all other samples in the batch as negatives (like NT-Xent), combined with explicit hard negative mining using a pretrained model to find near-misses.</p>
+
+<pre><code class="language-python">"""Hard negative mining for scientific abstract pairs."""
+import torch
+import torch.nn.functional as F
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+def mine_hard_negatives_for_abstracts(
+    anchors: list[str],
+    positives: list[str],
+    corpus: list[str],
+    model_name: str = 'all-MiniLM-L6-v2',
+    n_negatives: int = 5,
+    batch_size: int = 256
+) -> list[list[str]]:
+    """Mine hard negatives using a pretrained embedding model.
+
+    For each anchor, find corpus items that are similar to the anchor
+    but NOT in the positive set. These "near-miss" negatives provide
+    the strongest training signal.
+
+    Args:
+        anchors: list of anchor texts (e.g., titles)
+        positives: list of positive texts (e.g., abstracts)
+        corpus: larger pool to mine negatives from
+        model_name: pretrained model for initial similarity
+        n_negatives: number of hard negatives per anchor
+        batch_size: encoding batch size
+
+    Returns:
+        List of lists: hard negatives for each anchor
+    """
+    model = SentenceTransformer(model_name)
+
+    # Encode anchors and corpus
+    print("Encoding anchors...")
+    anchor_embs = model.encode(
+        anchors, batch_size=batch_size,
+        show_progress_bar=True, convert_to_tensor=True
+    )
+    print("Encoding corpus...")
+    corpus_embs = model.encode(
+        corpus, batch_size=batch_size,
+        show_progress_bar=True, convert_to_tensor=True
+    )
+
+    # Also encode positives to exclude them from negatives
+    pos_embs = model.encode(
+        positives, batch_size=batch_size,
+        convert_to_tensor=True
+    )
+
+    all_hard_negatives = []
+
+    for i in range(len(anchors)):
+        # Cosine similarity to corpus
+        sims = F.cosine_similarity(
+            anchor_embs[i].unsqueeze(0), corpus_embs, dim=1
+        )
+
+        # Exclude the positive (and very similar texts)
+        pos_sim = F.cosine_similarity(
+            pos_embs[i].unsqueeze(0), corpus_embs, dim=1
+        )
+        # Mask items that are too similar to the positive
+        # (likely paraphrases or the same paper)
+        too_similar = pos_sim > 0.9
+        sims[too_similar] = -1.0
+
+        # Top-k most similar remaining = hardest negatives
+        _, top_indices = sims.topk(n_negatives)
+        hard_negs = [corpus[idx] for idx in top_indices.tolist()]
+        all_hard_negatives.append(hard_negs)
+
+    return all_hard_negatives
+
+# Example usage (with synthetic data for illustration)
+anchors = [
+    "CRISPR-Cas9 delivery mechanisms in plant cells",
+    "Transformer architectures for protein structure prediction",
+    "Bayesian optimization of chemical reaction conditions",
+]
+positives = [
+    "We present a novel lipid nanoparticle system for delivering...",
+    "We adapt the attention mechanism to predict 3D coordinates...",
+    "We use Gaussian processes to model the yield surface...",
+]
+corpus = positives + [
+    "CRISPR ethics in human germline editing applications",
+    "Attention mechanisms in natural language processing",
+    "Monte Carlo methods for Bayesian inference",
+    "Deep learning for drug discovery pipelines",
+    "Plant genome editing using TALENs",
+    "Protein folding with molecular dynamics simulation",
+]
+
+# In practice: hard_negs = mine_hard_negatives_for_abstracts(...)
+print(f"Would mine {len(anchors)} x 5 = {len(anchors)*5} "
+      f"hard negatives from corpus of {len(corpus)}")</code></pre>
+<div class="code-caption">Listing 26.17: Hard negative mining for scientific text. A pretrained model finds corpus items that are similar to the anchor in general embedding space but are not the positive. These near-miss negatives force the fine-tuned model to learn domain-specific distinctions (e.g., CRISPR delivery vs. CRISPR ethics) rather than relying on keyword overlap.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: SPECTER2 and SciNCL</div>
+<p>The Allen Institute for AI developed SPECTER (2020) and SPECTER2 (2023) using exactly this approach: contrastive fine-tuning on citation pairs from Semantic Scholar. SPECTER2 uses a multi-task training setup where the model learns from title-abstract pairs, citation pairs, and co-view pairs (papers viewed together in the same session). SciNCL (Scientific Nearest-neighbor Contrastive Learning) improved on SPECTER by mining hard negatives from the citation graph: papers that cite similar papers but are not themselves related. The resulting models outperform general-purpose embeddings on scientific retrieval tasks (SciDocs benchmark) by 5 to 15 percentage points, demonstrating the value of domain-specific contrastive training.</p>
+</div>
+
+<h2>4. Fine-Tuning with sentence-transformers</h2>
+
+<p>The sentence-transformers library provides a high-level API for contrastive fine-tuning that handles batching, loss computation, evaluation, and checkpointing. This is where all the theory from Sections 26.1 through 26.3 comes together in a practical training pipeline.</p>
+
+<pre><code class="language-python">"""Fine-tune a domain-specific embedding model with sentence-transformers."""
+from sentence_transformers import (
+    SentenceTransformer, InputExample, losses, evaluation
+)
+from torch.utils.data import DataLoader
+import os
+
+def create_training_examples(pairs: list[dict]) -> list:
+    """Convert training pairs to sentence-transformers format.
+
+    Args:
+        pairs: list of dicts with 'anchor', 'positive', and
+               optional 'negative' keys
+
+    Returns:
+        List of InputExample objects
+    """
+    examples = []
+    for pair in pairs:
+        if 'negative' in pair:
+            # Triplet: anchor, positive, negative
+            examples.append(InputExample(texts=[
+                pair['anchor'], pair['positive'], pair['negative']
+            ]))
+        else:
+            # Pair: anchor, positive (negatives from in-batch)
+            examples.append(InputExample(texts=[
+                pair['anchor'], pair['positive']
+            ]))
+    return examples
+
+def train_domain_embedding_model(
+    train_pairs: list[dict],
+    val_queries: dict,
+    val_corpus: dict,
+    val_relevant: dict,
+    base_model: str = 'allenai/scibert_scivocab_uncased',
+    output_dir: str = './models/sci-embeddings',
+    epochs: int = 3,
+    batch_size: int = 64,
+    learning_rate: float = 2e-5,
+    warmup_ratio: float = 0.1,
+):
+    """Full training pipeline for a domain embedding model.
+
+    Args:
+        train_pairs: list of {'anchor': str, 'positive': str}
+        val_queries: {qid: query_text} for retrieval evaluation
+        val_corpus: {doc_id: doc_text} for retrieval evaluation
+        val_relevant: {qid: set(doc_ids)} ground truth relevance
+        base_model: pretrained model to fine-tune
+        output_dir: where to save the fine-tuned model
+    """
+    # 1. Load base model
+    model = SentenceTransformer(base_model)
+    print(f"Base model: {base_model}")
+    print(f"Embedding dimension: "
+          f"{model.get_sentence_embedding_dimension()}")
+
+    # 2. Prepare training data
+    train_examples = create_training_examples(train_pairs)
+    train_dataloader = DataLoader(
+        train_examples, shuffle=True, batch_size=batch_size
+    )
+    print(f"Training examples: {len(train_examples)}")
+
+    # 3. Define loss function
+    # MultipleNegativesRankingLoss: uses in-batch negatives
+    # Each (anchor, positive) pair treats all other positives
+    # in the batch as negatives. Equivalent to NT-Xent.
+    train_loss = losses.MultipleNegativesRankingLoss(model)
+
+    # 4. Set up evaluation
+    # InformationRetrievalEvaluator computes recall, MRR, NDCG
+    evaluator = evaluation.InformationRetrievalEvaluator(
+        queries=val_queries,
+        corpus=val_corpus,
+        relevant_docs=val_relevant,
+        name='sci-retrieval',
+        show_progress_bar=True,
+    )
+
+    # 5. Train
+    total_steps = len(train_dataloader) * epochs
+    warmup_steps = int(total_steps * warmup_ratio)
+
+    model.fit(
+        train_objectives=[(train_dataloader, train_loss)],
+        evaluator=evaluator,
+        epochs=epochs,
+        warmup_steps=warmup_steps,
+        optimizer_params={'lr': learning_rate},
+        output_path=output_dir,
+        evaluation_steps=len(train_dataloader) // 2,  # eval twice/epoch
+        save_best_model=True,
+        show_progress_bar=True,
+    )
+
+    print(f"\nModel saved to {output_dir}")
+    return model
+
+# Example configuration (data loading would use real corpus)
+print("Training configuration:")
+print(f"  Base model: allenai/scibert_scivocab_uncased")
+print(f"  Loss: MultipleNegativesRankingLoss (in-batch NT-Xent)")
+print(f"  Epochs: 3")
+print(f"  Batch size: 64 (provides 63 in-batch negatives)")
+print(f"  Learning rate: 2e-5 with linear warmup")
+print(f"  Evaluation: InformationRetrievalEvaluator on held-out set")</code></pre>
+<div class="code-caption">Listing 26.18: Complete fine-tuning pipeline using sentence-transformers. The <code>MultipleNegativesRankingLoss</code> is equivalent to the NT-Xent loss from <a href="section-26.2.html">Section 26.2</a>, treating all other batch items as negatives. The <code>InformationRetrievalEvaluator</code> computes the retrieval metrics from <a href="section-26.3.html">Section 26.3</a> at regular intervals during training.</div>
+
+<h2>5. Multi-Task Training</h2>
+
+<p>Real-world domain embedding models benefit from training on multiple tasks simultaneously. Each task provides a different view of semantic relatedness:</p>
+
+<ul>
+<li><strong>Title-abstract matching:</strong> Captures the core contribution of each paper.</li>
+<li><strong>Citation prediction:</strong> Captures topical relatedness between papers.</li>
+<li><strong>Sentence similarity:</strong> Captures fine-grained semantic similarity within text.</li>
+<li><strong>Classification:</strong> Captures category-level structure (e.g., MeSH headings, arXiv categories).</li>
+</ul>
+
+<p>sentence-transformers supports multi-task training by accepting a list of (dataloader, loss) tuples. The framework alternates between tasks during training, sampling one batch from each task per step.</p>
+
+<pre><code class="language-python">"""Multi-task training for robust domain embeddings."""
+from sentence_transformers import SentenceTransformer, losses, InputExample
+from torch.utils.data import DataLoader
+
+def setup_multi_task_training(
+    model: SentenceTransformer,
+    title_abstract_pairs: list[InputExample],
+    citation_pairs: list[InputExample],
+    sts_pairs: list[InputExample],  # with float similarity scores
+    batch_size: int = 64,
+) -> list[tuple]:
+    """Configure multi-task training objectives.
+
+    Returns list of (DataLoader, Loss) tuples for model.fit().
+    """
+    objectives = []
+
+    # Task 1: Title-Abstract matching (contrastive)
+    ta_loader = DataLoader(
+        title_abstract_pairs, shuffle=True, batch_size=batch_size
+    )
+    ta_loss = losses.MultipleNegativesRankingLoss(model)
+    objectives.append((ta_loader, ta_loss))
+
+    # Task 2: Citation pairs (contrastive with hard negatives)
+    cit_loader = DataLoader(
+        citation_pairs, shuffle=True, batch_size=batch_size
+    )
+    # TripletLoss for explicit hard negatives
+    # Each example has: [anchor, positive, negative]
+    cit_loss = losses.TripletLoss(
+        model=model,
+        distance_metric=losses.TripletDistanceMetric.COSINE,
+        triplet_margin=0.2,  # minimum margin between pos and neg
+    )
+    objectives.append((cit_loader, cit_loss))
+
+    # Task 3: Semantic similarity (regression)
+    sts_loader = DataLoader(
+        sts_pairs, shuffle=True, batch_size=batch_size
+    )
+    sts_loss = losses.CosineSimilarityLoss(model)
+    objectives.append((sts_loader, sts_loss))
+
+    return objectives
+
+# Example: multi-task configuration
+print("Multi-task training setup:")
+print("  Task 1: Title-Abstract (MNRL, in-batch negatives)")
+print("  Task 2: Citation pairs (TripletLoss, mined negatives)")
+print("  Task 3: STS regression (CosineSimilarityLoss)")
+print()
+print("Benefits of multi-task training:")
+print("  - Each task provides different supervision signal")
+print("  - Reduces overfitting to any single task")
+print("  - Title-abstract: broad topical coverage")
+print("  - Citations: inter-paper relatedness")
+print("  - STS: fine-grained similarity calibration")</code></pre>
+<div class="code-caption">Listing 26.19: Multi-task training configuration combining three complementary objectives. Title-abstract matching uses in-batch negatives. Citation pairs use explicit triplet loss with mined hard negatives. Semantic similarity regression calibrates the continuous similarity scale. The framework alternates batches from each task during training.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Instruction-Tuned Embeddings and Matryoshka Representations</div>
+<p>The latest generation of embedding models (E5-mistral, GTE-Qwen2, NV-Embed) use instruction tuning to produce task-aware embeddings. Instead of encoding a bare query, you prepend a task instruction: "Retrieve scientific papers about:" before a retrieval query, or "Classify this abstract by field:" before a classification input. The instruction modulates the encoder's behavior, producing different representations of the same text depending on the intended use. This approach achieves state-of-the-art results on MTEB (2024-2025) and is particularly valuable for scientific applications where the same abstract might need to be retrieved by topic, by method, or by dataset. The Instructor model (Su et al., 2023) and E5-mistral-instruct (Wang et al., 2024) demonstrate that a single instruction-tuned model can replace multiple task-specific models. More recently, Matryoshka Representation Learning (MRL), introduced by Kusupati et al. (2024, NeurIPS) and adopted in models like Nomic Embed v2 and GTE-Qwen2-MRL (2025), trains a single model whose embeddings remain effective when truncated to any prefix length (e.g., 64, 128, 256, or the full 768 dimensions). This lets you store compact 128-dimensional vectors for fast candidate retrieval, then re-rank with the full 768-dimensional vectors, cutting storage and search costs by 4 to 6x with less than 1% recall loss. For scientific corpora with tens of millions of papers, MRL makes the trade-off between index size and retrieval quality continuously tunable rather than a fixed architectural choice.</p>
+</div>
+
+<h2>6. Evaluation on Domain Benchmarks</h2>
+
+<p>After training, we evaluate on scientific retrieval benchmarks to verify that domain fine-tuning improved performance over the base model without catastrophically degrading general capabilities.</p>
+
+<pre><code class="language-python">"""Evaluate domain embedding model on scientific benchmarks."""
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+def evaluate_on_scidocs(model_path: str,
+                         baseline_model: str = 'all-MiniLM-L6-v2'
+                         ) -> dict:
+    """Compare fine-tuned model against baseline on SciDocs tasks.
+
+    SciDocs evaluates: citation prediction, co-citation prediction,
+    recommendation, classification by MeSH and MAG.
+
+    Returns dict with task-level scores for both models.
+    """
+    fine_tuned = SentenceTransformer(model_path)
+    baseline = SentenceTransformer(baseline_model)
+
+    # The actual SciDocs evaluation requires the benchmark data
+    # Here we show the evaluation protocol
+    results = {
+        'model': model_path,
+        'baseline': baseline_model,
+        'tasks': {}
+    }
+
+    # For each SciDocs task, encode documents and compute metrics
+    scidocs_tasks = [
+        'cite-prediction',   # predict citation from abstract similarity
+        'co-cite-prediction', # predict co-citation
+        'recommend',          # paper recommendation
+        'classify-mesh',      # MeSH heading classification
+        'classify-mag',       # Microsoft Academic Graph field
+    ]
+
+    for task in scidocs_tasks:
+        # In practice: load task data, encode, evaluate
+        # results['tasks'][task] = {'fine_tuned': score, 'baseline': score}
+        pass
+
+    return results
+
+def domain_retrieval_evaluation(model: SentenceTransformer,
+                                 queries: list[str],
+                                 corpus: list[str],
+                                 relevance: list[list[int]],
+                                 ) -> dict:
+    """Custom domain retrieval evaluation.
+
+    Args:
+        model: the embedding model to evaluate
+        queries: list of search queries
+        corpus: list of corpus documents
+        relevance: relevance[i] = list of relevant corpus indices
+                   for query i
+
+    Returns:
+        Dictionary of retrieval metrics
+    """
+    # Encode
+    q_embs = model.encode(queries, convert_to_tensor=True,
+                           normalize_embeddings=True)
+    c_embs = model.encode(corpus, convert_to_tensor=True,
+                           normalize_embeddings=True)
+
+    # Compute similarities
+    import torch
+    sims = torch.mm(q_embs, c_embs.t())  # (N_q, N_c)
+
+    # Compute metrics
+    recalls = {1: [], 5: [], 10: [], 50: []}
+    mrrs = []
+
+    for i in range(len(queries)):
+        ranked = sims[i].argsort(descending=True).tolist()
+        rel_set = set(relevance[i])
+
+        # MRR: rank of first relevant document
+        for rank, idx in enumerate(ranked):
+            if idx in rel_set:
+                mrrs.append(1.0 / (rank + 1))
+                break
+        else:
+            mrrs.append(0.0)
+
+        # Recall@k
+        for k in recalls:
+            top_k = set(ranked[:k])
+            recall = len(top_k & rel_set) / max(len(rel_set), 1)
+            recalls[k].append(recall)
+
+    return {
+        f'recall@{k}': np.mean(v) for k, v in recalls.items()
+    } | {'mrr': np.mean(mrrs)}
+
+# Demonstration: expected improvement from domain fine-tuning
+print("Expected evaluation results (SciDocs benchmark):")
+print()
+print(f"{'Task':<25} {'General Model':>15} {'Domain Model':>15}")
+print("-" * 57)
+
+expected = [
+    ('Cite prediction',      72.1, 81.3),
+    ('Co-cite prediction',   74.5, 83.7),
+    ('Recommendation',       52.3, 60.8),
+    ('MeSH classification',  81.2, 86.9),
+    ('MAG classification',   78.6, 83.4),
+    ('Average',              71.7, 79.2),
+]
+for task, gen, dom in expected:
+    delta = dom - gen
+    print(f"{task:<25} {gen:>14.1f}% {dom:>14.1f}% (+{delta:.1f})")</code></pre>
+<div class="code-caption">Listing 26.20: Domain retrieval evaluation pipeline. The fine-tuned model is compared against a general-purpose baseline on SciDocs tasks. The expected improvements of 5 to 10 percentage points on citation prediction and classification tasks demonstrate the value of domain-specific contrastive training. These numbers are representative of published results from SPECTER2 and SciNCL.</div>
+
+<h2>7. Integration with the Discovery Workbench</h2>
+
+<p>The trained domain embedding model becomes a core component of the Discovery Workbench, providing the representation layer for retrieval, clustering, and similarity search across the system.</p>
+
+<pre><code class="language-python">"""Integrate the domain embedding model into the Discovery Workbench."""
+import torch
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from dataclasses import dataclass
+from pathlib import Path
+
+@dataclass
+class EmbeddingConfig:
+    """Configuration for the embedding service."""
+    model_path: str
+    index_path: str
+    batch_size: int = 128
+    normalize: bool = True
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+class DomainEmbeddingService:
+    """Embedding service for the Discovery Workbench.
+
+    Provides encode, search, and cluster operations using
+    the domain-specific embedding model trained in this section.
+    """
+
+    def __init__(self, config: EmbeddingConfig):
+        self.config = config
+        self.model = SentenceTransformer(
+            config.model_path, device=config.device
+        )
+        self.index = None       # populated by build_index
+        self.metadata = None    # document metadata
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        """Encode texts into domain-specific embeddings."""
+        embeddings = self.model.encode(
+            texts,
+            batch_size=self.config.batch_size,
+            normalize_embeddings=self.config.normalize,
+            show_progress_bar=len(texts) > 1000,
+        )
+        return embeddings
+
+    def build_index(self, documents: list[str],
+                    metadata: list[dict] = None):
+        """Build a searchable index from a document corpus.
+
+        For production use, replace numpy with FAISS or Qdrant
+        for approximate nearest neighbor search at scale.
+        """
+        print(f"Encoding {len(documents)} documents...")
+        self.index = self.encode(documents)
+        self.metadata = metadata or [{}] * len(documents)
+        print(f"Index built: {self.index.shape}")
+
+    def search(self, query: str, top_k: int = 10) -> list[dict]:
+        """Semantic search over the indexed corpus."""
+        q_emb = self.encode([query])  # (1, D)
+
+        # Cosine similarity (embeddings already normalized)
+        scores = (q_emb @ self.index.T).flatten()
+
+        # Top-k results
+        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        results = []
+        for idx in top_indices:
+            results.append({
+                'rank': len(results) + 1,
+                'score': float(scores[idx]),
+                'metadata': self.metadata[idx],
+            })
+        return results
+
+    def find_similar(self, text: str, corpus_texts: list[str],
+                     top_k: int = 5) -> list[tuple[int, float]]:
+        """Find the most similar texts in a corpus."""
+        query_emb = self.encode([text])
+        corpus_embs = self.encode(corpus_texts)
+
+        scores = (query_emb @ corpus_embs.T).flatten()
+        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        return [(int(idx), float(scores[idx])) for idx in top_indices]
+
+    def cluster(self, texts: list[str],
+                n_clusters: int = 10) -> np.ndarray:
+        """Cluster texts using k-means on embeddings.
+
+        Clustering in embedding space groups by semantic similarity
+        rather than keyword overlap. See Chapter 25 for clustering
+        methods and Chapter 30 for anomaly detection in this space.
+        """
+        from sklearn.cluster import KMeans
+
+        embeddings = self.encode(texts)
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(embeddings)
+
+        return labels
+
+# Example: Discovery Workbench integration
+print("Discovery Workbench: Domain Embedding Service")
+print("=" * 50)
+
+# In production, load the model trained in this section
+# service = DomainEmbeddingService(EmbeddingConfig(
+#     model_path='./models/sci-embeddings',
+#     index_path='./data/corpus_index.npy'
+# ))
+
+# Demonstrate the API
+sample_abstracts = [
+    "We study CRISPR-Cas9 delivery in plant cells using LNPs.",
+    "Deep learning predicts protein structure from sequence.",
+    "Bayesian optimization accelerates catalyst discovery.",
+    "Natural language processing extracts relations from papers.",
+    "Graph neural networks model molecular properties.",
+]
+
+# service.build_index(sample_abstracts)
+# results = service.search("gene editing delivery methods")
+# clusters = service.cluster(sample_abstracts, n_clusters=2)
+
+print("\nAPI methods:")
+print("  encode(texts) -> np.ndarray of embeddings")
+print("  build_index(documents) -> searchable corpus index")
+print("  search(query, top_k) -> ranked retrieval results")
+print("  find_similar(text, corpus) -> nearest neighbors")
+print("  cluster(texts, n_clusters) -> semantic cluster labels")
+print("\nIntegration points:")
+print("  Chapter 36: Literature mining with semantic search")
+print("  Chapter 37: RAG retrieval over scientific corpora")
+print("  Chapter 38: Knowledge graph entity linking")
+print("  Chapter 39: Hypothesis generation via analogy search")</code></pre>
+<div class="code-caption">Listing 26.21: The <code>DomainEmbeddingService</code> integrates the trained domain model into the Discovery Workbench. It provides encode, search, cluster, and similarity operations that downstream chapters will use. The <code>search</code> method uses cosine similarity on normalized embeddings; for production scale, replace the numpy index with FAISS or a vector database like Qdrant (see <a href="../../part-4-knowledge/module-37-rag-discovery/index.html">Chapter 37</a>).</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Embedding Model as Infrastructure</div>
+<p>A domain embedding model is not a one-off experiment; it is infrastructure. Once trained and validated, it serves as the representation layer for every downstream component that operates on scientific text: retrieval in <a href="../../part-4-knowledge/module-37-rag-discovery/index.html">Chapter 37</a>, literature mining in <a href="../../part-4-knowledge/module-36-literature-mining/index.html">Chapter 36</a>, knowledge graph entity resolution in <a href="../../part-4-knowledge/module-38-knowledge-graphs/index.html">Chapter 38</a>, and hypothesis generation in <a href="../../part-4-knowledge/module-39-hypothesis-generation/index.html">Chapter 39</a>. Investing in a high-quality domain embedding model pays compound returns across the entire discovery pipeline. Version the model carefully, track evaluation metrics across versions, and retrain periodically as new scientific literature becomes available.</p>
+</div>
+
+<h2>8. Production Considerations</h2>
+
+<p>Moving from a research prototype to a production embedding service introduces several practical challenges.</p>
+
+<p><strong>Latency and throughput.</strong> Real-time search requires encoding queries in under 50 milliseconds. Batch indexing of millions of documents requires high throughput. Use ONNX export or TensorRT optimization to accelerate inference. The sentence-transformers library supports ONNX export directly: <code>model.save_to_onnx("model.onnx")</code>.</p>
+
+<p><strong>Index scalability.</strong> Brute-force cosine similarity over a million documents takes ~10ms on GPU, which is acceptable. For tens of millions of documents, approximate nearest neighbor (ANN) search is necessary. FAISS (Facebook AI Similarity Search) provides IVF and HNSW indexes that trade a small accuracy loss for orders-of-magnitude speedup. We cover vector databases and ANN search in detail in <a href="../../part-4-knowledge/module-37-rag-discovery/index.html">Chapter 37</a>.</p>
+
+<p><strong>Model versioning.</strong> As you retrain on new data or with improved objectives, downstream components must be aware of model changes. Embeddings from different model versions are not comparable (the embedding spaces differ). When you update the model, you must re-index the entire corpus. Use a model registry to track versions and ensure consistency.</p>
+
+<p><strong>Monitoring.</strong> In production, track embedding distribution statistics (mean cosine similarity, effective dimension, query-result score distribution) to detect model degradation or data drift. The intrinsic geometry metrics from <a href="section-26.3.html">Section 26.3</a> serve as runtime health checks.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Full Pipeline in 20 Lines</div>
+<p>The entire workflow from this section (load base model, prepare data, train, evaluate, deploy) can be expressed in approximately 20 lines of sentence-transformers code:</p>
+<pre><code class="language-python">from sentence_transformers import SentenceTransformer, InputExample, losses
+from sentence_transformers.evaluation import InformationRetrievalEvaluator
+from torch.utils.data import DataLoader
+
+# 1. Load base model
+model = SentenceTransformer('allenai/scibert_scivocab_uncased')
+
+# 2. Prepare data (pairs loaded from your corpus)
+examples = [InputExample(texts=[t, a]) for t, a in title_abstract_pairs]
+loader = DataLoader(examples, shuffle=True, batch_size=64)
+
+# 3. Define loss and evaluator
+loss = losses.MultipleNegativesRankingLoss(model)
+evaluator = InformationRetrievalEvaluator(
+    queries=val_queries, corpus=val_corpus, relevant_docs=val_rels
+)
+
+# 4. Train
+model.fit([(loader, loss)], evaluator=evaluator, epochs=3,
+          output_path='./sci-embed', save_best_model=True)
+
+# 5. Use
+model = SentenceTransformer('./sci-embed')
+embs = model.encode(["CRISPR delivery in plant cells"])</code></pre>
+<p>This replaces hundreds of lines of custom PyTorch training code with a declarative pipeline. sentence-transformers handles learning rate scheduling, gradient accumulation, mixed precision, evaluation callbacks, and model saving. The from-scratch implementations in this chapter teach the principles; this library shortcut is how you ship.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: The Embedding Arms Race</div>
+<p>The MTEB leaderboard has created a fierce competition among embedding model developers. In 2023, the top model scored 64.6 on average; by mid-2025, the top score exceeded 72. Each improvement involves a cocktail of innovations: better base models (Mistral, Qwen), improved training data (synthetic pairs from LLMs), new loss functions (Matryoshka representation learning for variable-dimension embeddings), and instruction tuning. For scientific applications, the practical lesson is: do not train from scratch. Start from the best available general model, then fine-tune on domain-specific data. The base model improves every few months; your domain data is the durable competitive advantage.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Fine-Tune and Compare a Domain Embedding in 30 Minutes</h4>
+<p>Build a domain embedding model on your laptop using free data and compare it against a general-purpose baseline. You need Python, <code>sentence-transformers</code>, and <code>datasets</code> (install via <code>pip install sentence-transformers datasets</code>).</p>
+<p><strong>Step 1.</strong> Load 5,000 title-abstract pairs from arXiv: <code>from datasets import load_dataset; ds = load_dataset("scientific_papers", "arxiv", split="train[:5000]")</code>. Extract <code>(title, abstract)</code> tuples, filtering out any rows where either field is empty.</p>
+<p><strong>Step 2.</strong> Split into 4,500 training pairs and 500 evaluation pairs. For the evaluation set, treat each title as a query and each abstract as the relevant document, building the <code>queries</code>, <code>corpus</code>, and <code>relevant_docs</code> dicts that <code>InformationRetrievalEvaluator</code> expects.</p>
+<p><strong>Step 3.</strong> Load the baseline model (<code>SentenceTransformer('all-MiniLM-L6-v2')</code>) and run the evaluator on it before any training. Record Recall@10 and MRR as your baseline numbers.</p>
+<p><strong>Step 4.</strong> Fine-tune the same model for 1 epoch using <code>MultipleNegativesRankingLoss</code> with batch size 32 and learning rate 2e-5. Save the best checkpoint via <code>save_best_model=True</code>.</p>
+<p><strong>Step 5.</strong> Reload the fine-tuned checkpoint and re-run the evaluator. Compare Recall@10 and MRR against your baseline. You should see a 3 to 8 percentage-point improvement on this small dataset, confirming that even modest domain fine-tuning reshapes the embedding space toward scientific similarity.</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>Conceptual:</strong> Explain why re-indexing the entire corpus is necessary when you update the embedding model, even if the new model is "better" by all evaluation metrics. What would happen if you mixed embeddings from two different model versions in the same search index?</li>
+<li><strong>Coding:</strong> Using the sentence-transformers library, fine-tune <code>all-MiniLM-L6-v2</code> on 10,000 title-abstract pairs from arXiv (available via the Hugging Face datasets library: <code>load_dataset("scientific_papers", "arxiv")</code>). Compare retrieval performance (Recall@10) before and after fine-tuning on a held-out set of 500 queries. Use <code>MultipleNegativesRankingLoss</code> with batch size 64 for 1 epoch.</li>
+<li><strong>Analysis:</strong> Download embeddings from both <code>all-MiniLM-L6-v2</code> and <code>allenai/specter2</code> for the same set of 1000 scientific abstracts. Compute the CKA similarity between the two representation spaces (using the function from <a href="section-26.3.html">Listing 26.14</a>). Are the representations similar or different? What does the CKA value tell you about whether the two models have learned similar or different notions of scientific similarity?</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-26.3.html">&larr; 26.3 Representation Evaluation</a>
+<span class="nav-spacer"></span>
+<a href="../module-27-foundation-models/index.html">Chapter 27: Scientific Foundation Models &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

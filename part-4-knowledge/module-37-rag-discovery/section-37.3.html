@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 37.3: Building a Research Copilot. Multi-hop query decomposition, parallel evidence retrieval, cited answer synthesis, and end-to-end faithfulness evaluation over a scientific paper corpus." name="description"/>
+<title>Section 37.3: Building a Research Copilot | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 37: Retrieval Augmented Discovery Systems</a></div>
+<h1>37.3 Building a Research Copilot</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I decomposed your question into seven sub-questions, retrieved forty-three passages, reranked them twice, verified every citation, and scored my own faithfulness. The answer is: we need more data."</p>
+<cite>A Research Copilot Who Understands Science All Too Well</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>This section assembles every component from Sections 37.1 and 37.2 into a complete, working research copilot. The system accepts complex scientific questions, decomposes them into retrieval sub-queries, searches a paper corpus with bi-encoder retrieval and cross-encoder reranking, generates cited answers with structured output, and evaluates its own faithfulness before delivering results. We build it incrementally: first the corpus ingestion pipeline, then the multi-hop retrieval engine, then the faithful generation stage, and finally the end-to-end evaluation harness. By the end of this section, you will have a research copilot that you can point at any collection of PDFs and start asking questions.</p>
+</div>
+
+<h2>1. Corpus Ingestion: From PDFs to Searchable Chunks</h2>
+
+<p><strong>What.</strong> Before a research copilot can answer questions, it must ingest a corpus of scientific papers: parse PDFs, split them into overlapping chunks, compute embeddings, and store everything in a vector database.</p>
+
+<p><strong>Why.</strong> The ingestion pipeline determines the quality ceiling of the entire system. Chunk too aggressively and you lose context (a result separated from its method section). Chunk too conservatively and you dilute relevance with surrounding noise. The chunking strategy also determines whether the system can answer questions that span multiple sections of a paper.</p>
+
+<p><strong>How.</strong> We use a sliding-window chunker with section-aware boundaries. Instead of splitting at fixed token counts, we split at paragraph and section boundaries, with overlap to preserve context at chunk edges.</p>
+
+<pre><code class="language-python">import hashlib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+@dataclass
+class PaperChunk:
+    """A chunk of text from a scientific paper with metadata."""
+    chunk_id: str
+    text: str
+    paper_id: str
+    paper_title: str
+    section: str           # e.g., "Methods", "Results", "Discussion"
+    page_numbers: list[int]
+    char_start: int
+    char_end: int
+    embedding: list[float] = field(default_factory=list)
+
+    def to_payload(self) -> dict:
+        """Convert to Qdrant payload format."""
+        return {
+            "text": self.text,
+            "paper_id": self.paper_id,
+            "paper_title": self.paper_title,
+            "section": self.section,
+            "page_numbers": self.page_numbers,
+        }
+
+
+def chunk_paper(
+    text: str,
+    paper_id: str,
+    paper_title: str,
+    chunk_size: int = 512,
+    chunk_overlap: int = 64,
+) -> list[PaperChunk]:
+    """Split a paper into overlapping chunks with metadata.
+
+    Uses word-level tokenization with paragraph-boundary awareness.
+    Chunks prefer to break at paragraph boundaries (double newlines)
+    rather than mid-sentence.
+    """
+    words = text.split()
+    chunks = []
+    start_idx = 0
+
+    while start_idx < len(words):
+        end_idx = min(start_idx + chunk_size, len(words))
+
+        # Try to break at a paragraph boundary
+        chunk_words = words[start_idx:end_idx]
+        chunk_text = " ".join(chunk_words)
+
+        # Look for the last paragraph break within the chunk
+        last_para = chunk_text.rfind("\n\n")
+        if last_para > len(chunk_text) * 0.5:
+            # Break at paragraph boundary if it is in the second half
+            chunk_text = chunk_text[:last_para].strip()
+            # Recalculate end_idx based on actual words used
+            actual_words = len(chunk_text.split())
+            end_idx = start_idx + actual_words
+
+        # Detect section from common headings
+        section = detect_section(chunk_text)
+
+        # Generate deterministic chunk ID
+        chunk_hash = hashlib.sha256(
+            f"{paper_id}:{start_idx}".encode()
+        ).hexdigest()[:12]
+
+        chunks.append(PaperChunk(
+            chunk_id=f"{paper_id}_chunk_{chunk_hash}",
+            text=chunk_text.strip(),
+            paper_id=paper_id,
+            paper_title=paper_title,
+            section=section,
+            page_numbers=[],  # Populated by PDF parser
+            char_start=start_idx,
+            char_end=end_idx,
+        ))
+
+        # Advance with overlap
+        start_idx = end_idx - chunk_overlap
+
+    return chunks
+
+
+def detect_section(text: str) -> str:
+    """Heuristic section detection from chunk text."""
+    text_lower = text[:200].lower()
+    sections = {
+        "abstract": ["abstract"],
+        "introduction": ["introduction", "1. introduction", "1 introduction"],
+        "methods": ["methods", "materials and methods", "experimental",
+                     "methodology", "2. methods"],
+        "results": ["results", "3. results", "findings"],
+        "discussion": ["discussion", "4. discussion"],
+        "conclusion": ["conclusion", "conclusions", "summary"],
+        "references": ["references", "bibliography"],
+    }
+    for section_name, markers in sections.items():
+        if any(marker in text_lower for marker in markers):
+            return section_name
+    return "body"</code></pre>
+<div class="code-caption">Listing 37.17: Paper chunking pipeline with section-aware splitting. Each chunk carries metadata about its source paper, section, and position. The chunker prefers paragraph boundaries over fixed-size splits, and the overlap parameter ensures context is not lost at chunk edges. The deterministic chunk ID enables idempotent re-ingestion.</div>
+
+<h2>2. The Ingestion Pipeline</h2>
+
+<p>With chunking defined, the ingestion pipeline parses PDFs, chunks them, computes embeddings, and indexes everything in Qdrant. This pipeline runs once per corpus update (when new papers are added) and is the most time-consuming part of the system.</p>
+
+<pre><code class="language-python">from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+)
+import fitz  # PyMuPDF for PDF parsing
+
+
+class CorpusIndex:
+    """Manages paper ingestion, embedding, and vector search."""
+
+    def __init__(
+        self,
+        collection_name: str = "research_papers",
+        embedding_model: str = "BAAI/bge-large-en-v1.5",
+        qdrant_url: str = ":memory:",
+    ):
+        self.collection_name = collection_name
+        self.embedder = SentenceTransformer(embedding_model)
+        self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
+        self.client = QdrantClient(qdrant_url)
+
+        # Create collection if it does not exist
+        collections = [
+            c.name for c in self.client.get_collections().collections
+        ]
+        if collection_name not in collections:
+            self.client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(
+                    size=self.embedding_dim,
+                    distance=Distance.COSINE,
+                ),
+            )
+
+    def ingest_pdf(self, pdf_path: str, paper_id: str = None) -> int:
+        """Parse a PDF, chunk it, embed chunks, and index them."""
+        path = Path(pdf_path)
+        if paper_id is None:
+            paper_id = path.stem
+
+        # Extract text with PyMuPDF
+        doc = fitz.open(pdf_path)
+        full_text = ""
+        page_breaks = []
+        for page_num, page in enumerate(doc):
+            page_breaks.append(len(full_text))
+            full_text += page.get_text() + "\n\n"
+        doc.close()
+
+        # Extract title from first line (heuristic)
+        first_line = full_text.split("\n")[0].strip()
+        paper_title = first_line if len(first_line) < 200 else paper_id
+
+        # Chunk the paper
+        chunks = chunk_paper(
+            text=full_text,
+            paper_id=paper_id,
+            paper_title=paper_title,
+            chunk_size=512,
+            chunk_overlap=64,
+        )
+
+        if not chunks:
+            return 0
+
+        # Compute embeddings in batch
+        texts = [c.text for c in chunks]
+        embeddings = self.embedder.encode(
+            texts,
+            normalize_embeddings=True,
+            show_progress_bar=True,
+            batch_size=32,
+        )
+
+        # Index in Qdrant
+        points = [
+            PointStruct(
+                id=abs(hash(chunk.chunk_id)) % (2**63),
+                vector=embedding.tolist(),
+                payload=chunk.to_payload(),
+            )
+            for chunk, embedding in zip(chunks, embeddings)
+        ]
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points,
+        )
+
+        return len(chunks)
+
+    def ingest_directory(self, directory: str) -> dict:
+        """Ingest all PDFs in a directory."""
+        pdf_dir = Path(directory)
+        results = {}
+        for pdf_path in sorted(pdf_dir.glob("*.pdf")):
+            n_chunks = self.ingest_pdf(str(pdf_path))
+            results[pdf_path.name] = n_chunks
+            print(f"  Indexed {pdf_path.name}: {n_chunks} chunks")
+        return results
+
+    def search(
+        self,
+        query: str,
+        k: int = 20,
+        section_filter: str = None,
+    ) -> list[dict]:
+        """Search the corpus for passages relevant to a query."""
+        query_embedding = self.embedder.encode(
+            [query], normalize_embeddings=True
+        )[0]
+
+        # Build optional filter
+        query_filter = None
+        if section_filter:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            query_filter = Filter(
+                must=[FieldCondition(
+                    key="section",
+                    match=MatchValue(value=section_filter),
+                )]
+            )
+
+        results = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_embedding.tolist(),
+            query_filter=query_filter,
+            limit=k,
+        )
+
+        return [
+            {
+                "doc_id": f"{r.payload['paper_id']}",
+                "passage": r.payload["text"],
+                "paper_title": r.payload["paper_title"],
+                "section": r.payload["section"],
+                "score": r.score,
+            }
+            for r in results.points
+        ]</code></pre>
+<div class="code-caption">Listing 37.18: Complete corpus ingestion pipeline. The <code>CorpusIndex</code> class handles PDF parsing (via PyMuPDF), chunking, embedding (via sentence-transformers), and indexing (via Qdrant). The <code>search</code> method supports optional section filtering, allowing queries like "find methods sections relevant to CRISPR delivery."</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Ingesting a Lab's Paper Collection</div>
+<p>A computational biology lab has 2,400 PDFs collected over a decade of research on protein-protein interactions. The ingestion pipeline processes them in 45 minutes on a machine with a mid-range GPU (for embedding computation). The result: approximately 180,000 chunks indexed in Qdrant, consuming about 1.5 GB of disk space for vectors and payloads. Queries return in under 50 milliseconds. A new postdoc can now ask questions like "What experimental evidence exists for the interaction between BRCA1 and PALB2?" and receive cited answers drawing on the lab's entire publication history, not just the papers they happened to read during their first week.</p>
+</div>
+
+<h2>3. The Multi-Hop Research Engine</h2>
+
+<p>With the corpus indexed, we build the research engine that processes complex questions. This engine combines the query decomposition from <a href="section-37.1.html">Section 37.1</a> with the faithfulness evaluation from <a href="section-37.2.html">Section 37.2</a> into a single, coherent pipeline.</p>
+
+<p data-agent="02">Multi-hop retrieval is the technique of breaking a complex question into simpler sub-queries, retrieving evidence for each one independently, and then merging the results before generating an answer. It matters because real scientific questions almost never map to a single passage in a single paper; a question like "How does drug X overcome resistance mechanism Y?" requires finding passages about the drug's pharmacology, the molecular basis of the resistance mechanism, and any clinical trials that tested the combination. The mechanism works by using an LLM to decompose the original question into self-contained retrieval queries, running each query against the vector index in parallel, deduplicating and reranking the pooled candidates against the original question, and passing only the top-scoring passages to the generator. Use multi-hop retrieval whenever a question involves two or more distinct concepts that are unlikely to co-occur in a single chunk; for simple factual lookups ("What was the sample size in the FLAURA trial?"), a single query with reranking is faster and sufficient.</p>
+
+<pre><code class="language-python">import anthropic
+import json
+from sentence_transformers import CrossEncoder
+from dataclasses import dataclass
+
+@dataclass
+class ResearchResult:
+    """Complete result from the research copilot."""
+    question: str
+    sub_queries: list[str]
+    evidence: list[dict]
+    answer: str
+    citations: list[dict]
+    faithfulness_score: float
+    faithfulness_details: list[dict]
+    evaluation: dict
+
+
+class ResearchCopilot:
+    """Multi-hop research copilot with faithfulness evaluation."""
+
+    def __init__(
+        self,
+        corpus_index: CorpusIndex,
+        reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-12-v2",
+        generator_model: str = "claude-sonnet-4-20250514",
+        k_retrieve: int = 20,
+        k_rerank: int = 8,
+        min_rerank_score: float = 0.3,
+    ):
+        self.corpus = corpus_index
+        self.reranker = CrossEncoder(reranker_model)
+        self.client = anthropic.Anthropic()
+        self.generator_model = generator_model
+        self.k_retrieve = k_retrieve
+        self.k_rerank = k_rerank
+        self.min_rerank_score = min_rerank_score
+
+    def decompose_question(self, question: str) -> list[str]:
+        """Break a complex question into retrieval sub-queries."""
+        response = self.client.messages.create(
+            model=self.generator_model,
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": f"""Decompose this scientific research question
+into 2-5 simpler sub-queries. Each sub-query should target a distinct
+aspect that can be answered by searching a scientific paper database.
+
+Question: {question}
+
+Return ONLY a JSON array of sub-query strings.""",
+            }],
+        )
+        return json.loads(response.content[0].text)
+
+    def retrieve_and_rerank(
+        self,
+        question: str,
+        sub_queries: list[str],
+    ) -> list[dict]:
+        """Multi-hop retrieve and rerank evidence."""
+        # Retrieve candidates from all sub-queries
+        all_candidates = {}
+        for sq in sub_queries:
+            results = self.corpus.search(sq, k=self.k_retrieve)
+            for r in results:
+                key = r["doc_id"] + ":" + r["passage"][:100]
+                if key not in all_candidates:
+                    all_candidates[key] = {
+                        **r,
+                        "sub_queries_matched": [],
+                    }
+                all_candidates[key]["sub_queries_matched"].append(sq)
+
+        if not all_candidates:
+            return []
+
+        # Rerank all unique candidates against the original question
+        candidate_list = list(all_candidates.values())
+        pairs = [(question, c["passage"]) for c in candidate_list]
+        rerank_scores = self.reranker.predict(pairs)
+
+        for candidate, score in zip(candidate_list, rerank_scores):
+            candidate["rerank_score"] = float(score)
+
+        # Filter by minimum score and take top-k
+        filtered = [
+            c for c in candidate_list
+            if c["rerank_score"] >= self.min_rerank_score
+        ]
+        filtered.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+        return filtered[:self.k_rerank]
+
+    def generate_answer(
+        self,
+        question: str,
+        evidence: list[dict],
+    ) -> tuple[str, list[dict]]:
+        """Generate a cited answer from evidence passages."""
+        if not evidence:
+            return (
+                "I could not find sufficient evidence in the corpus "
+                "to answer this question. Consider refining the query "
+                "or adding relevant papers to the corpus.",
+                [],
+            )
+
+        context_parts = []
+        for i, ev in enumerate(evidence):
+            context_parts.append(
+                f"[Source {i+1}] (Paper: {ev['paper_title']}, "
+                f"Section: {ev['section']}):\n{ev['passage']}"
+            )
+        context = "\n\n".join(context_parts)
+
+        response = self.client.messages.create(
+            model=self.generator_model,
+            max_tokens=3072,
+            system="""You are a scientific research assistant. Answer
+questions based ONLY on the provided source passages.
+
+Rules:
+1. Every factual claim must cite its source as [Source N].
+2. If multiple sources support a claim, cite all of them.
+3. If the sources do not contain enough information, say so.
+4. Do not add information from your training data.
+5. Distinguish direct evidence from inferences across sources.
+6. Note any contradictions between sources explicitly.
+7. Report specific numbers, methods, and findings precisely
+   as stated in the sources.""",
+            messages=[{
+                "role": "user",
+                "content": f"""Answer this research question using the
+provided sources.
+
+Question: {question}
+
+Sources:
+{context}
+
+Provide a detailed, well-organized, cited answer.""",
+            }],
+        )
+
+        answer = response.content[0].text
+
+        # Extract citation mapping
+        import re
+        citations = []
+        for i, ev in enumerate(evidence):
+            source_tag = f"Source {i+1}"
+            if source_tag in answer:
+                citations.append({
+                    "source_id": source_tag,
+                    "paper_id": ev["doc_id"],
+                    "paper_title": ev["paper_title"],
+                    "section": ev["section"],
+                    "rerank_score": ev["rerank_score"],
+                })
+
+        return answer, citations
+
+    def evaluate_faithfulness(
+        self,
+        answer: str,
+        evidence: list[dict],
+    ) -> tuple[float, list[dict]]:
+        """Evaluate faithfulness of the generated answer."""
+        evidence_passages = [e["passage"] for e in evidence]
+        result = compute_faithfulness(answer, evidence_passages)
+        return result["faithfulness_score"], result["details"]
+
+    def ask(self, question: str) -> ResearchResult:
+        """Full pipeline: decompose, retrieve, generate, evaluate."""
+        # Step 1: Decompose the question
+        sub_queries = self.decompose_question(question)
+
+        # Step 2: Multi-hop retrieve and rerank
+        evidence = self.retrieve_and_rerank(question, sub_queries)
+
+        # Step 3: Generate cited answer
+        answer, citations = self.generate_answer(question, evidence)
+
+        # Step 4: Evaluate faithfulness
+        faith_score, faith_details = self.evaluate_faithfulness(
+            answer, evidence
+        )
+
+        # Step 5: Compute retrieval metrics
+        evaluation = {
+            "num_sub_queries": len(sub_queries),
+            "num_candidates_retrieved": len(evidence),
+            "num_sources_cited": len(citations),
+            "mean_rerank_score": (
+                sum(e["rerank_score"] for e in evidence) / len(evidence)
+                if evidence else 0.0
+            ),
+            "faithfulness": faith_score,
+        }
+
+        return ResearchResult(
+            question=question,
+            sub_queries=sub_queries,
+            evidence=evidence,
+            answer=answer,
+            citations=citations,
+            faithfulness_score=faith_score,
+            faithfulness_details=faith_details,
+            evaluation=evaluation,
+        )</code></pre>
+<div class="code-caption">Listing 37.19: The complete <code>ResearchCopilot</code> class. The <code>ask</code> method orchestrates the full pipeline: question decomposition, multi-hop retrieval with reranking, cited answer generation, and faithfulness evaluation. Each stage is independently testable and replaceable, following the modular architecture from <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of faithfulness evaluation the way a newspaper editor fact-checks a journalist's article before publication. The journalist (the generator) writes a story based on interview transcripts and documents (the retrieved evidence). The editor does not verify whether the underlying sources are correct; the editor verifies that every claim in the article actually appears in those transcripts rather than being invented or embellished by the journalist. A claim that rephrases a source is fine. A claim that extrapolates beyond what any source says gets flagged, even if it happens to be true, because the article's credibility rests on its grounding in cited material. The faithfulness score is the fraction of claims that survive the editor's check.</p>
+</div>
+
+<h2>4. Running the Copilot End to End</h2>
+
+<p>Let us put the copilot through its paces with a realistic scientific question. We first ingest a small corpus, then ask a multi-hop question that requires synthesizing information from multiple papers.</p>
+
+<pre><code class="language-python"># Initialize the corpus and copilot
+corpus = CorpusIndex(
+    collection_name="oncology_papers",
+    embedding_model="BAAI/bge-large-en-v1.5",
+    qdrant_url=":memory:",  # Use a Qdrant server URL in production
+)
+
+# Ingest papers (in production, point to your PDF directory)
+# corpus.ingest_directory("./papers/oncology/")
+
+# For demonstration, we manually add pre-chunked passages
+from qdrant_client.models import PointStruct
+demo_passages = [
+    {
+        "text": "Osimertinib is a third-generation EGFR TKI that "
+                "selectively targets the T790M resistance mutation. "
+                "In the FLAURA trial, osimertinib demonstrated a median "
+                "progression-free survival of 18.9 months compared to "
+                "10.2 months for standard EGFR TKIs (HR 0.46, p<0.001).",
+        "paper_id": "soria_2018",
+        "paper_title": "Osimertinib in EGFR-Mutated NSCLC (FLAURA)",
+        "section": "results",
+    },
+    {
+        "text": "The T790M mutation in EGFR exon 20 is the most common "
+                "mechanism of acquired resistance to first-generation "
+                "EGFR TKIs, accounting for approximately 50-60% of "
+                "resistance cases. The mutation alters the ATP-binding "
+                "pocket, reducing drug binding affinity.",
+        "paper_id": "yu_2014",
+        "paper_title": "Analysis of EGFR Resistance Mechanisms",
+        "section": "results",
+    },
+    {
+        "text": "Combination therapy of osimertinib with chemotherapy "
+                "(platinum/pemetrexed) in the FLAURA2 trial showed a "
+                "median PFS of 25.5 months versus 16.7 months for "
+                "osimertinib monotherapy (HR 0.62, p<0.001) in "
+                "first-line EGFR-mutant NSCLC.",
+        "paper_id": "planchard_2023",
+        "paper_title": "FLAURA2: Osimertinib Plus Chemotherapy",
+        "section": "results",
+    },
+    {
+        "text": "MET amplification and C797S mutations are emerging "
+                "resistance mechanisms to osimertinib. MET amplification "
+                "is detected in 15-20% of patients progressing on "
+                "osimertinib, while C797S mutations occur in approximately "
+                "10-15% of cases.",
+        "paper_id": "leonetti_2019",
+        "paper_title": "Resistance to Osimertinib in EGFR-Mutant NSCLC",
+        "section": "discussion",
+    },
+    {
+        "text": "Liquid biopsy using circulating tumor DNA (ctDNA) enables "
+                "non-invasive monitoring of EGFR mutation status and "
+                "resistance mechanism emergence. Serial ctDNA analysis "
+                "can detect T790M and C797S mutations 2-4 months before "
+                "radiographic progression.",
+        "paper_id": "oxnard_2016",
+        "paper_title": "ctDNA Monitoring in EGFR-Mutant Lung Cancer",
+        "section": "results",
+    },
+]
+
+# Embed and index demo passages
+embeddings = corpus.embedder.encode(
+    [p["text"] for p in demo_passages],
+    normalize_embeddings=True,
+)
+points = [
+    PointStruct(
+        id=i,
+        vector=emb.tolist(),
+        payload=p,
+    )
+    for i, (p, emb) in enumerate(zip(demo_passages, embeddings))
+]
+corpus.client.upsert(
+    collection_name="oncology_papers",
+    points=points,
+)
+
+# Initialize the copilot
+copilot = ResearchCopilot(
+    corpus_index=corpus,
+    k_retrieve=10,
+    k_rerank=5,
+    min_rerank_score=0.1,
+)
+
+# Ask a multi-hop question
+result = copilot.ask(
+    "What are the resistance mechanisms to EGFR inhibitors in lung "
+    "cancer, and what monitoring strategies can detect resistance early?"
+)
+
+# Display results
+print(f"Question: {result.question}\n")
+print(f"Sub-queries:")
+for i, sq in enumerate(result.sub_queries, 1):
+    print(f"  {i}. {sq}")
+
+print(f"\nAnswer:\n{result.answer}\n")
+
+print(f"Citations ({len(result.citations)}):")
+for c in result.citations:
+    print(f"  {c['source_id']}: {c['paper_title']} "
+          f"(rerank={c['rerank_score']:.3f})")
+
+print(f"\nFaithfulness: {result.faithfulness_score:.2f}")
+print(f"Evaluation: {json.dumps(result.evaluation, indent=2)}")</code></pre>
+<div class="code-caption">Listing 37.20: End-to-end demonstration of the research copilot. The question requires synthesizing information about resistance mechanisms (from multiple papers) and monitoring strategies (from the ctDNA paper), a multi-hop task that single-query retrieval would struggle with. The copilot decomposes the question, retrieves relevant passages from different papers, generates a cited answer, and reports its own faithfulness score.</div>
+
+<h2>5. Evaluation Harness: Benchmarking the Copilot</h2>
+
+<p>A research copilot must be evaluated systematically, not just on individual questions. We build an evaluation harness that runs the copilot against a benchmark dataset and computes aggregate metrics across all questions.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+import time
+
+@dataclass
+class BenchmarkQuestion:
+    """A question in the evaluation benchmark."""
+    question: str
+    ground_truth_answer: str
+    relevant_paper_ids: list[str]  # Papers that should be retrieved
+    difficulty: str  # "single_hop", "multi_hop", "comparison"
+
+
+def create_benchmark() -> list[BenchmarkQuestion]:
+    """Create an evaluation benchmark for the copilot."""
+    return [
+        BenchmarkQuestion(
+            question="What was the progression-free survival "
+                     "benefit of osimertinib in the FLAURA trial?",
+            ground_truth_answer="Osimertinib demonstrated a median "
+                "PFS of 18.9 months compared to 10.2 months for "
+                "standard EGFR TKIs (HR 0.46, p<0.001).",
+            relevant_paper_ids=["soria_2018"],
+            difficulty="single_hop",
+        ),
+        BenchmarkQuestion(
+            question="What are the resistance mechanisms to "
+                     "osimertinib and how can they be detected?",
+            ground_truth_answer="MET amplification (15-20%) and "
+                "C797S mutations (10-15%) are the main resistance "
+                "mechanisms. ctDNA liquid biopsy can detect these "
+                "mutations 2-4 months before radiographic progression.",
+            relevant_paper_ids=["leonetti_2019", "oxnard_2016"],
+            difficulty="multi_hop",
+        ),
+        BenchmarkQuestion(
+            question="How does osimertinib plus chemotherapy compare "
+                     "to osimertinib monotherapy in first-line NSCLC?",
+            ground_truth_answer="FLAURA2 showed combination therapy "
+                "achieved median PFS of 25.5 months versus 16.7 months "
+                "for monotherapy (HR 0.62, p<0.001).",
+            relevant_paper_ids=["planchard_2023"],
+            difficulty="comparison",
+        ),
+    ]
+
+
+def run_benchmark(
+    copilot: ResearchCopilot,
+    benchmark: list[BenchmarkQuestion],
+) -> dict:
+    """Run the copilot against a benchmark and compute metrics."""
+    results = []
+
+    for bq in benchmark:
+        start_time = time.time()
+        result = copilot.ask(bq.question)
+        elapsed = time.time() - start_time
+
+        # Check retrieval: did we find the right papers?
+        retrieved_paper_ids = {
+            e["doc_id"] for e in result.evidence
+        }
+        relevant_retrieved = (
+            set(bq.relevant_paper_ids) & retrieved_paper_ids
+        )
+        retrieval_recall = (
+            len(relevant_retrieved) / len(bq.relevant_paper_ids)
+            if bq.relevant_paper_ids else 0.0
+        )
+
+        results.append({
+            "question": bq.question,
+            "difficulty": bq.difficulty,
+            "faithfulness": result.faithfulness_score,
+            "retrieval_recall": retrieval_recall,
+            "num_sources_cited": len(result.citations),
+            "num_sub_queries": len(result.sub_queries),
+            "latency_seconds": elapsed,
+        })
+
+    # Aggregate metrics
+    import numpy as np
+    faith_scores = [r["faithfulness"] for r in results]
+    recall_scores = [r["retrieval_recall"] for r in results]
+    latencies = [r["latency_seconds"] for r in results]
+
+    aggregate = {
+        "num_questions": len(results),
+        "mean_faithfulness": float(np.mean(faith_scores)),
+        "mean_retrieval_recall": float(np.mean(recall_scores)),
+        "mean_latency_seconds": float(np.mean(latencies)),
+        "faithfulness_by_difficulty": {},
+        "per_question": results,
+    }
+
+    for difficulty in ["single_hop", "multi_hop", "comparison"]:
+        diff_scores = [
+            r["faithfulness"] for r in results
+            if r["difficulty"] == difficulty
+        ]
+        if diff_scores:
+            aggregate["faithfulness_by_difficulty"][difficulty] = (
+                float(np.mean(diff_scores))
+            )
+
+    return aggregate
+
+
+# Run the benchmark
+benchmark = create_benchmark()
+bench_results = run_benchmark(copilot, benchmark)
+
+print("Benchmark Results:")
+print(f"  Questions: {bench_results['num_questions']}")
+print(f"  Mean Faithfulness: {bench_results['mean_faithfulness']:.3f}")
+print(f"  Mean Retrieval Recall: "
+      f"{bench_results['mean_retrieval_recall']:.3f}")
+print(f"  Mean Latency: {bench_results['mean_latency_seconds']:.1f}s")
+print(f"\n  Faithfulness by difficulty:")
+for diff, score in bench_results["faithfulness_by_difficulty"].items():
+    print(f"    {diff}: {score:.3f}")</code></pre>
+<div class="code-caption">Listing 37.21: Evaluation harness for benchmarking the research copilot. The harness runs each benchmark question through the full pipeline, measures faithfulness and retrieval recall, and computes aggregate metrics broken down by question difficulty. Multi-hop questions typically show lower faithfulness than single-hop ones because they require more synthesis across sources.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Benchmark Your Own Corpus</div>
+<p>Generic RAG benchmarks (Natural Questions, TriviaQA, HotpotQA) measure general knowledge retrieval, not scientific domain performance. The evaluation harness above is designed to be filled with questions from <em>your</em> corpus about <em>your</em> domain. Invest the time to create 20 to 50 benchmark questions with ground truth answers and relevant paper IDs. This corpus-specific benchmark is worth more than any generic leaderboard score because it measures exactly the performance your users will experience. Update the benchmark as the corpus grows and as users report failure cases.</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A high faithfulness score does not mean the answer is correct. Faithfulness measures whether the generated answer is supported by the retrieved passages, not whether those passages themselves are accurate or complete. If the retrieval stage misses the most relevant paper, the generator can produce a perfectly faithful answer to the wrong evidence: every claim traces back to a source, yet the answer is incomplete or misleading because the critical source was never retrieved. Always evaluate retrieval recall (did we find the right papers?) alongside faithfulness (did we stay true to what we found?). A copilot with 0.95 faithfulness but 0.40 retrieval recall is confidently summarizing the wrong slice of the literature.</p>
+</div>
+
+<h2>6. Production Considerations</h2>
+
+<p>The copilot we have built works, but deploying it for a research team requires additional engineering. Here are the key considerations, each linking back to architectural principles from <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.</p>
+
+<h3>6.1 Incremental Ingestion</h3>
+
+<p>Scientific corpora grow continuously. The ingestion pipeline must support incremental updates: ingest new papers without re-processing the entire corpus. Our <code>CorpusIndex</code> already supports this (call <code>ingest_pdf</code> for each new paper), but production systems should also detect and handle paper retractions, version updates, and duplicate detection.</p>
+
+<h3>6.2 Caching and Cost Management</h3>
+
+<p>Each query involves multiple LLM calls: decomposition, generation, and faithfulness evaluation. For a team of 20 researchers each asking 10 questions per day, that is 600+ LLM calls daily. Cache at two levels: (1) cache embedding computations (the same passage always produces the same vector), and (2) cache complete answers for repeated or near-duplicate questions using semantic similarity thresholds.</p>
+
+<pre><code class="language-python">class QueryCache:
+    """Semantic cache for research copilot queries."""
+
+    def __init__(self, embedder, similarity_threshold: float = 0.95):
+        self.embedder = embedder
+        self.threshold = similarity_threshold
+        self.cache: list[dict] = []  # In production, use Redis or similar
+
+    def get(self, question: str) -> ResearchResult | None:
+        """Return cached result if a semantically similar query exists."""
+        if not self.cache:
+            return None
+
+        q_emb = self.embedder.encode(
+            [question], normalize_embeddings=True
+        )[0]
+
+        for entry in self.cache:
+            sim = float(q_emb @ entry["embedding"])
+            if sim >= self.threshold:
+                return entry["result"]
+        return None
+
+    def put(self, question: str, result: ResearchResult):
+        """Cache a query result."""
+        q_emb = self.embedder.encode(
+            [question], normalize_embeddings=True
+        )[0]
+        self.cache.append({
+            "question": question,
+            "embedding": q_emb,
+            "result": result,
+        })</code></pre>
+<div class="code-caption">Listing 37.22: Semantic query cache for the research copilot. Questions are compared by embedding similarity rather than exact string match, so "EGFR resistance mechanisms in NSCLC" and "What causes resistance to EGFR inhibitors in lung cancer?" hit the same cache entry. A similarity threshold of 0.95 ensures only near-identical questions are served from cache.</div>
+
+<h3>6.3 User Feedback Loop</h3>
+
+<p>The most valuable signal for improving a research copilot comes from user feedback. When a researcher flags an answer as inaccurate, incorrect, or missing key information, that feedback should flow into the evaluation benchmark and, over time, guide improvements to the retrieval and generation stages.</p>
+
+<pre><code class="language-python">@dataclass
+class UserFeedback:
+    """Feedback on a copilot response from a researcher."""
+    question: str
+    answer: str
+    rating: int              # 1-5 scale
+    issues: list[str]        # ["missing_citation", "wrong_fact", ...]
+    correct_answer: str | None = None
+    missing_papers: list[str] | None = None  # Papers that should
+                                              # have been retrieved
+
+def feedback_to_benchmark(
+    feedbacks: list[UserFeedback],
+    min_rating_for_positive: int = 4,
+) -> list[BenchmarkQuestion]:
+    """Convert user feedback into benchmark questions."""
+    benchmarks = []
+    for fb in feedbacks:
+        if fb.rating < min_rating_for_positive and fb.correct_answer:
+            benchmarks.append(BenchmarkQuestion(
+                question=fb.question,
+                ground_truth_answer=fb.correct_answer,
+                relevant_paper_ids=fb.missing_papers or [],
+                difficulty="user_reported",
+            ))
+    return benchmarks</code></pre>
+<div class="code-caption">Listing 37.23: Converting user feedback into benchmark questions. Negative feedback with a corrected answer becomes a regression test, ensuring that identified failure cases are caught by future benchmark runs. This creates a virtuous cycle: user feedback improves the benchmark, which drives improvements to the system, which reduces negative feedback.</div>
+
+<h3>6.4 Connecting to Research Agents</h3>
+
+<p>The research copilot we built answers questions from a static corpus. In <a href="../module-40-research-agents/index.html">Chapter 40 (Research Agents)</a>, we will extend this into an agent that can actively search the literature, retrieve new papers, and update its corpus in real time. The copilot's modular architecture makes this extension straightforward: the <code>CorpusIndex.ingest_pdf</code> method becomes a tool that the agent can call during a conversation, and the <code>ResearchCopilot.ask</code> method becomes one step in a larger agentic workflow that includes literature search, experimental design, and hypothesis generation.</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: From Copilot to Discovery Engine</div>
+<p>A materials science group uses the research copilot to accelerate literature reviews. After three months, they notice a pattern: researchers frequently ask questions like "What synthesis conditions produce phase-pure perovskites with bandgap below 1.5 eV?" The copilot answers well when the information exists in a single paper, but struggles when the answer requires combining synthesis conditions from one paper with bandgap measurements from another. This observation leads them to extend the copilot into a structured extraction pipeline: for each paper, extract synthesis conditions, material properties, and characterization methods into a structured database (the knowledge graph approach from <a href="../module-38-knowledge-graphs/index.html">Chapter 38</a>). The copilot's retrieval still finds relevant passages, but the generator now also queries the structured database for precise numerical comparisons. The lesson: a research copilot is not the end state; it is the foundation for more sophisticated discovery systems.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Full-Stack RAG with LlamaIndex</div>
+<p>The complete pipeline we built across Listings 37.17 through 37.23 (chunking, embedding, indexing, multi-hop retrieval, reranking, generation, evaluation, caching) spans approximately 400 lines of Python. LlamaIndex provides all of these components as pre-built modules: <code>SimpleDirectoryReader</code> for ingestion, <code>VectorStoreIndex</code> with <code>QdrantVectorStore</code> for indexing, <code>SubQuestionQueryEngine</code> for multi-hop decomposition, <code>SentenceTransformerRerank</code> for reranking, and <code>FaithfulnessEvaluator</code> for evaluation. The equivalent LlamaIndex implementation is roughly 60 lines. The tradeoff: LlamaIndex's abstractions save development time but make debugging harder. When your copilot produces a wrong answer, our from-scratch implementation lets you inspect every stage independently. LlamaIndex requires understanding its callback and event system to achieve the same visibility. Our recommendation: build from scratch for your first RAG system (to learn the failure modes), then migrate to LlamaIndex for subsequent projects.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>The CRAG (Corrective Retrieval Augmented Generation) framework, introduced by Yan et al. in 2024, adds a lightweight retrieval evaluator between the retrieval and generation stages. Before passing evidence to the generator, CRAG scores each retrieved document's relevance and triggers one of three actions: if the documents are confidently relevant, proceed normally; if they are ambiguous, refine the query and re-retrieve; if they are confidently irrelevant, fall back to web search. This corrective loop addresses a blind spot in the pipeline we built: our copilot reranks but never reconsiders whether retrieval failed entirely. CRAG's self-correcting retrieval improved performance on PopQA and Biography benchmarks by 5 to 15 percentage points over standard RAG, with especially large gains on questions where initial retrieval returned off-topic passages. Integrating a similar retrieval confidence gate between our <code>retrieve_and_rerank</code> and <code>generate_answer</code> stages would let the copilot detect and recover from retrieval failures rather than faithfully summarizing irrelevant evidence.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Research Copilot Over arXiv Abstracts</h4>
+<p>You can build a stripped-down version of the copilot in this section using only free tools and a laptop. (1) Download 50 to 100 arXiv abstracts in a single topic (e.g., "retrieval augmented generation") using the arXiv API: <code>import urllib.request; urllib.request.urlretrieve("http://export.arxiv.org/api/query?search_query=all:retrieval+augmented+generation&amp;max_results=100", "arxiv.xml")</code>, then parse the XML to extract title and abstract fields. (2) Chunk each abstract as a single passage (abstracts are short enough to serve as their own chunks) and compute embeddings using <code>sentence-transformers</code> with the model <code>all-MiniLM-L6-v2</code>. (3) Store the embeddings in a NumPy matrix and implement cosine-similarity search: given a query embedding, compute dot products against all passage embeddings and return the top 5. (4) Write a <code>generate_answer</code> function that formats the top 5 abstracts as numbered sources, sends them along with the question to any LLM API (or a local model via <code>ollama</code>), and instructs the model to cite sources by number. (5) Test with a multi-hop question such as "What chunking strategies improve faithfulness in RAG systems?" and manually verify that each citation in the generated answer actually appears in the corresponding source abstract. This exercise reproduces the full retrieve-generate-verify loop without requiring Qdrant, a GPU, or a large PDF corpus.</p>
+</div>
+
+<h2>7. The Discovery Workbench Connection</h2>
+
+<p>The research copilot integrates naturally into the Discovery Workbench we have been building since <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>. In the workbench architecture, the copilot serves as the <em>knowledge retrieval layer</em>: other components (hypothesis generators from <a href="../module-39-hypothesis-generation/index.html">Chapter 39</a>, research agents from <a href="../module-40-research-agents/index.html">Chapter 40</a>, claim validators from <a href="../module-41-claim-validation/index.html">Chapter 41</a>) query the copilot to ground their reasoning in published evidence. The faithfulness guarantees we built into this chapter ensure that downstream components can trust the evidence the copilot provides, preventing hallucination from propagating through the entire discovery pipeline.</p>
+
+<h2>Section Summary</h2>
+
+<p>We built a complete multi-hop research copilot from components: a corpus ingestion pipeline that parses PDFs into searchable chunks (Listing 37.17-37.18), a multi-hop retrieval engine with query decomposition and cross-encoder reranking (Listing 37.19), a cited answer generator with faithfulness evaluation (Listing 37.20), and a benchmark harness for systematic evaluation (Listing 37.21). Production considerations include incremental ingestion, semantic query caching, and user feedback loops that convert failure cases into regression tests. The copilot's modular architecture positions it as the knowledge retrieval layer in the Discovery Workbench, supporting the research agents and hypothesis generators we will build in the chapters ahead.</p>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-37.2.html">&#8592; 37.2 Evidence Grounding and Hallucination Control</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="../module-38-knowledge-graphs/index.html">Chapter 38: Knowledge Graph Discovery &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

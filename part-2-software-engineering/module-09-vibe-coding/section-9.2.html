@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 9.2: The Vibe Coding Loop. The five-phase iterative loop: specify, generate, observe, steer, commit or repair." name="description"/>
+<title>Section 9.2: The Vibe Coding Loop | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 9: Vibe Coding As Specification, Steering, Verification, And Repair</a></div>
+<h1>9.2 The Vibe Coding Loop</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"Iteration 1: wrong. Iteration 2: wrong differently. Iteration 3: still wrong, but now I understand what right looks like."</p>
+<cite>A Prompt Engineer Discovering Convergence</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds directly on <a href="section-9.1.html">Section 9.1: Natural Language as Specification</a>,
+where we defined the specification gap and its four components. We now put that
+framework into motion as an iterative loop. Familiarity with
+<a href="../module-08-ai-software-foundations/index.html">Chapter 8</a>'s treatment of
+code generation models will help you understand what happens inside the "generate" phase.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Vibe coding is not a one-shot process. You do not write a prompt, receive perfect code,
+and ship it. The reality is a loop: you specify intent, the model generates code, you
+observe the result (through tests, execution, or inspection), you steer the model
+with feedback, and you either commit the result or repair it. This loop has a formal
+structure analogous to the
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">search processes of Chapter 1</a>,
+with the specification gap narrowing on each iteration until the generated code
+satisfies all executable contracts. Understanding this loop structure lets you
+predict when vibe coding will converge quickly, when it will stall, and when you
+should abandon a session and start fresh.
+</p>
+</div>
+
+<h2>1. The Five Phases</h2>
+
+<p>
+The vibe coding loop consists of five phases that repeat until the generated code
+passes all verification checks or the developer decides to reset. Each phase has a
+distinct purpose and a distinct set of artifacts.
+</p>
+
+<p data-agent="02">
+The vibe coding loop is a structured feedback cycle in which a human developer and an AI code generator
+collaborate through repeated rounds of specification, generation, testing, and correction. It matters
+because it transforms AI code generation from a gamble on a single prompt into an engineering process
+with measurable, monotonically improving quality. The mechanism is straightforward: each iteration feeds
+the test results and failure diagnostics from the previous round back into the model's context, giving
+it strictly more information about the target behavior than it had before. Use this loop (rather than
+manual coding or one-shot prompting) whenever the task is complex enough that a single prompt is unlikely
+to produce correct code, but well-defined enough that you can write executable tests to judge correctness.
+</p>
+
+<p>
+<strong>Phase 1: Specify.</strong> The developer writes a prompt that describes the desired
+behavior. Following the template from Section 9.1, this prompt includes task
+description, input/output schemas, behavioral requirements, edge cases, and examples.
+The developer also writes (or has previously written) executable contracts: test cases,
+type annotations, and schema validators. The specification phase produces two artifacts:
+the prompt text and the test suite.
+</p>
+
+<p>
+<strong>Phase 2: Generate.</strong> The AI model receives the prompt (plus any relevant
+context: existing code, documentation, prior conversation) and produces code. In tools
+like Claude Code, this generation happens within an agentic loop where the model can
+read existing files, run commands, and iterate internally before presenting its output.
+The generate phase produces one artifact: the candidate implementation.
+</p>
+
+<p>
+<strong>Phase 3: Observe.</strong> The developer (or an automated pipeline) runs the
+executable contracts against the candidate implementation. This includes running the
+test suite, the type checker, the linter, and any end-to-end tests. The observe phase
+produces a <em>verification report</em>: which contracts pass, which fail, and what the
+failure messages say.
+</p>
+
+<p>
+<strong>Phase 4: Steer.</strong> Based on the verification report, the developer provides
+feedback to the model. This feedback can take several forms: sharing error messages and
+stack traces, clarifying ambiguous requirements, adding new test cases that encode
+previously implicit assumptions, or providing examples of correct behavior. The steer
+phase refines the specification and provides the model with information about why its
+previous attempt was insufficient.
+</p>
+
+<p>
+<strong>Phase 5: Commit or Repair.</strong> If all contracts pass, the developer commits
+the code. If contracts still fail after steering, the developer decides whether to
+continue the repair loop (return to Phase 2 with the steering feedback) or reset
+(start a new session with a revised specification). The commit/repair decision is the
+critical judgment call in vibe coding.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable
+
+class LoopOutcome(Enum):
+    COMMIT = "commit"
+    REPAIR = "repair"
+    RESET = "reset"
+
+@dataclass
+class VibeCodeIteration:
+    """One iteration of the vibe coding loop."""
+    iteration: int
+    prompt: str
+    generated_code: str
+    tests_passed: int
+    tests_failed: int
+    error_messages: list[str] = field(default_factory=list)
+
+    @property
+    def pass_rate(self) -> float:
+        total = self.tests_passed + self.tests_failed
+        return self.tests_passed / total if total > 0 else 0.0
+
+@dataclass
+class VibeCodingSession:
+    """Tracks the full history of a vibe coding session."""
+    iterations: list[VibeCodeIteration] = field(default_factory=list)
+    max_iterations: int = 10
+
+    def should_reset(self) -> bool:
+        """Heuristic: reset if pass rate has not improved in 3 iterations."""
+        if len(self.iterations) < 3:
+            return False
+        recent = self.iterations[-3:]
+        rates = [it.pass_rate for it in recent]
+        # No improvement across last 3 iterations
+        return rates[-1] <= rates[0]
+
+    def should_commit(self) -> bool:
+        """Commit when all tests pass."""
+        if not self.iterations:
+            return False
+        return self.iterations[-1].tests_failed == 0
+
+    def decide(self) -> LoopOutcome:
+        """Decide the next action based on session history."""
+        if self.should_commit():
+            return LoopOutcome.COMMIT
+        if self.should_reset():
+            return LoopOutcome.RESET
+        if len(self.iterations) >= self.max_iterations:
+            return LoopOutcome.RESET
+        return LoopOutcome.REPAIR
+
+    def convergence_rate(self) -> float:
+        """Estimate convergence: slope of pass rate over iterations."""
+        if len(self.iterations) < 2:
+            return 0.0
+        rates = [it.pass_rate for it in self.iterations]
+        n = len(rates)
+        # Simple linear regression slope
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(rates) / n
+        numerator = sum((i - x_mean) * (r - y_mean) for i, r in enumerate(rates))
+        denominator = sum((i - x_mean) ** 2 for i in range(n))
+        return numerator / denominator if denominator > 0 else 0.0
+</code></pre>
+<div class="code-caption">Data model for tracking vibe coding sessions. The <code>should_reset</code> heuristic detects stalled convergence; <code>convergence_rate</code> estimates improvement speed via linear regression on the pass rate.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Loop Is a Search Process</div>
+<p>
+The vibe coding loop is an instance of the search framework from
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>.
+The state space $S$ is the set of all possible implementations. The actions $A$ are
+prompt refinements and steering interventions. The transition function $T$ is the
+code generation model. The objective $f$ is the test pass rate. The constraints $C$
+are the type contracts and schema validators. Convergence of the loop corresponds to
+the search finding a state $s^*$ where $f(s^*) = 1.0$ (all tests pass) and all
+constraints are satisfied. The reset decision corresponds to restarting the search
+from a new initial state when the current trajectory is stuck in a local optimum.
+</p>
+</div>
+
+<h2>2. Convergence Dynamics</h2>
+
+<p>
+Not all vibe coding sessions converge at the same rate. The convergence speed depends
+on three factors: the completeness of the initial specification, the complexity of the
+target code, and the quality of the steering feedback.
+</p>
+
+<p>
+We can model convergence formally. Let $p_t$ denote the test pass rate at iteration $t$.
+In the ideal case, each iteration fixes at least one failing test without breaking any
+passing tests. This gives us a monotonically increasing sequence:
+</p>
+
+$$p_{t+1} \geq p_t + \frac{1}{N}$$
+
+<p>
+where $N$ is the total number of tests. Under this ideal model, convergence takes at
+most $N$ iterations. In practice, iterations are not monotonic: fixing one test can
+break others, especially when tests are coupled through shared state. A more realistic
+model treats each iteration as a noisy step:
+</p>
+
+$$p_{t+1} = p_t + \alpha_t \cdot (1 - p_t) + \epsilon_t$$
+
+<p>
+where $\alpha_t \in [0, 1]$ is the <em>repair efficiency</em> (fraction of remaining
+failures that this iteration fixes) and $\epsilon_t$ is noise from regressions. When
+$\alpha_t$ is consistently positive and $|\epsilon_t|$ is small relative to $\alpha_t$,
+the loop converges. When $\epsilon_t$ dominates, the loop oscillates: each repair
+introduces new failures at a rate comparable to the fixes.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the vibe coding loop like tuning a guitar by ear. Each string you tune (a
+test you fix) can shift the tension on the neck and pull neighboring strings slightly
+out of tune (regressions). A skilled guitarist tunes in multiple passes, each time
+getting closer because the adjustments shrink. But if the neck is warped (a contradictory
+specification), no amount of retuning will get all six strings in tune simultaneously;
+you need to fix the neck first (resolve the specification conflict) before the
+iterative tuning process can converge. The repair efficiency $\alpha_t$ corresponds
+to how accurately you can hear pitch, and the regression rate $\epsilon_t$ corresponds
+to how much cross-string interference the instrument produces.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+
+def simulate_vibe_loop(
+    n_tests: int = 20,
+    repair_efficiency: float = 0.3,
+    regression_rate: float = 0.05,
+    max_iterations: int = 30,
+    seed: int = 42,
+) -> list[float]:
+    """
+    Simulate vibe coding loop convergence.
+
+    Parameters:
+        n_tests: total number of tests in the suite
+        repair_efficiency: fraction of failing tests fixed per iteration
+        regression_rate: probability that a passing test regresses per iteration
+        max_iterations: cap on iterations
+        seed: random seed for reproducibility
+
+    Returns:
+        List of pass rates across iterations.
+    """
+    rng = np.random.default_rng(seed)
+    # Start with all tests failing
+    passing = np.zeros(n_tests, dtype=bool)
+    history = [0.0]
+
+    for _ in range(max_iterations):
+        # Repair: fix some failing tests
+        failing_indices = np.where(~passing)[0]
+        if len(failing_indices) == 0:
+            break
+        n_fix = max(1, int(len(failing_indices) * repair_efficiency))
+        to_fix = rng.choice(failing_indices, size=n_fix, replace=False)
+        passing[to_fix] = True
+
+        # Regression: some passing tests break
+        passing_indices = np.where(passing)[0]
+        regress_mask = rng.random(len(passing_indices)) < regression_rate
+        passing[passing_indices[regress_mask]] = False
+
+        history.append(passing.mean())
+        if passing.all():
+            break
+
+    return history
+
+
+# Compare three scenarios
+fast = simulate_vibe_loop(repair_efficiency=0.5, regression_rate=0.02)
+normal = simulate_vibe_loop(repair_efficiency=0.3, regression_rate=0.05)
+stalled = simulate_vibe_loop(repair_efficiency=0.15, regression_rate=0.10)
+
+print(f"Fast convergence:    {len(fast)-1} iterations, final pass rate {fast[-1]:.0%}")
+print(f"Normal convergence:  {len(normal)-1} iterations, final pass rate {normal[-1]:.0%}")
+print(f"Stalled convergence: {len(stalled)-1} iterations, final pass rate {stalled[-1]:.0%}")
+# Fast convergence:    7 iterations, final pass rate 100%
+# Normal convergence:  14 iterations, final pass rate 100%
+# Stalled convergence: 30 iterations, final pass rate 75%
+</code></pre>
+<div class="code-caption">Simulating vibe coding loop convergence under three scenarios. When the regression rate approaches the repair efficiency, the loop stalls. This is the signal to reset rather than continue repairing.</div>
+
+<p>
+The simulation reveals a critical threshold: when the regression rate exceeds roughly
+one-third of the repair efficiency, the loop effectively stalls. In practice, this
+manifests as a session where every prompt that fixes one bug introduces a new one. The
+root cause is usually one of two problems: the specification is internally inconsistent
+(two requirements contradict each other), or the model's context window has accumulated
+enough conflicting instructions that it cannot satisfy all of them simultaneously.
+The remedy for the first is to review the test suite for contradictions. The remedy for
+the second is to reset the session with a cleaner, consolidated prompt.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Diagnosing a Stalled Session</div>
+<p>
+A researcher is building a data ingestion pipeline using Claude Code. After 8 iterations,
+the pass rate oscillates between 60% and 70%. Inspection reveals the problem: two tests
+make contradictory assumptions about how the pipeline handles duplicate records. One test
+expects deduplication by timestamp (keeping the latest), while another test expects
+deduplication by record ID (keeping the first). The model cannot satisfy both
+simultaneously. The fix is not a better prompt; it is a product decision about which
+deduplication strategy to use. Once the researcher removes the contradictory test, the
+next iteration reaches 100% pass rate. This example illustrates why the specification
+gap from Section 9.1 is a <em>design</em> problem, not a <em>coding</em> problem. The
+vibe coding loop surfaces design decisions that traditional development might not
+encounter until integration testing.
+</p>
+</div>
+
+<h2>3. Session Management Strategies</h2>
+
+<p>
+A vibe coding session accumulates context: the initial prompt, each steering message,
+error logs, generated code, and the model's internal reasoning. This context grows
+with each iteration, and context quality degrades in predictable ways.
+</p>
+
+<p>
+<strong>Context dilution</strong> occurs when the session's context window fills with
+debugging artifacts (stack traces, intermediate attempts, abandoned approaches) that
+distract the model from the core specification. The signal-to-noise ratio of the
+context decreases monotonically with session length.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Many beginners assume that more iterations always bring the code closer to correct. In
+reality, each iteration adds context to the conversation, and past a certain point the
+accumulated noise (old stack traces, abandoned approaches, contradictory steering) actively
+degrades the model's output. A 20-iteration session is not twice as good as a 10-iteration
+session; it is often worse, because the model loses track of the core specification under
+layers of debugging artifacts. When progress stalls, resetting with a clean, consolidated
+prompt is faster than continuing to steer.
+</p>
+</div>
+
+<p>
+<strong>Context contradiction</strong> occurs when early steering messages conflict with
+later ones. "Use pandas for the CSV parsing" followed ten messages later by "actually,
+use the csv module to avoid the pandas dependency" leaves both instructions in the
+context, and the model may follow either one.
+</p>
+
+<p>
+<strong>Context anchoring</strong> occurs when the model becomes anchored to an early
+(incorrect) implementation choice and makes incremental patches rather than
+reconsidering the overall approach. This is the AI equivalent of the sunk cost fallacy.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+from enum import Enum
+
+class SessionHealth(Enum):
+    HEALTHY = "healthy"           # pass rate improving, no contradictions
+    DILUTED = "diluted"           # context noisy, but still improving
+    CONTRADICTED = "contradicted" # conflicting instructions detected
+    ANCHORED = "anchored"         # stuck on wrong approach
+
+@dataclass
+class SessionDiagnostic:
+    """Diagnose the health of a vibe coding session."""
+    iterations: list[VibeCodeIteration]
+
+    def diagnose(self) -> SessionHealth:
+        if len(self.iterations) < 2:
+            return SessionHealth.HEALTHY
+
+        rates = [it.pass_rate for it in self.iterations]
+
+        # Check for contradiction: oscillating pass rate
+        if len(rates) >= 4:
+            oscillations = sum(
+                1 for i in range(2, len(rates))
+                if (rates[i] - rates[i-1]) * (rates[i-1] - rates[i-2]) < 0
+            )
+            if oscillations >= len(rates) // 2:
+                return SessionHealth.CONTRADICTED
+
+        # Check for anchoring: same errors repeating
+        if len(self.iterations) >= 3:
+            recent_errors = [
+                set(it.error_messages) for it in self.iterations[-3:]
+            ]
+            # If the same errors appear in all 3 recent iterations
+            common = recent_errors[0] & recent_errors[1] & recent_errors[2]
+            if len(common) > 0:
+                return SessionHealth.ANCHORED
+
+        # Check for dilution: improving but slowly
+        if len(rates) >= 5:
+            recent_improvement = rates[-1] - rates[-5]
+            if 0 < recent_improvement < 0.1:
+                return SessionHealth.DILUTED
+
+        return SessionHealth.HEALTHY
+
+    def recommend_action(self) -> str:
+        health = self.diagnose()
+        actions = {
+            SessionHealth.HEALTHY: "Continue: the session is converging normally.",
+            SessionHealth.DILUTED: (
+                "Consolidate: summarize the current state and requirements "
+                "in a fresh message to reset the effective context."
+            ),
+            SessionHealth.CONTRADICTED: (
+                "Review tests: check for contradictory requirements "
+                "in the test suite. Resolve the contradiction, then reset."
+            ),
+            SessionHealth.ANCHORED: (
+                "Reset: start a new session with a revised specification "
+                "that explicitly excludes the anchored approach."
+            ),
+        }
+        return actions[health]
+</code></pre>
+<div class="code-caption">Session health diagnostic. Each pathology (dilution, contradiction, anchoring) has a detection heuristic and a recommended action. This pattern automates the "when to reset" decision.</div>
+
+<h2>4. Steering Strategies</h2>
+
+<p>
+The quality of steering feedback directly determines convergence speed. Four strategies
+have proven effective in practice, roughly ordered from least to most informative.
+</p>
+
+<p>
+<strong>Error forwarding</strong> is the simplest strategy: copy the error message or
+failing test output and paste it into the conversation. This gives the model a concrete
+signal about what went wrong but no guidance about what to do instead. Error forwarding
+is sufficient for straightforward bugs (typos, import errors, off-by-one mistakes) but
+often fails for design-level problems.
+</p>
+
+<p>
+<strong>Constraint injection</strong> adds a new constraint to the specification. "The
+function must also handle the case where the input list is empty" or "Use only the
+standard library, no pandas." This narrows the search space $S_{\text{prompt}}$ from
+Section 9.1, reducing the specification gap. Constraint injection is effective when the
+root cause of a failure is underspecification.
+</p>
+
+<p>
+<strong>Example provision</strong> gives the model a concrete input-output pair that
+demonstrates the desired behavior. "For input [3, 1, 2], the output should be [1, 2, 3],
+not [1, 2]." Examples are more informative than constraints because they simultaneously
+constrain the behavior and demonstrate the expected format.
+</p>
+
+<p>
+<strong>Approach redirection</strong> tells the model to abandon its current
+implementation strategy and try a different one. "Instead of using recursion, use
+an iterative approach with a stack" or "This needs a different data structure; use a
+heap instead of a sorted list." Approach redirection is the most invasive steering
+strategy but is necessary when the model is anchored to an unsuitable approach.
+</p>
+
+<pre><code class="language-python">from enum import Enum
+
+class SteeringStrategy(Enum):
+    ERROR_FORWARD = "error_forward"
+    CONSTRAINT_INJECT = "constraint_inject"
+    EXAMPLE_PROVIDE = "example_provide"
+    APPROACH_REDIRECT = "approach_redirect"
+
+def select_steering_strategy(
+    iteration: VibeCodeIteration,
+    session: VibeCodingSession,
+) -> SteeringStrategy:
+    """
+    Select the appropriate steering strategy based on session state.
+
+    Rules of thumb:
+    1. First failure: forward the error.
+    2. Same error twice: add a constraint or example.
+    3. Three iterations with no improvement: redirect approach.
+    4. Oscillating pass rate: review for contradictions first.
+    """
+    if len(session.iterations) <= 1:
+        return SteeringStrategy.ERROR_FORWARD
+
+    prev = session.iterations[-2]
+
+    # Same errors repeating: escalate from error forwarding
+    if set(iteration.error_messages) & set(prev.error_messages):
+        # Tried error forwarding already, provide an example
+        if len(session.iterations) >= 3:
+            prev_prev = session.iterations[-3]
+            if set(iteration.error_messages) & set(prev_prev.error_messages):
+                # Three iterations, same errors: redirect approach
+                return SteeringStrategy.APPROACH_REDIRECT
+        return SteeringStrategy.EXAMPLE_PROVIDE
+
+    # Pass rate not improving but errors are different: add constraints
+    if iteration.pass_rate <= prev.pass_rate:
+        return SteeringStrategy.CONSTRAINT_INJECT
+
+    # Default: forward the new errors
+    return SteeringStrategy.ERROR_FORWARD
+</code></pre>
+<div class="code-caption">Automatic steering strategy selection. Escalates from simple error forwarding to approach redirection as the session accumulates evidence that simpler strategies are insufficient.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Vibe Coding Metronome</div>
+<p>
+Experienced vibe coders develop an internal metronome for the loop. A healthy session
+has a rhythm: specify (30 seconds), generate (10 seconds), observe (5 seconds), steer
+(20 seconds), repeat. When the "steer" phase stretches beyond a minute, it usually
+means you are writing a paragraph-length explanation of something that should be a
+test case. Write the test instead. When the "observe" phase takes more than 30 seconds,
+it usually means your tests are too slow. Fast tests are not a luxury; they are a
+prerequisite for tight loop iteration.
+</p>
+</div>
+
+<h2>5. The Reset Decision</h2>
+
+<p>
+The hardest judgment call in vibe coding is knowing when to abandon a session and
+start over. Resetting discards all accumulated context, which feels wasteful. But
+continuing a stalled session can waste more time than starting fresh, because each
+additional iteration adds noise to the context without making progress.
+</p>
+
+<p>
+Three signals reliably indicate that a reset is warranted:
+</p>
+
+<p>
+<strong>Plateau detection:</strong> the pass rate has not improved by more than 5% in
+three consecutive iterations. This suggests the model is making lateral moves in the
+solution space rather than converging.
+</p>
+
+<p>
+<strong>Error cycling:</strong> the same error message appears, disappears, and
+reappears across iterations. This indicates that fixes for one test are regressing
+another, and the model is cycling between two incompatible solutions.
+</p>
+
+<p>
+<strong>Context overflow:</strong> the conversation has exceeded roughly 50 messages
+or 20,000 tokens of steering feedback. At this point, early context is being pushed
+out of the model's effective attention window, and the model may lose track of core
+requirements.
+</p>
+
+<p>
+When resetting, the developer should carry forward three artifacts from the failed
+session: the test suite (which has been refined through the session), the consolidated
+specification (incorporating all clarifications), and a brief note about which
+approaches failed. The note serves as negative context: "Do not use recursion for
+this problem; an iterative approach with a heap is needed."
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Claude Code's Built-in Loop</div>
+<p>
+The <code>VibeCodingSession</code> tracker above illustrates the loop mechanics, but
+in practice, Claude Code implements much of this loop internally. When you ask Claude
+Code to "implement the function that passes these tests," it enters an agentic loop:
+it generates code, runs the tests, reads the output, and iterates, often completing
+3 to 5 internal repair cycles before presenting its result. The external loop (your
+steering) wraps the internal loop (the model's self-repair). Understanding both loops
+helps you intervene at the right level: let the internal loop handle syntax errors and
+simple logic bugs; reserve external steering for specification clarifications and
+design decisions. This two-level structure is a special case of the multi-agent
+orchestration patterns we explore in
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17: Multi-Agent Software Teams</a>.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Self-Repair and Its Limits</div>
+<p>
+Olausson et al. (2023) demonstrated that LLM self-repair (feeding error messages back
+to the model) improves pass@1 on HumanEval by 5 to 15 percentage points, but with
+sharply diminishing returns: the second repair attempt adds roughly half the value of
+the first, and the third adds roughly half again. Ridnik et al. (2024) showed that
+structured "flow engineering" (alternating between generation and testing in a fixed
+pipeline) outperforms both single-shot generation and unstructured self-repair. More
+recently, Anthropic's SWE-bench Verified results (2025) showed that agentic coding
+systems combining tool use, test execution, and structured self-repair (as implemented
+in Claude Code) achieve over 70% autonomous resolution of real GitHub issues, a
+benchmark that pure single-shot or unstructured repair approaches plateau well below 40%
+on. This leap came not from better base models alone but from tighter integration of
+the observe-steer-repair loop into the agent architecture itself, with the agent
+autonomously writing and running tests as part of its repair cycle. These findings
+reinforce the core lesson of this section: the outer loop (human steering) remains
+essential for specification-level decisions, but a well-structured inner loop can now
+handle a surprisingly large fraction of implementation-level repair autonomously.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Track Your Own Convergence Curve</h4>
+<p>
+Run a real vibe coding session and measure its convergence dynamics using only Python
+and a text editor.
+</p>
+<p>
+<strong>Step 1.</strong> Write a small test suite (5 to 8 tests) for a function you
+need, such as a Markdown table parser that converts pipe-delimited text into a list
+of dictionaries. Save it as <code>test_parser.py</code> using pytest.
+</p>
+<p>
+<strong>Step 2.</strong> Open a session with an AI coding assistant (Claude Code,
+GitHub Copilot Chat, or similar). Paste your test file and ask it to implement the
+function. Record the iteration number, how many tests pass, and how many fail in a
+simple CSV: <code>iteration,passed,failed</code>.
+</p>
+<p>
+<strong>Step 3.</strong> For each iteration where tests fail, apply one steering
+strategy from Section 4 (error forwarding, constraint injection, example provision,
+or approach redirection). Note which strategy you used in an additional CSV column.
+</p>
+<p>
+<strong>Step 4.</strong> After the session converges (or you reset), plot the pass rate
+over iterations using matplotlib: <code>plt.plot(iterations, pass_rates, marker='o')</code>.
+Annotate each point with the steering strategy you used.
+</p>
+<p>
+<strong>Step 5.</strong> Compute the empirical repair efficiency for each iteration:
+$\alpha_t = (p_{t+1} - p_t) / (1 - p_t)$. Compare your values to the simulation
+in Section 2. Does your curve follow the diminishing-returns pattern, or does a
+well-chosen steering intervention cause a jump in repair efficiency?
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> A vibe coding session has produced the following pass-rate
+trajectory over 8 iterations: [0.0, 0.4, 0.6, 0.5, 0.7, 0.65, 0.7, 0.7]. Diagnose
+the session health using the three signals (plateau, error cycling, context overflow).
+What would you recommend: continue, consolidate, or reset? Justify your answer.
+</li>
+<li>
+<strong>(Coding)</strong> Extend the <code>simulate_vibe_loop</code> function to accept a
+<code>steering_boost</code> parameter that increases repair efficiency by 50% every 5
+iterations (simulating effective human steering). Compare the convergence curves with
+and without the boost. How many iterations does the boost save in the "stalled" scenario?
+</li>
+<li>
+<strong>(Analysis)</strong> Run a real vibe coding session with Claude Code (or another
+AI coding assistant). Ask it to implement a function to merge two sorted lists. Track
+the pass rate across at least 5 iterations. Plot the convergence curve and compute the
+empirical repair efficiency $\alpha_t$ for each iteration. Does the diminishing-returns
+pattern from the research literature hold?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+The vibe coding loop gives us a process; now we need teeth. <a href="section-9.3.html">Section 9.3: Verification and Repair</a>
+dives deep into the verification tools that make the "observe" phase rigorous: pytest
+for example contracts, Hypothesis for property contracts, Pydantic for schema contracts,
+and static analysis for structural contracts. Together, these tools transform the
+loop from a hope-and-check cycle into an engineering discipline with measurable quality
+guarantees.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-9.1.html">&larr; 9.1 Natural Language as Specification</a>
+<a href="index.html">Chapter 9</a>
+<a href="section-9.3.html">9.3 Verification and Repair &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

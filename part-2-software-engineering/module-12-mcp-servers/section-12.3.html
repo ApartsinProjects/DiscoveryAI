@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.3: Testing and Publishing. Testing MCP servers with pytest, authentication and sandboxing patterns, Docker packaging, and publishing to registries." name="description"/>
+<title>Section 12.3: Testing and Publishing | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Building MCP Servers for Scientific Workflows</a></div>
+<h1>12.3 Testing and Publishing</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"My test suite covered 97% of the code. The 3% it missed was the authentication layer, the rate limiter, and the part that actually called the API."</p>
+<cite>A Coverage Metric With Misplaced Confidence</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+You should have working MCP tools from <a href="section-12.2.html">Section 12.2</a>
+and be familiar with pytest. This section assumes you have Docker installed for the
+sandboxing examples. The testing patterns build on the software engineering principles
+from <a href="../module-08-ai-software-foundations/index.html">Chapter 8</a> and
+connect to the broader testing strategies covered in
+<a href="../module-18-ai-testing/index.html">Chapter 18: AI Assisted Testing and QA</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+An untested MCP server is a liability. When an AI agent calls your
+<code>search_pubchem</code> tool mid-experiment and gets back malformed JSON, the
+entire reasoning chain collapses. Testing MCP servers requires three layers:
+<strong>unit tests</strong> that verify individual tool logic with mocked APIs,
+<strong>integration tests</strong> that validate real API interactions, and
+<strong>end-to-end tests</strong> that exercise the full JSON-RPC protocol through the
+MCP inspector. Beyond testing, production servers need authentication (who can call
+your tools?), sandboxing (what can your tools access?), and packaging (how do users
+install your server?). This section covers all three concerns.
+</p>
+</div>
+
+<h2>1. Unit Testing with Mocked APIs</h2>
+
+<p>
+Unit tests verify that your tool logic is correct without depending on external
+services. The key technique is <strong>mocking</strong>: replacing real HTTP calls with
+pre-recorded responses so tests run fast, offline, and deterministically.
+</p>
+
+<p data-agent="02">
+Mocking is the practice of substituting a real dependency (an HTTP client, a database connection, a file system call) with a controlled stand-in that returns predetermined responses. It matters because scientific MCP tools typically depend on external APIs such as PubChem or OpenAlex, and calling those APIs in every test run introduces network latency, rate limit risk, and nondeterministic behavior when the upstream data changes. The mechanism is straightforward: Python's <code>unittest.mock.patch</code> intercepts the import path of the dependency at runtime and replaces it with a <code>Mock</code> or <code>AsyncMock</code> object whose return values you define in the test. Use mocking for unit tests where you need speed and reproducibility; switch to live API calls (integration tests) when you need to verify that your code still matches the real service's current contract.
+</p>
+
+<p>
+For MCP tools, we test at two levels. First, we test the tool function directly by
+calling it as a regular Python async function with mocked dependencies. Second, we
+test the JSON-RPC layer by constructing protocol messages and sending them through
+the server's message handler. The first level catches logic bugs; the second catches
+serialization and schema validation bugs.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that full unit test coverage with mocked APIs guarantees
+your MCP server works correctly in production. It does not. Mocks freeze the API
+contract at the moment you recorded them; if the upstream service renames a JSON field,
+changes a status code, or adds a required parameter, every mocked test still passes
+while the live server silently breaks. Mocks verify <em>your</em> logic, not the
+<em>integration</em>; you always need a separate layer of live API tests (Section 2)
+to catch contract drift.
+</p>
+</div>
+
+<pre><code class="language-python">"""Unit tests for PubChem MCP tools."""
+import json
+import pytest
+from unittest.mock import AsyncMock, patch
+
+# Import the tool function directly
+from science_mcp.tools.pubchem import search_pubchem, compute_descriptors
+
+
+# --- Fixtures ---
+
+@pytest.fixture
+def mock_pubchem_search_response():
+    """Pre-recorded PubChem search response for 'aspirin'."""
+    return {
+        "IdentifierList": {
+            "CID": [2244, 71364, 71365]
+        }
+    }
+
+@pytest.fixture
+def mock_pubchem_properties_response():
+    """Pre-recorded PubChem properties response for aspirin (CID 2244)."""
+    return {
+        "PropertyTable": {
+            "Properties": [
+                {
+                    "CID": 2244,
+                    "IUPACName": "2-acetyloxybenzoic acid",
+                    "MolecularFormula": "C9H8O4",
+                    "MolecularWeight": 180.16,
+                    "CanonicalSMILES": "CC(=O)OC1=CC=CC=C1C(=O)O",
+                }
+            ]
+        }
+    }
+
+
+# --- Tool logic tests ---
+
+class TestSearchPubChem:
+    """Tests for the search_pubchem tool."""
+
+    @pytest.mark.asyncio
+    async def test_successful_search(
+        self, mock_pubchem_search_response, mock_pubchem_properties_response
+    ):
+        """A valid search returns structured compound data."""
+        mock_responses = [
+            AsyncMock(status_code=200, json=lambda: mock_pubchem_search_response),
+            AsyncMock(status_code=200, json=lambda: mock_pubchem_properties_response),
+        ]
+
+        with patch("science_mcp.tools.pubchem.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value.get = AsyncMock(side_effect=mock_responses)
+
+            result = await search_pubchem("aspirin", search_type="name", max_results=1)
+
+        data = json.loads(result)
+        assert "compounds" in data
+        assert len(data["compounds"]) >= 1
+        assert data["compounds"][0]["cid"] == 2244
+        assert data["compounds"][0]["formula"] == "C9H8O4"
+        assert data["source"] == "PubChem"
+
+    @pytest.mark.asyncio
+    async def test_compound_not_found(self):
+        """A search for a nonexistent compound returns empty results."""
+        mock_resp = AsyncMock(status_code=404)
+        mock_resp.raise_for_status = AsyncMock(side_effect=None)
+
+        with patch("science_mcp.tools.pubchem.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_client.return_value)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_client.return_value.get = AsyncMock(return_value=mock_resp)
+
+            result = await search_pubchem("xyznonexistent12345")
+
+        data = json.loads(result)
+        assert data["compounds"] == []
+        assert data["total_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_max_results(self):
+        """max_results outside allowed range raises ValueError."""
+        with pytest.raises(ValueError, match="max_results must be 1-25"):
+            await search_pubchem("aspirin", max_results=100)
+
+
+class TestComputeDescriptors:
+    """Tests for the compute_descriptors tool (no mocking needed)."""
+
+    @pytest.mark.asyncio
+    async def test_aspirin_descriptors(self):
+        """Aspirin descriptors match known values."""
+        result = await compute_descriptors("CC(=O)OC1=CC=CC=C1C(=O)O")
+        data = json.loads(result)
+
+        assert "descriptors" in data
+        desc = data["descriptors"]
+        assert 180 < desc["molecular_weight"] < 181  # ~180.16
+        assert desc["hydrogen_bond_donors"] == 1
+        assert desc["hydrogen_bond_acceptors"] == 4
+        assert data["lipinski_rule_of_five"]["drug_like"] is True
+
+    @pytest.mark.asyncio
+    async def test_invalid_smiles(self):
+        """Invalid SMILES returns a structured error, not an exception."""
+        result = await compute_descriptors("not_a_molecule!!!")
+        data = json.loads(result)
+
+        assert "error" in data
+        assert "Invalid SMILES" in data["error"]
+        assert "suggestion" in data
+</code></pre>
+<div class="code-caption">Unit tests for MCP tools. API-dependent tools are tested with mocked HTTP responses; local computation tools (RDKit) are tested directly. Note that <code>test_invalid_smiles</code> verifies the tool returns a structured error rather than raising an exception.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Test the Contract, Not the Implementation</div>
+<p>
+MCP tools have two consumers: the LLM (which reads the description and calls the tool)
+and the test suite (which verifies the tool's behavior). Both consumers care about the
+<em>contract</em>: given this input, the tool returns this output structure. Neither
+consumer cares about internal implementation details (which HTTP library you use, how
+you parse the response). Structure your tests around the contract: valid inputs produce
+expected output shapes, invalid inputs produce structured errors, edge cases produce
+defined behavior. This mirrors the testing philosophy from
+<a href="../module-18-ai-testing/index.html">Chapter 18</a>, where we treat AI-generated
+code the same way: test behavior, not mechanics.
+</p>
+</div>
+
+<h2>2. Integration Testing Against Live APIs</h2>
+
+<p>
+Unit tests with mocks verify logic, but they cannot catch API changes (a renamed
+field, a new rate limit, a deprecated endpoint). Integration tests call the real API,
+but they are slower, non-deterministic, and require network access. The standard
+pattern is to run integration tests in CI on a schedule (nightly, not on every push)
+and mark them so developers can skip them locally.
+</p>
+
+<pre><code class="language-python">"""Integration tests against live scientific APIs."""
+import json
+import pytest
+
+from science_mcp.tools.pubchem import search_pubchem
+from science_mcp.tools.literature import search_literature
+
+# Mark all tests in this module as integration tests
+pytestmark = pytest.mark.integration
+
+
+class TestPubChemIntegration:
+    """Live API tests for PubChem tools."""
+
+    @pytest.mark.asyncio
+    async def test_aspirin_search_live(self):
+        """Search for aspirin returns the expected CID from live PubChem."""
+        result = await search_pubchem("aspirin", search_type="name", max_results=3)
+        data = json.loads(result)
+
+        assert data["total_count"] >= 1
+        cids = [c["cid"] for c in data["compounds"]]
+        assert 2244 in cids, "Aspirin (CID 2244) should appear in results"
+
+    @pytest.mark.asyncio
+    async def test_smiles_search_live(self):
+        """SMILES search returns matching compounds from live PubChem."""
+        # Ethanol SMILES
+        result = await search_pubchem("CCO", search_type="smiles", max_results=1)
+        data = json.loads(result)
+
+        assert data["total_count"] >= 1
+        assert data["compounds"][0]["formula"] == "C2H6O"
+
+
+class TestOpenAlexIntegration:
+    """Live API tests for OpenAlex tools."""
+
+    @pytest.mark.asyncio
+    async def test_literature_search_live(self):
+        """Search for a well-known topic returns results from live OpenAlex."""
+        result = await search_literature(
+            "transformer attention mechanism", max_results=5
+        )
+        data = json.loads(result)
+
+        assert data["total_count"] > 0
+        assert len(data["papers"]) <= 5
+        # At least one paper should have a title
+        assert any(p["title"] for p in data["papers"])
+
+    @pytest.mark.asyncio
+    async def test_date_filter_live(self):
+        """Date filtering works correctly with live OpenAlex."""
+        result = await search_literature(
+            "CRISPR", max_results=3, year_from=2023, year_to=2024
+        )
+        data = json.loads(result)
+
+        for paper in data["papers"]:
+            if paper["year"]:
+                assert 2023 <= paper["year"] <= 2024
+</code></pre>
+<div class="code-caption">Integration tests against live PubChem and OpenAlex APIs. These tests are marked with <code>@pytest.mark.integration</code> so they can be run selectively: <code>pytest -m integration</code> runs only these; <code>pytest -m "not integration"</code> skips them.</div>
+
+<p>
+Configure pytest to recognize the custom marker in <code>pyproject.toml</code>:
+</p>
+
+<pre><code class="language-toml">[tool.pytest.ini_options]
+markers = [
+    "integration: tests that call live external APIs (deselect with '-m not integration')",
+]
+asyncio_mode = "auto"
+</code></pre>
+<div class="code-caption">Pytest configuration for integration test markers. The <code>asyncio_mode = "auto"</code> setting eliminates the need for <code>@pytest.mark.asyncio</code> decorators on every async test.</div>
+
+<h2>3. End-to-End Testing with the MCP Inspector</h2>
+
+<p>
+The MCP Inspector is a developer tool that connects to your server as a client and
+lets you interactively browse tools, call them, and inspect responses. It validates
+the JSON-RPC protocol, checks schema compliance, and displays the raw message
+exchange. For automated end-to-end testing, we can script the inspector or use the
+MCP Python SDK's client to drive the server programmatically.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the three test layers like quality checks at a restaurant. <strong>Unit tests</strong>
+are the chef tasting each ingredient before cooking: is the salt pure, is the cream
+fresh? <strong>Integration tests</strong> are cooking a dish with the real ingredients and
+checking that it tastes right: did the supplier change the recipe for the soy sauce?
+<strong>End-to-end protocol tests</strong> are a mystery diner ordering from the menu, eating
+the meal, and paying the bill: does the full experience work, from menu description
+through kitchen to table? A chef who only tastes ingredients (unit tests with mocks)
+will miss a broken ordering system, a mislabeled menu, or a waiter who garbles the
+order. Each layer catches a different class of failure, and skipping any one of them
+leaves a blind spot.
+</p>
+</div>
+
+<pre><code class="language-python">"""End-to-end tests using the MCP client SDK."""
+import json
+import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+@pytest.fixture
+async def mcp_session():
+    """Start the MCP server and connect a test client."""
+    server_params = StdioServerParameters(
+        command="python",
+        args=["-m", "science_mcp.server"],
+    )
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            yield session
+
+
+class TestMCPProtocol:
+    """End-to-end tests exercising the full JSON-RPC protocol."""
+
+    @pytest.mark.asyncio
+    async def test_list_tools(self, mcp_session):
+        """Server advertises expected tools during capability negotiation."""
+        tools = await mcp_session.list_tools()
+        tool_names = {t.name for t in tools.tools}
+
+        assert "search_pubchem" in tool_names
+        assert "search_literature" in tool_names
+        assert "compute_descriptors" in tool_names
+
+    @pytest.mark.asyncio
+    async def test_tool_schemas_valid(self, mcp_session):
+        """Every advertised tool has a valid JSON Schema for its inputs."""
+        tools = await mcp_session.list_tools()
+
+        for tool in tools.tools:
+            schema = tool.inputSchema
+            assert schema.get("type") == "object", (
+                f"Tool '{tool.name}' schema must have type 'object'"
+            )
+            assert "properties" in schema, (
+                f"Tool '{tool.name}' schema must define properties"
+            )
+
+    @pytest.mark.asyncio
+    async def test_call_compute_descriptors(self, mcp_session):
+        """Calling compute_descriptors through the protocol returns valid JSON."""
+        result = await mcp_session.call_tool(
+            "compute_descriptors",
+            arguments={"smiles": "CCO"},  # ethanol
+        )
+
+        # MCP returns content as a list of content blocks
+        assert len(result.content) >= 1
+        text = result.content[0].text
+        data = json.loads(text)
+
+        assert "descriptors" in data
+        assert data["descriptors"]["molecular_weight"] > 0
+
+    @pytest.mark.asyncio
+    async def test_call_with_invalid_input(self, mcp_session):
+        """Calling a tool with invalid input returns a structured error."""
+        result = await mcp_session.call_tool(
+            "compute_descriptors",
+            arguments={"smiles": "NOT_VALID!!!"},
+        )
+
+        text = result.content[0].text
+        data = json.loads(text)
+        assert "error" in data
+</code></pre>
+<div class="code-caption">End-to-end tests using the MCP Python SDK's client. The test fixture spawns the server as a subprocess, connects via stdio, and runs the initialization handshake. Tests verify both the protocol layer (tool listing, schema validation) and the application layer (tool execution, error handling).</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Three-Layer Test Pyramid</div>
+<p>
+For a scientific MCP server with 10 tools, a healthy test distribution looks like
+this: 50+ unit tests (fast, mocked, run on every commit), 10-15 integration tests
+(live API, run nightly), and 5-10 end-to-end tests (full protocol, run on releases).
+The unit tests catch logic bugs in minutes. The integration tests catch API drift
+overnight. The end-to-end tests catch protocol-level regressions before users see
+them. This pyramid mirrors the testing strategies discussed in
+<a href="../module-18-ai-testing/index.html">Chapter 18</a>, and the CI/CD patterns
+from <a href="../module-21-devops/index.html">Chapter 21</a>.
+</p>
+</div>
+
+<h2>4. Authentication and Authorization</h2>
+
+<p>
+A scientific MCP server may expose tools that access proprietary databases, consume
+paid API quotas, or control expensive instruments. Authentication verifies
+<em>who</em> is connecting; authorization determines <em>what</em> they can do.
+</p>
+
+<p>
+For <strong>stdio transport</strong>, authentication is implicit: the host spawns the server
+as a child process, and only the host can communicate with it. The server inherits
+the host's environment variables, which is the standard mechanism for passing API keys:
+</p>
+
+<pre><code class="language-python">"""Authentication via environment variables (stdio transport)."""
+import os
+from mcp.server import Server
+
+server = Server("authenticated-science")
+
+def get_api_key(service: str) -> str:
+    """Retrieve an API key from environment variables.
+
+    Raises RuntimeError if the key is not set, with instructions
+    for the user to configure it.
+    """
+    env_var = f"{service.upper()}_API_KEY"
+    key = os.environ.get(env_var)
+    if not key:
+        raise RuntimeError(
+            f"Missing {env_var} environment variable. "
+            f"Set it in your MCP client configuration: "
+            f'"env": {{"{env_var}": "your-key-here"}}'
+        )
+    return key
+
+@server.tool()
+async def search_proprietary_db(query: str) -> str:
+    """Search a proprietary compound database (requires API key).
+
+    Args:
+        query: Search term for the database.
+    """
+    api_key = get_api_key("PROPRIETARY_DB")
+    # Use the key to authenticate with the database
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.proprietary-db.example.com/search",
+            params={"q": query},
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        resp.raise_for_status()
+        return resp.text
+</code></pre>
+<div class="code-caption">API key authentication via environment variables. The MCP client configuration passes the key to the server process without exposing it in the tool schema or the JSON-RPC messages.</div>
+
+<p>
+For <strong>HTTP transports</strong> (SSE, Streamable HTTP), the server is a network service
+that anyone might attempt to reach. Here you need explicit authentication. The MCP
+specification recommends OAuth 2.0 for remote servers, with the host handling the
+OAuth flow and including the access token in HTTP headers.
+</p>
+
+<pre><code class="language-python">"""Token-based auth middleware for HTTP-transport MCP servers."""
+from functools import wraps
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+def require_auth(allowed_scopes: list[str]):
+    """Middleware that validates OAuth bearer tokens and scopes.
+
+    Args:
+        allowed_scopes: List of OAuth scopes required to access this endpoint.
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(request: Request, *args, **kwargs):
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                return JSONResponse(
+                    {"error": "Missing or invalid Authorization header"},
+                    status_code=401,
+                )
+
+            token = auth_header[7:]
+            # Validate the token (in production, verify JWT signature and claims)
+            claims = await validate_token(token)
+            if claims is None:
+                return JSONResponse(
+                    {"error": "Invalid or expired token"},
+                    status_code=401,
+                )
+
+            # Check scopes
+            token_scopes = set(claims.get("scope", "").split())
+            if not token_scopes.issuperset(allowed_scopes):
+                return JSONResponse(
+                    {"error": f"Insufficient scope. Required: {allowed_scopes}"},
+                    status_code=403,
+                )
+
+            return await func(request, *args, **kwargs)
+        return wrapper
+    return decorator
+</code></pre>
+<div class="code-caption">OAuth bearer token middleware for HTTP-transport MCP servers. The decorator validates the token and checks that the client has the required scopes before allowing access to the endpoint.</div>
+
+<h2>5. Sandboxing with Docker</h2>
+
+<p>
+MCP servers that execute user-provided input (SMILES strings, search queries,
+code snippets) should run in a sandboxed environment. Docker provides process
+isolation, filesystem restrictions, network policies, and resource limits. A
+containerized MCP server cannot access the host filesystem, cannot make
+arbitrary network connections, and cannot consume unbounded CPU or memory.
+</p>
+
+<pre><code class="language-dockerfile"># Dockerfile for a sandboxed scientific MCP server
+FROM python:3.12-slim
+
+# Install system dependencies for RDKit
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libxrender1 libxext6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd --create-home --shell /bin/bash mcpuser
+WORKDIR /home/mcpuser/app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy server code
+COPY src/ ./src/
+
+# Switch to non-root user
+USER mcpuser
+
+# Run server on stdio (default) or HTTP
+ENV MCP_TRANSPORT=stdio
+ENTRYPOINT ["python", "-m", "science_mcp.server"]
+</code></pre>
+<div class="code-caption">Dockerfile for a sandboxed MCP server. The server runs as a non-root user with minimal system libraries. The slim base image reduces the attack surface.</div>
+
+<pre><code class="language-yaml"># docker-compose.yml for MCP server with resource limits
+services:
+  science-mcp:
+    build: .
+    environment:
+      - PUBCHEM_API_KEY=${PUBCHEM_API_KEY}
+      - OPENALEX_EMAIL=${OPENALEX_EMAIL}
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    # Restrict network access to only scientific APIs
+    networks:
+      - science-apis
+    # Read-only filesystem except for tmp
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M
+
+networks:
+  science-apis:
+    driver: bridge
+</code></pre>
+<div class="code-caption">Docker Compose configuration with resource limits and network restrictions. The server gets at most 2 CPUs and 1 GB RAM, a read-only filesystem, and network access restricted to the science-apis bridge network.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Container-Based MCP Hosting</div>
+<p>
+Writing Dockerfiles and compose configurations by hand works but is verbose. The
+<code>mcp</code> CLI tool can generate container configurations automatically:
+<code>mcp build --docker</code> produces a Dockerfile from your
+<code>pyproject.toml</code>, and <code>mcp run --container</code> launches the server
+in an isolated Docker container with stdio piped back to the host. For Claude Desktop,
+the configuration is a single entry:
+<code>{"command": "docker", "args": ["run", "-i", "science-mcp:latest"]}</code>.
+This reduces the 30-line Dockerfile and 20-line compose file to a one-liner.
+</p>
+</div>
+
+<h2>6. Publishing and Distribution</h2>
+
+<p>
+A well-tested, sandboxed MCP server is ready for distribution. The MCP ecosystem
+supports several distribution channels:
+</p>
+
+<p>
+<strong>PyPI</strong> is the standard channel for Python packages. Package your server as a
+regular Python package with <code>pyproject.toml</code>, and users install it with
+<code>pip install science-mcp</code>. The entry point should be a console script
+that starts the server on stdio.
+</p>
+
+<pre><code class="language-toml"># pyproject.toml for an MCP server package
+[project]
+name = "science-mcp"
+version = "1.0.0"
+description = "MCP server for scientific discovery workflows"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0",
+    "pubchempy>=1.0.4",
+]
+
+[project.optional-dependencies]
+chemistry = ["rdkit-pypi>=2024.3.1"]
+all = ["science-mcp[chemistry]"]
+
+[project.scripts]
+science-mcp = "science_mcp.server:main_sync"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+</code></pre>
+<div class="code-caption">Package configuration for a distributable MCP server. The console script <code>science-mcp</code> lets users start the server directly. Optional dependencies (RDKit) are separated so users who only need literature search skip the chemistry installation.</div>
+
+<p>
+<strong>Claude Desktop configuration</strong> is where most users will connect to your server.
+The configuration file maps server names to launch commands:
+</p>
+
+<pre><code class="language-json">{
+  "mcpServers": {
+    "science-mcp": {
+      "command": "science-mcp",
+      "env": {
+        "OPENALEX_EMAIL": "researcher@university.edu"
+      }
+    },
+    "science-mcp-docker": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "science-mcp:latest"],
+      "env": {
+        "OPENALEX_EMAIL": "researcher@university.edu"
+      }
+    }
+  }
+}
+</code></pre>
+<div class="code-caption">Claude Desktop MCP configuration. Users can choose between running the server directly (faster startup) or in a Docker container (better isolation). Environment variables pass API keys and configuration without embedding them in the server code.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: MCP Server Registries and Automated Verification</div>
+<p>
+As of 2026, MCP server discovery is largely manual: users find servers through
+GitHub searches, documentation links, and word of mouth. Emerging
+<strong>MCP registries</strong> aim to solve this with searchable catalogs of servers,
+including verified schemas, security audits, and compatibility matrices. A significant
+step in this direction is the <strong>MCP Specification v2025-03-26</strong>, which formalized
+the Streamable HTTP transport, structured tool annotations (including
+<code>readOnlyHint</code> and <code>destructiveHint</code> metadata), and an OAuth 2.1
+authorization framework for remote servers (Anthropic, 2025). These protocol-level
+additions make automated trust verification possible: a registry can now programmatically
+check whether a server's tools declare their side effects, whether its transport layer
+supports the latest authentication standard, and whether its schemas pass validation
+against the canonical JSON Schema specification. For scientific workflows,
+domain-specific registries could catalog servers by research area (chemistry, genomics,
+climate science), enabling agents to dynamically discover and connect to new
+capabilities while verifying safety annotations before granting access. This connects
+to the
+<a href="../../part-7-autonomous-discovery/module-54-multi-agent-discovery/index.html">multi-agent discovery</a>
+vision in Chapter 54, where agents compose tool ecosystems on the fly.
+</p>
+</div>
+
+<h2>7. Continuous Integration Pipeline</h2>
+
+<p>
+A complete CI pipeline for an MCP server runs unit tests on every push, integration
+tests nightly, and end-to-end protocol tests on every release. Here is a GitHub
+Actions workflow that implements this:
+</p>
+
+<pre><code class="language-yaml"># .github/workflows/test.yml
+name: Test MCP Server
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 2 * * *"  # Nightly at 2 AM UTC
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[all]" && pip install pytest pytest-asyncio
+      - run: pytest -m "not integration" --tb=short
+
+  integration-tests:
+    if: github.event_name == 'schedule' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[all]" && pip install pytest pytest-asyncio
+      - run: pytest -m integration --tb=short
+        env:
+          OPENALEX_EMAIL: ci@example.com
+
+  protocol-tests:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[all]" && pip install pytest pytest-asyncio mcp
+      - run: pytest tests/test_protocol.py --tb=short
+</code></pre>
+<div class="code-caption">GitHub Actions CI pipeline with three test tiers. Unit tests run on every push, integration tests run nightly and on pushes to main, and full protocol tests run only on tagged releases.</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Test a Minimal MCP Server</h4>
+<p>
+Build a complete test suite for a single-tool MCP server in five steps, using only
+Python standard libraries plus <code>mcp</code> and <code>pytest</code>:
+</p>
+<p>
+<strong>1.</strong> Create a file <code>echo_server.py</code> with a single MCP tool called
+<code>reverse_text</code> that takes a string and returns it reversed. Use the
+<code>mcp</code> SDK's <code>@server.tool()</code> decorator and add a
+<code>main_sync()</code> entry point that runs the server on stdio.
+</p>
+<p>
+<strong>2.</strong> Write three unit tests in <code>test_echo_unit.py</code>: one that verifies
+<code>reverse_text("hello")</code> returns <code>"olleh"</code>, one that verifies an
+empty string returns an empty string, and one that verifies a Unicode string
+(e.g., with accented characters) round-trips correctly.
+</p>
+<p>
+<strong>3.</strong> Write two end-to-end tests in <code>test_echo_protocol.py</code> using the
+MCP client SDK: one that connects to the server via <code>stdio_client</code>, calls
+<code>list_tools()</code>, and asserts <code>reverse_text</code> appears; and one that
+calls <code>reverse_text</code> through the protocol and checks the JSON-RPC response
+content.
+</p>
+<p>
+<strong>4.</strong> Add a <code>pyproject.toml</code> with a <code>[project.scripts]</code> entry
+pointing to your server's <code>main_sync</code>, then run
+<code>pip install -e .</code> so the console script is available.
+</p>
+<p>
+<strong>5.</strong> Run <code>pytest test_echo_unit.py test_echo_protocol.py -v</code> and
+confirm all five tests pass. Then intentionally break the tool (e.g., return the
+string unchanged) and verify that the tests catch the regression.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual</strong>: Explain why end-to-end MCP protocol tests are necessary in
+addition to unit tests that call tool functions directly. What class of bugs can
+protocol tests catch that unit tests cannot? Give two concrete examples.
+</li>
+<li>
+<strong>Coding</strong>: Write a pytest fixture that records HTTP responses from PubChem
+to JSON files on the first run, then replays them on subsequent runs (a "cassette"
+pattern). Use the <code>pytest-recording</code> or <code>vcrpy</code> library, or
+implement it from scratch with <code>httpx</code> event hooks. Verify that your
+<code>search_pubchem</code> tests produce identical results in both live and replay modes.
+</li>
+<li>
+<strong>Analysis</strong>: The Docker configuration in this section limits the server to
+1 GB of memory. Estimate the maximum number of concurrent <code>compute_descriptors</code>
+calls the server can handle before hitting this limit, assuming each RDKit molecule
+object consumes approximately 5 KB of memory and each call holds the molecule for
+200 ms. What happens when the limit is exceeded, and how should the server handle it?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We have tested and packaged individual MCP tools. In
+<a href="section-12.4.html">Section 12.4: Building a Scientific MCP Server</a>, we
+combine PubChem, OpenAlex, and a vector database into a complete server, add resource
+subscriptions and prompt templates, and integrate the server into the
+Discovery Workbench.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-12.2.html">&#8592; 12.2 Implementing Scientific Tools</a>
+<a href="index.html">Chapter 12</a>
+<a href="section-12.4.html">12.4 Building a Scientific MCP Server &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

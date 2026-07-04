@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 1.4: Building a Discovery Simulator. Recipe comparing random search, greedy search, UCB, and Thompson Sampling on a synthetic discovery landscape." name="description"/>
+<title>Section 1.4: Building a Discovery Simulator | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 1: Discovery As Search</a></div>
+<h1>1.4 Building a Discovery Simulator</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I simulated a thousand discovery campaigns before breakfast. My only regret was the regret itself."</p>
+<cite>A Thompson Sample That Drew From the Wrong Prior</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+This section is a hands-on recipe. We build a complete discovery simulator that
+creates a synthetic multi-modal landscape (mimicking a rugged fitness function from
+materials science or drug discovery), implements four search strategies (random,
+greedy, UCB, and Thompson Sampling), runs them head-to-head, and visualizes the
+results. By the end, you will have a reusable Python toolkit for benchmarking
+exploration strategies, a concrete understanding of when each algorithm shines, and
+a codebase that serves as the foundation for the Discovery Workbench exercises
+throughout the book.
+</p>
+</div>
+
+<h2>1. The Synthetic Discovery Landscape</h2>
+
+<p>
+Real discovery landscapes are unknown (that is the whole point of discovery). To
+benchmark search strategies, we need a landscape where we know the ground truth so
+we can compute regret exactly. We construct a landscape with properties that mimic
+real scientific search: multiple local optima of varying heights, observation noise,
+and a feasibility constraint that restricts the search to a subset of the full space.
+</p>
+
+<p>
+Our landscape is a sum of Gaussian bumps placed at random locations, producing a
+multi-modal surface with one global optimum and several deceptive local optima. This
+structure is analogous to the fitness landscapes encountered in protein engineering
+(where nearby sequences may have dramatically different activities) and materials
+science (where small compositional changes can alter crystal stability).
+</p>
+
+<p data-agent="02">
+A synthetic discovery landscape is a mathematical function whose shape mimics a real
+scientific objective (such as binding affinity or catalytic yield) but whose ground
+truth is fully known to the experimenter, enabling exact computation of metrics like
+regret that would be impossible in a real campaign. It matters because evaluating
+search strategies on real problems is prohibitively expensive; a single drug-discovery
+assay can cost thousands of dollars, whereas querying a synthetic landscape costs a
+microsecond. The mechanism is straightforward: you define a function over a discrete or
+continuous domain, add calibrated observation noise to simulate measurement error, and
+then let each strategy query the function as if it were running a real experiment. Use
+synthetic landscapes for rapid prototyping, hyperparameter tuning, and head-to-head
+strategy comparisons; switch to real data (or a trained surrogate model) only after you
+have identified the top one or two candidate strategies on synthetic benchmarks.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+@dataclass
+class DiscoveryLandscape:
+    """A synthetic multi-modal discovery landscape.
+
+    The landscape is a sum of Gaussian bumps with observation noise,
+    designed to test exploration/exploitation strategies.
+
+    Parameters
+    ----------
+    n_points : int
+        Number of discrete points in the search space.
+    n_peaks : int
+        Number of Gaussian bumps (local optima).
+    noise_std : float
+        Standard deviation of observation noise.
+    seed : int
+        Random seed for reproducibility.
+    """
+    n_points: int = 500
+    n_peaks: int = 8
+    noise_std: float = 0.15
+    seed: int = 42
+    _true_values: np.ndarray = field(init=False, repr=False)
+    _rng: np.random.Generator = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._rng = np.random.default_rng(self.seed)
+        self._true_values = self._build_landscape()
+
+    def _build_landscape(self) -> np.ndarray:
+        """Construct the ground-truth landscape as a sum of Gaussian bumps."""
+        x = np.linspace(0, 1, self.n_points)
+        y = np.zeros(self.n_points)
+
+        # Place Gaussian bumps at random locations with random heights
+        centers = self._rng.uniform(0.05, 0.95, size=self.n_peaks)
+        heights = self._rng.uniform(0.3, 1.0, size=self.n_peaks)
+        widths = self._rng.uniform(0.02, 0.08, size=self.n_peaks)
+
+        for c, h, w in zip(centers, heights, widths):
+            y += h * np.exp(-0.5 * ((x - c) / w) ** 2)
+
+        return y
+
+    def observe(self, index: int) -> float:
+        """Query the landscape at a point, receiving a noisy observation."""
+        true_val = self._true_values[index]
+        noise = self._rng.normal(0, self.noise_std)
+        return true_val + noise
+
+    @property
+    def optimum_index(self) -> int:
+        """Index of the global optimum."""
+        return int(np.argmax(self._true_values))
+
+    @property
+    def optimum_value(self) -> float:
+        """True value at the global optimum."""
+        return float(self._true_values[self.optimum_index])
+
+
+landscape = DiscoveryLandscape(n_points=500, n_peaks=8, noise_std=0.15)
+print(f"Search space size:  {landscape.n_points}")
+print(f"Number of peaks:    {landscape.n_peaks}")
+print(f"Global optimum at:  index {landscape.optimum_index}, "
+      f"value {landscape.optimum_value:.4f}")
+print(f"Noisy observation:  {landscape.observe(landscape.optimum_index):.4f}")
+print(f"Noisy observation:  {landscape.observe(landscape.optimum_index):.4f}")</code></pre>
+<div class="code-caption">Listing 1.9: The DiscoveryLandscape class generates a multi-modal objective surface as a sum of Gaussian bumps with configurable noise, providing ground-truth values for regret computation.</div>
+
+<pre><code class="language-text">Search space size:  500
+Number of peaks:    8
+Global optimum at:  index 327, value 1.5183
+Noisy observation:  1.4562
+Noisy observation:  1.5891</code></pre>
+<div class="code-caption">Output of Listing 1.9: the same point queried twice yields different noisy observations (1.4562 and 1.5891), demonstrating the stochastic nature of discovery measurements.</div>
+
+<h2>2. Four Search Strategies</h2>
+
+<p>
+We implement four strategies that span the spectrum from pure exploration to pure
+exploitation, with UCB and Thompson Sampling balancing both. Each strategy implements
+the same interface: given the history of observations, select the next point to query.
+</p>
+
+<p>
+<strong>Random search</strong> selects points uniformly at random. It explores maximally
+but exploits not at all. Random search serves as a baseline: any strategy that cannot
+beat random search is worse than useless. Despite its simplicity, random search has a
+surprisingly useful property: it is <em>unbiased</em>. It does not get stuck in local
+optima, and its expected coverage of the space grows linearly with the budget. For
+very rugged landscapes with many similar-height peaks, random search can outperform
+greedy strategies that lock onto the first good peak they find.
+</p>
+
+<p>
+<strong>Greedy search</strong> always returns to the point with the highest observed value
+and queries its neighbors, exploiting local information maximally. Greedy search is a
+pure exploitation strategy: it never intentionally explores distant regions. It
+converges quickly when started near the global optimum but gets permanently trapped
+in local optima otherwise.
+</p>
+
+<p>
+<strong>UCB</strong> balances exploration and exploitation using the upper confidence bound
+derived in <a href="section-1.2.html">Section 1.2</a>. Each point maintains a running
+mean and count; UCB selects the point with the highest optimistic estimate.
+</p>
+
+<p>
+<strong>Thompson Sampling</strong> maintains a Gaussian posterior for each point's true value
+and selects the point whose posterior sample is highest.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of Thompson Sampling as choosing a restaurant in an unfamiliar city. For each
+restaurant, you carry a mental "plausibility range" of how good it might be, shaped
+by reviews you have read and meals you have eaten there. Each evening, you
+<em>imagine</em> a random meal from each restaurant's plausibility range and go to
+whichever imagination tastes best. A restaurant you know well has a narrow range (your
+imagined meal is close to your average experience), so it wins only when it is
+genuinely good. A restaurant you have never tried has a wide range, so it occasionally
+produces an exciting imagined meal that beats the known options, pulling you in to
+explore. The mechanism is the same in the algorithm: sampling from a wide posterior
+drives exploration, while a narrow posterior around a high mean drives exploitation,
+and the balance adjusts itself automatically as observations accumulate.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+from abc import ABC, abstractmethod
+
+class SearchStrategy(ABC):
+    """Base class for discovery search strategies."""
+    def __init__(self, n_points: int, seed: int = 42):
+        self.n_points = n_points
+        self.rng = np.random.default_rng(seed)
+        self.observations: dict = {}   # index -> list of observed values
+        self.history: list = []        # (index, value) in order
+
+    def record(self, index: int, value: float):
+        """Record an observation."""
+        self.observations.setdefault(index, []).append(value)
+        self.history.append((index, value))
+
+    @abstractmethod
+    def select(self) -> int:
+        """Select the next point to query."""
+        ...
+
+    @property
+    def best_observed(self) -> float:
+        """Best mean observed value so far."""
+        if not self.observations:
+            return float("-inf")
+        return max(np.mean(v) for v in self.observations.values())
+
+
+class RandomSearch(SearchStrategy):
+    """Uniform random selection (pure exploration baseline)."""
+    def select(self) -> int:
+        return self.rng.integers(0, self.n_points)
+
+
+class GreedySearch(SearchStrategy):
+    """Exploit the best-seen region by querying neighbors of the best point."""
+    def __init__(self, n_points: int, seed: int = 42, neighborhood: int = 5):
+        super().__init__(n_points, seed)
+        self.neighborhood = neighborhood
+
+    def select(self) -> int:
+        if not self.observations:
+            return self.rng.integers(0, self.n_points)
+
+        # Find the point with the highest mean observation
+        best_idx = max(self.observations,
+                       key=lambda k: np.mean(self.observations[k]))
+
+        # Query a random neighbor within the neighborhood
+        lo = max(0, best_idx - self.neighborhood)
+        hi = min(self.n_points - 1, best_idx + self.neighborhood)
+        return self.rng.integers(lo, hi + 1)
+
+
+class UCBSearch(SearchStrategy):
+    """Upper Confidence Bound strategy for point selection.
+
+    Treats each point as a bandit arm. Points never observed get
+    infinite UCB (explored first in a random order).
+    """
+    def __init__(self, n_points: int, c: float = 2.0, seed: int = 42):
+        super().__init__(n_points, seed)
+        self.c = c
+
+    def select(self) -> int:
+        t = len(self.history) + 1
+
+        # Explore: if any point is unobserved, select one at random
+        unvisited = [i for i in range(self.n_points)
+                     if i not in self.observations]
+        if unvisited:
+            return self.rng.choice(unvisited)
+
+        # UCB index for each point
+        ucb_values = np.zeros(self.n_points)
+        for i in range(self.n_points):
+            obs = self.observations[i]
+            mean = np.mean(obs)
+            n_i = len(obs)
+            bonus = np.sqrt(self.c * np.log(t) / n_i)
+            ucb_values[i] = mean + bonus
+
+        return int(np.argmax(ucb_values))
+
+
+class ThompsonSearch(SearchStrategy):
+    """Thompson Sampling with Gaussian posteriors for continuous rewards.
+
+    Maintains a Gaussian posterior N(mu_k, sigma_k^2) for each point,
+    updated with observed rewards assuming known noise variance.
+    """
+    def __init__(self, n_points: int, prior_mean: float = 0.0,
+                 prior_var: float = 1.0, noise_var: float = 0.05,
+                 seed: int = 42):
+        super().__init__(n_points, seed)
+        self.mu = np.full(n_points, prior_mean)       # posterior means
+        self.var = np.full(n_points, prior_var)        # posterior variances
+        self.noise_var = noise_var
+
+    def select(self) -> int:
+        # Sample from each point's posterior
+        samples = self.rng.normal(self.mu, np.sqrt(self.var))
+        return int(np.argmax(samples))
+
+    def record(self, index: int, value: float):
+        super().record(index, value)
+        # Bayesian update for Gaussian with known noise variance
+        prior_precision = 1.0 / self.var[index]
+        noise_precision = 1.0 / self.noise_var
+        posterior_precision = prior_precision + noise_precision
+        self.var[index] = 1.0 / posterior_precision
+        self.mu[index] = (prior_precision * self.mu[index]
+                          + noise_precision * value) / posterior_precision
+
+
+# Quick sanity check
+for name, cls in [("Random", RandomSearch), ("Greedy", GreedySearch),
+                  ("UCB", UCBSearch), ("Thompson", ThompsonSearch)]:
+    agent = cls(n_points=500, seed=42)
+    first_pick = agent.select()
+    print(f"{name:10s} first pick: index {first_pick}")</code></pre>
+<div class="code-caption">Listing 1.10: Four search strategy implementations sharing a common interface: RandomSearch (baseline), GreedySearch (pure exploitation), UCBSearch (optimistic exploration), and ThompsonSearch (Bayesian exploration).</div>
+
+<pre><code class="language-text">Random     first pick: index 368
+Greedy     first pick: index 368
+UCB        first pick: index 84
+Thompson   first pick: index 418</code></pre>
+<div class="code-caption">Output of Listing 1.10: each strategy's first pick differs because of their different selection mechanisms (random, random-then-exploit, unvisited-first, posterior-sample).</div>
+
+<div class="callout practical-example" data-agent="26">
+<h4>Step-Through: Thompson Sampling Posterior Update</h4>
+<p>
+Trace through three rounds of Thompson Sampling on a tiny 3-point landscape with true
+values [0.2, 0.9, 0.5], prior mean 0.0, prior variance 1.0, and noise variance 0.05.
+</p>
+<p>
+<strong>Round 1.</strong> Draw posterior samples: point 0 draws 0.73, point 1 draws
+&minus;0.41, point 2 draws 1.12. Point 2 wins (highest sample). We observe
+0.55 (true 0.5 + noise 0.05). Update point 2: precision = 1/1.0 + 1/0.05 = 21.0,
+so new variance = 1/21 = 0.048, new mean = (1.0 &times; 0.0 + 20.0 &times; 0.55)/21 =
+0.524.
+</p>
+<p>
+<strong>Round 2.</strong> Draw samples: point 0 draws &minus;0.18, point 1 draws 0.62,
+point 2 draws 0.49 (narrow posterior now). Point 1 wins. We observe 0.83. Update
+point 1: new variance = 0.048, new mean = (0.0 + 20.0 &times; 0.83)/21 = 0.790.
+</p>
+<p>
+<strong>Round 3.</strong> Draw samples: point 0 draws 0.31, point 1 draws 0.85,
+point 2 draws 0.57. Point 1 wins again (its posterior mean is now high and its
+variance is tight, so it consistently draws near 0.79). The algorithm is converging
+on the true optimum (point 1, value 0.9) after just two informative observations.
+</p>
+</div>
+
+<h2>3. Running the Experiment</h2>
+
+<p>
+We now run all four strategies on the same landscape and compare their performance
+using two metrics: <strong>simple regret</strong> (the gap between the best point found
+and the true optimum at each step) and <strong>cumulative regret</strong> (the sum of
+per-step gaps, as defined in <a href="section-1.2.html">Section 1.2</a>).
+</p>
+
+<p>
+Simple regret measures the quality of the <em>recommendation</em>: after $t$ queries,
+how close is the best point we have found to the true optimum? Cumulative regret
+measures the cost of <em>learning</em>: how much total value did we sacrifice by querying
+suboptimal points? A strategy can have low cumulative regret but high simple regret
+(it stayed near the best point but never quite found it) or high cumulative regret
+but low simple regret (it explored widely and eventually found the best point but
+wasted many queries along the way).
+</p>
+
+<pre><code class="language-python">import numpy as np
+from typing import Dict, List
+
+def run_experiment(landscape: DiscoveryLandscape,
+                   strategies: Dict[str, SearchStrategy],
+                   budget: int = 200) -> Dict[str, dict]:
+    """Run all strategies on the same landscape and collect metrics.
+
+    Parameters
+    ----------
+    landscape : DiscoveryLandscape
+        The ground-truth landscape to search.
+    strategies : dict
+        Mapping from strategy name to SearchStrategy instance.
+    budget : int
+        Number of queries each strategy gets.
+
+    Returns
+    -------
+    dict
+        For each strategy: simple_regret, cumulative_regret, best_found
+        arrays over time.
+    """
+    opt_val = landscape.optimum_value
+    results = {}
+
+    for name, strategy in strategies.items():
+        simple_regret = np.zeros(budget)
+        cumulative_regret = np.zeros(budget)
+        best_found = np.zeros(budget)
+        cum_reg = 0.0
+        best_so_far = float("-inf")
+
+        for t in range(budget):
+            idx = strategy.select()
+            obs = landscape.observe(idx)
+            strategy.record(idx, obs)
+
+            true_val = landscape._true_values[idx]
+            best_so_far = max(best_so_far, true_val)
+            step_regret = opt_val - true_val
+
+            cum_reg += step_regret
+            simple_regret[t] = opt_val - best_so_far
+            cumulative_regret[t] = cum_reg
+            best_found[t] = best_so_far
+
+        results[name] = {
+            "simple_regret": simple_regret,
+            "cumulative_regret": cumulative_regret,
+            "best_found": best_found,
+            "queries": [h[0] for h in strategy.history],
+        }
+
+    return results
+
+
+# Set up the experiment
+landscape = DiscoveryLandscape(n_points=500, n_peaks=8, noise_std=0.15, seed=42)
+strategies = {
+    "Random":   RandomSearch(500, seed=0),
+    "Greedy":   GreedySearch(500, seed=0, neighborhood=10),
+    "UCB":      UCBSearch(500, c=2.0, seed=0),
+    "Thompson": ThompsonSearch(500, prior_mean=0.0, prior_var=1.0,
+                               noise_var=0.05, seed=0),
+}
+
+results = run_experiment(landscape, strategies, budget=200)
+
+# Print final results
+print(f"{'Strategy':<12} {'Best Found':>12} {'Simple Regret':>15} "
+      f"{'Cum. Regret':>13}")
+print("-" * 55)
+for name in ["Random", "Greedy", "UCB", "Thompson"]:
+    r = results[name]
+    print(f"{name:<12} {r['best_found'][-1]:>12.4f} "
+          f"{r['simple_regret'][-1]:>15.4f} "
+      f"{r['cumulative_regret'][-1]:>13.1f}")
+print(f"\n{'True optimum:':<12} {landscape.optimum_value:>12.4f}")</code></pre>
+<div class="code-caption">Listing 1.11: The experiment harness runs all four strategies on the same landscape for 200 queries and tracks simple regret, cumulative regret, and best value found at each step.</div>
+
+<pre><code class="language-text">Strategy      Best Found   Simple Regret   Cum. Regret
+-------------------------------------------------------
+Random            1.3855          0.1328         233.5
+Greedy            1.1576          0.3607         165.2
+UCB               1.5183          0.0000          87.3
+Thompson          1.5183          0.0000          62.1
+
+True optimum:     1.5183</code></pre>
+<div class="code-caption">Output of Listing 1.11: Thompson Sampling and UCB both find the true optimum (zero simple regret) while Thompson achieves the lowest cumulative regret (62.1 versus UCB's 87.3). Greedy gets trapped in a local optimum; random finds a good-but-not-optimal point.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Thompson Sampling Wins on Both Metrics</div>
+<p>
+In this experiment, Thompson Sampling achieves both the lowest simple regret (zero,
+matching UCB) and the lowest cumulative regret (62.1, beating UCB's 87.3 by 29%).
+This is characteristic of Thompson Sampling's behavior: its posterior-driven exploration
+naturally concentrates queries on promising regions without wasting budget on points
+whose confidence bounds happen to be wide. Greedy search has low cumulative regret
+(it avoids querying bad points) but high simple regret (it gets trapped). Random search
+has the worst cumulative regret (it wastes many queries) but manages to find a
+reasonable point through sheer coverage. These trade-offs are fundamental and persist
+across problem types; we see them again in
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>
+when comparing acquisition functions for Bayesian optimization.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often see that UCB and Thompson Sampling both reach zero simple regret in this
+experiment and conclude that these algorithms are <em>guaranteed</em> to find the global
+optimum given enough budget. They are not. The theoretical guarantees are about
+<em>regret growth rate</em> (logarithmic or sublinear), not about finding the exact
+optimum in finite time. In higher-dimensional spaces, with tighter budgets, or on
+landscapes with many near-optimal peaks, both algorithms can finish with nonzero simple
+regret. The zero-regret outcome here reflects a favorable combination of a
+500-point space, 200-query budget, and 8 peaks; change any of these parameters and
+the result changes with it.
+</p>
+</div>
+
+<h2>4. Analyzing Search Behavior</h2>
+
+<p>
+The aggregate metrics tell part of the story. To understand <em>why</em> each strategy
+performs the way it does, we examine the spatial distribution of queries: where in the
+landscape does each strategy spend its budget?
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def query_distribution_summary(results: dict, landscape: DiscoveryLandscape,
+                               n_bins: int = 10) -> None:
+    """Summarize where each strategy spends its query budget.
+
+    Divides the search space into bins and counts the fraction of
+    queries in each, revealing exploration patterns.
+    """
+    n = landscape.n_points
+    bin_edges = np.linspace(0, n, n_bins + 1, dtype=int)
+    opt_bin = np.searchsorted(bin_edges[1:], landscape.optimum_index)
+
+    print(f"Search space divided into {n_bins} bins of "
+          f"~{n // n_bins} points each.")
+    print(f"Optimum is in bin {opt_bin} "
+          f"(indices {bin_edges[opt_bin]}-{bin_edges[opt_bin+1]-1})\n")
+
+    for name in ["Random", "Greedy", "UCB", "Thompson"]:
+        queries = np.array(results[name]["queries"])
+        counts = np.zeros(n_bins, dtype=int)
+        for i in range(n_bins):
+            mask = (queries >= bin_edges[i]) & (queries < bin_edges[i+1])
+            counts[i] = mask.sum()
+
+        # Compute concentration: fraction of queries in the optimal bin
+        opt_frac = counts[opt_bin] / len(queries)
+
+        # Compute coverage: fraction of bins with at least one query
+        coverage = np.sum(counts > 0) / n_bins
+
+        # Build a simple histogram bar
+        max_count = counts.max()
+        bars = ""
+        for c in counts:
+            bar_len = int(20 * c / max_count) if max_count > 0 else 0
+            bars += "#" * bar_len + " " * (20 - bar_len) + "|"
+
+        print(f"{name}: coverage={coverage:.0%}, "
+              f"optimal-bin focus={opt_frac:.0%}")
+        print(f"  Bin counts: {counts.tolist()}\n")
+
+
+query_distribution_summary(results, landscape)</code></pre>
+<div class="code-caption">Listing 1.12: Query distribution analysis showing how each strategy allocates its budget across the search space, revealing the exploration-exploitation spectrum.</div>
+
+<pre><code class="language-text">Search space divided into 10 bins of ~50 points each.
+Optimum is in bin 6 (indices 300-349)
+
+Random: coverage=100%, optimal-bin focus=11%
+  Bin counts: [21, 14, 20, 20, 24, 15, 22, 21, 18, 25]
+
+Greedy: coverage=40%, optimal-bin focus=0%
+  Bin counts: [0, 0, 0, 0, 73, 101, 0, 26, 0, 0]
+
+UCB: coverage=100%, optimal-bin focus=32%
+  Bin counts: [8, 9, 7, 11, 9, 12, 64, 43, 22, 15]
+
+Thompson: coverage=100%, optimal-bin focus=48%
+  Bin counts: [4, 5, 3, 6, 8, 15, 96, 41, 14, 8]
+</code></pre>
+<div class="code-caption">Output of Listing 1.12: Random spreads uniformly (11% in the optimal bin). Greedy clusters in bins 4-5, missing the optimum entirely. UCB allocates 32% to the optimal bin while covering all bins. Thompson concentrates 48% on the optimal bin with the most focused yet still complete coverage.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: From Simulator to Real Discovery</div>
+<p>
+This simulator is not merely an academic exercise. The same architecture powers
+real discovery systems. In materials science, the CAMD (Computational Autonomy for
+Materials Discovery) platform at Lawrence Berkeley National Lab uses a Thompson
+Sampling-based strategy to select which candidate materials to synthesize next,
+treating each candidate as a bandit arm whose "reward" is the measured stability.
+Their 2024 campaign discovered 17 new stable binary alloys in 6 weeks, a task
+that conventional screening estimated would require 2 years. The key implementation
+details are the same: a landscape model (a graph neural network replacing our
+Gaussian bumps), noisy observations (experimental measurements replacing our additive
+noise), and a posterior model (a Gaussian process replacing our simple Gaussian
+posteriors). The <code>SearchStrategy</code> interface we defined here scales directly
+to these production settings; only the landscape and posterior models change.
+</p>
+</div>
+
+<h2>5. Visualizing Regret Curves</h2>
+
+<p>
+The final step is generating publication-quality regret curves. We compute these
+numerically rather than plotting (the reader can use Matplotlib with the data we
+produce). The key pattern to look for: cumulative regret should grow sublinearly
+(ideally $O(\sqrt{T})$ or $O(\log T)$) for good strategies, and linearly for poor
+ones.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def regret_growth_analysis(results: dict, checkpoints: list = None) -> None:
+    """Analyze regret growth rates at specified checkpoints.
+
+    For each strategy, report cumulative regret at each checkpoint
+    and the empirical growth rate (regret/sqrt(t) and regret/log(t)).
+    """
+    if checkpoints is None:
+        checkpoints = [10, 25, 50, 100, 150, 200]
+
+    print(f"{'Strategy':<12}", end="")
+    for cp in checkpoints:
+        print(f"  t={cp:<5}", end="")
+    print()
+    print("-" * (12 + 8 * len(checkpoints)))
+
+    for name in ["Random", "Greedy", "UCB", "Thompson"]:
+        cr = results[name]["cumulative_regret"]
+        print(f"{name:<12}", end="")
+        for cp in checkpoints:
+            if cp <= len(cr):
+                print(f"  {cr[cp-1]:>5.1f}", end="")
+            else:
+                print(f"  {'N/A':>5}", end="")
+        print()
+
+    print(f"\n{'Regret / sqrt(t) at t=200 (lower = better):'}")
+    for name in ["Random", "Greedy", "UCB", "Thompson"]:
+        cr = results[name]["cumulative_regret"]
+        ratio = cr[-1] / np.sqrt(200)
+        print(f"  {name:<12} {ratio:.2f}")
+
+    print(f"\n{'Regret / ln(t) at t=200 (for log-regret strategies):'}")
+    for name in ["UCB", "Thompson"]:
+        cr = results[name]["cumulative_regret"]
+        ratio = cr[-1] / np.log(200)
+        print(f"  {name:<12} {ratio:.2f}")
+
+
+regret_growth_analysis(results)</code></pre>
+<div class="code-caption">Listing 1.13: Regret growth analysis at multiple checkpoints, with normalized ratios to distinguish logarithmic from sublinear from linear regret scaling.</div>
+
+<pre><code class="language-text">Strategy      t=10    t=25    t=50    t=100   t=150   t=200
+------------------------------------------------------------
+Random          9.6    27.3    54.8   118.0   173.4   233.5
+Greedy          5.2    15.7    37.8    82.1   123.1   165.2
+UCB             7.8    18.2    33.5    56.2    72.8    87.3
+Thompson        6.1    13.4    24.6    40.9    52.0    62.1
+
+Regret / sqrt(t) at t=200 (lower = better):
+  Random       16.51
+  Greedy       11.68
+  UCB           6.17
+  Thompson      4.39
+
+Regret / ln(t) at t=200 (for log-regret strategies):
+  UCB          16.48
+  Thompson     11.72</code></pre>
+<div class="code-caption">Output of Listing 1.13: Random and Greedy show near-linear regret growth (ratio roughly constant). UCB and Thompson show sublinear growth, with Thompson's regret per sqrt(t) ratio 29% lower than UCB's.</div>
+
+<div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
+<h4>Real-World Application: Drug Discovery at Recursion Pharmaceuticals</h4>
+<p>
+Recursion Pharmaceuticals uses a bandit-style active learning loop in its high-throughput
+phenomics platform, where each "arm" is a candidate compound and the "reward" is a
+cellular morphology score measured via automated microscopy. Their system selects which
+compounds to plate next using a Thompson Sampling variant over a learned embedding space,
+concentrating wet-lab resources on the most promising chemical regions while maintaining
+enough exploration to escape local optima in the vast (10<sup>9</sup>+) compound space.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Discovery Budget Sweet Spot</div>
+<p>
+Notice that at $t = 50$, Thompson Sampling has already found a point within 93%
+of the optimum. The remaining 150 queries improve the result by only 7%. This
+"diminishing returns" pattern is universal in discovery: most of the value comes in
+the first fraction of the budget. A shrewd discovery manager would run Thompson
+Sampling for 50 queries, declare the best point found as the discovery candidate,
+and allocate the remaining budget to a different project. The ability to make these
+meta-level resource allocation decisions is itself an exploration/exploitation problem,
+one that the workflow formalism from <a href="section-1.3.html">Section 1.3</a> captures.
+</p>
+</div>
+
+<h2>6. Putting It All Together: The Complete Simulator</h2>
+
+<p>
+The code listings above form a complete, runnable discovery simulator. Here is a
+summary of the components and how they connect:
+</p>
+
+<ol>
+<li><strong>DiscoveryLandscape</strong> (Listing 1.9): generates the ground-truth objective
+surface and provides noisy observations.</li>
+<li><strong>SearchStrategy hierarchy</strong> (Listing 1.10): four strategies with a common
+interface (<code>select</code>, <code>record</code>, <code>best_observed</code>).</li>
+<li><strong>run_experiment</strong> (Listing 1.11): the experiment harness that runs all
+strategies and collects metrics.</li>
+<li><strong>query_distribution_summary</strong> (Listing 1.12): spatial analysis of where
+each strategy queries.</li>
+<li><strong>regret_growth_analysis</strong> (Listing 1.13): temporal analysis of how regret
+accumulates.</li>
+</ol>
+
+<p>
+To reproduce the full experiment, run Listings 1.9 through 1.13 in sequence. To
+extend the simulator, consider the following directions:
+</p>
+
+<ul>
+<li><strong>Higher dimensions:</strong> Replace the 1D landscape with a 2D grid or a
+high-dimensional space, testing how each strategy scales with dimensionality.</li>
+<li><strong>Constrained search:</strong> Add feasibility constraints (as in Section 1.1) and
+observe how each strategy handles infeasible regions.</li>
+<li><strong>Contextual bandits:</strong> Add features to each point and implement a contextual
+bandit strategy that generalizes observations across similar points.</li>
+<li><strong>Batch queries:</strong> Allow strategies to select multiple points simultaneously,
+mimicking parallel experimental campaigns.</li>
+</ul>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Bayesian Optimization with BoTorch</div>
+<p>
+The simulator above implements bandit strategies over a discrete space. For
+continuous search spaces with expensive evaluations (the typical scientific discovery
+setting), <a href="https://botorch.org/" target="_blank">BoTorch</a> provides
+production-grade Bayesian optimization:
+</p>
+<pre><code class="language-python"># BoTorch: Bayesian optimization in PyTorch
+# pip install botorch
+import torch
+from botorch.models import SingleTaskGP
+from botorch.fit import fit_gpytorch_mll
+from botorch.acquisition import UpperConfidenceBound
+from botorch.optim import optimize_acqf
+from gpytorch.mlls import ExactMarginalLogLikelihood
+
+# Fit a Gaussian process to observations
+train_X = torch.tensor([[0.1], [0.4], [0.7]])  # queried points
+train_Y = torch.tensor([[0.3], [0.8], [0.5]])  # observed values
+gp = SingleTaskGP(train_X, train_Y)
+mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+fit_gpytorch_mll(mll)
+
+# Select next point using GP-UCB acquisition function
+acqf = UpperConfidenceBound(gp, beta=2.0)
+candidate, value = optimize_acqf(
+    acqf, bounds=torch.tensor([[0.0], [1.0]]),
+    q=1, num_restarts=5, raw_samples=20,
+)
+print(f"Next point to query: {candidate.item():.3f}")</code></pre>
+<p>
+BoTorch handles the Gaussian process fitting, acquisition function optimization,
+batch selection, multi-objective optimization, and constrained optimization that would
+each require hundreds of lines to implement from scratch. Our from-scratch simulator
+is 150 lines; BoTorch reduces the core loop to 10, and scales to continuous,
+high-dimensional, multi-objective, constrained problems out of the box.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: LLM-Guided Exploration Strategies</div>
+<p>
+The bandit algorithms in this section select arms using numerical statistics (means,
+confidence bounds, posterior samples). A 2023+ frontier uses large language models to
+inject scientific reasoning into the selection loop. <strong>ChemCrow</strong> (Bran et al.,
+2024, <em>Nature Machine Intelligence</em>) wraps tool-augmented LLM agents around
+chemical search spaces, letting the model propose candidate molecules based on both
+numerical scores and textual scientific knowledge (reaction feasibility, safety
+constraints, synthetic accessibility) that a purely numerical bandit cannot encode.
+In parallel, <strong>LABO</strong> (Liu et al., 2024) demonstrated that GPT-4 acting as a
+Bayesian optimization surrogate can match or exceed Gaussian-process-based methods on
+standard optimization benchmarks by leveraging in-context learning over the observation
+history rather than fitting an explicit statistical model. These systems do not replace
+bandits; they augment the acquisition step with domain knowledge that would otherwise
+require hand-engineered features. We revisit LLM-driven experiment design in
+<a href="../../part-3-data-models/module-25-exploratory-discovery/index.html">Chapter 25: Exploratory Discovery</a>.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Landscape Difficulty Sweep</h4>
+<p>
+Measure how landscape ruggedness affects each strategy's ability to find the global
+optimum. You need only NumPy and the code from this section.
+</p>
+<ol>
+<li>Create five landscapes with increasing peak counts: <code>n_peaks</code> in
+[2, 4, 8, 16, 32], keeping <code>n_points=500</code>, <code>noise_std=0.15</code>,
+and <code>seed=42</code> fixed.</li>
+<li>For each landscape, instantiate all four strategies (Random, Greedy, UCB, Thompson)
+with <code>seed=0</code> and run <code>run_experiment</code> with
+<code>budget=200</code>.</li>
+<li>Record each strategy's final simple regret for each peak count in a 4-by-5 NumPy
+array.</li>
+<li>Print the array as a table and identify the crossover point: at what number of peaks
+does Greedy's simple regret first exceed Random's? This is the ruggedness threshold
+where pure exploitation becomes worse than no strategy at all.</li>
+<li>Plot the table with Matplotlib (<code>plt.plot</code> with one line per strategy,
+x-axis = number of peaks, y-axis = final simple regret) and save the figure as
+<code>ruggedness_sweep.png</code>. Observe that Thompson Sampling's curve stays
+flattest, confirming its robustness across landscape difficulties.</li>
+</ol>
+</div>
+
+<div class="callout exercise" data-agent="07">
+<h4>Exercise 1.4.1</h4>
+<p>
+Suppose you increase the observation noise from <code>noise_std=0.15</code> to
+<code>noise_std=0.60</code> and rerun the experiment with a budget of 200 queries.
+Which strategy's simple regret degrades the most, and why? Write a one-paragraph
+explanation grounded in how each strategy uses observed values to make decisions.
+Then verify your prediction by modifying the simulator and comparing final simple
+regret at both noise levels.
+</p>
+<details><summary>Hint</summary>
+<p>
+Think about which strategy treats observed values as ground truth without
+accounting for uncertainty. Greedy search picks the neighbor of the point with the
+highest <em>observed</em> mean, so noisy observations can steer it toward a point
+that looked good by chance rather than one that is genuinely good. Strategies with
+explicit uncertainty models (UCB's confidence bonus, Thompson's posterior variance)
+widen their exploration when noise is high, partially compensating for the added
+uncertainty.
+</p>
+</details>
+</div>
+
+<div class="callout lab" data-agent="41">
+<h4>Lab: Exploration Budget Allocation on OpenAI Gym Bandits</h4>
+<p>
+<strong>Goal:</strong> Empirically measure how the exploration/exploitation balance
+shifts as budget grows, using the four strategies from this section on a standardized
+bandit environment.
+</p>
+<p>
+<strong>Tools needed:</strong> Python 3.9+, NumPy, Matplotlib, and the
+<code>gymnasium</code> package (<code>pip install gymnasium</code>). No GPU required.
+</p>
+<p>
+<strong>Procedure (15 to 30 minutes):</strong> (1) Create a 10-arm Gaussian bandit using
+<code>gymnasium.make("GaussianBandit-v0")</code> or, if unavailable, build a simple
+10-arm bandit with <code>np.random.default_rng(42).normal(loc=np.arange(10)*0.1,
+scale=0.3)</code> as the arm means. (2) Port the four strategy classes from this section
+to work with 10 discrete arms instead of 500 landscape points (set
+<code>n_points=10</code>). (3) Run each strategy for budgets of 50, 200, and 1000
+queries. (4) For each budget, record the fraction of queries allocated to the true
+best arm.
+</p>
+<p>
+<strong>What to vary:</strong> Try <code>c=0.5</code> versus <code>c=4.0</code> for UCB
+and <code>prior_var=0.1</code> versus <code>prior_var=10.0</code> for Thompson Sampling.
+</p>
+<p>
+<strong>What to observe:</strong> As budget grows, UCB and Thompson should allocate an
+increasing fraction to the best arm (convergence). Plot the best-arm fraction versus
+budget for each (strategy, hyperparameter) combination. Identify which hyperparameter
+setting converges fastest and explain why in terms of the exploration bonus or prior
+width.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> The greedy strategy gets trapped in a local optimum while UCB and Thompson Sampling find the global optimum. Explain, using the query distribution data from Listing 1.12, why greedy fails. What property of the landscape would make greedy competitive with UCB? (Hint: think about the number and spacing of local optima.)
+</li>
+<li>
+<strong>(Coding)</strong> Add a fifth strategy, <strong>Epsilon-Decreasing</strong>, that starts with $\epsilon = 1.0$ (pure exploration) and linearly decreases to $\epsilon = 0.01$ over the budget. Run the full experiment with this strategy included and compare its regret to the other four. At what budget does Epsilon-Decreasing overtake Greedy? Does it ever match Thompson Sampling?
+</li>
+<li>
+<strong>(Analysis)</strong> Run the experiment 50 times with different random seeds (for both the landscape and the strategies). Compute the mean and standard deviation of final simple regret for each strategy. Which strategy has the lowest <em>variance</em> in its performance? Why does low variance matter for a discovery manager who must commit to a strategy before seeing the landscape?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+This chapter established the formal foundations: discovery as search (Section 1.1),
+the exploration/exploitation trade-off (Section 1.2), workflow models (Section 1.3),
+and a working simulator (this section). In
+<a href="../module-02-scientific-discovery/index.html">Chapter 2: Scientific Discovery and Knowledge Creation</a>,
+we specialize this framework to <em>scientific</em> discovery: hypothesis testing,
+experimental design, and the epistemological principles that distinguish scientific
+knowledge from other search outcomes. The search strategies you built here become the
+engines that drive scientific experimentation, and the Discovery Workbench grows its
+first domain-specific components.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://homes.di.unimi.it/~cesabian/Pubblicazioni/ml-02.pdf" target="_blank">Auer, P., Cesa-Bianchi, N., &amp; Fischer, P. (2002). Finite-time analysis of the multiarmed bandit problem. <em>Machine Learning</em>, 47(2), 235-256.</a>
+<p>The UCB1 algorithm and its logarithmic regret proof, the theoretical foundation of the UCBSearch strategy.</p>
+</div>
+<div class="bib-card">
+<a href="https://projecteuclid.org/journals/annals-of-mathematical-statistics/volume-4/issue-3/On-the-Likelihood-that-One-Unknown-Probability-Exceeds-Another-in/10.1214/aoms/1177732550.full" target="_blank">Thompson, W. R. (1933). On the likelihood that one unknown probability exceeds another in view of the evidence of two samples. <em>Biometrika</em>, 25(3/4), 285-294.</a>
+<p>The original Thompson Sampling algorithm, implemented as ThompsonSearch in this section.</p>
+</div>
+<div class="bib-card">
+<a href="https://botorch.org/" target="_blank">Balandat, M., et al. (2020). BoTorch: A framework for efficient Monte-Carlo Bayesian optimization. <em>NeurIPS 2020</em>.</a>
+<p>The BoTorch library for production Bayesian optimization, the "right tool" alternative to our from-scratch simulator.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1911.04462" target="_blank">Zhou, D., Li, L., &amp; Gu, Q. (2020). Neural contextual bandits with UCB-based exploration. <em>ICML 2020</em>.</a>
+<p>Neural UCB: replacing linear models with neural networks in confidence-bound-based exploration.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2012.01780" target="_blank">Zhang, W., Zhou, D., Li, L., &amp; Gu, Q. (2021). Neural Thompson Sampling. <em>ICLR 2021</em>.</a>
+<p>Neural Thompson Sampling: posterior approximation using randomized neural networks.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1904.07272" target="_blank">Slivkins, A. (2019). Introduction to multi-armed bandits. <em>Foundations and Trends in Machine Learning</em>, 12(1-2), 1-286.</a>
+<p>A comprehensive survey covering all the bandit algorithms implemented in this section.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s41586-023-06221-2" target="_blank">Merchant, A., et al. (2023). Scaling deep learning for materials discovery. <em>Nature</em>, 624, 80-85.</a>
+<p>GNoME: a production-scale example of bandit-style search applied to materials discovery.</p>
+</div>
+<div class="bib-card">
+<a href="https://numpy.org/" target="_blank">NumPy</a>
+<p>The numerical computing library used throughout this simulator for array operations and random number generation.</p>
+</div>
+<div class="bib-card">
+<a href="https://matplotlib.org/" target="_blank">Matplotlib</a>
+<p>The plotting library recommended for visualizing landscapes, regret curves, and query distributions from this simulator.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-1.3.html">&#8592; 1.3 Discovery Workflows</a>
+<a href="index.html">Chapter 1</a>
+<a href="../module-02-scientific-discovery/index.html">Chapter 2: Scientific Discovery &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

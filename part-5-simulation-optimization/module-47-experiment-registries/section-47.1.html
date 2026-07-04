@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 47.1: Registry Design and Artifact Versioning. Content-addressable storage, artifact taxonomy, and versioning strategies for code, data, models, and configurations." name="description"/>
+<title>Section 47.1: Registry Design and Artifact Versioning | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation and Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 47: Experiment Registries and Scientific Provenance</a></div>
+<h1>47.1 Registry Design and Artifact Versioning</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I have 347 model checkpoints, 23 dataset versions, and 14 config files. I know exactly which combinations produced my best result. I wrote it on a sticky note. The sticky note is gone."</p>
+<cite>A Gradient Descent That Lost Its Provenance</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section assumes familiarity with Git version control and basic command-line workflows.
+Readers who completed <a href="../../part-2-software-engineering/module-22-mlops-llmops/index.html">Chapter 22: MLOps, LLMOps, and AgentOps</a>
+will recognize the model lifecycle concepts that registries formalize. Understanding of
+cryptographic hash functions (SHA-256) at the level covered in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6: Discovery System Architecture</a>
+is helpful but not required; we introduce the necessary concepts here.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+An experiment registry is the laboratory notebook of computational science. Where a bench
+scientist records reagent lot numbers, instrument settings, and procedural steps, a
+computational scientist must record code versions, data snapshots, hyperparameter values,
+random seeds, and environment specifications. This section designs a registry from first
+principles: we define what artifacts are, how to identify them unambiguously through
+content-addressable hashing, and how to version each artifact class (code, data, models,
+configurations) using tools that scale from a single researcher's laptop to a multi-team
+research organization.
+</p>
+</div>
+
+<h2>1. What Is an Experiment Registry?</h2>
+
+<p>
+An experiment registry is a structured store that records three categories of information
+about computational experiments:
+</p>
+
+<p data-agent="02">
+More precisely, an experiment registry is a metadata database layered on top of artifact storage: it does not merely archive files, but maintains a queryable graph of which code, data, configuration, and environment produced every result. This matters because without such a registry, reproducing or comparing past experiments requires manually reconstructing the exact combination of inputs from scattered files, commit logs, and personal notes, a process that fails as soon as a single link is missing. The registry works by assigning each artifact a content-derived identifier (typically a cryptographic hash), then recording the directed relationships between inputs, execution events, and outputs in a structured schema. Use a registry rather than ad-hoc folder naming or spreadsheets whenever your project involves more than a handful of experiment runs, whenever multiple people collaborate on the same pipeline, or whenever you need to demonstrate reproducibility to reviewers or regulators.
+</p>
+
+<ol>
+<li><strong>Artifacts</strong>: the tangible objects produced and consumed by experiments (datasets, code, model weights, configuration files, evaluation reports).</li>
+<li><strong>Runs</strong>: the execution events that transform input artifacts into output artifacts (a training run, a preprocessing step, an evaluation pass).</li>
+<li><strong>Relationships</strong>: the directed edges connecting runs to their input and output artifacts, forming a directed acyclic graph (DAG) that captures the complete lineage of every result.</li>
+</ol>
+
+<p>
+The registry's purpose is to answer a deceptively simple question: <em>given any artifact in
+the system, how was it produced?</em> This question decomposes into sub-questions that grow
+more demanding as scientific rigor increases. At the simplest level, we want to know which
+code and data produced a model. At the most rigorous level, we want to regenerate the model
+from scratch, bit-for-bit, given only the registry's metadata.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Reproducibility Is a Spectrum</div>
+<p>
+Reproducibility is not binary; it exists on a spectrum from <em>repeatability</em> (same team,
+same setup, same result) through <em>reproducibility</em> (different team, same method, consistent
+result) to <em>replicability</em> (different team, different method, same conclusion). A registry
+that captures code and hyperparameters enables repeatability. Adding exact data versions and
+environment specifications enables reproducibility. Adding provenance metadata that documents
+<em>why</em> choices were made enables others to attempt replication with alternative approaches.
+The registry design in this section targets full reproducibility, with hooks for the richer
+metadata that supports replication.
+</p>
+</div>
+
+<h2>2. Content-Addressable Storage</h2>
+
+<p>
+The foundation of artifact versioning is <strong>content-addressable storage</strong> (CAS):
+identifying every artifact by the cryptographic hash of its contents rather than by a
+human-assigned name or path. Git uses this principle for source code; DVC extends it to
+large binary files. The key property is that the identifier is deterministic and
+collision-resistant: if two artifacts have the same hash, they have the same contents (with
+negligible probability of collision), and any change to the contents produces a completely
+different hash.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of content-addressable storage like a library that shelves books not by title or author, but by a unique fingerprint derived from scanning every page. If two copies are identical, page for page, they share the same fingerprint and occupy the same shelf slot; the library never stores a duplicate. If someone changes even a single comma on page 47, the fingerprint changes completely and the modified copy gets its own shelf. This is why content-addressable storage detects tampering automatically: retrieving a book means re-scanning its pages and confirming the fingerprint still matches. If it does not, you know something changed, even if the title on the spine looks the same.
+</p>
+</div>
+
+<p>
+For an artifact with byte content $b$, the content address is:
+</p>
+
+$$\text{addr}(b) = \text{SHA-256}(b)$$
+
+<p>
+This gives us a 256-bit identifier (typically displayed as a 64-character hexadecimal string)
+that serves as both a unique name and an integrity check. When we store an artifact, we
+compute its hash; when we retrieve it, we recompute the hash and verify it matches. Any
+corruption, truncation, or tampering is detected automatically.
+</p>
+
+<pre><code class="language-python">"""Content-addressable artifact storage with hash verification."""
+import hashlib
+import json
+import shutil
+from pathlib import Path
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+
+@dataclass
+class ArtifactMetadata:
+    """Metadata for a registered artifact."""
+    artifact_type: str          # "dataset", "model", "config", "code", "report"
+    sha256: str                 # Content hash
+    size_bytes: int             # File size
+    created_at: str             # ISO 8601 timestamp
+    source_run_id: Optional[str] = None  # Run that produced this artifact
+    tags: dict = field(default_factory=dict)
+    parent_hashes: list = field(default_factory=list)  # Input artifact hashes
+
+
+def compute_hash(file_path: Path, chunk_size: int = 8192) -> str:
+    """Compute SHA-256 hash of a file, streaming to handle large files."""
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+class ArtifactStore:
+    """Content-addressable artifact store with metadata tracking."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.objects_dir = root / "objects"
+        self.metadata_dir = root / "metadata"
+        self.objects_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_dir.mkdir(parents=True, exist_ok=True)
+
+    def register(
+        self,
+        file_path: Path,
+        artifact_type: str,
+        source_run_id: Optional[str] = None,
+        tags: Optional[dict] = None,
+        parent_hashes: Optional[list] = None,
+    ) -> ArtifactMetadata:
+        """Register an artifact: hash it, copy to CAS, record metadata."""
+        file_path = Path(file_path)
+        sha = compute_hash(file_path)
+
+        # Store the object using its hash as the filename
+        # Use two-level directory structure (like Git) for filesystem scalability
+        obj_dir = self.objects_dir / sha[:2]
+        obj_dir.mkdir(exist_ok=True)
+        obj_path = obj_dir / sha[2:]
+
+        if not obj_path.exists():
+            shutil.copy2(file_path, obj_path)
+
+        metadata = ArtifactMetadata(
+            artifact_type=artifact_type,
+            sha256=sha,
+            size_bytes=file_path.stat().st_size,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            source_run_id=source_run_id,
+            tags=tags or {},
+            parent_hashes=parent_hashes or [],
+        )
+
+        # Persist metadata as JSON alongside the object
+        meta_path = self.metadata_dir / f"{sha}.json"
+        with open(meta_path, "w") as f:
+            json.dump(metadata.__dict__, f, indent=2)
+
+        return metadata
+
+    def verify(self, sha: str) -> bool:
+        """Verify that a stored artifact matches its content hash."""
+        obj_path = self.objects_dir / sha[:2] / sha[2:]
+        if not obj_path.exists():
+            return False
+        return compute_hash(obj_path) == sha
+
+    def retrieve(self, sha: str, dest: Path) -> Path:
+        """Retrieve an artifact by hash, verifying integrity."""
+        if not self.verify(sha):
+            raise ValueError(f"Artifact {sha[:12]}... failed integrity check")
+        obj_path = self.objects_dir / sha[:2] / sha[2:]
+        shutil.copy2(obj_path, dest)
+        return dest
+
+
+# Usage: register a trained model
+store = ArtifactStore(Path("./artifact_store"))
+meta = store.register(
+    file_path=Path("outputs/model_v3.pt"),
+    artifact_type="model",
+    source_run_id="run_20260415_001",
+    tags={"architecture": "transformer", "task": "property_prediction"},
+    parent_hashes=["a1b2c3...", "d4e5f6..."],  # training data + config hashes
+)
+print(f"Registered: {meta.artifact_type} [{meta.sha256[:12]}...]")
+print(f"Integrity check: {store.verify(meta.sha256)}")
+</code></pre>
+<div class="code-caption">Figure 47.1: A content-addressable artifact store. Each artifact is identified by its SHA-256 hash, stored in a two-level directory structure (like Git's object store), and accompanied by JSON metadata recording its type, provenance, and parent artifacts.</div>
+
+<p>
+The two-level directory structure (<code>objects/a1/b2c3d4...</code>) prevents any single
+directory from containing millions of entries, which would degrade filesystem performance.
+Git invented this pattern; we reuse it here because it scales well from hundreds to millions
+of artifacts.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Detecting Silent Data Corruption</div>
+<p>
+A materials science team stored 50,000 crystal structure files on a shared NFS mount. After
+a storage migration, they discovered that 23 files had been silently truncated. Because they
+had registered every file in a content-addressable store, a batch verification script
+identified the corrupted files in seconds by comparing stored hashes against recomputed
+hashes. Without the registry, the corruption would have gone undetected until someone
+tried to use the damaged files in a downstream analysis, potentially months later, producing
+wrong results with no indication of the cause.
+</p>
+</div>
+
+<h2>3. The Artifact Taxonomy</h2>
+
+<p>
+Not all artifacts are alike. A well-designed registry distinguishes artifact classes because
+they have different versioning characteristics, storage requirements, and lifecycle patterns.
+Table 47.1 summarizes the five primary artifact classes and their properties.
+</p>
+
+<figure>
+<table>
+<thead>
+<tr>
+<th>Artifact Class</th>
+<th>Examples</th>
+<th>Typical Size</th>
+<th>Versioning Tool</th>
+<th>Change Frequency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Code</strong></td>
+<td>Training scripts, preprocessing pipelines, evaluation harnesses</td>
+<td>KB to MB</td>
+<td>Git</td>
+<td>High (many commits/day)</td>
+</tr>
+<tr>
+<td><strong>Data</strong></td>
+<td>Raw datasets, processed features, train/test splits</td>
+<td>MB to TB</td>
+<td>DVC, LakeFS</td>
+<td>Low (new versions on acquisition or reprocessing)</td>
+</tr>
+<tr>
+<td><strong>Models</strong></td>
+<td>Trained weights, checkpoints, ONNX exports</td>
+<td>MB to GB</td>
+<td>MLflow Model Registry, DVC</td>
+<td>Medium (new version per training run)</td>
+</tr>
+<tr>
+<td><strong>Configs</strong></td>
+<td>Hyperparameters, environment specs, pipeline definitions</td>
+<td>KB</td>
+<td>Git, MLflow params</td>
+<td>High (tuned frequently)</td>
+</tr>
+<tr>
+<td><strong>Results</strong></td>
+<td>Metrics, plots, evaluation reports, predictions</td>
+<td>KB to MB</td>
+<td>MLflow metrics, W&amp;B</td>
+<td>High (one per run)</td>
+</tr>
+</tbody>
+</table>
+<figcaption>Table 47.1: The five primary artifact classes in an experiment registry. Each class has different storage requirements and change patterns, which determine the appropriate versioning strategy.</figcaption>
+</figure>
+
+<p>
+The key design decision is <strong>where</strong> each artifact class lives. Code and configs
+are small and text-based; they belong in Git, where diff, blame, and branch operations
+provide powerful inspection tools. Data and models are large and binary; they belong in a
+content-addressable store (DVC, cloud object storage, or a dedicated artifact store like
+the one in Figure 47.1) with only their hashes tracked in Git. This separation is the
+core insight behind DVC's architecture: Git tracks <code>.dvc</code> pointer files (small
+text files containing hashes), while the actual data lives elsewhere.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is believing that versioning code with Git is sufficient for experiment reproducibility. In practice, the same code run against a different version of the training data, a different set of hyperparameters, or a different library environment will produce different results. Full reproducibility requires versioning <em>all five</em> artifact classes (code, data, models, configs, and results) together, so that every result can be traced back to the exact combination of inputs that produced it.
+</p>
+</div>
+
+<h2>4. Versioning Code with Git</h2>
+
+<p>
+Git is the foundation of all experiment versioning. Every experiment should be associated
+with a specific Git commit, so that the exact code that produced a result can be recovered.
+The minimum viable practice is to tag each experiment run with the current commit hash:
+</p>
+
+<pre><code class="language-python">"""Capture Git state at experiment time."""
+import subprocess
+
+
+def get_git_info() -> dict:
+    """Capture current Git state for provenance tracking."""
+
+    def run_git(args: list[str]) -> str:
+        result = subprocess.run(
+            ["git"] + args,
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+
+    # Check for uncommitted changes
+    status = run_git(["status", "--porcelain"])
+    is_dirty = len(status) > 0
+
+    info = {
+        "commit_hash": run_git(["rev-parse", "HEAD"]),
+        "commit_short": run_git(["rev-parse", "--short", "HEAD"]),
+        "branch": run_git(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "commit_message": run_git(["log", "-1", "--format=%s"]),
+        "commit_timestamp": run_git(["log", "-1", "--format=%cI"]),
+        "is_dirty": is_dirty,
+        "dirty_files": status if is_dirty else None,
+    }
+
+    if is_dirty:
+        # Record a diff patch for dirty files so the exact state
+        # can be reconstructed even from uncommitted changes
+        info["dirty_diff"] = run_git(["diff", "HEAD"])
+
+    return info
+
+
+# At the start of every experiment run
+git_info = get_git_info()
+if git_info["is_dirty"]:
+    print(f"WARNING: Running from dirty working tree ({git_info['commit_short']}+)")
+    print(f"  Modified files: {git_info['dirty_files']}")
+    print("  Consider committing before running experiments.")
+else:
+    print(f"Clean commit: {git_info['commit_short']} on {git_info['branch']}")
+</code></pre>
+<div class="code-caption">Figure 47.2: Capturing Git state for provenance. The function records the commit hash, branch, and any uncommitted modifications. Running experiments from a dirty working tree is a reproducibility hazard flagged by the warning.</div>
+
+<div class="callout warning">
+<div class="callout-title">Warning: The Dirty Working Tree Problem</div>
+<p>
+One of the most common reproducibility failures is running an experiment from a dirty Git
+working tree: the commit hash points to a previous state, but the actual code includes
+uncommitted modifications. The <code>get_git_info()</code> function above captures this case
+by recording both the dirty flag and the diff. The better practice is to enforce clean commits
+before experiment runs, either through a pre-run check that refuses to start on a dirty tree,
+or through an automatic "snapshot commit" that creates a temporary commit with all current
+changes.
+</p>
+</div>
+
+<h2>5. Versioning Data with DVC</h2>
+
+<p>
+Data Version Control (DVC) extends Git's versioning model to large files. The core idea
+is simple: instead of storing a 10 GB dataset in Git (which would make the repository
+unusable), DVC stores a small <code>.dvc</code> pointer file in Git that contains the
+dataset's SHA-256 hash and storage location. The actual data lives in a configured remote
+storage backend (S3, GCS, Azure Blob, SSH, or a local directory).
+</p>
+
+<pre><code class="language-bash"># Initialize DVC in an existing Git repository
+dvc init
+
+# Configure a remote storage backend
+dvc remote add -d myremote s3://my-bucket/dvc-store
+
+# Track a large dataset with DVC
+dvc add data/crystal_structures.parquet
+
+# This creates data/crystal_structures.parquet.dvc (pointer file)
+# and adds data/crystal_structures.parquet to .gitignore
+cat data/crystal_structures.parquet.dvc
+</code></pre>
+<div class="code-caption">Figure 47.3: Initializing DVC and tracking a dataset. The <code>.dvc</code> file is a small YAML pointer containing the hash; Git tracks the pointer while DVC manages the actual data.</div>
+
+<p>
+The <code>.dvc</code> file that Git tracks looks like this:
+</p>
+
+<pre><code class="language-yaml">outs:
+- md5: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6
+  size: 10737418240
+  hash: md5
+  path: crystal_structures.parquet
+</code></pre>
+<div class="code-caption">Figure 47.4: Contents of a DVC pointer file. Git tracks this small YAML file; the actual 10 GB dataset lives in the configured remote storage, identified by its MD5 hash.</div>
+
+<p>
+Now Git commits form a timeline of code <em>and</em> data versions. Checking out a previous
+commit restores both the code and the DVC pointer files, and <code>dvc pull</code> retrieves
+the corresponding data versions from remote storage. This gives us the time-travel property
+essential for reproducibility: any historical experiment state can be fully reconstructed.
+</p>
+
+<pre><code class="language-python">"""Programmatic DVC operations for pipeline integration."""
+import subprocess
+import yaml
+from pathlib import Path
+
+
+class DVCManager:
+    """Manage DVC-tracked artifacts programmatically."""
+
+    @staticmethod
+    def track(file_path: str) -> dict:
+        """Add a file to DVC tracking and return its metadata."""
+        subprocess.run(["dvc", "add", file_path], check=True)
+
+        # Read the generated .dvc file to get the hash
+        dvc_file = Path(f"{file_path}.dvc")
+        with open(dvc_file) as f:
+            dvc_meta = yaml.safe_load(f)
+
+        return {
+            "path": file_path,
+            "hash": dvc_meta["outs"][0]["md5"],
+            "size": dvc_meta["outs"][0]["size"],
+            "dvc_file": str(dvc_file),
+        }
+
+    @staticmethod
+    def push():
+        """Push tracked data to remote storage."""
+        subprocess.run(["dvc", "push"], check=True)
+
+    @staticmethod
+    def pull():
+        """Pull tracked data from remote storage."""
+        subprocess.run(["dvc", "pull"], check=True)
+
+    @staticmethod
+    def checkout(git_ref: str):
+        """Restore code and data to a specific Git ref."""
+        # First checkout the code (and .dvc pointer files)
+        subprocess.run(["git", "checkout", git_ref], check=True)
+        # Then pull the corresponding data versions
+        subprocess.run(["dvc", "checkout"], check=True)
+
+
+# Track a processed dataset
+meta = DVCManager.track("data/processed/features.parquet")
+print(f"Tracked {meta['path']} with hash {meta['hash'][:12]}...")
+</code></pre>
+<div class="code-caption">Figure 47.5: Programmatic DVC management. The DVCManager class wraps DVC CLI operations for integration into automated pipelines, enabling artifact tracking as part of a Python workflow rather than manual shell commands.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DVC Python API</div>
+<p>
+The manual subprocess calls in Figure 47.5 demonstrate the mechanism, but DVC also provides
+a Python API (<code>import dvc.api</code>) that handles operations directly:
+<code>dvc.api.get_url()</code> retrieves artifact URLs, <code>dvc.api.read()</code> loads
+versioned files, and <code>dvc.api.params_show()</code> reads parameters for the current
+workspace. The API reduces the DVCManager class to roughly 5 lines per method and eliminates
+subprocess management.
+</p>
+</div>
+
+<h2>6. Versioning Models with MLflow</h2>
+
+<p>
+While DVC handles data versioning, MLflow's Model Registry provides lifecycle management
+for trained models. The registry assigns each model a name, tracks versions sequentially,
+and supports stage transitions (Staging, Production, Archived) that map to deployment
+workflows. Combined with MLflow's experiment tracking (which logs parameters, metrics, and
+artifacts per run), we get a complete record of how each model version was produced.
+</p>
+
+<pre><code class="language-python">"""Model versioning with MLflow's Model Registry."""
+import mlflow
+from mlflow.tracking import MlflowClient
+
+
+def train_and_register(
+    model_name: str,
+    train_data_hash: str,
+    config: dict,
+    model,
+    metrics: dict,
+):
+    """Train a model, log everything, and register in the Model Registry."""
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    mlflow.set_experiment("crystal_property_prediction")
+
+    with mlflow.start_run() as run:
+        # Log the provenance chain
+        mlflow.set_tag("data_hash", train_data_hash)
+        mlflow.set_tag("git_commit", get_git_info()["commit_hash"])
+
+        # Log all hyperparameters
+        mlflow.log_params(config)
+
+        # Log evaluation metrics
+        mlflow.log_metrics(metrics)
+
+        # Log the model artifact with its signature
+        mlflow.pytorch.log_model(
+            model,
+            artifact_path="model",
+            registered_model_name=model_name,
+        )
+
+        run_id = run.info.run_id
+        print(f"Run {run_id}: logged {len(config)} params, {len(metrics)} metrics")
+
+    # The model is now registered; retrieve its version
+    client = MlflowClient()
+    versions = client.search_model_versions(f"name='{model_name}'")
+    latest = max(versions, key=lambda v: int(v.version))
+    print(f"Registered {model_name} v{latest.version}")
+
+    return run_id, latest.version
+
+
+# Example usage
+run_id, version = train_and_register(
+    model_name="CrystalPropertyPredictor",
+    train_data_hash="a1b2c3d4...",
+    config={"lr": 0.001, "epochs": 100, "hidden_dim": 256, "dropout": 0.1},
+    model=trained_model,       # Your PyTorch model
+    metrics={"mae": 0.042, "r2": 0.94, "rmse": 0.061},
+)
+</code></pre>
+<div class="code-caption">Figure 47.6: Model registration with MLflow. Each training run logs the data hash, Git commit, hyperparameters, and metrics. The trained model is registered with a name and auto-incrementing version, creating a searchable history of all model versions.</div>
+
+<h2>7. Configuration Management</h2>
+
+<p>
+Hyperparameters and configuration files are the most frequently changed and the most
+frequently lost artifacts. A training script might accept dozens of parameters (learning
+rate, batch size, architecture choices, data splits, augmentation settings), and the
+difference between a successful and failed experiment often comes down to a single
+parameter value that was changed in the command line but never recorded.
+</p>
+
+<p>
+The solution is to make configuration files the <em>primary interface</em> to experiments,
+never raw command-line arguments. Every experiment run reads from a structured configuration
+file (YAML, TOML, or JSON); the file is versioned in Git; and the registry stores the
+content hash of the configuration alongside the run record.
+</p>
+
+<pre><code class="language-python">"""Structured configuration management for experiments."""
+import hashlib
+import json
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+
+@dataclass
+class ExperimentConfig:
+    """Typed, hashable experiment configuration."""
+    # Data parameters
+    dataset_path: str
+    dataset_version: str       # DVC hash of the dataset
+    train_split: float = 0.8
+    random_seed: int = 42
+
+    # Model parameters
+    architecture: str = "transformer"
+    hidden_dim: int = 256
+    num_layers: int = 4
+    dropout: float = 0.1
+
+    # Training parameters
+    learning_rate: float = 1e-3
+    batch_size: int = 64
+    max_epochs: int = 100
+    early_stopping_patience: int = 10
+
+    # Environment
+    device: str = "cuda"
+    num_workers: int = 4
+
+    def content_hash(self) -> str:
+        """Compute a deterministic hash of this configuration."""
+        # Sort keys for deterministic serialization
+        config_bytes = json.dumps(
+            asdict(self), sort_keys=True
+        ).encode("utf-8")
+        return hashlib.sha256(config_bytes).hexdigest()
+
+    def save(self, path: Path):
+        """Save configuration to a JSON file."""
+        with open(path, "w") as f:
+            json.dump(asdict(self), f, indent=2, sort_keys=True)
+
+    @classmethod
+    def load(cls, path: Path) -> "ExperimentConfig":
+        """Load configuration from a JSON file."""
+        with open(path) as f:
+            return cls(**json.load(f))
+
+
+# Create and hash a configuration
+config = ExperimentConfig(
+    dataset_path="data/crystals.parquet",
+    dataset_version="a1b2c3d4e5f6...",
+    learning_rate=0.0005,
+    num_layers=6,
+)
+config_hash = config.content_hash()
+print(f"Config hash: {config_hash[:12]}...")
+
+# Two configs with the same values produce the same hash
+config2 = ExperimentConfig(
+    dataset_path="data/crystals.parquet",
+    dataset_version="a1b2c3d4e5f6...",
+    learning_rate=0.0005,
+    num_layers=6,
+)
+assert config.content_hash() == config2.content_hash()  # Deterministic
+</code></pre>
+<div class="code-caption">Figure 47.7: Typed, hashable experiment configurations. The dataclass provides type safety and IDE autocompletion; the content hash enables deduplication (two runs with identical configs produce the same hash) and integrity verification.</div>
+
+<h2>8. Environment Reproducibility with Docker</h2>
+
+<p>
+Code, data, and config versioning capture <em>what</em> the experiment does, but not
+<em>where</em> it runs. Library version differences, CUDA toolkit versions, operating
+system patches, and even compiler flags can produce different results from identical code.
+Docker containers capture the complete runtime environment in a reproducible image.
+</p>
+
+<pre><code class="language-dockerfile"># Dockerfile for reproducible experiment environments
+FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+
+# Pin exact library versions for reproducibility
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy experiment code
+COPY src/ /app/src/
+COPY configs/ /app/configs/
+
+WORKDIR /app
+
+# Record the image hash for provenance
+RUN echo "Build timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > /app/BUILD_INFO
+RUN pip freeze > /app/FROZEN_REQUIREMENTS.txt
+
+ENTRYPOINT ["python", "-m", "src.train"]
+</code></pre>
+<div class="code-caption">Figure 47.8: A Dockerfile for reproducible experiment environments. Pinning the base image tag, freezing pip requirements, and recording build metadata create a fully specified runtime that can be reconstructed months or years later.</div>
+
+<p>
+The Docker image hash becomes another artifact in the registry, linked to the runs that
+used it. Combined with the Git commit hash (for code), DVC hash (for data), and config
+hash (for parameters), we now have a four-part identifier that fully specifies an
+experiment:
+</p>
+
+$$\text{Experiment} = (\text{code}_{\text{git}}, \; \text{data}_{\text{dvc}}, \; \text{config}_{\text{sha}}, \; \text{env}_{\text{docker}})$$
+
+<p>
+Any two experiments that share this four-tuple must, by construction, produce the same
+results (subject to hardware-level non-determinism in GPU floating-point operations, which
+we discuss in <a href="section-47.3.html">Section 47.3</a>).
+</p>
+
+<h2>9. The Artifact DAG</h2>
+
+<p>
+With all artifact classes versioned and hashed, we can now assemble the <strong>artifact
+DAG</strong>: a directed acyclic graph where nodes are artifacts and edges represent
+"produced by" relationships. Each edge passes through a run (an execution event), so
+the full graph is technically a bipartite DAG of artifacts and runs.
+</p>
+
+<pre><code class="language-python">"""Artifact DAG construction and traversal."""
+from dataclasses import dataclass, field
+from collections import defaultdict
+
+
+@dataclass
+class RunRecord:
+    """Record of a single experiment run."""
+    run_id: str
+    git_commit: str
+    config_hash: str
+    docker_image: str
+    input_hashes: list[str]    # Hashes of input artifacts
+    output_hashes: list[str]   # Hashes of output artifacts
+    start_time: str
+    end_time: str
+    metrics: dict = field(default_factory=dict)
+
+
+class ArtifactDAG:
+    """Directed acyclic graph of artifacts and the runs that connect them."""
+
+    def __init__(self):
+        self.runs: dict[str, RunRecord] = {}
+        self.produced_by: dict[str, str] = {}   # artifact_hash -> run_id
+        self.consumed_by: dict[str, list[str]] = defaultdict(list)
+
+    def add_run(self, run: RunRecord):
+        """Register a run and its artifact relationships."""
+        self.runs[run.run_id] = run
+        for out_hash in run.output_hashes:
+            self.produced_by[out_hash] = run.run_id
+        for in_hash in run.input_hashes:
+            self.consumed_by[in_hash].append(run.run_id)
+
+    def trace_lineage(self, artifact_hash: str) -> list[RunRecord]:
+        """Trace the complete lineage of an artifact back to raw inputs."""
+        lineage = []
+        visited = set()
+        stack = [artifact_hash]
+
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+
+            if current in self.produced_by:
+                run_id = self.produced_by[current]
+                run = self.runs[run_id]
+                lineage.append(run)
+                stack.extend(run.input_hashes)
+
+        return lineage
+
+    def regeneration_plan(self, artifact_hash: str) -> list[RunRecord]:
+        """Produce an ordered list of runs needed to regenerate an artifact."""
+        lineage = self.trace_lineage(artifact_hash)
+        # Reverse to get execution order (inputs first)
+        return list(reversed(lineage))
+
+
+# Build an artifact DAG from experiment history
+dag = ArtifactDAG()
+
+# Stage 1: Data preprocessing
+dag.add_run(RunRecord(
+    run_id="preprocess_001",
+    git_commit="abc123",
+    config_hash="cfg_aaa",
+    docker_image="exp:v1.0",
+    input_hashes=["raw_data_hash"],
+    output_hashes=["processed_data_hash"],
+    start_time="2026-04-15T10:00:00Z",
+    end_time="2026-04-15T10:05:00Z",
+))
+
+# Stage 2: Model training
+dag.add_run(RunRecord(
+    run_id="train_001",
+    git_commit="abc123",
+    config_hash="cfg_bbb",
+    docker_image="exp:v1.0",
+    input_hashes=["processed_data_hash"],
+    output_hashes=["model_hash"],
+    start_time="2026-04-15T10:10:00Z",
+    end_time="2026-04-15T12:30:00Z",
+    metrics={"val_loss": 0.023, "val_accuracy": 0.97},
+))
+
+# Trace lineage of the trained model
+lineage = dag.trace_lineage("model_hash")
+print(f"Model lineage: {len(lineage)} runs")
+for run in lineage:
+    print(f"  {run.run_id}: {len(run.input_hashes)} inputs -> "
+          f"{len(run.output_hashes)} outputs")
+
+# Generate a regeneration plan
+plan = dag.regeneration_plan("model_hash")
+print(f"\nRegeneration plan ({len(plan)} steps):")
+for i, run in enumerate(plan, 1):
+    print(f"  Step {i}: {run.run_id} (commit {run.git_commit[:7]})")
+</code></pre>
+<div class="code-caption">Figure 47.9: Building and querying an artifact DAG. The <code>trace_lineage</code> method walks backward from any artifact to discover every run and artifact involved in its production. The <code>regeneration_plan</code> method reverses this into an execution order for reproducing the artifact from scratch.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The DAG Enables Incremental Recomputation</div>
+<p>
+The artifact DAG is not just a provenance record; it is a computation graph. Given the DAG
+and a content-addressable store, you can identify exactly which artifacts need to be
+recomputed when an input changes. If you modify the preprocessing code but not the raw data,
+only the preprocessing and downstream stages need re-execution; the raw data retrieval step
+can be skipped. This is the same principle behind build systems like Make and Bazel, applied
+to scientific experiments. DVC pipelines (<code>dvc.yaml</code>) implement this pattern
+directly, as we will see in <a href="section-47.3.html">Section 47.3</a>.
+</p>
+</div>
+
+<h2>10. Tool Comparison</h2>
+
+<p>
+Table 47.2 compares the major experiment tracking and artifact versioning tools available
+as of 2026. No single tool covers all requirements; production registries typically combine
+two or three.
+</p>
+
+<figure>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>MLflow</th>
+<th>W&amp;B</th>
+<th>DVC</th>
+<th>Git + CAS</th>
+<th>DAGsHub</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Experiment tracking</td>
+<td>Yes (core)</td>
+<td>Yes (core)</td>
+<td>Via params/metrics</td>
+<td>Manual</td>
+<td>MLflow integration</td>
+</tr>
+<tr>
+<td>Large artifact storage</td>
+<td>Artifact store</td>
+<td>Artifact store</td>
+<td>Yes (core)</td>
+<td>Custom</td>
+<td>DVC integration</td>
+</tr>
+<tr>
+<td>Model registry</td>
+<td>Yes (core)</td>
+<td>Model registry</td>
+<td>No</td>
+<td>No</td>
+<td>MLflow integration</td>
+</tr>
+<tr>
+<td>Pipeline DAG</td>
+<td>No</td>
+<td>No</td>
+<td>Yes (<code>dvc.yaml</code>)</td>
+<td>No</td>
+<td>DVC integration</td>
+</tr>
+<tr>
+<td>Data versioning</td>
+<td>Limited</td>
+<td>Artifact versioning</td>
+<td>Yes (core)</td>
+<td>Manual hashing</td>
+<td>DVC integration</td>
+</tr>
+<tr>
+<td>Self-hosted option</td>
+<td>Yes (open source)</td>
+<td>Enterprise only</td>
+<td>Yes (open source)</td>
+<td>Yes</td>
+<td>Cloud + self-hosted</td>
+</tr>
+<tr>
+<td>Provenance standard</td>
+<td>Custom</td>
+<td>Custom</td>
+<td>Custom</td>
+<td>Custom</td>
+<td>Custom</td>
+</tr>
+</tbody>
+</table>
+<figcaption>Table 47.2: Comparison of experiment tracking and artifact versioning tools. The "Provenance standard" row highlights a gap: none of these tools natively supports W3C PROV or OpenLineage, which we address in <a href="section-47.2.html">Section 47.2</a>.</figcaption>
+</figure>
+
+<p>
+The combination we build in <a href="section-47.3.html">Section 47.3</a> uses Git for code,
+DVC for data and pipeline definitions, and MLflow for experiment tracking and model
+registration. This combination is open-source, self-hostable, and covers all five artifact
+classes with content-addressable verification at every stage.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Weights &amp; Biases in Three Lines</div>
+<p>
+If you prefer a managed solution over the Git + DVC + MLflow stack, Weights &amp; Biases
+(W&amp;B) provides experiment tracking, artifact versioning, and model registry in a single
+API. A minimal integration takes three lines: <code>wandb.init(project="my_project")</code>,
+<code>wandb.config.update(config_dict)</code>, and <code>wandb.log(metrics_dict)</code>.
+W&amp;B handles artifact hashing, storage, and UI automatically. The tradeoff is vendor
+lock-in: your provenance data lives on W&amp;B's servers (or your enterprise deployment)
+rather than in portable open formats. For teams that prioritize speed of setup over data
+sovereignty, this is often the right choice.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+The Croissant metadata format, introduced by MLCommons in 2024 (Akhtar et al., "Croissant: A Metadata Format for ML-Ready Datasets," published at KDD 2024), pushes artifact registries toward cross-platform interoperability. Croissant defines a JSON-LD vocabulary that describes dataset structure, provenance, licensing, and responsible-AI properties in a machine-readable schema. Major platforms including Hugging Face, Kaggle, and OpenML have adopted Croissant as a standard metadata layer, enabling registries to exchange dataset descriptions without proprietary lock-in. This complements the per-artifact hashing covered in this section by adding a semantic layer: not just <em>what</em> the artifact contains (its hash), but <em>what the artifact means</em> (its fields, splits, intended uses, and known limitations) in a format that any compliant tool can parse.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Artifact Registry</h4>
+<p>
+Build a working content-addressable artifact store and use it to track a small experiment, using only the Python standard library.
+(1) Create a directory called <code>my_registry/</code> with subdirectories <code>objects/</code> and <code>metadata/</code>. Write a Python function <code>register(filepath)</code> that computes the SHA-256 hash of any file, copies it into <code>objects/</code> using the first two hex characters as a subdirectory name (e.g., <code>objects/a1/b2c3d4...</code>), and saves a JSON metadata file in <code>metadata/</code> recording the hash, original filename, file size, and a timestamp.
+(2) Create three small text files simulating experiment artifacts: a config file (<code>config.json</code> with a learning rate and batch size), a "dataset" file (a CSV with 10 rows of dummy data), and a "results" file (a JSON with dummy metrics). Register all three.
+(3) Modify one value in <code>config.json</code> (change the learning rate) and register it again. Verify that the new registration produces a different hash and that both versions coexist in the store.
+(4) Write a <code>verify(sha256)</code> function that re-reads the stored file, recomputes its hash, and confirms it matches. Run it on all registered artifacts.
+(5) Write a <code>lineage(sha256)</code> function that reads the metadata JSON for a given hash and prints its parent artifact hashes. Manually set the results file's metadata to list the config and dataset hashes as parents, then call <code>lineage()</code> to reconstruct which inputs produced the result.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+We have built the storage and versioning layer for individual artifacts. But knowing what
+exists is not the same as knowing how things relate. <a href="section-47.2.html">Section 47.2:
+Data Lineage and Provenance Standards</a> formalizes the relationships between artifacts using
+the W3C PROV data model and the OpenLineage specification, giving us a portable, queryable
+representation of the entire experiment history.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 47 Overview</a>
+<a href="section-47.2.html">Section 47.2: Data Lineage and Provenance Standards &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

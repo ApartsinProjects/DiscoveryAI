@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.2: Artifact Graphs and Provenance. Typed nodes, versioned edges, run records, and human approval gates." name="description"/>
+<title>Section 6.2: Artifact Graphs and Provenance | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Discovery System Architecture</a></div>
+<h1>6.2 Artifact Graphs and Provenance</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"This plot changed my career. Unfortunately, nobody can tell me which dataset produced it."</p>
+<cite>A Provenance Record That Outlived Its Creator</cite>
+</blockquote>
+
+<section class="prerequisites">
+<h2>Prerequisites</h2>
+<p>This section builds on <a href="section-6.1.html">Section 6.1</a> (the seven-layer Workbench architecture), <a href="../module-03-knowledge-representation/index.html">Chapter 3</a> (knowledge graphs and typed relations), and <a href="../module-01-discovery-as-search/index.html">Chapter 1</a> (discovery as search through state spaces). You should be comfortable with Python dataclasses, basic graph concepts (nodes, edges, directed acyclic graphs), and the idea of cryptographic hashing. Familiarity with NetworkX is helpful but not required; we introduce it from scratch.</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>A discovery system generates hundreds of artifacts: datasets, cleaned features, trained models, hypotheses, experimental results, figures. Without a formal record of what produced what, the system becomes a black box. Artifact graphs solve this by representing every artifact as a typed node and every derivation step as a versioned edge, so that the question "where did this result come from?" can be answered by a single graph traversal. The W3C PROV standard gives us the vocabulary; content-addressable hashing gives us immutable versioning; and human-in-the-loop approval gates ensure that no agent-proposed experiment runs without oversight. Together, these mechanisms turn a pile of files into a reproducible, auditable chain of evidence.</p>
+</div>
+
+<h2>1. What Is an Artifact Graph?</h2>
+
+<p><strong>What.</strong> An artifact graph is a directed acyclic graph (DAG) $G = (V, E)$ where each vertex $v \in V$ represents a typed artifact (a dataset, a model, a hypothesis, an experimental result, a figure) and each directed edge $e \in E$ represents a provenance relation between artifacts. An edge $(u, v)$ with label <code>derived_from</code> means that artifact $v$ was produced by a process that consumed artifact $u$.</p>
+
+<p><strong>Why.</strong> Reproducibility demands more than saved files. A trained model is meaningless without the dataset it was trained on, the hyperparameters used, the code version that ran the training, and the environment in which it executed. An artifact graph captures all of these relationships in a queryable structure, so that any node can be traced back to its raw inputs through a single ancestry traversal.</p>
+
+<p><strong>How.</strong> We define a finite set of artifact types $\mathcal{T} = \{\texttt{dataset}, \texttt{model}, \texttt{hypothesis}, \texttt{result}, \texttt{figure}, \texttt{code}\}$ and a finite set of edge types $\mathcal{R} = \{\texttt{derived\_from}, \texttt{trained\_on}, \texttt{validated\_by}, \texttt{produced\_by}, \texttt{approved\_by}\}$. Every vertex carries a type label $\tau(v) \in \mathcal{T}$, a content hash, and a timestamp. Every edge carries a relation label $\rho(e) \in \mathcal{R}$ and a reference to the run record that created it.</p>
+
+<p><strong>When.</strong> Use an artifact graph whenever your system produces more than a handful of derived objects, whenever multiple people (or agents) contribute artifacts, or whenever you need to answer regulatory or peer-review questions about how a result was obtained. In practice, this means always.</p>
+
+<p>The DAG property is essential. Cycles would mean that artifact A depends on artifact B which depends on artifact A, a logical impossibility in a temporal derivation chain. Acyclicity also enables topological ordering: given a change to any upstream artifact, you can determine exactly which downstream artifacts need recomputation, and in what order.</p>
+
+<h2>2. The W3C PROV Model</h2>
+
+<p>We do not need to invent a provenance vocabulary from scratch. The W3C PROV Data Model (Moreau and Missier, 2013) defines three core concepts:</p>
+
+<ul>
+<li><strong>Entity:</strong> a physical, digital, or conceptual thing. In our system, every artifact node is an Entity.</li>
+<li><strong>Activity:</strong> something that occurs over a period of time and acts upon or with Entities. A training run, a data cleaning step, or a hypothesis evaluation is an Activity.</li>
+<li><strong>Agent:</strong> something that bears responsibility for an Activity. An Agent can be a person, an AI model, or a software service.</li>
+</ul>
+
+<p>The three core relations in PROV map directly onto our edge types:</p>
+
+$$
+\texttt{Entity} \xrightarrow{\texttt{wasGeneratedBy}} \texttt{Activity} \xrightarrow{\texttt{used}} \texttt{Entity}
+$$
+
+$$
+\texttt{Activity} \xrightarrow{\texttt{wasAssociatedWith}} \texttt{Agent}
+$$
+
+<p>This triple structure (Entity, Activity, Agent) is powerful because it separates the <em>what</em> (which artifacts exist), the <em>how</em> (which activities produced them), and the <em>who</em> (which agent is responsible). Our implementation wraps PROV's vocabulary in Python dataclasses, keeping the formalism but discarding the XML serialization overhead.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of the Entity-Activity-Agent triple like a restaurant kitchen's order ticket system. The <em>Entity</em> is a finished dish on the pass (the physical thing that exists). The <em>Activity</em> is the cooking process described on the ticket: which ingredients went in, what temperature, how long it was seared, which station prepared it. The <em>Agent</em> is the line cook whose name is stamped on the ticket. If a customer complains about a dish, the manager traces the ticket back to the exact cook, the exact steps, and the exact ingredients, just as a provenance query traces a result back through activities to the responsible agent and input artifacts. The separation matters because you can change the cook (Agent) without changing the recipe (Activity), or reuse the same recipe on different ingredients (Entities), and each combination is tracked independently.</p>
+</div>
+
+<h2>3. Content-Addressable Versioning</h2>
+
+<p>Every artifact in the graph needs a stable identifier that changes when (and only when) the artifact's content changes. We borrow the solution from Git: content-addressable hashing. Given an artifact's serialized content $c$, its identifier is:</p>
+
+<p data-agent="02">Content-addressable hashing is a technique in which the unique identifier for a piece of data is computed directly from the data's contents, typically via a cryptographic hash function such as SHA-256. It matters because it provides automatic deduplication (identical content always maps to the same identifier) and tamper evidence (any modification, even a single byte, produces a completely different hash). The mechanism works by feeding the raw bytes of an artifact, prefixed with its type label, through a deterministic hash function whose output serves as both the artifact's address and its integrity fingerprint. Use content-addressable hashing whenever you need immutable, verifiable references to data objects; prefer simpler sequential IDs (auto-increment counters, UUIDs) only when content identity is irrelevant and you need mutable records that can be updated in place.</p>
+
+$$
+\text{id}(v) = \text{SHA-256}(\tau(v) \,\|\, c)
+$$
+
+<p>where $\tau(v)$ is the artifact type and $\|$ denotes concatenation. Two artifacts with identical type and content produce the same hash, regardless of when or where they were created. If a single byte of content changes, the hash changes entirely. This gives us immutable versioning for free: you never "update" an artifact; you create a new version with a new hash and add a <code>derived_from</code> edge linking the new version to the old one.</p>
+
+<p>The practical consequence is that every edge in the graph points to a specific, immutable snapshot of its source and target. There is no ambiguity about which version of a dataset was used to train which version of a model.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent mistake is assuming that the artifact graph tracks <em>file paths</em> or <em>filenames</em> as identifiers, so that renaming or moving a file breaks provenance. In reality, content-addressable hashing means the identifier is derived solely from the artifact's contents: two files with identical bytes produce the same hash regardless of where they are stored, and the same file copied to a new path retains its identity in the graph. Conversely, overwriting a file at the same path with different content produces a <em>different</em> hash, which the graph correctly treats as a new artifact. Provenance is anchored to content, not to location.</p>
+</div>
+
+<pre><code class="language-python">import hashlib
+import json
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
+
+
+class ArtifactType(Enum):
+    DATASET = "dataset"
+    MODEL = "model"
+    HYPOTHESIS = "hypothesis"
+    RESULT = "result"
+    FIGURE = "figure"
+    CODE = "code"
+
+
+class EdgeType(Enum):
+    DERIVED_FROM = "derived_from"
+    TRAINED_ON = "trained_on"
+    VALIDATED_BY = "validated_by"
+    PRODUCED_BY = "produced_by"
+    APPROVED_BY = "approved_by"
+
+
+@dataclass(frozen=True)
+class Artifact:
+    """A typed, content-addressed node in the artifact graph."""
+    artifact_type: ArtifactType
+    name: str
+    content_hash: str
+    created_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    metadata: dict = field(default_factory=dict)
+
+    @staticmethod
+    def compute_hash(artifact_type: ArtifactType, content: bytes) -> str:
+        """SHA-256 of type prefix concatenated with raw content."""
+        hasher = hashlib.sha256()
+        hasher.update(artifact_type.value.encode("utf-8"))
+        hasher.update(b"|")
+        hasher.update(content)
+        return hasher.hexdigest()
+
+
+# Example: hash a small CSV dataset
+raw_csv = b"gene,expression\nBRCA1,12.4\nTP53,8.7\nMYC,15.2"
+content_hash = Artifact.compute_hash(ArtifactType.DATASET, raw_csv)
+
+dataset_v1 = Artifact(
+    artifact_type=ArtifactType.DATASET,
+    name="gene_expression_v1",
+    content_hash=content_hash,
+    metadata={"rows": 3, "source": "lab_notebook_2024"}
+)
+
+print(f"Artifact:  {dataset_v1.name}")
+print(f"Type:      {dataset_v1.artifact_type.value}")
+print(f"Hash:      {dataset_v1.content_hash[:16]}...")
+print(f"Frozen:    {dataset_v1.__class__.__dataclass_params__.frozen}")</code></pre>
+<div class="code-caption">Listing 6.3: Core data model for typed, content-addressed artifacts. The <code>frozen=True</code> dataclass ensures immutability; the SHA-256 hash is computed from the artifact type concatenated with the raw content bytes.</div>
+
+<pre><code class="language-text">Artifact:  gene_expression_v1
+Type:      dataset
+Hash:      a7c3e1f09b2d4a81...
+Frozen:    True</code></pre>
+<div class="code-caption">Output 6.3: The artifact is immutable and uniquely identified by its content hash.</div>
+
+<h2>4. The Run Record Schema</h2>
+
+<p>An artifact on its own tells you <em>what</em> exists. A run record tells you <em>how</em> it came to exist. Every Activity in our PROV-aligned model is captured as a <code>RunRecord</code> that logs:</p>
+
+<ul>
+<li><strong>Inputs:</strong> the content hashes of all consumed artifacts.</li>
+<li><strong>Outputs:</strong> the content hashes of all produced artifacts.</li>
+<li><strong>Parameters:</strong> every hyperparameter, threshold, or configuration value.</li>
+<li><strong>Agent:</strong> who (or what) executed the activity.</li>
+<li><strong>Timestamps:</strong> start and end times.</li>
+<li><strong>Code version:</strong> the Git commit SHA of the code that ran.</li>
+<li><strong>Environment hash:</strong> a hash of the frozen dependency list (e.g., <code>pip freeze</code> output), ensuring the software environment is recorded.</li>
+<li><strong>Approval status:</strong> whether a human reviewed and approved the run before or after execution.</li>
+</ul>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from typing import Optional
+import subprocess
+import uuid
+
+
+@dataclass
+class RunRecord:
+    """A PROV-aligned Activity capturing how artifacts were produced."""
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    activity_name: str = ""
+    agent: str = ""            # human user or AI model identifier
+    inputs: list[str] = field(default_factory=list)    # content hashes
+    outputs: list[str] = field(default_factory=list)   # content hashes
+    parameters: dict = field(default_factory=dict)
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    git_commit: Optional[str] = None
+    env_hash: Optional[str] = None
+    approval: Optional["ApprovalGate"] = None
+
+    def capture_environment(self):
+        """Snapshot the current Git commit and pip environment."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=True
+            )
+            self.git_commit = result.stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            self.git_commit = "unknown"
+
+        try:
+            result = subprocess.run(
+                ["pip", "freeze"],
+                capture_output=True, text=True, check=True
+            )
+            env_bytes = result.stdout.encode("utf-8")
+            self.env_hash = hashlib.sha256(env_bytes).hexdigest()[:16]
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            self.env_hash = "unknown"
+
+
+@dataclass
+class ApprovalGate:
+    """Human-in-the-loop approval for a proposed activity."""
+    required: bool = True
+    approved: bool = False
+    reviewer: Optional[str] = None
+    reviewed_at: Optional[str] = None
+    comments: str = ""
+
+
+# Build a run record for a training activity
+run = RunRecord(
+    activity_name="train_classifier",
+    agent="discovery_agent_v2",
+    inputs=[dataset_v1.content_hash],
+    parameters={"learning_rate": 0.001, "epochs": 50, "model": "RandomForest"},
+    approval=ApprovalGate(required=True, approved=False)
+)
+run.capture_environment()
+
+print(f"Run ID:     {run.run_id}")
+print(f"Activity:   {run.activity_name}")
+print(f"Agent:      {run.agent}")
+print(f"Git commit: {run.git_commit[:12] if run.git_commit else 'N/A'}...")
+print(f"Env hash:   {run.env_hash}")
+print(f"Approved:   {run.approval.approved}")</code></pre>
+<div class="code-caption">Listing 6.4: The <code>RunRecord</code> schema captures inputs, outputs, parameters, code version, environment hash, and human approval status for every activity in the discovery pipeline.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Run Record Is the Unit of Reproducibility</div>
+<p>A single artifact hash tells you <em>what</em> exists. A single run record tells you <em>how</em> it was created. But full reproducibility requires the chain: the run record for artifact C points to its input artifacts A and B, whose own run records point to their inputs, all the way back to raw data. This chain is exactly the path through the artifact graph. Reproducing any result means re-executing the run records along its ancestry path, in topological order, with the recorded parameters, code version, and environment. If any link in the chain is missing, reproducibility breaks.</p>
+</div>
+
+<h2>5. Building the Artifact Graph with NetworkX</h2>
+
+<p>With our data model in place, we can assemble the full artifact graph. We use NetworkX's <code>DiGraph</code> as the underlying container, storing <code>Artifact</code> objects as node attributes and <code>RunRecord</code> references as edge attributes. The graph enforces the DAG property by checking for cycles on every edge insertion.</p>
+
+<pre><code class="language-python">import networkx as nx
+
+
+class ArtifactGraph:
+    """A directed acyclic graph of typed, versioned artifacts."""
+
+    def __init__(self):
+        self._graph = nx.DiGraph()
+        self._runs: dict[str, RunRecord] = {}
+
+    def add_artifact(self, artifact: Artifact) -> str:
+        """Register an artifact node. Returns its content hash."""
+        self._graph.add_node(
+            artifact.content_hash,
+            artifact=artifact,
+            artifact_type=artifact.artifact_type.value,
+            name=artifact.name,
+        )
+        return artifact.content_hash
+
+    def add_derivation(
+        self,
+        source_hash: str,
+        target_hash: str,
+        edge_type: EdgeType,
+        run_record: RunRecord,
+    ):
+        """Add a provenance edge. Raises if the edge would create a cycle."""
+        self._graph.add_edge(
+            source_hash,
+            target_hash,
+            edge_type=edge_type.value,
+            run_id=run_record.run_id,
+        )
+        # Check DAG property; remove the edge and raise if violated
+        if not nx.is_directed_acyclic_graph(self._graph):
+            self._graph.remove_edge(source_hash, target_hash)
+            raise ValueError(
+                f"Edge {source_hash[:8]}...->{target_hash[:8]}... "
+                "would create a cycle; rejected."
+            )
+        self._runs[run_record.run_id] = run_record
+
+    def ancestry(self, artifact_hash: str) -> list[str]:
+        """Trace all ancestors of an artifact (constant-time per edge)."""
+        return list(nx.ancestors(self._graph, artifact_hash))
+
+    def descendants(self, artifact_hash: str) -> list[str]:
+        """Find all artifacts derived from a given artifact."""
+        return list(nx.descendants(self._graph, artifact_hash))
+
+    def find_by_type(self, artifact_type: ArtifactType) -> list[str]:
+        """Return all artifact hashes of a given type."""
+        return [
+            node for node, data in self._graph.nodes(data=True)
+            if data.get("artifact_type") == artifact_type.value
+        ]
+
+    def topological_order(self) -> list[str]:
+        """Return artifacts in dependency order (sources first)."""
+        return list(nx.topological_sort(self._graph))
+
+    def __len__(self) -> int:
+        return self._graph.number_of_nodes()
+
+    def summary(self) -> dict:
+        """Quick stats about the graph."""
+        return {
+            "nodes": self._graph.number_of_nodes(),
+            "edges": self._graph.number_of_edges(),
+            "runs": len(self._runs),
+            "types": dict(
+                (t.value, len(self.find_by_type(t)))
+                for t in ArtifactType
+            ),
+        }</code></pre>
+<div class="code-caption">Listing 6.5: The <code>ArtifactGraph</code> class wraps a NetworkX <code>DiGraph</code>, enforces acyclicity on every edge insertion, and exposes ancestry, descendant, and topological-order queries.</div>
+
+<p>Let us populate the graph with a realistic discovery pipeline: raw data, cleaned data, a trained model, a hypothesis test, and a result figure.</p>
+
+<pre><code class="language-python"># Build a small discovery pipeline graph
+
+graph = ArtifactGraph()
+
+# 1. Raw dataset
+raw_data = Artifact(
+    artifact_type=ArtifactType.DATASET,
+    name="raw_gene_expression",
+    content_hash=Artifact.compute_hash(
+        ArtifactType.DATASET, b"raw expression matrix, 20k genes x 500 samples"
+    ),
+    metadata={"genes": 20000, "samples": 500}
+)
+
+# 2. Cleaned dataset (derived from raw)
+clean_data = Artifact(
+    artifact_type=ArtifactType.DATASET,
+    name="cleaned_gene_expression",
+    content_hash=Artifact.compute_hash(
+        ArtifactType.DATASET, b"cleaned matrix, 18k genes x 480 samples"
+    ),
+    metadata={"genes": 18000, "samples": 480, "removed": "low-quality"}
+)
+
+# 3. Trained classifier (trained on cleaned data)
+model = Artifact(
+    artifact_type=ArtifactType.MODEL,
+    name="cancer_subtype_classifier",
+    content_hash=Artifact.compute_hash(
+        ArtifactType.MODEL, b"random forest, 500 trees, max_depth=12"
+    ),
+    metadata={"algorithm": "RandomForest", "accuracy": 0.94}
+)
+
+# 4. Hypothesis
+hypothesis = Artifact(
+    artifact_type=ArtifactType.HYPOTHESIS,
+    name="brca1_subtype_predictor",
+    content_hash=Artifact.compute_hash(
+        ArtifactType.HYPOTHESIS, b"BRCA1 expression predicts basal subtype"
+    ),
+)
+
+# 5. Validation result
+result = Artifact(
+    artifact_type=ArtifactType.RESULT,
+    name="brca1_validation_result",
+    content_hash=Artifact.compute_hash(
+        ArtifactType.RESULT, b"p=0.003, AUC=0.91, hypothesis supported"
+    ),
+    metadata={"p_value": 0.003, "auc": 0.91}
+)
+
+# Register all artifacts
+for art in [raw_data, clean_data, model, hypothesis, result]:
+    graph.add_artifact(art)
+
+# Add provenance edges with run records
+cleaning_run = RunRecord(
+    activity_name="clean_and_filter",
+    agent="data_engineer",
+    inputs=[raw_data.content_hash],
+    outputs=[clean_data.content_hash],
+    parameters={"min_expression": 1.0, "min_samples": 0.8}
+)
+
+training_run = RunRecord(
+    activity_name="train_classifier",
+    agent="discovery_agent_v2",
+    inputs=[clean_data.content_hash],
+    outputs=[model.content_hash],
+    parameters={"n_estimators": 500, "max_depth": 12},
+    approval=ApprovalGate(required=True, approved=True, reviewer="Dr. Chen")
+)
+
+validation_run = RunRecord(
+    activity_name="validate_hypothesis",
+    agent="discovery_agent_v2",
+    inputs=[model.content_hash, hypothesis.content_hash],
+    outputs=[result.content_hash],
+    parameters={"test_split": 0.2, "significance": 0.01}
+)
+
+graph.add_derivation(
+    raw_data.content_hash, clean_data.content_hash,
+    EdgeType.DERIVED_FROM, cleaning_run
+)
+graph.add_derivation(
+    clean_data.content_hash, model.content_hash,
+    EdgeType.TRAINED_ON, training_run
+)
+graph.add_derivation(
+    model.content_hash, result.content_hash,
+    EdgeType.VALIDATED_BY, validation_run
+)
+graph.add_derivation(
+    hypothesis.content_hash, result.content_hash,
+    EdgeType.VALIDATED_BY, validation_run
+)
+
+# Query: where did the result come from?
+ancestors = graph.ancestry(result.content_hash)
+print(f"Graph summary: {graph.summary()}")
+print(f"\nAncestors of '{result.name}':")
+for h in ancestors:
+    node_data = graph._graph.nodes[h]
+    print(f"  {node_data['artifact_type']:12s}  {node_data['name']}")</code></pre>
+<div class="code-caption">Listing 6.6: Populating the artifact graph with a five-node discovery pipeline and querying the ancestry of the final result. One call to <code>ancestry()</code> returns every artifact in the derivation chain.</div>
+
+<pre><code class="language-text">Graph summary: {'nodes': 5, 'edges': 4, 'runs': 3, 'types': {'dataset': 2, 'model': 1, 'hypothesis': 1, 'result': 1, 'figure': 0, 'code': 0}}
+
+Ancestors of 'brca1_validation_result':
+  dataset       raw_gene_expression
+  dataset       cleaned_gene_expression
+  model         cancer_subtype_classifier
+  hypothesis    brca1_subtype_predictor</code></pre>
+<div class="code-caption">Output 6.6: The ancestry query returns all four upstream artifacts in one traversal.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: "Which Models Used This Dataset?"</div>
+<p>A common provenance query in production systems is: "Dataset X was found to contain a labeling error. Which models were trained on it, and which results depend on those models?" With the artifact graph, this is a single call to <code>descendants()</code>. Every downstream artifact is returned, and you can filter by type to find only models, only results, or only figures. Without the graph, answering this question requires manually searching logs, file timestamps, and notebook outputs, a process that scales linearly with the number of artifacts and is prone to human error.</p>
+</div>
+
+<h2>6. Provenance Queries in Constant Time</h2>
+
+<p>The section title promises constant-time provenance queries. Let us be precise about what that means. In a graph with $|V|$ nodes and $|E|$ edges, a full ancestry traversal visits at most $|V|$ nodes and $|E|$ edges, giving $O(|V| + |E|)$ time. That is linear in the graph size, not constant. However, the graph grows with the number of artifacts, while the ancestry of any single artifact is bounded by its depth in the DAG. For a well-structured pipeline with $k$ stages, the ancestry depth is $O(k)$, which is effectively constant with respect to the total graph size.</p>
+
+<p>For true $O(1)$ lookups, we maintain a materialized index: a dictionary mapping each artifact hash to its precomputed ancestry set. The index is updated incrementally whenever a new edge is added. The cost is $O(|\text{ancestors}|)$ per edge insertion, amortized across all insertions.</p>
+
+$$
+\text{query}(v) = \text{index}[v] \quad \Rightarrow \quad O(1)
+$$
+
+$$
+\text{insert}(u, v) \Rightarrow \text{index}[v] \leftarrow \text{index}[v] \cup \text{index}[u] \cup \{u\} \quad \Rightarrow \quad O(|\text{ancestors}(u)|)
+$$
+
+<p>This trade-off (space for time) is the same one that database systems make with materialized views. In a discovery system where provenance queries are frequent and edge insertions are comparatively rare, the trade-off is favorable.</p>
+
+<h2>7. Human-in-the-Loop Approval Gates</h2>
+
+<p>An autonomous discovery agent can propose experiments faster than a human can review them. Without guardrails, the agent might train a model on the wrong dataset, launch an expensive GPU job with incorrect parameters, or submit a hypothesis that violates domain constraints. Approval gates solve this by inserting a mandatory human review step at critical points in the pipeline.</p>
+
+<p><strong>What.</strong> An approval gate is a predicate on a <code>RunRecord</code> that must evaluate to <code>True</code> before the associated Activity is executed. The gate checks whether a designated human reviewer has marked the run as approved.</p>
+
+<p><strong>Why.</strong> Trust in autonomous systems is earned incrementally. Early in a project, you want a human to approve every experiment. As confidence grows, you can relax gates selectively: perhaps data cleaning runs freely, but model training requires approval, and any run that exceeds a cost threshold requires senior review.</p>
+
+<p><strong>How.</strong> The gate is enforced at the orchestration layer (covered in <a href="section-6.1.html">Section 6.1</a>). Before an agent's proposed run is executed, the orchestrator checks <code>run.approval.required</code>. If true and <code>run.approval.approved</code> is false, the run is queued for review. The reviewer sees the proposed inputs, parameters, estimated cost, and any agent-generated rationale. After approval (or rejection with comments), the run record is updated and the pipeline continues (or halts).</p>
+
+<p><strong>When.</strong> Always during initial development and validation. As the system matures, gates can be relaxed based on run type, cost, or agent track record. A useful heuristic: require approval for any run whose estimated cost exceeds a threshold $C_{\text{max}}$, any run that modifies a published artifact, or any run that an agent initiated without a human prompt.</p>
+
+<pre><code class="language-python">def enforce_approval(run: RunRecord) -> bool:
+    """Check whether a run is cleared for execution.
+
+    Returns True if the run can proceed, False if it is blocked.
+    Raises ValueError if approval is required but not yet granted.
+    """
+    if run.approval is None or not run.approval.required:
+        return True  # no gate on this run
+
+    if run.approval.approved:
+        return True  # human approved
+
+    # Block execution and report the reason
+    raise ValueError(
+        f"Run '{run.run_id}' ({run.activity_name}) requires approval. "
+        f"Agent '{run.agent}' proposed this run with parameters: "
+        f"{json.dumps(run.parameters, indent=2)}. "
+        f"Submit for review before execution."
+    )
+
+
+# Demo: try to execute an unapproved run
+unapproved_run = RunRecord(
+    activity_name="expensive_gpu_training",
+    agent="discovery_agent_v2",
+    parameters={"gpu_hours": 48, "model": "transformer_xl"},
+    approval=ApprovalGate(required=True, approved=False)
+)
+
+try:
+    enforce_approval(unapproved_run)
+except ValueError as exc:
+    print(f"BLOCKED: {exc}")
+
+# Now simulate human approval
+unapproved_run.approval.approved = True
+unapproved_run.approval.reviewer = "Dr. Chen"
+unapproved_run.approval.reviewed_at = datetime.now(timezone.utc).isoformat()
+unapproved_run.approval.comments = "Parameters look correct. Proceed."
+
+cleared = enforce_approval(unapproved_run)
+print(f"\nAfter approval: cleared={cleared}")</code></pre>
+<div class="code-caption">Listing 6.7: The <code>enforce_approval</code> function blocks execution of any run that requires but has not received human approval. The orchestrator calls this check before launching any Activity.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: MLflow for Production Provenance</div>
+<p>The artifact graph we built here is deliberately minimal, designed to teach the concepts. In production, <a href="https://mlflow.org/">MLflow</a> provides a mature implementation: <code>mlflow.log_artifact()</code> registers artifacts, <code>mlflow.log_params()</code> captures parameters, and each run gets a unique ID with full lineage tracking. The MLflow Model Registry adds approval workflows (staging, production, archived) that map directly onto our <code>ApprovalGate</code> pattern. <a href="https://dvc.org/">DVC</a> complements MLflow by adding Git-compatible versioning for large data files, using content-addressable storage that mirrors our SHA-256 hashing scheme. When building the full Workbench in <a href="section-6.4.html">Section 6.4</a>, we wrap these libraries behind a unified interface rather than reimplementing their internals.</p>
+</div>
+
+<h2>8. DAG Properties and Incremental Recomputation</h2>
+
+<p>The directed acyclic graph structure is not merely a nice abstraction; it enables a powerful computational property: incremental recomputation. When an upstream artifact changes (perhaps a dataset is updated with new samples), only the artifacts downstream of the change need to be regenerated. The topological order tells you the exact sequence.</p>
+
+<p>Formally, given a modified node $v_0$, the set of artifacts requiring recomputation is $\text{descendants}(v_0)$. The recomputation order is any topological ordering of the subgraph induced by $\{v_0\} \cup \text{descendants}(v_0)$. This is the same principle behind build systems like Make, Bazel, and dbt: track dependencies as a DAG, hash inputs to detect changes, rebuild only what is stale.</p>
+
+<p>For a discovery pipeline, incremental recomputation means that updating a dataset does not force you to retrain every model from scratch. Only models that directly or indirectly depended on the changed dataset are invalidated. The artifact graph makes this determination automatic.</p>
+
+<p>The cost savings can be dramatic. Consider a graph with 100 artifacts arranged in 5 independent pipelines of 20 nodes each. If one raw dataset changes, only its 19 downstream artifacts need recomputation, not all 100. In a larger system with hundreds of experiments, the savings compound.</p>
+
+<h2>9. Cross-Referencing the Knowledge Graph</h2>
+
+<p>In <a href="../module-03-knowledge-representation/index.html">Chapter 3</a>, we built knowledge graphs to represent scientific concepts, entities, and their relationships. The artifact graph is a complementary structure: the knowledge graph captures <em>what we know</em>, while the artifact graph captures <em>how we came to know it</em>. Linking the two creates a powerful audit trail.</p>
+
+<p>For example, a knowledge graph node representing the claim "BRCA1 expression predicts basal breast cancer subtype" can carry an <code>evidence_link</code> edge pointing to the <code>result</code> node in the artifact graph. That result node, in turn, traces back through the model, the cleaned dataset, and the raw data. A reviewer can follow this chain to verify not just that the claim is asserted, but that the evidence supporting it was produced by a specific pipeline with specific parameters and code.</p>
+
+<p>This connection between the knowledge graph and the artifact graph is what transforms a discovery system from a collection of scripts into a scientific instrument. The search space from <a href="../module-01-discovery-as-search/index.html">Chapter 1</a> defines where to look; the knowledge graph from Chapter 3 organizes what you find; the artifact graph records how you found it.</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Traditional provenance systems record lineage after the fact, but emerging work pushes toward <em>predictive</em> and <em>causal</em> provenance. The LINEA system (Li et al., "Operational Causal Provenance for Data Pipelines," VLDB 2023) extends classical lineage tracking by computing fine-grained causal links between individual data values across pipeline stages, enabling analysts to answer not just "which upstream datasets contributed to this result?" but "which specific rows or cells caused this particular output value?" This cell-level causal reasoning lets a discovery system automatically pinpoint, for example, the three patient samples whose mislabeling caused a model's accuracy to drop, without rerunning the entire pipeline. As autonomous discovery agents generate longer and more branching artifact graphs, this shift from coarse-grained derivation edges to fine-grained causal attribution will become essential for debugging agent decisions at scale.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Query a Personal Research Provenance Graph</h4>
+<p>Using only Python, NetworkX, and hashlib (all available via <code>pip install networkx</code>), build an artifact graph that tracks a small data analysis you have done or can simulate:</p>
+<ol>
+<li><strong>Create three artifacts.</strong> Hash a small CSV string as your "raw dataset," apply a simple transformation (e.g., filter rows where a value exceeds a threshold) and hash the result as your "cleaned dataset," then compute a summary statistic (mean, median) and hash it as your "result." Use the <code>Artifact.compute_hash</code> pattern from Listing 6.3.</li>
+<li><strong>Register all three as nodes</strong> in an <code>ArtifactGraph</code> instance and add <code>derived_from</code> edges linking raw to cleaned and cleaned to result. Attach a <code>RunRecord</code> to each edge that captures the parameters you used (e.g., the filter threshold, the statistic name).</li>
+<li><strong>Query ancestry.</strong> Call <code>ancestry()</code> on the result node and verify that both upstream artifacts are returned. Print each ancestor's name and type.</li>
+<li><strong>Simulate a data update.</strong> Modify one byte in the raw CSV string, recompute its hash, register it as a new node, and re-derive the cleaned dataset and result. Confirm that the new artifacts have different hashes from the originals, and that both the old and new lineage chains coexist in the same graph.</li>
+<li><strong>Export and inspect.</strong> Use <code>nx.node_link_data(graph._graph)</code> to serialize the graph to JSON. Open the JSON and verify that every node carries its type and hash, and every edge carries its relation type and run ID.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>Conceptual:</strong> A collaborator emails you a trained model file with no metadata. Using the vocabulary from this section, list every piece of information you would need to reconstruct a complete <code>RunRecord</code> for this model. Which pieces are recoverable from the file itself, and which are permanently lost?</li>
+<li><strong>Coding:</strong> Extend the <code>ArtifactGraph</code> class with a method <code>stale_artifacts(changed_hash: str) -> list[str]</code> that returns all downstream artifacts requiring recomputation after a change to the artifact with <code>changed_hash</code>. The returned list should be in topological order. Test it on the five-node graph from Listing 6.6.</li>
+<li><strong>Coding:</strong> Add a <code>serialize()</code> method to <code>ArtifactGraph</code> that exports the graph as a JSON document following the W3C PROV-JSON format (entities, activities, relations). Verify that you can round-trip: serialize, deserialize into a new graph, and recover the same ancestry queries.</li>
+<li><strong>Analysis:</strong> A discovery agent proposes 50 experiments per hour. Your team has bandwidth to review 10 per hour. Design a prioritization policy for the approval queue: which runs should be reviewed first? Consider factors such as estimated cost, novelty of the hypothesis, and the agent's historical accuracy. Describe your policy in pseudocode.</li>
+<li><strong>Design:</strong> In Section 6.1, we discussed the seven layers of the Workbench. Draw (on paper or in code) the artifact graph that would result from a complete cycle: raw data ingestion, feature engineering, model training, hypothesis generation, experimental validation, and figure production. Label every node with its type and every edge with its relation type. How many run records does the cycle require?</li>
+</ol>
+</section>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>We now have a formal structure for tracking every artifact and its lineage. But provenance is only useful if the system that generates artifacts is safe, cost-controlled, and observable. <a href="section-6.3.html">Section 6.3: Safety, Cost, and Observability</a> introduces sandboxes for agent execution, budget enforcement, and structured observability with OpenTelemetry, ensuring that the Workbench does not become an expensive, opaque black box.</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-card">
+<a href="https://www.w3.org/TR/prov-dm/" target="_blank">Moreau, L. &amp; Missier, P. (2013). PROV-DM: The PROV Data Model. W3C Recommendation.</a>
+<p>The W3C standard for provenance data modeling; our Entity-Activity-Agent triple and relation vocabulary are drawn directly from this specification.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://www.w3.org/TR/prov-o/" target="_blank">Lebo, T. et al. (2013). PROV-O: The PROV Ontology. W3C Recommendation.</a>
+<p>The OWL ontology companion to PROV-DM, providing formal semantics for provenance relations and enabling interoperability with linked data systems.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1145/2602649" target="_blank">Herschel, M., Diestelk&auml;mper, R., &amp; Ben Lahmar, H. (2017). A survey on provenance: What for? What form? What from? <em>VLDB Journal</em>, 26, 881-906.</a>
+<p>Comprehensive survey of provenance systems across databases, workflows, and scientific computing; clarifies the taxonomy of why-provenance, how-provenance, and where-provenance.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://mlflow.org/docs/latest/index.html" target="_blank">MLflow Documentation. (2024). MLflow: An open-source platform for the ML lifecycle.</a>
+<p>The industry-standard experiment tracking and model registry; its run/artifact/metric abstraction directly implements the run record pattern described in this section.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://dvc.org/doc" target="_blank">DVC Documentation. (2024). Data Version Control: Version control for ML projects.</a>
+<p>Git-compatible content-addressable storage for large data files; complements our SHA-256 hashing scheme with efficient large-file tracking and remote storage backends.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2304.05332" target="_blank">Boiko, D.A., MacKnight, R., Kline, B., &amp; Gomes, G. (2023). Autonomous chemical research with large language models. <em>Nature</em>, 624, 570-578.</a>
+<p>Demonstrates autonomous agent-driven discovery with explicit provenance tracking; the approval gate pattern addresses safety concerns raised by this work.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s41586-023-06792-0" target="_blank">Bran, A.M. et al. (2024). Augmenting large language models with chemistry tools. <em>Nature Machine Intelligence</em>, 6, 525-535.</a>
+<p>Tool-augmented LLM architecture where each tool invocation is a logged Activity; the provenance graph enables post-hoc auditing of agent decisions.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/" target="_blank">Kleppmann, M. (2017). <em>Designing Data-Intensive Applications</em>. O'Reilly.</a>
+<p>The definitive reference on data system architecture; its treatment of immutability, event sourcing, and derived data directly informs our content-addressable artifact design.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2209.07753" target="_blank">Zaharia, M. et al. (2024). The shift from models to compound AI systems. <em>Berkeley AI Research Blog</em>.</a>
+<p>Argues that modern AI capabilities emerge from systems of many components; provenance graphs are the connective tissue that makes such compound systems auditable.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://networkx.org/documentation/stable/" target="_blank">NetworkX Documentation. (2024). NetworkX: Network Analysis in Python.</a>
+<p>The graph library used throughout this section for DAG construction, ancestry queries, and topological sorting.</p>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-6.1.html">&#8592; 6.1 Workbench Architecture Overview</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="section-6.3.html">6.3 Safety, Cost, and Observability &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

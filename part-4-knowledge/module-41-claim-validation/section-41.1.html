@@ -1,0 +1,1482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.1: Claim Extraction and Evidence Mapping. Parsing numerical and qualitative claims from scientific text, structuring them as typed objects, and linking them to artifacts through Crossref and OpenAlex." name="description"/>
+<title>Section 41.1: Claim Extraction and Evidence Mapping | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Scientific Claim Validation</a></div>
+<h1>41.1 Claim Extraction and Evidence Mapping</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I read 847 papers last week. Each one claimed to be state-of-the-art. Statistically, at most one of them was telling the truth, and I suspect it was the one that forgot to mention it."</p>
+<cite>A Literature Review Agent With Declining Trust</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section opens Chapter 41. You should have completed
+<a href="../module-40-research-agents/index.html">Chapter 40: Research Agents</a>,
+which introduced autonomous agents for scientific literature workflows, and
+<a href="../module-36-literature-mining/index.html">Chapter 36: Literature Mining</a>,
+which covered extraction of structured information from scientific text. Familiarity
+with regular expressions, Python dataclasses, and REST APIs (the <code>requests</code>
+library) is assumed. Knowledge of basic NLP concepts (tokenization, named entity
+recognition) from <a href="../../part-1-foundations/module-03-knowledge-representation/index.html">Chapter 3</a>
+is helpful.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A scientific claim is a compressed assertion: "94.7% accuracy on MMLU" packs an entire
+experimental pipeline (data preparation, model training, hyperparameter selection,
+evaluation protocol) into five words and a number. Claim extraction reverses this
+compression, recovering the structured components: what was measured (accuracy), on
+what benchmark (MMLU), with what result (94.7%), under what conditions (unspecified,
+which is itself informative). Evidence mapping then connects each structured claim to
+the artifacts that could confirm or refute it: the dataset, the code, the model
+checkpoint, the experiment log. Together, extraction and mapping transform a paper
+from prose into a verifiable evidence graph.
+</p>
+</div>
+
+<h2>1. Anatomy of a Scientific Claim</h2>
+
+<p>
+Before we can extract claims programmatically, we need a precise definition of what
+constitutes a claim. Not every sentence in a paper is a claim. "We used PyTorch 2.1"
+is a methodological statement. "Related work includes Smith et al. (2023)" is a citation.
+"Our model achieves 94.7% accuracy on MMLU" is a claim: it asserts a specific,
+verifiable result.
+</p>
+
+<p>
+We define a <strong>scientific claim</strong> as an assertion that (1) attributes a
+measurable or qualifiable outcome to a specific method, system, or intervention, and
+(2) could in principle be verified or refuted by re-executing an experiment or
+re-analyzing data. This definition excludes background statements, definitions,
+and methodological descriptions, while including numerical results, comparative
+statements ("outperforms baseline X by 3.2 points"), and qualitative findings
+("the model fails to generalize to out-of-domain inputs").
+</p>
+
+<p data-agent="02">
+Claim extraction is the process of identifying these verifiable assertions in unstructured
+scientific text and converting each one into a typed, machine-readable object with explicit
+fields for the metric, the result, the dataset, and the provenance location. It matters
+because a single paper can contain dozens of claims scattered across the abstract, results
+tables, figure captions, and supplementary material; without systematic extraction, reviewers
+and automated agents alike miss claims or conflate distinct results. The mechanism is a
+two-stage filter: first, a sentence classifier separates claim-bearing sentences from
+background prose, then a structured parser decomposes each flagged sentence into subject,
+predicate, value, and context fields. Use claim extraction when you need to audit, compare,
+or reproduce results at scale; for a one-off reading of a single paper, manual annotation
+with a structured template is simpler and equally effective.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+The most dangerous claims are not the false ones; they are the unfalsifiable ones.
+A claim like "our approach is promising" cannot be checked. A claim like "our approach
+achieves 94.7% on MMLU" can. The first step of claim validation is separating
+verifiable claims from rhetorical assertions, and discarding the latter.
+</p>
+</div>
+
+<p>
+A structured claim consists of several components. The <strong>subject</strong> identifies
+what is being evaluated (a model, a method, a treatment). The <strong>predicate</strong>
+specifies the measured property (accuracy, F1, reduction in tumor volume). The
+<strong>value</strong> gives the result, either as a number with units or as a
+qualitative assessment. The <strong>context</strong> identifies the conditions: the
+dataset, the split, the evaluation protocol, the baseline. And the
+<strong>provenance</strong> points to where in the paper the claim appears: section,
+sentence, table cell, or figure caption.
+</p>
+
+<pre><code class="language-python">"""
+Structured representation of a scientific claim.
+Each claim is a typed object with components that map
+directly to the evidence needed for verification.
+"""
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class ClaimType(Enum):
+    NUMERICAL = "numerical"        # "achieves 94.7% accuracy"
+    COMPARATIVE = "comparative"    # "outperforms X by 3.2 points"
+    QUALITATIVE = "qualitative"    # "generalizes to unseen domains"
+    STATISTICAL = "statistical"    # "significant at p < 0.01"
+    CAUSAL = "causal"              # "treatment reduces tumor volume"
+
+
+class EvidenceStrength(Enum):
+    STRONG = "strong"              # Artifact exists, result verified
+    MODERATE = "moderate"          # Artifact exists, not yet verified
+    WEAK = "weak"                  # No artifact, citation only
+    UNSUPPORTED = "unsupported"    # No evidence found
+
+
+@dataclass
+class ClaimValue:
+    """The measured result of a claim."""
+    magnitude: Optional[float] = None       # 94.7
+    unit: Optional[str] = None              # "percent"
+    qualifier: Optional[str] = None         # "approximately", "at least"
+    confidence_interval: Optional[tuple] = None  # (93.1, 96.3)
+    p_value: Optional[float] = None         # 0.01
+    text: str = ""                          # Original text: "94.7%"
+
+
+@dataclass
+class Claim:
+    """A single scientific claim extracted from text."""
+    claim_id: str                  # Unique identifier
+    claim_type: ClaimType
+    subject: str                   # "our proposed model"
+    predicate: str                 # "accuracy"
+    value: ClaimValue
+    context: dict = field(default_factory=dict)  # dataset, split, etc.
+    provenance: dict = field(default_factory=dict)  # section, sentence_idx
+    evidence_strength: EvidenceStrength = EvidenceStrength.UNSUPPORTED
+    linked_artifacts: list = field(default_factory=list)
+    source_sentence: str = ""      # Full original sentence
+
+    def is_verifiable(self) -> bool:
+        """A claim is verifiable if it has a numerical value or
+        references a specific, reproducible experiment."""
+        return (
+            self.claim_type in (ClaimType.NUMERICAL, ClaimType.STATISTICAL)
+            or (self.claim_type == ClaimType.COMPARATIVE
+                and self.value.magnitude is not None)
+        )
+
+    def summary(self) -> str:
+        """Human-readable one-line summary of the claim."""
+        val = self.value.text or str(self.value.magnitude)
+        ctx = self.context.get("dataset", "unspecified context")
+        return f"{self.subject} | {self.predicate} = {val} | {ctx}"
+</code></pre>
+<div class="code-caption">Listing 41.1: Structured claim representation with typed components. Each field maps to a specific verification step: the value needs numerical matching, the context needs dataset identification, and the provenance enables tracing back to the source text.</div>
+
+<p>
+The <code>Claim</code> dataclass in Listing 41.1 is the atomic unit of our validation
+pipeline. Every downstream operation (evidence mapping, artifact verification,
+reproducibility scoring) consumes and annotates <code>Claim</code> objects. The
+<code>is_verifiable</code> method implements our definition: only claims with
+measurable outcomes qualify for automated verification.
+</p>
+
+<h2>2. Extracting Claims from Scientific Text</h2>
+
+<p>
+Claim extraction operates at two levels: sentence classification (which sentences contain
+claims?) and claim parsing (what are the structured components of each claim?). We build
+a hybrid system that combines rule-based pattern matching for numerical claims with
+LLM-assisted extraction for complex or qualitative claims.
+</p>
+
+<h3>2.1 Rule-Based Numerical Claim Extraction</h3>
+
+<p>
+Numerical claims follow predictable patterns. A sentence like "Our model achieves 94.7%
+accuracy on the MMLU benchmark" contains a metric name ("accuracy"), a value ("94.7%"),
+and a context ("MMLU benchmark"). Regular expressions can capture these patterns with
+high precision, though at the cost of recall for unusual phrasings.
+</p>
+
+<pre><code class="language-python">"""
+Rule-based extraction of numerical claims from scientific text.
+Patterns target common reporting formats: percentages, counts,
+p-values, confidence intervals, and comparative deltas.
+"""
+import re
+from typing import Generator
+
+
+# Pattern components (composed into full claim patterns)
+FLOAT = r"(\d+\.?\d*)"
+PERCENT = FLOAT + r"\s*[%％]"
+PVALUE = r"[pP]\s*[<>=≤≥]\s*" + FLOAT
+CI_PATTERN = (
+    r"\[?\(?" + FLOAT + r"\s*[,;–-]\s*" + FLOAT + r"\)?\]?"
+)
+METRIC_NAMES = (
+    r"(?:accuracy|precision|recall|F1(?:\s*score)?|AUC(?:\s*-?\s*ROC)?"
+    r"|BLEU|ROUGE(?:-[12L])?"
+    r"|perplexity|loss|error\s*rate|IoU|mAP|R²|RMSE|MAE"
+    r"|sensitivity|specificity|PPV|NPV)"
+)
+COMPARISON_VERBS = (
+    r"(?:outperforms?|surpass(?:es)?|exceeds?|improves?\s+(?:upon|over)"
+    r"|beats?|achieves?\s+higher|reduces?)"
+)
+
+
+class NumericalClaimExtractor:
+    """Extract numerical claims using regex pattern matching."""
+
+    def __init__(self):
+        self.patterns = self._compile_patterns()
+
+    def _compile_patterns(self) -> list[tuple[str, re.Pattern]]:
+        """Build ordered list of (claim_type, pattern) pairs."""
+        return [
+            # "achieves 94.7% accuracy on MMLU"
+            ("metric_report", re.compile(
+                r"(?:achieves?|obtains?|reaches?|reports?|yields?)"
+                r"\s+(?:an?\s+)?" + PERCENT
+                + r"\s+" + METRIC_NAMES,
+                re.IGNORECASE
+            )),
+            # "accuracy of 94.7% on MMLU"
+            ("metric_of", re.compile(
+                METRIC_NAMES + r"\s+of\s+" + PERCENT,
+                re.IGNORECASE
+            )),
+            # "outperforms the baseline by 3.2 points"
+            ("comparative", re.compile(
+                COMPARISON_VERBS + r".*?by\s+" + FLOAT
+                + r"\s*(?:points?|pp|percentage\s+points?|%)",
+                re.IGNORECASE
+            )),
+            # "p < 0.01" or "p = 0.03"
+            ("significance", re.compile(PVALUE, re.IGNORECASE)),
+            # "95% confidence interval [92.1, 97.3]"
+            ("confidence_interval", re.compile(
+                r"(?:\d+%?\s+)?(?:confidence\s+interval|CI)\s*"
+                + CI_PATTERN,
+                re.IGNORECASE
+            )),
+        ]
+
+    def extract(
+        self, text: str, source_id: str = ""
+    ) -> Generator[Claim, None, None]:
+        """Extract claims from a block of scientific text.
+
+        Args:
+            text: The input text (abstract, section, or full paper).
+            source_id: Identifier for provenance tracking.
+
+        Yields:
+            Claim objects for each detected numerical assertion.
+        """
+        sentences = self._split_sentences(text)
+        claim_counter = 0
+
+        for sent_idx, sentence in enumerate(sentences):
+            for claim_type_name, pattern in self.patterns:
+                for match in pattern.finditer(sentence):
+                    claim_counter += 1
+                    claim = self._match_to_claim(
+                        match, claim_type_name, sentence,
+                        sent_idx, source_id, claim_counter
+                    )
+                    if claim is not None:
+                        yield claim
+
+    def _match_to_claim(
+        self, match: re.Match, claim_type_name: str,
+        sentence: str, sent_idx: int, source_id: str, counter: int
+    ) -> Claim | None:
+        """Convert a regex match into a structured Claim object."""
+        groups = match.groups()
+        if not groups:
+            return None
+
+        # Parse the primary numerical value
+        try:
+            magnitude = float(groups[0])
+        except (ValueError, IndexError):
+            return None
+
+        # Determine claim type
+        type_map = {
+            "metric_report": ClaimType.NUMERICAL,
+            "metric_of": ClaimType.NUMERICAL,
+            "comparative": ClaimType.COMPARATIVE,
+            "significance": ClaimType.STATISTICAL,
+            "confidence_interval": ClaimType.NUMERICAL,
+        }
+
+        value = ClaimValue(
+            magnitude=magnitude,
+            unit="percent" if "%" in match.group() else None,
+            text=match.group().strip()
+        )
+
+        # Extract dataset context using simple heuristics
+        context = self._extract_context(sentence)
+
+        return Claim(
+            claim_id=f"{source_id}_claim_{counter:04d}",
+            claim_type=type_map.get(
+                claim_type_name, ClaimType.NUMERICAL
+            ),
+            subject=self._extract_subject(sentence),
+            predicate=self._extract_metric(sentence),
+            value=value,
+            context=context,
+            provenance={
+                "source_id": source_id,
+                "sentence_index": sent_idx,
+                "match_span": (match.start(), match.end()),
+            },
+            source_sentence=sentence.strip()
+        )
+
+    def _split_sentences(self, text: str) -> list[str]:
+        """Split text into sentences, handling abbreviations."""
+        # Simple sentence splitter; production systems use spaCy
+        parts = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+        return [s.strip() for s in parts if s.strip()]
+
+    def _extract_subject(self, sentence: str) -> str:
+        """Extract the subject (what is being evaluated)."""
+        patterns = [
+            r"(?:our|the\s+proposed)\s+([\w\s]+?)(?:\s+(?:achieves?|obtains?))",
+            r"([\w\s]+?)\s+(?:outperforms?|surpass)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, sentence, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+        return "unspecified"
+
+    def _extract_metric(self, sentence: str) -> str:
+        """Extract the metric name from the sentence."""
+        m = re.search(METRIC_NAMES, sentence, re.IGNORECASE)
+        return m.group().lower() if m else "unspecified"
+
+    def _extract_context(self, sentence: str) -> dict:
+        """Extract dataset and evaluation context."""
+        context = {}
+        # Look for "on X" patterns for dataset names
+        m = re.search(
+            r"\bon\s+(?:the\s+)?([\w\-]+(?:\s+[\w\-]+)?)"
+            r"\s+(?:benchmark|dataset|test\s+set|corpus)",
+            sentence, re.IGNORECASE
+        )
+        if m:
+            context["dataset"] = m.group(1).strip()
+        return context
+
+
+# --- Demonstration ---
+extractor = NumericalClaimExtractor()
+sample_abstract = (
+    "We present DiscoveryNet, a foundation model for scientific claim "
+    "verification. DiscoveryNet achieves 94.7% accuracy on the SciFact "
+    "benchmark, outperforming the previous best by 3.2 percentage points. "
+    "On the FEVER dataset, our model obtains an F1 score of 89.3%. "
+    "All improvements are statistically significant (p < 0.001). "
+    "The 95% confidence interval for SciFact accuracy is [93.1, 96.3]."
+)
+
+for claim in extractor.extract(sample_abstract, source_id="paper_001"):
+    print(claim.summary())
+    # paper_001 | accuracy = 94.7% | SciFact
+    # paper_001 | unspecified = 3.2 percentage points | {}
+    # paper_001 | f1 score = 89.3% | {}
+    # paper_001 | unspecified = 0.001 | {}
+</code></pre>
+<div class="code-caption">Listing 41.2: Rule-based numerical claim extractor using composable regex patterns. The extractor identifies metric reports, comparative statements, significance levels, and confidence intervals, converting each into a structured Claim object with provenance tracking.</div>
+
+<p>
+The extractor in Listing 41.2 achieves high precision on standard reporting formats
+but misses claims that use non-standard phrasing. For example, "the error rate dropped
+to single digits" is a numerical claim that no regex will catch. For these cases, we
+turn to LLM-assisted extraction.
+</p>
+
+<h3>2.2 LLM-Assisted Claim Extraction</h3>
+
+<p>
+Large language models excel at understanding the semantics of scientific text, including
+implicit claims and complex phrasing. We use structured output generation to produce
+claim objects directly from text, with the LLM serving as a flexible parser that handles
+the long tail of formats our regex patterns miss.
+</p>
+
+<pre><code class="language-python">"""
+LLM-assisted claim extraction using structured output.
+The LLM acts as a semantic parser, converting free-text
+scientific claims into structured Claim objects.
+"""
+import json
+from typing import Any
+
+
+CLAIM_EXTRACTION_PROMPT = """\
+You are a scientific claim extractor. Given a passage from a
+scientific paper, identify all verifiable claims and return them
+as a JSON array.
+
+A verifiable claim must:
+1. Assert a specific, measurable outcome (numerical or qualitative)
+2. Attribute the outcome to a method, system, or intervention
+3. Be falsifiable through experiment or data analysis
+
+For each claim, extract:
+- subject: what is being evaluated
+- predicate: what property is measured
+- value: the result (number, comparison, or qualitative finding)
+- unit: the unit of measurement (if applicable)
+- dataset: the evaluation dataset or context (if mentioned)
+- claim_type: one of [numerical, comparative, qualitative,
+  statistical, causal]
+
+Do NOT include:
+- Background statements or definitions
+- Methodological descriptions without outcomes
+- Hedged speculation ("may", "could potentially")
+
+Return ONLY a JSON array. Example:
+[{
+  "subject": "DiscoveryNet",
+  "predicate": "accuracy",
+  "value": 94.7,
+  "unit": "percent",
+  "dataset": "SciFact",
+  "claim_type": "numerical"
+}]
+
+Passage:
+"""
+
+
+def extract_claims_with_llm(
+    text: str,
+    llm_client: Any,
+    model: str = "claude-sonnet-4-20250514"
+) -> list[Claim]:
+    """Extract claims using an LLM with structured output.
+
+    Args:
+        text: Scientific text to analyze.
+        llm_client: An Anthropic or OpenAI client instance.
+        model: Model identifier for the API call.
+
+    Returns:
+        List of Claim objects parsed from LLM output.
+    """
+    response = llm_client.messages.create(
+        model=model,
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": CLAIM_EXTRACTION_PROMPT + text
+        }]
+    )
+
+    raw_text = response.content[0].text
+    # Strip markdown code fences if present
+    if raw_text.startswith("```"):
+        raw_text = raw_text.split("\n", 1)[1].rsplit("```", 1)[0]
+
+    claims_data = json.loads(raw_text)
+    claims = []
+
+    for i, cd in enumerate(claims_data):
+        claim = Claim(
+            claim_id=f"llm_claim_{i:04d}",
+            claim_type=ClaimType(
+                cd.get("claim_type", "numerical")
+            ),
+            subject=cd.get("subject", "unspecified"),
+            predicate=cd.get("predicate", "unspecified"),
+            value=ClaimValue(
+                magnitude=cd.get("value") if isinstance(
+                    cd.get("value"), (int, float)
+                ) else None,
+                unit=cd.get("unit"),
+                text=str(cd.get("value", "")),
+            ),
+            context={"dataset": cd.get("dataset", "")},
+            source_sentence=text[:200],  # Truncated for reference
+        )
+        claims.append(claim)
+
+    return claims
+</code></pre>
+<div class="code-caption">Listing 41.3: LLM-assisted claim extraction using structured output prompting. The LLM handles non-standard phrasings and implicit claims that rule-based patterns miss, producing the same Claim objects as the regex extractor.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example</div>
+<p>
+<strong>Hybrid claim extraction at a pharmaceutical company.</strong> A drug discovery team
+reviews hundreds of papers monthly to track competitor results. Their pipeline runs the
+regex extractor first (fast, high-precision) to capture standard numerical claims like
+"IC50 = 3.2 nM" and "overall survival improved by 4.7 months (HR = 0.72, p = 0.003)."
+The LLM extractor then processes the remaining sentences to catch qualitative claims
+like "the compound showed favorable selectivity across the kinase panel." By running
+regex first, they reduce LLM API costs by roughly 60%, since most claims in results
+sections follow standard formats.
+</p>
+</div>
+
+<h3>2.3 Merging and Deduplicating Claims</h3>
+
+<p>
+When both extractors run on the same text, they produce overlapping results. A merge
+step deduplicates claims by comparing their value, predicate, and context fields. Two
+claims match if they reference the same metric on the same dataset with values within
+a small tolerance (to handle rounding differences between abstract and table).
+</p>
+
+<pre><code class="language-python">"""
+Merge and deduplicate claims from multiple extractors.
+Uses value proximity and context overlap to identify duplicates.
+"""
+from itertools import combinations
+
+
+def claims_match(a: Claim, b: Claim, tol: float = 0.5) -> bool:
+    """Determine if two claims refer to the same result.
+
+    Two claims match if they share the same predicate (metric),
+    similar context (dataset), and values within tolerance.
+    """
+    # Same metric?
+    if a.predicate != b.predicate and a.predicate != "unspecified":
+        if b.predicate != "unspecified":
+            return False
+
+    # Same dataset context?
+    ds_a = a.context.get("dataset", "").lower()
+    ds_b = b.context.get("dataset", "").lower()
+    if ds_a and ds_b and ds_a != ds_b:
+        return False
+
+    # Values within tolerance?
+    if (a.value.magnitude is not None
+            and b.value.magnitude is not None):
+        return abs(a.value.magnitude - b.value.magnitude) <= tol
+
+    # If no numerical comparison possible, check text overlap
+    return a.value.text.strip() == b.value.text.strip()
+
+
+def merge_claims(
+    regex_claims: list[Claim],
+    llm_claims: list[Claim]
+) -> list[Claim]:
+    """Merge claims from regex and LLM extractors.
+
+    Priority: regex claims are preferred (more precise provenance),
+    LLM-only claims are added if they have no regex match.
+    """
+    merged = list(regex_claims)  # Start with regex claims
+    used_llm = set()
+
+    # Match LLM claims to regex claims
+    for rc in regex_claims:
+        for j, lc in enumerate(llm_claims):
+            if j not in used_llm and claims_match(rc, lc):
+                # Enrich regex claim with LLM-extracted fields
+                if rc.subject == "unspecified":
+                    rc.subject = lc.subject
+                if not rc.context.get("dataset"):
+                    rc.context.update(lc.context)
+                used_llm.add(j)
+
+    # Add unmatched LLM claims
+    for j, lc in enumerate(llm_claims):
+        if j not in used_llm:
+            merged.append(lc)
+
+    return merged
+</code></pre>
+<div class="code-caption">Listing 41.4: Claim merging strategy that combines regex precision with LLM recall. Regex claims take priority for provenance accuracy; unmatched LLM claims are appended to capture the long tail.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut</div>
+<p>
+The <a href="https://github.com/allenai/scifact" target="_blank">SciFact</a> pipeline from
+Allen AI provides pre-trained models for scientific claim detection and evidence retrieval.
+Using their <code>verisci</code> package, the entire extraction and evidence-matching pipeline
+reduces to roughly 15 lines of code instead of the 200+ lines above. The library handles
+sentence-level claim classification, evidence paragraph retrieval, and entailment scoring
+internally. Our from-scratch implementation reveals the design decisions (claim typing,
+context extraction, merge strategy) that the library abstracts away, which matter when
+you need to customize extraction for a specific domain or claim format.
+</p>
+</div>
+
+<h2>3. Evidence Mapping Through Scholarly APIs</h2>
+
+<p>
+Once claims are extracted, the next step is finding the evidence that supports or refutes
+them. Evidence comes in layers: the paper itself, the papers it cites, the datasets it
+references, the code repositories it links, and the experiment logs it (hopefully)
+provides. Scholarly metadata APIs let us traverse these layers programmatically.
+</p>
+
+<h3>3.1 Crossref: DOI Resolution and Citation Metadata</h3>
+
+<p>
+Crossref is the authoritative registry for DOIs (Digital Object Identifiers). Every
+DOI resolves to a metadata record containing the title, authors, publication date,
+journal, and (crucially) a list of cited references. This reference list is the first
+layer of our evidence map: it tells us what prior work the authors claim to build upon.
+</p>
+
+<pre><code class="language-python">"""
+Evidence mapping through the Crossref REST API.
+Retrieves bibliographic metadata, citation lists,
+and cross-reference integrity checks.
+"""
+import requests
+import time
+from dataclasses import dataclass
+
+
+@dataclass
+class CrossrefRecord:
+    """Bibliographic record from Crossref."""
+    doi: str
+    title: str
+    authors: list[str]
+    year: int
+    journal: str
+    reference_count: int
+    is_referenced_by_count: int
+    references: list[str]  # List of cited DOIs
+
+
+class CrossrefClient:
+    """Client for the Crossref REST API with polite pooling."""
+
+    BASE_URL = "https://api.crossref.org/works"
+
+    def __init__(self, email: str):
+        """Initialize with a contact email for the polite pool.
+
+        Crossref gives faster responses to requests that include
+        a mailto parameter, placing them in the 'polite' pool.
+        """
+        self.session = requests.Session()
+        self.session.params = {"mailto": email}
+        self.session.headers.update({
+            "User-Agent": f"DiscoveryAI/1.0 (mailto:{email})"
+        })
+
+    def get_work(self, doi: str) -> CrossrefRecord | None:
+        """Fetch metadata for a single DOI.
+
+        Args:
+            doi: A DOI string (e.g., "10.1038/s41586-023-06221-2").
+
+        Returns:
+            CrossrefRecord or None if not found.
+        """
+        url = f"{self.BASE_URL}/{doi}"
+        try:
+            resp = self.session.get(url, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException:
+            return None
+
+        msg = resp.json().get("message", {})
+        authors = [
+            f"{a.get('given', '')} {a.get('family', '')}".strip()
+            for a in msg.get("author", [])
+        ]
+        refs = [
+            r.get("DOI", "")
+            for r in msg.get("reference", [])
+            if r.get("DOI")
+        ]
+        title_parts = msg.get("title", [""])
+        year_parts = msg.get("published-print", {}).get(
+            "date-parts", [[None]]
+        )
+
+        return CrossrefRecord(
+            doi=doi,
+            title=title_parts[0] if title_parts else "",
+            authors=authors,
+            year=year_parts[0][0] if year_parts[0][0] else 0,
+            journal=msg.get("container-title", [""])[0],
+            reference_count=msg.get("reference-count", 0),
+            is_referenced_by_count=msg.get(
+                "is-referenced-by-count", 0
+            ),
+            references=refs,
+        )
+
+    def verify_citations(
+        self, paper_doi: str, claimed_refs: list[str]
+    ) -> dict:
+        """Check which claimed references actually appear
+        in the Crossref metadata for a paper.
+
+        Returns:
+            Dictionary with verified, missing, and extra refs.
+        """
+        record = self.get_work(paper_doi)
+        if record is None:
+            return {"error": f"Could not fetch {paper_doi}"}
+
+        actual_refs = set(record.references)
+        claimed_set = set(claimed_refs)
+
+        return {
+            "verified": list(claimed_set & actual_refs),
+            "missing_from_metadata": list(
+                claimed_set - actual_refs
+            ),
+            "in_metadata_not_claimed": list(
+                actual_refs - claimed_set
+            ),
+            "total_actual": len(actual_refs),
+            "total_claimed": len(claimed_set),
+        }
+</code></pre>
+<div class="code-caption">Listing 41.5: Crossref API client for DOI resolution and citation verification. The polite pool email parameter ensures faster API responses, and the verify_citations method identifies discrepancies between claimed and actual reference lists.</div>
+
+<h3>3.2 OpenAlex: Citation Graph Traversal</h3>
+
+<p>
+While Crossref provides the authoritative DOI registry, OpenAlex offers a richer
+knowledge graph of scholarly works, authors, institutions, and concepts. For evidence
+mapping, OpenAlex is particularly valuable because it provides bidirectional citation
+links (both "cites" and "cited by"), concept tagging, and open-access status indicators.
+</p>
+
+<pre><code class="language-python">"""
+OpenAlex client for citation graph traversal and
+author/institution-level evidence mapping.
+"""
+
+
+class OpenAlexClient:
+    """Client for the OpenAlex API."""
+
+    BASE_URL = "https://api.openalex.org"
+
+    def __init__(self, email: str):
+        self.session = requests.Session()
+        self.session.params = {"mailto": email}
+
+    def get_work_by_doi(self, doi: str) -> dict | None:
+        """Fetch an OpenAlex work record by DOI."""
+        url = f"{self.BASE_URL}/works/doi:{doi}"
+        try:
+            resp = self.session.get(url, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException:
+            return None
+
+    def get_citing_works(
+        self, openalex_id: str, limit: int = 50
+    ) -> list[dict]:
+        """Find works that cite the given work.
+
+        Useful for checking whether a claim has been
+        independently reproduced by other groups.
+        """
+        url = f"{self.BASE_URL}/works"
+        params = {
+            "filter": f"cites:{openalex_id}",
+            "per_page": min(limit, 200),
+            "sort": "cited_by_count:desc"
+        }
+        try:
+            resp = self.session.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            return resp.json().get("results", [])
+        except requests.RequestException:
+            return []
+
+    def build_evidence_map(self, doi: str) -> dict:
+        """Build a multi-layer evidence map for a paper.
+
+        Returns:
+            A dictionary with citation context, citing works,
+            author history, and independent reproduction signals.
+        """
+        work = self.get_work_by_doi(doi)
+        if work is None:
+            return {"error": f"Work not found: {doi}"}
+
+        oa_id = work.get("id", "")
+
+        # Layer 1: Direct citation context
+        cited_works = work.get("referenced_works", [])
+
+        # Layer 2: Who cites this paper?
+        citing = self.get_citing_works(oa_id, limit=20)
+
+        # Layer 3: Author track record
+        authors = work.get("authorships", [])
+        author_ids = [
+            a["author"]["id"] for a in authors
+            if a.get("author", {}).get("id")
+        ]
+
+        # Layer 4: Concept overlap with citing papers
+        paper_concepts = {
+            c["display_name"]
+            for c in work.get("concepts", [])
+            if c.get("score", 0) > 0.5
+        }
+
+        independent_reproductions = []
+        for cw in citing:
+            # A citing work is an "independent reproduction" if
+            # it shares concepts but has no author overlap
+            cw_authors = {
+                a["author"]["id"]
+                for a in cw.get("authorships", [])
+                if a.get("author", {}).get("id")
+            }
+            cw_concepts = {
+                c["display_name"]
+                for c in cw.get("concepts", [])
+                if c.get("score", 0) > 0.5
+            }
+            if (not cw_authors & set(author_ids)
+                    and len(cw_concepts & paper_concepts) >= 2):
+                independent_reproductions.append({
+                    "id": cw.get("id"),
+                    "title": cw.get("title"),
+                    "year": cw.get("publication_year"),
+                    "concept_overlap": list(
+                        cw_concepts & paper_concepts
+                    ),
+                })
+
+        return {
+            "paper_id": oa_id,
+            "title": work.get("title"),
+            "cited_works_count": len(cited_works),
+            "cited_by_count": work.get("cited_by_count", 0),
+            "independent_reproductions": independent_reproductions,
+            "author_count": len(authors),
+            "open_access": work.get("open_access", {}).get(
+                "is_oa", False
+            ),
+        }
+</code></pre>
+<div class="code-caption">Listing 41.6: OpenAlex client for building multi-layer evidence maps. The build_evidence_map method identifies independent reproductions by finding citing papers that share research concepts but have no author overlap with the original work.</div>
+
+<h2>4. Citation Integrity and Anomaly Detection</h2>
+
+<p>
+Citation checking goes beyond verifying that references exist. A growing body of
+research documents systematic citation anomalies: phantom references (citations to
+papers that do not exist), citation cartels (groups of authors who cite each other
+excessively to inflate metrics), self-citation inflation, and reference list
+manipulation. Automated detection of these patterns is an important layer of
+claim validation because a paper with corrupted citations undermines the evidence
+chain for every claim it makes.
+</p>
+
+<pre><code class="language-python">"""
+Citation anomaly detector.
+Identifies phantom references, excessive self-citation,
+citation cartel patterns, and temporal anomalies.
+"""
+from collections import Counter
+
+
+@dataclass
+class CitationAnomaly:
+    """A detected anomaly in citation patterns."""
+    anomaly_type: str      # phantom, self_citation, cartel, temporal
+    severity: str          # low, medium, high
+    description: str
+    evidence: dict
+
+
+class CitationAnomalyDetector:
+    """Detect anomalous citation patterns in a paper."""
+
+    def __init__(
+        self,
+        crossref: CrossrefClient,
+        openalex: OpenAlexClient
+    ):
+        self.crossref = crossref
+        self.openalex = openalex
+
+    def detect_anomalies(
+        self, doi: str
+    ) -> list[CitationAnomaly]:
+        """Run all anomaly checks on a paper.
+
+        Args:
+            doi: The paper's DOI.
+
+        Returns:
+            List of detected anomalies, sorted by severity.
+        """
+        anomalies = []
+        record = self.crossref.get_work(doi)
+        if record is None:
+            return anomalies
+
+        work = self.openalex.get_work_by_doi(doi)
+
+        # Check 1: Phantom references
+        anomalies.extend(
+            self._check_phantom_refs(record)
+        )
+
+        # Check 2: Self-citation rate
+        if work:
+            anomalies.extend(
+                self._check_self_citation(record, work)
+            )
+
+        # Check 3: Temporal anomalies
+        anomalies.extend(
+            self._check_temporal_anomalies(record)
+        )
+
+        # Sort by severity
+        severity_order = {"high": 0, "medium": 1, "low": 2}
+        anomalies.sort(
+            key=lambda a: severity_order.get(a.severity, 3)
+        )
+        return anomalies
+
+    def _check_phantom_refs(
+        self, record: CrossrefRecord
+    ) -> list[CitationAnomaly]:
+        """Check for references that don't resolve to real papers."""
+        anomalies = []
+        unresolvable = []
+
+        for ref_doi in record.references[:50]:  # Limit API calls
+            ref_record = self.crossref.get_work(ref_doi)
+            if ref_record is None:
+                unresolvable.append(ref_doi)
+            time.sleep(0.1)  # Rate limiting
+
+        if unresolvable:
+            ratio = len(unresolvable) / max(
+                len(record.references), 1
+            )
+            severity = (
+                "high" if ratio > 0.1
+                else "medium" if ratio > 0.05
+                else "low"
+            )
+            anomalies.append(CitationAnomaly(
+                anomaly_type="phantom",
+                severity=severity,
+                description=(
+                    f"{len(unresolvable)} of "
+                    f"{len(record.references)} references "
+                    f"could not be resolved via Crossref "
+                    f"({ratio:.1%} unresolvable rate)"
+                ),
+                evidence={
+                    "unresolvable_dois": unresolvable,
+                    "total_refs": len(record.references),
+                }
+            ))
+        return anomalies
+
+    def _check_self_citation(
+        self, record: CrossrefRecord, work: dict
+    ) -> list[CitationAnomaly]:
+        """Detect excessive self-citation rates."""
+        anomalies = []
+        paper_authors = set(record.authors)
+
+        self_cited = 0
+        checked = 0
+        for ref_doi in record.references[:30]:
+            ref_record = self.crossref.get_work(ref_doi)
+            if ref_record is not None:
+                checked += 1
+                ref_authors = set(ref_record.authors)
+                if paper_authors & ref_authors:
+                    self_cited += 1
+            time.sleep(0.1)
+
+        if checked > 0:
+            rate = self_cited / checked
+            # Self-citation rates above 25% are unusual;
+            # above 40% warrant investigation
+            if rate > 0.25:
+                severity = "high" if rate > 0.40 else "medium"
+                anomalies.append(CitationAnomaly(
+                    anomaly_type="self_citation",
+                    severity=severity,
+                    description=(
+                        f"Self-citation rate of {rate:.1%} "
+                        f"({self_cited}/{checked} checked refs). "
+                        f"Typical range is 5-15% for most fields."
+                    ),
+                    evidence={
+                        "self_cited": self_cited,
+                        "checked": checked,
+                        "rate": rate,
+                    }
+                ))
+        return anomalies
+
+    def _check_temporal_anomalies(
+        self, record: CrossrefRecord
+    ) -> list[CitationAnomaly]:
+        """Detect references to future papers or suspicious
+        clustering of citation years."""
+        anomalies = []
+        ref_years = []
+
+        for ref_doi in record.references[:30]:
+            ref_record = self.crossref.get_work(ref_doi)
+            if ref_record and ref_record.year:
+                ref_years.append(ref_record.year)
+                # Future citation check
+                if ref_record.year > record.year + 1:
+                    anomalies.append(CitationAnomaly(
+                        anomaly_type="temporal",
+                        severity="high",
+                        description=(
+                            f"Paper from {record.year} cites "
+                            f"a work from {ref_record.year}: "
+                            f"'{ref_record.title[:60]}...'"
+                        ),
+                        evidence={
+                            "paper_year": record.year,
+                            "ref_year": ref_record.year,
+                            "ref_doi": ref_doi,
+                        }
+                    ))
+            time.sleep(0.1)
+
+        # Check for suspicious year clustering
+        if ref_years:
+            year_counts = Counter(ref_years)
+            most_common_year, count = year_counts.most_common(1)[0]
+            ratio = count / len(ref_years)
+            if ratio > 0.5 and len(ref_years) > 5:
+                anomalies.append(CitationAnomaly(
+                    anomaly_type="temporal",
+                    severity="medium",
+                    description=(
+                        f"{ratio:.0%} of references are from "
+                        f"{most_common_year}. Unusual clustering "
+                        f"may indicate narrow literature review."
+                    ),
+                    evidence={
+                        "year_distribution": dict(year_counts),
+                        "dominant_year": most_common_year,
+                        "concentration": ratio,
+                    }
+                ))
+        return anomalies
+</code></pre>
+<div class="code-caption">Listing 41.7: Citation anomaly detector that checks for phantom references, excessive self-citation, and temporal impossibilities. Each anomaly is graded by severity, with thresholds calibrated to empirical norms across scientific fields.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+Citation anomaly detection is not about catching fraud (though it can). Its primary value
+is calibrating trust in a paper's evidence chain. A paper with a 5% phantom reference rate
+probably has a few formatting errors in its bibliography. A paper with a 40% self-citation
+rate and references to future publications has a fundamentally compromised evidence chain,
+and every claim it makes should be treated with proportionally lower confidence.
+</p>
+</div>
+
+<h2>5. Building the Claim-to-Artifact Linkage Graph</h2>
+
+<p>
+The final step in evidence mapping is connecting claims not just to other papers but to
+concrete computational artifacts: datasets, code repositories, model checkpoints, and
+experiment logs. This is where claim validation transitions from bibliometric analysis
+to computational verification.
+</p>
+
+<p>
+A <strong>claim-to-artifact linkage graph</strong> is a directed graph where claim nodes
+connect to artifact nodes through typed edges: "measured_on" (claim to dataset),
+"produced_by" (claim to code), "logged_in" (claim to experiment tracker), and
+"derived_from" (claim to upstream claim). Building this graph requires extracting
+artifact references from the paper text (GitHub URLs, dataset identifiers, MLflow
+experiment IDs) and verifying that each artifact actually exists and is accessible.
+</p>
+
+<pre><code class="language-python">"""
+Claim-to-artifact linkage graph construction.
+Connects extracted claims to their supporting computational
+artifacts: datasets, code, model checkpoints, experiment logs.
+"""
+import re
+from enum import Enum
+
+
+class ArtifactType(Enum):
+    DATASET = "dataset"
+    CODE_REPO = "code_repository"
+    MODEL_CHECKPOINT = "model_checkpoint"
+    EXPERIMENT_LOG = "experiment_log"
+    SUPPLEMENTARY = "supplementary_material"
+
+
+@dataclass
+class Artifact:
+    """A computational artifact supporting a claim."""
+    artifact_id: str
+    artifact_type: ArtifactType
+    uri: str                     # URL, DOI, or local path
+    accessible: bool = False     # Verified accessible?
+    integrity_hash: str = ""     # SHA-256 if downloadable
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class EvidenceLink:
+    """A typed edge between a claim and an artifact."""
+    claim_id: str
+    artifact_id: str
+    link_type: str     # measured_on, produced_by, logged_in
+    confidence: float  # 0 to 1
+
+
+class ArtifactLinker:
+    """Extract artifact references and link them to claims."""
+
+    # Patterns for common artifact references
+    GITHUB_PATTERN = re.compile(
+        r"https?://github\.com/[\w\-]+/[\w\-.]+"
+    )
+    HUGGINGFACE_PATTERN = re.compile(
+        r"https?://huggingface\.co/[\w\-]+/[\w\-.]+"
+    )
+    ARXIV_PATTERN = re.compile(
+        r"(?:arxiv[:\s]+)?(\d{4}\.\d{4,5})"
+    )
+    DATASET_NAMES = {
+        "imagenet", "cifar-10", "cifar-100", "mnist",
+        "glue", "superglue", "squad", "mmlu", "hellaswag",
+        "humaneval", "mbpp", "scifact", "fever", "coco",
+        "wmt", "penn treebank", "wikitext"
+    }
+
+    def extract_artifacts(self, text: str) -> list[Artifact]:
+        """Extract artifact references from paper text."""
+        artifacts = []
+
+        # GitHub repositories
+        for match in self.GITHUB_PATTERN.finditer(text):
+            url = match.group()
+            artifacts.append(Artifact(
+                artifact_id=f"github_{len(artifacts)}",
+                artifact_type=ArtifactType.CODE_REPO,
+                uri=url,
+            ))
+
+        # Hugging Face models/datasets
+        for match in self.HUGGINGFACE_PATTERN.finditer(text):
+            url = match.group()
+            # Heuristic: /datasets/ in URL means dataset
+            atype = (
+                ArtifactType.DATASET if "/datasets/" in url
+                else ArtifactType.MODEL_CHECKPOINT
+            )
+            artifacts.append(Artifact(
+                artifact_id=f"hf_{len(artifacts)}",
+                artifact_type=atype,
+                uri=url,
+            ))
+
+        # Named datasets mentioned in text
+        text_lower = text.lower()
+        for ds_name in self.DATASET_NAMES:
+            if ds_name in text_lower:
+                artifacts.append(Artifact(
+                    artifact_id=f"dataset_{ds_name}",
+                    artifact_type=ArtifactType.DATASET,
+                    uri=f"named:{ds_name}",
+                    metadata={"name": ds_name}
+                ))
+
+        return artifacts
+
+    def verify_accessibility(
+        self, artifact: Artifact
+    ) -> Artifact:
+        """Check whether an artifact URI is accessible."""
+        if artifact.uri.startswith("http"):
+            try:
+                resp = requests.head(
+                    artifact.uri, timeout=10,
+                    allow_redirects=True
+                )
+                artifact.accessible = resp.status_code < 400
+            except requests.RequestException:
+                artifact.accessible = False
+        elif artifact.uri.startswith("named:"):
+            # Named datasets: assume accessible if well-known
+            artifact.accessible = True
+        return artifact
+
+    def link_claims_to_artifacts(
+        self,
+        claims: list[Claim],
+        artifacts: list[Artifact]
+    ) -> list[EvidenceLink]:
+        """Create evidence links between claims and artifacts.
+
+        Uses heuristic matching: a claim links to a dataset
+        artifact if the dataset name appears in the claim's
+        context, and to a code artifact if the code repo
+        is mentioned in the same section.
+        """
+        links = []
+
+        for claim in claims:
+            claim_dataset = claim.context.get(
+                "dataset", ""
+            ).lower()
+
+            for artifact in artifacts:
+                link = self._try_link(
+                    claim, artifact, claim_dataset
+                )
+                if link is not None:
+                    links.append(link)
+
+        return links
+
+    def _try_link(
+        self, claim: Claim, artifact: Artifact,
+        claim_dataset: str
+    ) -> EvidenceLink | None:
+        """Attempt to create a link between a claim and artifact."""
+
+        # Dataset match: claim mentions the dataset by name
+        if (artifact.artifact_type == ArtifactType.DATASET
+                and claim_dataset):
+            ds_name = artifact.metadata.get("name", "").lower()
+            if ds_name and ds_name in claim_dataset:
+                return EvidenceLink(
+                    claim_id=claim.claim_id,
+                    artifact_id=artifact.artifact_id,
+                    link_type="measured_on",
+                    confidence=0.9,
+                )
+
+        # Code repo: link all numerical claims to available code
+        if (artifact.artifact_type == ArtifactType.CODE_REPO
+                and claim.is_verifiable()
+                and artifact.accessible):
+            return EvidenceLink(
+                claim_id=claim.claim_id,
+                artifact_id=artifact.artifact_id,
+                link_type="produced_by",
+                confidence=0.6,
+            )
+
+        return None
+</code></pre>
+<div class="code-caption">Listing 41.8: Artifact linker that extracts code repositories, datasets, and model checkpoints from paper text, verifies their accessibility, and creates typed evidence links to extracted claims. Link confidence reflects the strength of the heuristic match.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example</div>
+<p>
+<strong>Evidence mapping for a materials science paper.</strong> A research group
+publishes a paper claiming "our graph neural network predicts band gap with MAE = 0.21 eV
+on the Materials Project test set." The artifact linker extracts three artifacts: a
+GitHub repository (the GNN code), a Hugging Face model card (the trained checkpoint),
+and a named dataset reference (Materials Project). It creates three evidence links:
+the claim is "measured_on" the Materials Project dataset, "produced_by" the GitHub code,
+and "logged_in" an MLflow experiment (found as a URL in the repository's README). The
+GitHub repository and the MLflow server are both accessible; the Hugging Face checkpoint
+returns a 404. The missing checkpoint is flagged as a gap in the evidence chain, reducing
+the claim's overall evidence strength from "strong" to "moderate."
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut</div>
+<p>
+The <a href="https://github.com/paperswithcode/paperswithcode-client" target="_blank">Papers
+With Code API client</a> provides pre-built mappings between papers, datasets, and code
+repositories for most ML research papers. A single API call to
+<code>papersWithCode.paper_get(arxiv_id)</code> returns linked repositories, datasets,
+and benchmark results, reducing the artifact extraction and linking pipeline to roughly
+10 lines of code. The library maintains curated mappings for over 100,000 papers, with
+accuracy far exceeding heuristic URL extraction. Use it as the primary source for ML
+papers, and fall back to the custom linker for papers outside the ML domain.
+</p>
+</div>
+
+<h2>6. Putting It Together: The Extraction Pipeline</h2>
+
+<p>
+The complete claim extraction and evidence mapping pipeline chains the components we have
+built: sentence-level claim extraction (regex + LLM), claim merging and deduplication,
+scholarly metadata retrieval (Crossref + OpenAlex), citation anomaly detection, artifact
+extraction and linking, and evidence strength scoring.
+</p>
+
+<p>
+The pipeline assigns each claim an <strong>evidence strength</strong> based on the layers
+of evidence available. A claim with a verified artifact, an accessible code repository,
+and independent reproductions in the citation graph receives "strong" evidence. A claim
+with only a citation to the authors' own prior work receives "weak" evidence. A claim
+with no supporting artifacts and phantom references receives "unsupported."
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of evidence mapping like a home inspector verifying a real estate listing. The listing
+(the paper) claims "new roof, updated plumbing, no structural issues." The inspector does
+not take the seller's word; instead, she traces each claim to a concrete artifact: the
+roofing receipt from the contractor, the plumbing permit on file with the city, the
+structural engineer's signed report. If the receipt exists and the contractor confirms the
+work, evidence is strong. If the seller says "I have the receipt somewhere" but cannot
+produce it, evidence is weak. If the permit number on the listing does not match any city
+record, that is a phantom reference. The inspector's job is not to declare the house good
+or bad; it is to grade how verifiable each claim is, so the buyer knows where to dig deeper.
+Evidence mapping does exactly this for scientific claims: it checks whether the receipts
+(datasets, code, experiment logs) exist, are accessible, and match what the paper says.
+</p>
+</div>
+
+<p>
+Formally, we model evidence strength as a weighted sum of binary indicators:
+</p>
+
+$$
+E(c) = w_1 \cdot \mathbb{1}[\text{artifact exists}] + w_2 \cdot \mathbb{1}[\text{artifact accessible}] + w_3 \cdot \mathbb{1}[\text{code available}] + w_4 \cdot \mathbb{1}[\text{independent reproduction}] - w_5 \cdot \mathbb{1}[\text{citation anomaly}]
+$$
+
+<p>
+where $c$ is a claim and the weights $w_i$ reflect the relative importance of each evidence
+layer. In practice, we use $w_1 = 0.15$, $w_2 = 0.20$, $w_3 = 0.25$, $w_4 = 0.30$,
+$w_5 = 0.10$. A score above 0.7 maps to "strong," 0.4 to 0.7 maps to "moderate," and
+below 0.4 maps to "weak." The threshold values are calibrated against known-reproducible
+and known-irreproducible papers from the Open Science Collaboration replication studies
+(see the chapter bibliography).
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is assuming that a high evidence strength score means a claim is true.
+Evidence strength measures verifiability (whether the supporting artifacts exist, are
+accessible, and have been independently reproduced), not veracity; a claim can score
+"strong" on evidence strength while still being wrong due to a subtle data leakage bug
+or an incorrect evaluation protocol.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+Evidence strength is not truth. A claim can have strong evidence and still be wrong
+(the experiment may contain a subtle bug). Conversely, a claim with weak evidence may
+be perfectly correct (the authors simply did not share their code). Evidence strength
+measures <em>verifiability</em>, not veracity. It tells you how much work remains
+to confirm or refute a claim, not whether the claim is true.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+In 2024, Wadden et al. released SciFact-Open (ACL 2024), a benchmark and retrieval system
+that extends scientific claim verification beyond a fixed corpus to the entire open web of
+scholarly literature. Unlike the original SciFact dataset, which pairs claims with a closed
+set of candidate abstracts, SciFact-Open requires the system to retrieve evidence documents
+from scratch using search APIs, then classify entailment. This setup is far more realistic
+for production claim validation pipelines, where the relevant evidence may come from any
+journal or preprint server. Their best pipeline combines dense passage retrieval with an
+LLM-based entailment classifier and achieves roughly 30% lower accuracy than closed-corpus
+systems, quantifying the gap between curated benchmarks and real-world claim verification.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Claim Extraction and Evidence Pipeline</h4>
+<p>
+<strong>Step 1.</strong> Pick any recent arXiv paper in your field. Copy its abstract into
+a plain text file called <code>abstract.txt</code>.<br/>
+<strong>Step 2.</strong> Write a Python script that uses the <code>re</code> module to
+extract all percentage-based claims (pattern: a number followed by <code>%</code> with a
+nearby metric keyword such as "accuracy", "F1", or "BLEU"). Print each match with its
+surrounding sentence.<br/>
+<strong>Step 3.</strong> Use the <code>requests</code> library to query the Crossref API
+(<code>https://api.crossref.org/works/DOI</code>) with the paper's DOI. Parse the JSON
+response to extract the list of cited reference DOIs.<br/>
+<strong>Step 4.</strong> For each cited DOI (limit to the first 10), check whether it
+resolves successfully by sending a <code>HEAD</code> request to
+<code>https://doi.org/DOI</code>. Record how many return HTTP 200 vs. an error status.<br/>
+<strong>Step 5.</strong> Combine your results into a small report: list each extracted
+claim, the total number of references, and the percentage of references that resolved
+successfully. Compare the phantom reference rate you find against the 5% threshold
+discussed in this section.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+With claims extracted and mapped to their supporting artifacts, we are ready to move from
+metadata-level analysis to computational verification.
+<a href="section-41.2.html">Section 41.2: Reproducibility Auditing</a> takes the
+claim-to-artifact linkage graph and attempts to close the loop: re-executing experimental
+pipelines from MLflow artifacts and DVC-tracked datasets, computing reproducibility
+scores with statistical tolerance bands, and detecting data leakage patterns that silently
+invalidate reported metrics.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 41 Overview</a>
+<a href="section-41.2.html">Section 41.2: Reproducibility Auditing &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

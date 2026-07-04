@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 45.3: Reinforcement Learning as Optimization. Policy gradients, REINFORCE, actor-critic methods, and framing experiment campaigns as MDPs for sequential discovery." name="description"/>
+<title>Section 45.3: Reinforcement Learning as Optimization | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation &amp; Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 45: Optimization For Discovery</a></div>
+<h1>45.3 Reinforcement Learning as Optimization</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I maximized my cumulative reward over a 50-step horizon. Turns out the real reward was the intermediates I synthesized along the way."</p>
+<cite>A Policy Gradient With Sentimental Variance</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Bayesian optimization and evolutionary methods treat the objective as a static
+function: evaluate candidates, observe fitness, repeat. But many discovery
+problems are inherently <em>sequential</em>. A retrosynthesis planner must choose
+a sequence of reactions. A robotic lab must decide which assay to run next based
+on all previous results. A materials screening campaign allocates budget across
+multiple stages, each informed by the last. These are sequential decision problems,
+and reinforcement learning (RL) provides the mathematical framework to solve them.
+This section develops policy gradient methods and actor-critic architectures,
+then shows when RL outperforms static optimization and when it does not.
+</p>
+</div>
+
+<h2>1. Discovery as a Markov Decision Process</h2>
+
+<p>
+A Markov Decision Process (MDP) is defined by the tuple
+$(\mathcal{S}, \mathcal{A}, P, R, \gamma)$:
+</p>
+
+<p data-agent="02">
+An MDP is a formal mathematical model for any situation where an agent makes a sequence of decisions under uncertainty, receiving feedback after each step. It matters because it transforms vague notions of "planning" and "strategy" into a precise optimization problem with provable solution methods: given the state, transition, and reward structure, algorithms can compute the decision rule (policy) that maximizes long-term cumulative reward. The core mechanism is the Bellman equation, which decomposes the value of a multi-step plan into the immediate reward plus the discounted value of the resulting next state, enabling dynamic programming or gradient-based solutions. Use an MDP formulation (and therefore RL) instead of single-shot optimization when your problem involves sequential choices where earlier decisions affect later options; if each evaluation is independent, simpler methods like Bayesian optimization or evolutionary search are more sample-efficient.
+</p>
+
+<ul>
+<li><strong>States</strong> $\mathcal{S}$: the current state of knowledge (observed data, remaining budget, intermediate compounds synthesized so far).</li>
+<li><strong>Actions</strong> $\mathcal{A}$: the set of possible next experiments, reactions, or measurements.</li>
+<li><strong>Transition dynamics</strong> $P(s' \mid s, a)$: how the state evolves after taking action $a$ in state $s$. In discovery, this includes both the deterministic part (budget decreases, data accumulates) and the stochastic part (experiment outcomes are noisy).</li>
+<li><strong>Reward</strong> $R(s, a, s')$: the immediate value of the transition. This might be the activity of a newly synthesized compound, the information gained from a measurement, or a penalty for resource consumption.</li>
+<li><strong>Discount factor</strong> $\gamma \in [0, 1]$: how much the agent values future rewards relative to immediate ones.</li>
+</ul>
+
+<p>
+The goal is to find a <strong>policy</strong> $\pi(a \mid s)$ (a distribution over
+actions given the current state) that maximizes the expected cumulative reward:
+</p>
+
+$$J(\pi) = \mathbb{E}_{\tau \sim \pi}\left[\sum_{t=0}^{T} \gamma^t R(s_t, a_t, s_{t+1})\right]$$
+
+<p>
+where $\tau = (s_0, a_0, s_1, a_1, \ldots)$ is a trajectory sampled by following
+policy $\pi$ in the MDP.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+The critical difference between RL and BO is that RL optimizes a
+<em>policy</em> (a decision rule), not a single point. The policy maps states to
+actions, meaning it adapts to what has been observed so far. BO's acquisition
+function does something similar (it conditions on all past data), but RL
+explicitly models the sequential structure and can learn long-horizon strategies
+that BO cannot represent.
+</p>
+</div>
+
+<p>
+Mapping a discovery campaign to an MDP requires careful state design. Table 45.1
+shows three example mappings.
+</p>
+
+<div style="overflow-x: auto;">
+<table>
+<caption>Table 45.1: Discovery campaigns modeled as MDPs.</caption>
+<thead>
+<tr>
+<th>Campaign</th>
+<th>State $s$</th>
+<th>Action $a$</th>
+<th>Reward $R$</th>
+<th>Horizon $T$</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Drug screening</td>
+<td>Tested compounds, assay results, budget remaining</td>
+<td>Choose next compound to test</td>
+<td>Activity of tested compound</td>
+<td>Budget / cost-per-test</td>
+</tr>
+<tr>
+<td>Retrosynthesis</td>
+<td>Current molecule, available reagents</td>
+<td>Choose reaction template</td>
+<td>+1 if target reached, 0 otherwise</td>
+<td>Max synthesis steps</td>
+</tr>
+<tr>
+<td>Robotic lab</td>
+<td>Instrument states, sample queue, results so far</td>
+<td>Schedule next instrument action</td>
+<td>Information gain from measurement</td>
+<td>Shift duration</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h2>2. The Policy Gradient Theorem</h2>
+
+<p>
+We parameterize the policy as $\pi_\theta(a \mid s)$ using a neural network with
+parameters $\theta$. The policy gradient theorem (Sutton et al., 1999) gives us
+the gradient of the expected return with respect to $\theta$:
+</p>
+
+$$\nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}\left[\sum_{t=0}^{T} \nabla_\theta \log \pi_\theta(a_t \mid s_t)\, G_t\right]$$
+
+<p>
+where $G_t = \sum_{k=t}^{T} \gamma^{k-t} R_k$ is the return from time step $t$.
+This expression uses the <strong>log-derivative trick</strong>: because
+$\nabla_\theta \pi_\theta = \pi_\theta \nabla_\theta \log \pi_\theta$, we can
+estimate the gradient by sampling trajectories under $\pi_\theta$ and weighting
+each action's log-probability by the return that followed it. Actions that led to
+high returns get reinforced (their probability increases); actions that led to low
+returns get suppressed.
+</p>
+
+<h3>2.1 REINFORCE</h3>
+
+<p>
+The simplest policy gradient algorithm, REINFORCE (Williams, 1992), directly
+applies the policy gradient theorem using Monte Carlo estimates of $G_t$:
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
+import numpy as np
+
+class PolicyNetwork(nn.Module):
+    """Simple policy network for discrete action spaces."""
+
+    def __init__(self, state_dim: int, n_actions: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, n_actions),
+        )
+
+    def forward(self, state: torch.Tensor) -> Categorical:
+        logits = self.net(state)
+        return Categorical(logits=logits)
+
+
+def reinforce(
+    env,
+    policy: PolicyNetwork,
+    n_episodes: int = 1000,
+    lr: float = 1e-3,
+    gamma: float = 0.99,
+) -> list:
+    """Train a policy using REINFORCE with baseline subtraction.
+
+    Parameters
+    ----------
+    env : environment with reset() -> state, step(action) -> (state, reward, done)
+    policy : PolicyNetwork
+    n_episodes : int
+    lr : float
+    gamma : float
+
+    Returns
+    -------
+    episode_returns : list of float
+        Total return per episode.
+    """
+    optimizer = optim.Adam(policy.parameters(), lr=lr)
+    baseline = 0.0  # Running average baseline
+    episode_returns = []
+
+    for episode in range(n_episodes):
+        state = env.reset()
+        log_probs = []
+        rewards = []
+
+        # Collect a trajectory
+        done = False
+        while not done:
+            state_t = torch.FloatTensor(state)
+            dist = policy(state_t)
+            action = dist.sample()
+            log_probs.append(dist.log_prob(action))
+
+            state, reward, done, _ = env.step(action.item())
+            rewards.append(reward)
+
+        # Compute discounted returns
+        returns = []
+        G = 0.0
+        for r in reversed(rewards):
+            G = r + gamma * G
+            returns.insert(0, G)
+        returns = torch.FloatTensor(returns)
+
+        # Baseline subtraction reduces variance
+        episode_return = returns[0].item()
+        baseline = 0.99 * baseline + 0.01 * episode_return
+        returns = returns - baseline
+
+        # Policy gradient update
+        loss = -torch.stack([lp * G for lp, G in zip(log_probs, returns)]).sum()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        episode_returns.append(episode_return)
+
+    return episode_returns</code></pre>
+<div class="code-caption">Listing 45.10: REINFORCE with a running-average baseline. The baseline subtraction does not change the expected gradient (it is a constant shift) but dramatically reduces variance, making learning more stable. The policy network outputs a categorical distribution over discrete actions.</div>
+
+<p>
+REINFORCE is simple but suffers from high variance: each gradient estimate depends
+on the return of an entire trajectory, and trajectories vary widely. Two techniques
+reduce this variance: baseline subtraction (implemented above) and using a learned
+value function as the baseline, which leads us to actor-critic methods.
+</p>
+
+<h2>3. Actor-Critic Methods</h2>
+
+<p>
+An actor-critic architecture maintains two networks: the <strong>actor</strong>
+$\pi_\theta(a \mid s)$ (the policy) and the <strong>critic</strong>
+$V_\phi(s)$ (a value function that estimates the expected return from state $s$).
+The critic replaces the Monte Carlo return $G_t$ with a lower-variance estimate,
+the <strong>advantage</strong>:
+</p>
+
+$$A(s_t, a_t) = R_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t)$$
+
+<p>
+The advantage measures how much better action $a_t$ was compared to the average
+action from state $s_t$. The policy gradient becomes:
+</p>
+
+$$\nabla_\theta J \approx \mathbb{E}\left[\sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t)\, A(s_t, a_t)\right]$$
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the advantage function like a restaurant review that accounts for expectations. If you visit a restaurant in a neighborhood where most places are mediocre (low $V_\phi(s)$), even a decent meal produces a positive "advantage" (it exceeded the baseline). But the same meal at a restaurant in a world-class food district (high $V_\phi(s)$) produces a negative advantage, because it fell below what you expected from that location. The critic learns these neighborhood expectations, and the actor uses the relative surprise (positive or negative) to adjust its choices. Without this calibration, the agent would treat every good meal the same regardless of context, learning much more slowly.
+</p>
+</div>
+
+<p>
+The critic is trained to minimize the squared TD error:
+$\mathcal{L}_\text{critic} = \mathbb{E}[(R_t + \gamma V_\phi(s_{t+1}) - V_\phi(s_t))^2]$.
+</p>
+
+<pre><code class="language-python">class ActorCritic(nn.Module):
+    """Combined actor-critic network with shared feature extractor."""
+
+    def __init__(self, state_dim: int, n_actions: int, hidden: int = 128):
+        super().__init__()
+        # Shared feature layers
+        self.shared = nn.Sequential(
+            nn.Linear(state_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+        )
+        # Actor head: policy logits
+        self.actor = nn.Linear(hidden, n_actions)
+        # Critic head: state value
+        self.critic = nn.Linear(hidden, 1)
+
+    def forward(self, state: torch.Tensor):
+        features = self.shared(state)
+        policy = Categorical(logits=self.actor(features))
+        value = self.critic(features).squeeze(-1)
+        return policy, value
+
+
+def train_actor_critic(
+    env,
+    model: ActorCritic,
+    n_episodes: int = 2000,
+    lr: float = 3e-4,
+    gamma: float = 0.99,
+    entropy_coef: float = 0.01,
+) -> list:
+    """Train an actor-critic agent on a discovery environment.
+
+    Parameters
+    ----------
+    env : environment with reset/step interface
+    model : ActorCritic network
+    n_episodes : int
+    lr : float
+    gamma : float
+    entropy_coef : float
+        Entropy bonus to encourage exploration.
+
+    Returns
+    -------
+    episode_returns : list of float
+    """
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    episode_returns = []
+
+    for episode in range(n_episodes):
+        state = env.reset()
+        total_reward = 0.0
+        done = False
+
+        log_probs, values, rewards, entropies = [], [], [], []
+
+        while not done:
+            state_t = torch.FloatTensor(state)
+            policy, value = model(state_t)
+            action = policy.sample()
+
+            log_probs.append(policy.log_prob(action))
+            values.append(value)
+            entropies.append(policy.entropy())
+
+            state, reward, done, _ = env.step(action.item())
+            rewards.append(reward)
+            total_reward += reward
+
+        # Compute advantages using TD residuals
+        returns = []
+        G = 0.0
+        for r in reversed(rewards):
+            G = r + gamma * G
+            returns.insert(0, G)
+        returns = torch.FloatTensor(returns)
+        values_t = torch.stack(values)
+
+        advantages = returns - values_t.detach()
+
+        # Combined loss: actor + critic + entropy
+        actor_loss = -(torch.stack(log_probs) * advantages).sum()
+        critic_loss = 0.5 * ((returns - values_t) ** 2).sum()
+        entropy_loss = -torch.stack(entropies).sum()
+
+        loss = actor_loss + critic_loss + entropy_coef * entropy_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        optimizer.step()
+
+        episode_returns.append(total_reward)
+
+    return episode_returns</code></pre>
+<div class="code-caption">Listing 45.11: Actor-critic training loop with entropy regularization. The shared feature extractor reduces parameters. Gradient clipping prevents destructive updates from high-variance episodes. The entropy bonus discourages premature convergence to a deterministic policy.</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that RL requires fewer evaluations than Bayesian optimization because it learns a "smarter" policy. In practice, the opposite is true for small budgets: RL needs hundreds or thousands of training episodes to learn a good policy, and each episode itself consumes a full sequence of evaluations. RL's advantage emerges only when the learned policy can be reused across many campaigns, when a simulator provides cheap training episodes, or when the sequential structure of the problem is so strong that no single-step method can capture it. For a one-off optimization with fewer than 50 evaluations and no simulator, Bayesian optimization remains the better choice.
+</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Adaptive Experiment Sequencing</div>
+<p>
+A materials science lab has a budget of 20 experiments to find a high-temperature
+superconductor. The state includes all compositions tested so far, their measured
+critical temperatures, and the remaining budget. The action is which composition
+to test next. A BO agent would treat this as 20 independent acquisition decisions.
+An RL agent can learn a <em>strategy</em>: "spend the first 5 experiments broadly
+surveying the phase diagram, then concentrate on the most promising region, but
+reserve 2 experiments for a final confirmation sweep." This staged strategy is a
+policy, not a point selection, and it adapts to intermediate results. In
+simulation studies on synthetic superconductor landscapes, RL agents trained via
+actor-critic achieve 15% to 25% higher best-found $T_c$ compared to BO with EI,
+because they learn to allocate the fixed budget more strategically.
+</p>
+</div>
+
+<h2>4. Continuous Action Spaces</h2>
+
+<p>
+When actions are continuous (e.g., choosing a composition vector or setting
+continuous process parameters), the policy outputs the parameters of a
+continuous distribution, typically a diagonal Gaussian:
+</p>
+
+$$\pi_\theta(a \mid s) = \mathcal{N}\bigl(\mu_\theta(s),\; \text{diag}(\sigma_\theta(s))^2\bigr)$$
+
+<p>
+The log-probability under this distribution is:
+</p>
+
+$$\log \pi_\theta(a \mid s) = -\frac{1}{2}\sum_{i=1}^d \left[\frac{(a_i - \mu_i)^2}{\sigma_i^2} + \log \sigma_i^2 + \log 2\pi\right]$$
+
+<p>
+The policy gradient then pushes the mean $\mu_\theta$ toward actions that yielded
+high advantage and adjusts the variance $\sigma_\theta$ to explore more (if
+exploration helps) or less (if exploitation is sufficient).
+</p>
+
+<pre><code class="language-python">class ContinuousActorCritic(nn.Module):
+    """Actor-critic for continuous action spaces (Gaussian policy)."""
+
+    def __init__(self, state_dim: int, action_dim: int, hidden: int = 128):
+        super().__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(state_dim, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+        )
+        self.mu_head = nn.Linear(hidden, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))  # Learnable
+        self.value_head = nn.Linear(hidden, 1)
+
+    def forward(self, state: torch.Tensor):
+        features = self.shared(state)
+        mu = self.mu_head(features)
+        std = self.log_std.exp().expand_as(mu)
+        dist = torch.distributions.Normal(mu, std)
+        value = self.value_head(features).squeeze(-1)
+        return dist, value
+
+    def act(self, state: torch.Tensor):
+        """Sample an action and return it with log-probability and value."""
+        dist, value = self.forward(state)
+        action = dist.sample()
+        log_prob = dist.log_prob(action).sum(-1)  # Sum over action dimensions
+        return action, log_prob, value</code></pre>
+<div class="code-caption">Listing 45.12: Continuous actor-critic with a diagonal Gaussian policy. The log standard deviation is a learnable parameter shared across states. Tanh activations keep the hidden representations bounded, which improves stability for continuous control.</div>
+
+<h2>5. When RL Outperforms Static Optimization</h2>
+
+<p>
+RL is not always the right tool. Its advantages over BO and evolutionary methods
+emerge in specific settings:
+</p>
+
+<ul>
+<li><strong>Long horizons with intermediate feedback</strong>: when the discovery process has many stages and each stage provides partial information (e.g., multi-step synthesis, sequential screening), RL learns to use that feedback adaptively.</li>
+<li><strong>Shared structure across campaigns</strong>: if you run many similar discovery campaigns (e.g., optimizing different proteins with similar fitness landscapes), RL can meta-learn a policy that transfers across campaigns. BO starts from scratch each time.</li>
+<li><strong>Resource allocation</strong>: when the decision is not "where to evaluate" but "how to allocate a fixed budget across competing subproblems," RL naturally handles the sequential budget constraint.</li>
+<li><strong>Combinatorial action spaces</strong>: reaction planning, molecule assembly, and protocol design involve choosing from structured combinatorial spaces where BO's continuous surrogates are a poor fit.</li>
+</ul>
+
+<p>
+RL struggles when:
+</p>
+
+<ul>
+<li><strong>The evaluation budget is tiny ($N < 50$)</strong>: RL needs many episodes to learn a policy. With very few evaluations, BO's sample efficiency wins.</li>
+<li><strong>The environment dynamics are unknown and hard to simulate</strong>: RL needs either a simulator or many real interactions. If neither is available, BO with a GP surrogate is more data-efficient.</li>
+<li><strong>The problem is single-step</strong>: if there is no sequential structure, RL reduces to bandit optimization (which is just BO with a different name).</li>
+</ul>
+
+<div class="callout connection">
+<div class="callout-title">Connection: RL and Experiment Design</div>
+<p>
+The RL formulation here is the foundation for automated experiment design in
+<a href="../module-46-experiment-design/index.html">Chapter 46</a>. There,
+the MDP state includes the current dataset, the GP posterior, and the remaining
+experimental budget. The action is which experiment to run. The reward is
+information gain or improvement in the best-found value. The policy learns to
+sequence experiments adaptively, which is precisely what a skilled experimentalist
+does intuitively. The self-driving laboratories in
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">Chapter 55</a>
+deploy these RL policies on robotic platforms that execute experiments autonomously.
+</p>
+</div>
+
+<h2>6. Scaling with Ray Tune</h2>
+
+<p>
+Training RL policies requires many episodes, and each episode may involve expensive
+evaluations. Ray Tune distributes this workload across a cluster:
+</p>
+
+<pre><code class="language-python">from ray import tune
+from ray.tune.schedulers import ASHAScheduler
+
+def train_rl_agent(config):
+    """Training function compatible with Ray Tune."""
+    env = DiscoveryEnv(
+        n_compounds=config["n_compounds"],
+        noise_level=config["noise_level"],
+    )
+    model = ActorCritic(
+        state_dim=env.observation_space.shape[0],
+        n_actions=env.action_space.n,
+        hidden=config["hidden_size"],
+    )
+    returns = train_actor_critic(
+        env, model,
+        n_episodes=config["n_episodes"],
+        lr=config["lr"],
+        gamma=config["gamma"],
+        entropy_coef=config["entropy_coef"],
+    )
+    # Report final performance to Ray Tune
+    tune.report(mean_return=np.mean(returns[-100:]))
+
+
+# Hyperparameter search over RL training configs
+scheduler = ASHAScheduler(
+    metric="mean_return",
+    mode="max",
+    max_t=5000,
+    grace_period=500,
+    reduction_factor=3,
+)
+
+analysis = tune.run(
+    train_rl_agent,
+    config={
+        "n_compounds": 100,
+        "noise_level": 0.1,
+        "hidden_size": tune.choice([64, 128, 256]),
+        "lr": tune.loguniform(1e-4, 1e-2),
+        "gamma": tune.uniform(0.95, 0.999),
+        "entropy_coef": tune.loguniform(1e-3, 1e-1),
+        "n_episodes": 5000,
+    },
+    num_samples=20,
+    scheduler=scheduler,
+)</code></pre>
+<div class="code-caption">Listing 45.13: Distributed RL hyperparameter tuning with Ray Tune. The ASHA scheduler aggressively prunes underperforming trials, allocating compute to the most promising configurations. Each trial trains a full RL agent; Ray handles parallelization across available resources.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Stable-Baselines3</div>
+<p>
+For standard RL algorithms (PPO, SAC, A2C), Stable-Baselines3 provides
+production-quality implementations:
+</p>
+<pre><code class="language-python">from stable_baselines3 import PPO
+
+model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4)
+model.learn(total_timesteps=100_000)
+
+# Deploy the trained policy
+obs = env.reset()
+for _ in range(50):
+    action, _ = model.predict(obs, deterministic=True)
+    obs, reward, done, info = env.step(action)
+</code></pre>
+<p>
+Stable-Baselines3 reduces the actor-critic implementation (approximately 100 lines
+above) to 3 lines, and adds vectorized environments, automatic logging,
+callback hooks, and pre-implemented algorithms (PPO, SAC, TD3, A2C) that would
+require thousands of lines to implement correctly.
+</p>
+</div>
+
+<h2>7. Multi-Objective RL</h2>
+
+<p>
+When the discovery MDP has multiple reward signals (e.g., compound activity and
+synthetic cost at each step), we can extend the policy gradient to handle
+vector-valued rewards. The simplest approach is linear scalarization:
+$R = \sum_i w_i R_i$ with weights $\mathbf{w}$ that encode the scientist's
+preferences. A more sophisticated approach trains a family of policies indexed by
+$\mathbf{w}$, producing a Pareto front of policies analogous to the Pareto front
+of solutions in NSGA-III. Recent work on multi-objective RL (MORL) maintains a
+set of policies that span the achievable trade-offs, connecting RL to the
+multi-objective framework of <a href="section-45.2.html">Section 45.2</a>.
+</p>
+
+<p>
+The Discovery Workbench integrates RL agents through the same suggest/observe
+interface used by the Bayesian optimizer in
+<a href="section-45.1.html">Section 45.1</a>. The key difference is that the
+RL agent maintains an internal state (the policy's hidden activations or the
+current episode context), while the BO agent is stateless between suggestions
+(all history is captured in the GP posterior). This distinction matters for
+deployment: RL agents need checkpointing and state management; BO agents
+need only the observation history.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+The Decision Transformer architecture (Chen et al., 2021) reframed RL as sequence modeling, but its impact on scientific discovery accelerated with subsequent work. In 2024, Anstine and Isayev introduced AcTrainer, a framework that applies the return-conditioned transformer paradigm specifically to molecular optimization, training on offline datasets of molecular trajectories to generate novel compounds conditioned on desired property targets. By casting molecule generation as a sequence decision problem and conditioning on high return values at inference time, AcTrainer sidesteps the need for environment simulators or online rollouts entirely. This "offline RL via transformers" approach is especially relevant for discovery settings where real experiments are expensive and historical datasets are abundant: the model learns a policy from logged data without ever interacting with the environment during training.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Train an RL Agent on CartPole, Then Swap in a Custom Reward</h4>
+<p>
+This mini-project takes you from a working RL agent on a standard benchmark to a modified
+objective that mimics discovery-style reward shaping, all using standard Python libraries.
+</p>
+<p>
+<strong>Step 1.</strong> Install dependencies: <code>pip install gymnasium torch numpy matplotlib</code>.
+Create a new Python file and import Gymnasium's CartPole-v1 environment.
+</p>
+<p>
+<strong>Step 2.</strong> Copy the <code>PolicyNetwork</code> and <code>reinforce()</code> function from
+Listing 45.10 above. Run REINFORCE on CartPole-v1 for 1000 episodes (state_dim=4, n_actions=2)
+and plot the episode returns over time. You should see returns climbing toward 500.
+</p>
+<p>
+<strong>Step 3.</strong> Wrap CartPole in a custom Gymnasium wrapper that replaces the default +1 per-step
+reward with a "discovery-style" reward: assign +0.1 per step (survival), but add +5.0 bonus whenever the
+cart crosses the center position (x=0) from either direction (simulating an "informative measurement" event).
+Track how many center-crossings occur per episode.
+</p>
+<p>
+<strong>Step 4.</strong> Train a fresh REINFORCE agent on your wrapped environment for 1000 episodes.
+Compare the learning curves and final policies: the reshaped agent should learn to oscillate through center
+rather than simply balancing, demonstrating how reward design steers the learned strategy.
+</p>
+<p>
+<strong>Step 5.</strong> Experiment with the discount factor $\gamma$. Train three agents with
+$\gamma \in \{0.9, 0.99, 0.999\}$ on your custom reward and plot all three learning curves.
+Observe how lower $\gamma$ makes the agent favor immediate center-crossings while higher $\gamma$
+produces smoother, longer trajectories. This tradeoff mirrors the exploration vs. exploitation
+balance in real discovery campaigns.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+We now have three optimization paradigms: Bayesian optimization for sample-efficient
+black-box search, evolutionary methods for multi-objective population-based search,
+and reinforcement learning for sequential decision-making.
+<a href="section-45.4.html">Section 45.4: Building a Multi-Objective Optimizer</a>
+integrates these into a working pipeline that combines NSGA-III with BoTorch GP
+surrogates to solve a realistic multi-objective discovery problem, with hypervolume
+comparison across methods.
+</p>
+</section>
+
+</main>
+
+<footer>
+<nav class="section-nav">
+<a href="section-45.2.html">&larr; Section 45.2</a>
+<a href="section-45.4.html">Section 45.4 &rarr;</a>
+</nav>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

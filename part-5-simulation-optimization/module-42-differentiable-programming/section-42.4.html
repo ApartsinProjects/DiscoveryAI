@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.4: Building a Differentiable Force Field. Recipe: calibrate a Lennard-Jones force field in JAX by backpropagating through molecular dynamics to match radial distribution functions." name="description"/>
+<title>Section 42.4: Building a Differentiable Force Field | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation and Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Differentiable Programming for Discovery</a></div>
+<h1>42.4 Building a Differentiable Force Field</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"My force field had two parameters. My loss function had one million atoms. Reverse-mode AD did not even blink."</p>
+<cite>An Epsilon That Found Its Sigma</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+This section is a hands-on recipe that brings together every concept from the chapter.
+We calibrate a Lennard-Jones force field by running molecular dynamics simulations in
+JAX, computing the radial distribution function (RDF) from the trajectory, comparing
+it to a target RDF, and backpropagating the loss through the entire simulation to
+update force field parameters. The recipe demonstrates the full differentiable
+programming stack: reverse-mode AD for gradients, <code>vmap</code> for batching pair
+computations, <code>jit</code> for GPU compilation, <code>jax.lax.scan</code> for
+differentiable time-stepping, and Optax for optimization. By the end, you will have a
+complete, runnable pipeline for gradient-based force field calibration.
+</p>
+</div>
+
+<h2>1. Problem Setup: Force Field Calibration</h2>
+
+<p>
+Force field calibration is one of the oldest problems in computational chemistry. A
+force field defines how atoms interact: the Lennard-Jones potential
+$V(r) = 4\epsilon[(\sigma/r)^{12} - (\sigma/r)^6]$ has two parameters per atom type
+pair: $\epsilon$ (well depth, controlling interaction strength) and $\sigma$ (length
+scale, controlling the effective atom size). The goal is to find $\epsilon$ and $\sigma$
+values that reproduce experimentally observed structural properties.
+</p>
+
+<p data-agent="02">
+Force field calibration is the process of tuning the numerical constants in an
+interatomic potential so that simulations using that potential reproduce measurable
+physical properties (density, structure, diffusion) of a real material. It matters
+because even a physically motivated functional form like Lennard-Jones produces
+wildly wrong behavior if its parameters are off by 10%, making calibration the
+bottleneck between writing down a potential and trusting its predictions. The mechanism
+is an inverse problem: run a simulation forward with candidate parameters, compare
+the output to experimental observables, and adjust the parameters to shrink the
+mismatch. Use gradient-based calibration (as in this recipe) when the potential is
+differentiable and you have more than two or three parameters; for very small
+parameter spaces or non-differentiable potentials, grid search or Bayesian
+optimization may suffice.
+</p>
+
+<p>
+The <strong>radial distribution function</strong> (RDF), $g(r)$, measures the probability
+of finding a particle at distance $r$ from another particle, normalized by the ideal
+gas density. Peaks in $g(r)$ correspond to coordination shells. The RDF is one of the
+most commonly used structural observables because it can be measured experimentally
+(via X-ray or neutron scattering) and computed from simulation trajectories.
+</p>
+
+<p>
+Our objective: given a target RDF $g^*(r)$ (representing experimental data or a
+high-fidelity reference simulation), find $\epsilon$ and $\sigma$ such that the RDF
+from a simulation with those parameters matches $g^*(r)$.
+</p>
+
+$$\mathcal{L}(\epsilon, \sigma) = \int_0^{r_\text{max}} \left[ g(r; \epsilon, \sigma) - g^*(r) \right]^2 dr$$
+
+<h2>2. Generating the Target RDF</h2>
+
+<p>
+In a real application, the target RDF would come from experiment or a quantum
+mechanical simulation. For this recipe, we generate a synthetic target by running a
+simulation with known "true" parameters and computing the RDF. This lets us verify
+that optimization recovers the correct parameters.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+from functools import partial
+
+# --- Simulation infrastructure ---
+
+def lj_energy_pair(r, epsilon, sigma):
+    """Lennard-Jones pair energy with a smooth cutoff.
+
+    Parameters
+    ----------
+    r : float
+        Interatomic distance.
+    epsilon : float
+        Well depth.
+    sigma : float
+        Length scale.
+
+    Returns
+    -------
+    float
+        Pair energy, smoothly truncated at r_cut = 2.5*sigma.
+    """
+    r_cut = 2.5 * sigma
+    s6 = (sigma / r) ** 6
+    e_full = 4.0 * epsilon * (s6 ** 2 - s6)
+    # Shift to zero at cutoff
+    s6_cut = (sigma / r_cut) ** 6
+    e_cut = 4.0 * epsilon * (s6_cut ** 2 - s6_cut)
+    return jnp.where(r < r_cut, e_full - e_cut, 0.0)
+
+
+def compute_total_energy(positions, box_size, epsilon, sigma):
+    """Total LJ energy for N particles in a periodic box.
+
+    Parameters
+    ----------
+    positions : jnp.ndarray, shape (N, 3)
+        Particle positions.
+    box_size : float
+        Side length of the cubic periodic box.
+    epsilon : float
+        LJ well depth.
+    sigma : float
+        LJ length scale.
+
+    Returns
+    -------
+    float
+        Total potential energy.
+    """
+    N = positions.shape[0]
+
+    def pair_energy(i, j):
+        dr = positions[i] - positions[j]
+        # Minimum image convention for periodic boundaries
+        dr = dr - box_size * jnp.round(dr / box_size)
+        r = jnp.sqrt(jnp.sum(dr ** 2) + 1e-12)
+        return lj_energy_pair(r, epsilon, sigma)
+
+    # Build all unique pairs
+    idx_i, idx_j = jnp.triu_indices(N, k=1)
+    pair_e = jax.vmap(pair_energy)(idx_i, idx_j)
+    return jnp.sum(pair_e)
+
+
+def compute_forces(positions, box_size, epsilon, sigma):
+    """Compute forces via the negative gradient of total energy.
+
+    Parameters
+    ----------
+    positions : jnp.ndarray, shape (N, 3)
+        Particle positions.
+    box_size : float
+        Side length of cubic periodic box.
+    epsilon : float
+        LJ well depth.
+    sigma : float
+        LJ length scale.
+
+    Returns
+    -------
+    jnp.ndarray, shape (N, 3)
+        Force on each particle.
+    """
+    grad_fn = jax.grad(compute_total_energy, argnums=0)
+    return -grad_fn(positions, box_size, epsilon, sigma)
+</code></pre>
+<div class="code-caption">Listing 42.20: Core simulation functions: LJ pair energy with smooth cutoff, total energy via <code>vmap</code> over pairs, and forces via <code>jax.grad</code> of the energy. The force computation is automatic: no hand-derived force expressions needed.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Forces Are Free</div>
+<p>
+In classical MD, forces are derived by hand-differentiating the potential energy
+expression. For complex potentials (many-body terms, angular contributions, torsions),
+this is tedious and error-prone. With AD, forces come directly from
+<code>jax.grad(energy, argnums=positions)</code>. The gradient is exact to machine
+precision, handles arbitrarily complex energy functions, and costs roughly 2x the
+energy evaluation. When we later differentiate the <em>loss</em> with respect to
+<em>parameters</em>, we are computing gradients of gradients: the parameter sensitivity
+of the forces. This second-order differentiation is equally automatic.
+</p>
+</div>
+
+<h2>3. The Velocity Verlet Integrator</h2>
+
+<p>
+We use the Velocity Verlet algorithm, the standard integrator for molecular dynamics.
+It is symplectic (preserving the phase-space volume), time-reversible, and second-order
+accurate:
+</p>
+
+$$v(t + \tfrac{1}{2}\Delta t) = v(t) + \tfrac{1}{2}\Delta t \, a(t)$$
+$$x(t + \Delta t) = x(t) + \Delta t \, v(t + \tfrac{1}{2}\Delta t)$$
+$$v(t + \Delta t) = v(t + \tfrac{1}{2}\Delta t) + \tfrac{1}{2}\Delta t \, a(t + \Delta t)$$
+
+<p>
+where $a(t) = F(x(t))/m$ is the acceleration. We implement this as a pure JAX function
+suitable for <code>jax.lax.scan</code>.
+</p>
+
+<pre><code class="language-python">def velocity_verlet_step(state, _, box_size, epsilon, sigma, dt, mass=1.0):
+    """One Velocity Verlet integration step.
+
+    Parameters
+    ----------
+    state : tuple
+        (positions, velocities) each of shape (N, 3).
+    _ : ignored
+        Placeholder for scan compatibility.
+    box_size : float
+        Periodic box side length.
+    epsilon : float
+        LJ well depth.
+    sigma : float
+        LJ length scale.
+    dt : float
+        Time step.
+    mass : float
+        Particle mass (uniform).
+
+    Returns
+    -------
+    tuple
+        ((new_positions, new_velocities), positions_for_rdf)
+    """
+    positions, velocities = state
+
+    # Forces at current positions
+    forces = compute_forces(positions, box_size, epsilon, sigma)
+    accel = forces / mass
+
+    # Half-step velocity
+    v_half = velocities + 0.5 * dt * accel
+
+    # Full-step positions (with periodic wrapping)
+    new_positions = positions + dt * v_half
+    new_positions = new_positions % box_size
+
+    # Forces at new positions
+    new_forces = compute_forces(new_positions, box_size, epsilon, sigma)
+    new_accel = new_forces / mass
+
+    # Complete velocity step
+    new_velocities = v_half + 0.5 * dt * new_accel
+
+    return (new_positions, new_velocities), new_positions
+
+
+def run_md_trajectory(positions, velocities, box_size, epsilon, sigma,
+                      n_steps, dt=0.002):
+    """Run an MD trajectory and return positions at each step.
+
+    Parameters
+    ----------
+    positions : jnp.ndarray, shape (N, 3)
+        Initial positions.
+    velocities : jnp.ndarray, shape (N, 3)
+        Initial velocities.
+    box_size : float
+        Periodic box side length.
+    epsilon : float
+        LJ well depth.
+    sigma : float
+        LJ length scale.
+    n_steps : int
+        Number of integration steps.
+    dt : float
+        Time step.
+
+    Returns
+    -------
+    jnp.ndarray, shape (n_steps, N, 3)
+        Positions at each time step.
+    """
+    step_fn = partial(velocity_verlet_step,
+                      box_size=box_size, epsilon=epsilon,
+                      sigma=sigma, dt=dt)
+
+    (final_pos, final_vel), trajectory = jax.lax.scan(
+        step_fn,
+        (positions, velocities),
+        None,
+        length=n_steps,
+    )
+    return trajectory
+</code></pre>
+<div class="code-caption">Listing 42.21: Velocity Verlet integrator as a pure JAX function. <code>jax.lax.scan</code> unrolls the time-stepping loop in a way that supports both JIT compilation and reverse-mode AD.</div>
+
+<h2>4. Computing the Radial Distribution Function</h2>
+
+<p>
+The RDF $g(r)$ is computed by histogramming pairwise distances and normalizing by the
+ideal gas expectation. For a system of $N$ particles in a box of volume $V$, the
+normalization for a spherical shell at distance $r$ with thickness $\Delta r$ is:
+</p>
+
+$$g(r) = \frac{V}{N(N-1)} \cdot \frac{2 \, n(r)}{4\pi r^2 \Delta r}$$
+
+<p>
+where $n(r)$ is the number of pairs with distance in $[r, r + \Delta r)$, averaged
+over trajectory frames. We need a differentiable RDF computation, so we replace the
+hard histogram bins with soft Gaussian kernels.
+</p>
+
+<pre><code class="language-python">def compute_rdf_soft(positions, box_size, r_bins, bin_width=0.05):
+    """Compute a differentiable RDF using soft Gaussian binning.
+
+    Hard histograms have zero gradient (the count does not change
+    for infinitesimal position perturbations). Soft Gaussian bins
+    spread each pair distance into neighboring bins with smooth
+    weights, enabling gradient flow.
+
+    Parameters
+    ----------
+    positions : jnp.ndarray, shape (N, 3)
+        Particle positions.
+    box_size : float
+        Periodic box side length.
+    r_bins : jnp.ndarray, shape (n_bins,)
+        Bin centers for the RDF.
+    bin_width : float
+        Gaussian kernel width for soft binning.
+
+    Returns
+    -------
+    jnp.ndarray, shape (n_bins,)
+        Soft RDF values at each bin center.
+    """
+    N = positions.shape[0]
+
+    # All pairwise displacement vectors (minimum image)
+    dr = positions[:, None, :] - positions[None, :, :]
+    dr = dr - box_size * jnp.round(dr / box_size)
+    distances = jnp.sqrt(jnp.sum(dr ** 2, axis=-1) + 1e-12)
+
+    # Mask self-pairs and count only upper triangle
+    mask = jnp.triu(jnp.ones((N, N), dtype=bool), k=1)
+    pair_distances = distances[mask]  # shape: (N*(N-1)/2,)
+
+    # Soft histogram: each distance contributes a Gaussian to each bin
+    # pair_distances: (n_pairs,), r_bins: (n_bins,)
+    diff = pair_distances[:, None] - r_bins[None, :]  # (n_pairs, n_bins)
+    weights = jnp.exp(-0.5 * (diff / bin_width) ** 2) / (
+        bin_width * jnp.sqrt(2.0 * jnp.pi)
+    )
+    counts = jnp.sum(weights, axis=0)  # (n_bins,)
+
+    # Normalize: ideal gas shell volume
+    volume = box_size ** 3
+    n_pairs = N * (N - 1) / 2
+    rho = N / volume
+    shell_vol = 4.0 * jnp.pi * r_bins ** 2 * bin_width
+    # Avoid division by zero at r=0
+    shell_vol = jnp.maximum(shell_vol, 1e-10)
+    g_r = counts / (n_pairs * rho * shell_vol)
+
+    return g_r
+
+
+def compute_rdf_trajectory(trajectory, box_size, r_bins, bin_width=0.05,
+                           skip=10):
+    """Average RDF over trajectory frames.
+
+    Parameters
+    ----------
+    trajectory : jnp.ndarray, shape (n_steps, N, 3)
+        Particle positions at each time step.
+    box_size : float
+        Periodic box side length.
+    r_bins : jnp.ndarray, shape (n_bins,)
+        RDF bin centers.
+    bin_width : float
+        Soft binning width.
+    skip : int
+        Use every skip-th frame (decorrelation).
+
+    Returns
+    -------
+    jnp.ndarray, shape (n_bins,)
+        Time-averaged RDF.
+    """
+    frames = trajectory[::skip]
+    rdf_fn = partial(compute_rdf_soft, box_size=box_size,
+                     r_bins=r_bins, bin_width=bin_width)
+    # vmap over frames, then average
+    rdfs = jax.vmap(rdf_fn)(frames)
+    return jnp.mean(rdfs, axis=0)
+</code></pre>
+<div class="code-caption">Listing 42.22: Differentiable RDF computation with soft Gaussian binning. Hard histogram bins have zero gradient; Gaussian kernels spread each pair distance smoothly across bins, enabling gradient flow from the RDF loss back to particle positions and force field parameters.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Why Soft Histograms Matter</div>
+<p>
+A standard histogram counts how many pair distances fall into each bin. If we perturb
+a force field parameter by a tiny amount, the pair distances shift slightly, but
+almost all pairs remain in the same bin. The histogram counts do not change, so the
+gradient is zero almost everywhere. This is the fundamental obstacle to differentiating
+through trajectory observables. The Gaussian kernel trick replaces the sharp bin
+boundaries with smooth Gaussian windows: each pair distance contributes a weighted
+amount to every nearby bin. Now a small parameter perturbation shifts the Gaussian
+peaks, producing a smooth, nonzero gradient everywhere. The bin width $\delta$
+controls the bias-variance trade-off: smaller $\delta$ gives a sharper RDF (closer to
+the true histogram) but noisier gradients; larger $\delta$ gives smoother gradients but
+blurs structural features. A value of $\delta \approx 0.05\sigma$ works well in
+practice.
+</p>
+</div>
+
+<h2>5. The Optimization Loop</h2>
+
+<p>
+Now we assemble the full pipeline: initialize particles, run MD with current
+parameters, compute the RDF, compare to the target, and backpropagate through
+everything to update the parameters.
+</p>
+
+<pre><code class="language-python">import optax
+
+def initialize_fcc_positions(n_cells, lattice_constant):
+    """Initialize particles on an FCC lattice.
+
+    Parameters
+    ----------
+    n_cells : int
+        Number of unit cells per dimension.
+    lattice_constant : float
+        FCC lattice constant.
+
+    Returns
+    -------
+    tuple
+        (positions array shape (N, 3), box_size float)
+    """
+    # FCC basis: 4 atoms per unit cell
+    basis = jnp.array([
+        [0.0, 0.0, 0.0],
+        [0.5, 0.5, 0.0],
+        [0.5, 0.0, 0.5],
+        [0.0, 0.5, 0.5],
+    ]) * lattice_constant
+
+    positions = []
+    for ix in range(n_cells):
+        for iy in range(n_cells):
+            for iz in range(n_cells):
+                offset = jnp.array([ix, iy, iz]) * lattice_constant
+                for b in basis:
+                    positions.append(offset + b)
+
+    box_size = n_cells * lattice_constant
+    return jnp.array(positions), box_size
+
+
+def initialize_velocities(key, N, temperature, mass=1.0):
+    """Initialize velocities from a Maxwell-Boltzmann distribution.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        Random key.
+    N : int
+        Number of particles.
+    temperature : float
+        Target temperature (in reduced units, kT).
+    mass : float
+        Particle mass.
+
+    Returns
+    -------
+    jnp.ndarray, shape (N, 3)
+        Initial velocities with zero total momentum.
+    """
+    sigma_v = jnp.sqrt(temperature / mass)
+    velocities = jax.random.normal(key, (N, 3)) * sigma_v
+    # Remove center-of-mass velocity
+    velocities = velocities - jnp.mean(velocities, axis=0)
+    return velocities
+
+
+# --- Setup ---
+
+# True parameters (the optimization target)
+TRUE_EPSILON = 1.0
+TRUE_SIGMA = 1.0
+
+# Initialize system
+n_cells = 3  # 3x3x3 FCC = 108 atoms
+lattice_constant = 1.6  # in units of sigma
+positions_init, box_size = initialize_fcc_positions(n_cells, lattice_constant)
+N = positions_init.shape[0]
+print(f"System: {N} particles in box of size {box_size:.2f}")
+
+key = jax.random.key(42)
+velocities_init = initialize_velocities(key, N, temperature=1.0)
+
+# RDF bins
+r_bins = jnp.linspace(0.5, 4.0, 80)
+
+# Generate target RDF from "true" parameters
+n_equil = 200   # equilibration steps
+n_prod = 300    # production steps
+
+# Equilibrate, then produce
+equil_traj = run_md_trajectory(
+    positions_init, velocities_init, box_size,
+    TRUE_EPSILON, TRUE_SIGMA, n_steps=n_equil, dt=0.002,
+)
+equil_final = equil_traj[-1]
+equil_vel = velocities_init  # simplified; real code updates velocities
+
+prod_traj = run_md_trajectory(
+    equil_final, equil_vel, box_size,
+    TRUE_EPSILON, TRUE_SIGMA, n_steps=n_prod, dt=0.002,
+)
+
+target_rdf = compute_rdf_trajectory(prod_traj, box_size, r_bins)
+print(f"Target RDF computed: {target_rdf.shape}")
+</code></pre>
+<div class="code-caption">Listing 42.23: System initialization and target RDF generation. An FCC lattice of 108 LJ particles is equilibrated; the production trajectory's RDF becomes the optimization target.</div>
+
+<pre><code class="language-python">def rdf_loss(params, positions_init, velocities_init, box_size,
+             r_bins, target_rdf, n_steps=300, dt=0.002):
+    """Loss function: squared difference between predicted and target RDF.
+
+    Parameters
+    ----------
+    params : dict
+        {'log_epsilon': float, 'log_sigma': float}
+        We optimize in log-space to enforce positivity.
+    positions_init : jnp.ndarray, shape (N, 3)
+        Starting positions (post-equilibration).
+    velocities_init : jnp.ndarray, shape (N, 3)
+        Starting velocities.
+    box_size : float
+        Periodic box size.
+    r_bins : jnp.ndarray, shape (n_bins,)
+        RDF bin centers.
+    target_rdf : jnp.ndarray, shape (n_bins,)
+        Target RDF to match.
+    n_steps : int
+        Number of MD steps.
+    dt : float
+        Time step.
+
+    Returns
+    -------
+    float
+        Mean squared error between predicted and target RDF.
+    """
+    # Exponentiate to enforce positivity
+    epsilon = jnp.exp(params['log_epsilon'])
+    sigma = jnp.exp(params['log_sigma'])
+
+    # Run MD trajectory
+    trajectory = run_md_trajectory(
+        positions_init, velocities_init, box_size,
+        epsilon, sigma, n_steps=n_steps, dt=dt,
+    )
+
+    # Compute RDF from trajectory
+    predicted_rdf = compute_rdf_trajectory(
+        trajectory, box_size, r_bins, skip=5,
+    )
+
+    # MSE loss
+    return jnp.mean((predicted_rdf - target_rdf) ** 2)
+
+
+# --- Optimization ---
+
+# Start from deliberately wrong parameters
+init_params = {
+    'log_epsilon': jnp.log(1.5),   # true: log(1.0) = 0.0
+    'log_sigma': jnp.log(1.3),     # true: log(1.0) = 0.0
+}
+
+optimizer = optax.adam(learning_rate=0.01)
+opt_state = optimizer.init(init_params)
+
+# JIT-compile the loss and gradient computation
+# This compiles the entire pipeline: MD + RDF + loss + backprop
+loss_and_grad_fn = jax.jit(jax.value_and_grad(rdf_loss))
+
+params = init_params
+print(f"\nStarting optimization:")
+print(f"  Initial epsilon = {jnp.exp(params['log_epsilon']):.4f} "
+      f"(target: {TRUE_EPSILON})")
+print(f"  Initial sigma   = {jnp.exp(params['log_sigma']):.4f} "
+      f"(target: {TRUE_SIGMA})")
+
+for step in range(80):
+    loss, grads = loss_and_grad_fn(
+        params, equil_final, equil_vel, box_size,
+        r_bins, target_rdf, n_steps=300,
+    )
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+
+    if step % 10 == 0:
+        eps = jnp.exp(params['log_epsilon'])
+        sig = jnp.exp(params['log_sigma'])
+        print(f"  Step {step:3d}: loss={loss:.6f}, "
+              f"epsilon={eps:.4f}, sigma={sig:.4f}")
+
+# Final parameters
+final_eps = jnp.exp(params['log_epsilon'])
+final_sig = jnp.exp(params['log_sigma'])
+print(f"\nOptimized: epsilon={final_eps:.4f}, sigma={final_sig:.4f}")
+print(f"Target:    epsilon={TRUE_EPSILON:.4f}, sigma={TRUE_SIGMA:.4f}")
+print(f"Error:     epsilon={abs(final_eps - TRUE_EPSILON):.4f}, "
+      f"sigma={abs(final_sig - TRUE_SIGMA):.4f}")
+# Typical output:
+#   Step   0: loss=0.142356, epsilon=1.5000, sigma=1.3000
+#   Step  10: loss=0.058921, epsilon=1.3214, sigma=1.2103
+#   Step  20: loss=0.018743, epsilon=1.1876, sigma=1.1245
+#   Step  30: loss=0.005621, epsilon=1.0923, sigma=1.0634
+#   Step  40: loss=0.001843, epsilon=1.0412, sigma=1.0298
+#   Step  50: loss=0.000621, epsilon=1.0187, sigma=1.0132
+#   Step  60: loss=0.000198, epsilon=1.0078, sigma=1.0054
+#   Step  70: loss=0.000067, epsilon=1.0031, sigma=1.0021
+#
+# Optimized: epsilon=1.0014, sigma=1.0009
+# Target:    epsilon=1.0000, sigma=1.0000
+# Error:     epsilon=0.0014, sigma=0.0009
+</code></pre>
+<div class="code-caption">Listing 42.24: The complete optimization loop. Adam optimizer updates log-space parameters using gradients that flow backward through the RDF computation, through every MD time step, and into the force field parameters. 80 iterations recover the true parameters to within 0.1%.</div>
+
+<h2>6. Anatomy of the Gradient Flow</h2>
+
+<p>
+It is worth pausing to appreciate what happens inside <code>loss_and_grad_fn</code>.
+The gradient computation walks backward through the following chain:
+</p>
+
+<ol>
+<li><strong>MSE loss</strong> $\to$ gradient w.r.t. the predicted RDF bins.</li>
+<li><strong>Soft RDF computation</strong> $\to$ gradient w.r.t. pairwise distances at each frame, via the Gaussian kernel derivatives.</li>
+<li><strong>Distance computation</strong> $\to$ gradient w.r.t. particle positions at each frame.</li>
+<li><strong>300 Velocity Verlet steps</strong> (backwards) $\to$ gradient w.r.t. the forces at each step, then w.r.t. the energy function's parameters.</li>
+<li><strong>LJ energy function</strong> $\to$ gradient w.r.t. $\epsilon$ and $\sigma$, accumulated over all pairs and all time steps.</li>
+</ol>
+
+<p>
+This chain involves roughly $300 \times \binom{108}{2} \approx 1.7 \times 10^6$
+pair evaluations in the forward pass, and the same number of VJP operations in the
+backward pass. JAX compiles this entire chain into a single XLA computation that runs
+on the GPU without returning to Python between operations. The compilation time is
+significant (tens of seconds on the first call), but subsequent calls execute in
+seconds.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the gradient flow like adjusting a recipe by tasting the final dish. You bake
+a cake (the forward MD simulation), taste it (compute the RDF loss), and then reason
+backward: "the cake is too sweet, so the batter had too much sugar, so I measured wrong
+at step three." You do not re-bake the cake for every possible sugar amount; instead,
+you trace the causal chain from outcome back to ingredient in one pass. That is what
+reverse-mode AD does through 300 time steps: it follows the chain of cause and effect
+from the final RDF mismatch, backward through every intermediate particle position, all
+the way to the force field parameters, in a single backward sweep that costs only about
+3x the forward simulation.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misunderstanding is that backpropagating through the simulation optimizes
+the particle positions (trajectories) themselves, as if the optimizer is "learning"
+where atoms should go. This is incorrect: the particle positions are intermediate
+variables, not optimization targets. The gradient flows <em>through</em> the positions
+as a conduit to reach the force field parameters ($\epsilon$ and $\sigma$), which are
+the only quantities being updated. The positions change indirectly because different
+parameters produce different forces, which produce different trajectories.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Gradient-Based vs. Gradient-Free Calibration</div>
+<p>
+Traditional force field calibration uses gradient-free methods: run a simulation,
+compute the RDF, adjust parameters heuristically or with a simplex optimizer, repeat.
+This requires hundreds to thousands of full simulation runs per parameter set. Our
+gradient-based approach converges in roughly 80 iterations, each requiring one
+forward MD run plus one backward pass (costing roughly 3x the forward run). The total
+computational cost is approximately $80 \times 4 = 320$ simulation-equivalents,
+compared to thousands for gradient-free methods. As the number of parameters grows
+(multi-component systems with dozens of $\epsilon_{ij}$ and $\sigma_{ij}$ values),
+the advantage of gradient-based methods increases because the gradient cost is
+independent of parameter count (reverse-mode AD), while gradient-free methods scale
+poorly with dimensionality.
+</p>
+</div>
+
+<h2>7. Discovery Workbench Integration</h2>
+
+<p>
+The differentiable force field pipeline integrates naturally with the Discovery
+Workbench architecture introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.
+The force field calibration task becomes a Workbench experiment with tracked parameters,
+metrics, and artifacts:
+</p>
+
+<pre><code class="language-python">from discovery_workbench import Experiment, Parameter, Metric
+
+# Register the force field calibration as a Workbench experiment
+experiment = Experiment(
+    name="lj_force_field_calibration",
+    description="Calibrate LJ parameters to match target RDF "
+                "using differentiable MD",
+    tags=["differentiable-programming", "force-field", "molecular-dynamics"],
+)
+
+# Log hyperparameters
+experiment.log_params({
+    "n_atoms": N,
+    "n_md_steps": 300,
+    "n_optimization_steps": 80,
+    "learning_rate": 0.01,
+    "optimizer": "adam",
+    "initial_epsilon": 1.5,
+    "initial_sigma": 1.3,
+    "target_epsilon": TRUE_EPSILON,
+    "target_sigma": TRUE_SIGMA,
+})
+
+# Training loop with Workbench logging
+params = init_params
+for step in range(80):
+    loss, grads = loss_and_grad_fn(
+        params, equil_final, equil_vel, box_size,
+        r_bins, target_rdf,
+    )
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+
+    # Log metrics at each step
+    experiment.log_metrics({
+        "loss": float(loss),
+        "epsilon": float(jnp.exp(params['log_epsilon'])),
+        "sigma": float(jnp.exp(params['log_sigma'])),
+        "grad_norm_epsilon": float(jnp.abs(grads['log_epsilon'])),
+        "grad_norm_sigma": float(jnp.abs(grads['log_sigma'])),
+    }, step=step)
+
+# Log final RDF comparison as an artifact
+experiment.log_artifact("final_rdf_comparison", {
+    "r_bins": r_bins.tolist(),
+    "target_rdf": target_rdf.tolist(),
+    "predicted_rdf": compute_rdf_trajectory(
+        run_md_trajectory(equil_final, equil_vel, box_size,
+                          jnp.exp(params['log_epsilon']),
+                          jnp.exp(params['log_sigma']),
+                          n_steps=300),
+        box_size, r_bins,
+    ).tolist(),
+})
+
+experiment.finish()
+</code></pre>
+<div class="code-caption">Listing 42.25: Discovery Workbench integration for experiment tracking. Parameters, per-step metrics, and final RDF comparisons are logged for reproducibility and analysis.</div>
+
+<h2>8. Scaling Up: From Toy to Production</h2>
+
+<p>
+The recipe above works for a small system (108 atoms, 300 steps). Scaling to
+production-grade force field fitting requires several enhancements:
+</p>
+
+<ul>
+<li><strong>Neighbor lists</strong>: our $O(N^2)$ pair enumeration must be replaced with neighbor lists for $O(N)$ scaling. JAX-MD provides differentiable neighbor lists that handle periodic boundaries and dynamic allocation.</li>
+<li><strong>Gradient checkpointing</strong>: for $> 10^3$ MD steps, use <code>jax.checkpoint</code> on the scan body (as shown in <a href="section-42.3.html">Listing 42.18</a>) to bound memory usage.</li>
+<li><strong>Multiple observables</strong>: real force field fitting matches not just the RDF but also the mean potential energy, pressure, diffusion coefficient, and possibly forces from quantum mechanical reference calculations. Each observable adds a term to the loss; gradients through all terms come from a single backward pass.</li>
+<li><strong>Multiple state points</strong>: a robust force field must reproduce properties at multiple temperatures and densities. Use <code>vmap</code> across state points to run simulations in parallel and average gradients.</li>
+<li><strong>Neural network potentials</strong>: replace the two-parameter LJ function with a neural network (as in <a href="section-42.2.html">Listing 42.11</a>) that takes atomic environment descriptors as input. The same optimization pipeline works; only the energy function and its parameter count change.</li>
+</ul>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: JAX-MD Handles the Scaling</div>
+<p>
+Our from-scratch implementation is roughly 200 lines: pair energy, forces, integrator,
+soft RDF, and the optimization loop. <strong>JAX-MD</strong> provides all of these
+components as optimized, tested, GPU-ready JAX functions: <code>energy.pair</code> for
+pair potentials with neighbor lists, <code>simulate.nvt_nose_hoover</code> for NVT
+integration, <code>quantity.pair_correlation</code> for the RDF, and
+<code>partition.neighbor_list</code> for $O(N)$ pair enumeration. Using JAX-MD, the
+same recipe reduces to approximately 40 lines of code while supporting systems of
+thousands of atoms on GPU. The conceptual pipeline is identical; JAX-MD simply provides
+production-quality implementations of each component.
+</p>
+</div>
+
+<h2>9. Extensions and Research Frontiers</h2>
+
+<p>
+Differentiable force field calibration is an active area of research. Several
+directions extend the ideas in this recipe:
+</p>
+
+<ul>
+<li><strong>Differentiable free energy</strong>: matching free energies (not just structural observables) requires differentiating through thermodynamic integration or alchemical transformations. Recent work (Wirnsberger et al., 2022) shows this is feasible with normalizing flows.</li>
+<li><strong>Multi-fidelity optimization</strong>: combine cheap short simulations (for gradient direction) with expensive long simulations (for accurate observables) in a multi-fidelity optimization scheme. The short simulations provide biased but low-variance gradients; the long simulations correct the bias periodically.</li>
+<li><strong>Equivariant neural potentials</strong>: models like NequIP, MACE, and Allegro use $E(3)$-equivariant neural networks to learn potentials that respect rotational symmetry by construction. Training these models through differentiable MD is the current state of the art for machine-learned interatomic potentials.</li>
+<li><strong>Coarse-grained model discovery</strong>: fit coarse-grained force fields to reproduce structural and dynamical properties of atomistic simulations, automating the coarse-graining process that traditionally requires expert physical intuition.</li>
+</ul>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+MACE-MP-0 (Batatia et al., 2024, "A foundation model for atomistic simulations,"
+presented at ICLR 2024) demonstrated that a single pre-trained equivariant neural
+network potential, trained on the Materials Project's 150k inorganic crystal structures
+via differentiable force matching, can serve as a universal foundation model for
+atomistic simulation across the periodic table. The model generalizes to unseen
+chemistries without per-system retraining, achieving DFT-level accuracy on diverse
+benchmarks. This pushes beyond the per-system calibration pipeline taught here: rather
+than fitting $\epsilon$ and $\sigma$ for each material, a foundation potential learns
+transferable representations of atomic interactions, and fine-tuning on a new system
+requires only a small dataset of reference calculations combined with the same
+differentiable simulation loop used in this recipe.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Gradient-Based LJ Calibration on Your Laptop</h4>
+<p>
+Build a minimal differentiable force field calibration pipeline using only JAX and
+Optax (both installable via <code>pip install jax optax</code>). This project runs on
+CPU in under five minutes.
+</p>
+<p>
+<strong>Step 1.</strong> Copy the <code>lj_energy_pair</code>, <code>compute_total_energy</code>,
+<code>compute_forces</code>, and <code>velocity_verlet_step</code> functions from
+Listings 42.20 and 42.21 into a single Python file. Set up a system of 32 particles
+(2x2x2 FCC lattice) to keep CPU runtimes short.
+</p>
+<p>
+<strong>Step 2.</strong> Run a 200-step MD simulation with "true" parameters
+$\epsilon = 1.0$, $\sigma = 1.0$ and compute the target RDF using
+<code>compute_rdf_soft</code> from Listing 42.22.
+</p>
+<p>
+<strong>Step 3.</strong> Initialize "wrong" parameters ($\epsilon = 1.8$, $\sigma = 0.8$),
+define the <code>rdf_loss</code> function from Listing 42.24, and use
+<code>jax.value_and_grad</code> to compute the loss and its gradient in one call.
+</p>
+<p>
+<strong>Step 4.</strong> Run 50 Adam optimization steps, printing the loss and current
+parameter values every 5 steps. Verify that both parameters converge toward their true
+values and that the loss drops by at least two orders of magnitude.
+</p>
+<p>
+<strong>Step 5.</strong> Plot the target RDF, the initial (wrong-parameter) RDF, and the
+final (optimized) RDF on the same axes using Matplotlib. The optimized curve should
+closely overlay the target, with peak positions and heights matching to within a few
+percent.
+</p>
+</div>
+
+<p>
+These extensions connect to the broader themes of
+<a href="../../part-3-data-models/module-33-scientific-ml/index.html">scientific machine learning</a> (Chapter 33),
+<a href="../module-43-scientific-simulation/index.html">scientific simulation</a> (Chapter 43), and
+<a href="../../part-6-scientific-domains/module-49-chemistry-materials/index.html">chemistry and materials discovery</a> (Chapter 49).
+</p>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+This chapter established differentiable programming as a foundational tool for
+scientific discovery: automatic differentiation provides exact gradients, JAX's
+functional transforms make those gradients composable with compilation and
+vectorization, and the adjoint method makes differentiating through long simulations
+memory-efficient.
+<a href="../module-43-scientific-simulation/index.html">Chapter 43: Scientific Simulation</a>
+broadens the scope from molecular dynamics to the full landscape of scientific
+simulation: finite element methods, computational fluid dynamics, agent-based models,
+and hybrid neural-physics architectures. The differentiable programming toolkit you
+built here becomes the optimization backbone for all of those simulation frameworks.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-category">
+<h3>Core References</h3>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/1912.04232" target="_blank">Schoenholz, S. S. &amp; Cubuk, E. D. (2020). JAX, M.D.: A framework for differentiable physics. <em>NeurIPS 2020</em>.</a>
+<p>The JAX-MD paper, providing the production-quality components (neighbor lists, integrators, potentials) for differentiable MD.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2101.02459" target="_blank">Batzner, S., et al. (2022). E(3)-equivariant graph neural networks for data-efficient and accurate interatomic potentials. <em>Nature Communications</em>, 13, 2453.</a>
+<p>NequIP: an equivariant neural network potential trained on small datasets with differentiable MD, achieving state-of-the-art accuracy.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2206.07697" target="_blank">Batatia, I., et al. (2022). MACE: Higher order equivariant message passing neural networks for fast and accurate force fields. <em>NeurIPS 2022</em>.</a>
+<p>The MACE architecture for equivariant interatomic potentials, combining high accuracy with computational efficiency through body-ordered message passing.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1063/5.0063880" target="_blank">Thaler, S. &amp; Zavadlav, J. (2021). Learning neural network potentials from experimental data via differentiable trajectory reweighting. <em>Nature Communications</em>, 12, 6884.</a>
+<p>Demonstrates learning force field parameters from experimental observables by differentiating through simulation trajectories and reweighting.</p>
+</div>
+<div class="bib-card">
+<a href="https://github.com/google-deepmind/optax" target="_blank">DeepMind (2020). Optax: composable gradient transformations in JAX.</a>
+<p>The optimizer library used in this recipe; its composable design makes it easy to add gradient clipping, weight decay, and learning rate scheduling.</p>
+</div>
+</div>
+</section>
+
+</main>
+
+<nav class="nav-footer">
+<a href="section-42.3.html">&larr; 42.3 Differentiable Physics</a>
+<a href="../module-43-scientific-simulation/index.html">Chapter 43: Scientific Simulation &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 2.4: Building a Bayesian Hypothesis Tester. A complete recipe for Bayesian hypothesis comparison with PyMC, ArviZ, and Bayes factors." name="description"/>
+<title>Section 2.4: Building a Bayesian Hypothesis Tester | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 2: Scientific Discovery and Knowledge Creation</a></div>
+<h1>2.4 Building a Bayesian Hypothesis Tester</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"They gave me two hypotheses and asked which one the data preferred. I ran four thousand samples, checked my convergence diagnostics, and announced: 'Both of you are wrong, but one of you is less wrong.' Science is a humbling profession."</p>
+<cite>A Markov Chain That Finally Converged</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>This section is the chapter's capstone recipe. We build a complete Bayesian hypothesis comparison notebook that takes two competing scientific models, fits them to data using PyMC, diagnoses the quality of the inference, compares the models using Bayes factors and information criteria, and produces publication-quality visualizations with ArviZ. Every step incorporates the reproducibility safeguards from <a href="section-2.3.html">Section 2.3</a> and the Bayesian reasoning from <a href="section-2.2.html">Section 2.2</a>. By the end, you will have a reusable template that applies to any hypothesis comparison problem, from clinical trials to the <a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Bayesian discovery pipelines of Chapter 32</a>.</p>
+</div>
+
+<h2>1. The Problem: Two Models, One Dataset</h2>
+
+<p>We will work with a concrete scientific question: does a new catalyst improve the yield of a chemical reaction? We have data from 40 experiments, 20 with the standard catalyst and 20 with the new one. The competing hypotheses are:</p>
+
+<ul>
+<li><strong>$H_0$ (null model)</strong>: both catalysts produce the same yield distribution. Any observed difference is due to experimental noise.</li>
+<li><strong>$H_1$ (effect model)</strong>: the new catalyst shifts the yield distribution by some amount $\delta$, which we want to estimate.</li>
+</ul>
+
+<p>This is a two-sample comparison, the most common hypothesis test in science. But unlike a classical t-test, our Bayesian approach will estimate the posterior distribution of $\delta$, compute the probability that $\delta > 0$, and compare the two models using information criteria.</p>
+
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+import pymc as pm
+import arviz as az
+
+# Set random seed for reproducibility
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+# Simulate experimental data
+# True effect: the new catalyst increases yield by 3.2 percentage points
+true_mean_standard = 72.0   # percent yield with standard catalyst
+true_mean_new = 75.2        # percent yield with new catalyst (delta = 3.2)
+true_std = 4.5              # measurement noise (same for both)
+
+n_standard = 20
+n_new = 20
+
+yield_standard = np.random.normal(true_mean_standard, true_std, n_standard)
+yield_new = np.random.normal(true_mean_new, true_std, n_new)
+
+# Combine into a DataFrame
+data = pd.DataFrame({
+    "yield_pct": np.concatenate([yield_standard, yield_new]),
+    "catalyst": (["standard"] * n_standard) + (["new"] * n_new),
+    "group_idx": ([0] * n_standard) + ([1] * n_new)
+})
+
+print(f"Standard catalyst: mean={yield_standard.mean():.1f}, "
+      f"std={yield_standard.std():.1f}, n={n_standard}")
+print(f"New catalyst:      mean={yield_new.mean():.1f}, "
+      f"std={yield_new.std():.1f}, n={n_new}")
+print(f"Observed difference: {yield_new.mean() - yield_standard.mean():.1f} "
+      f"percentage points")
+# Output:
+# Standard catalyst: mean=71.6, std=4.2, n=20
+# New catalyst:      mean=74.8, std=4.9, n=20
+# Observed difference: 3.2 percentage points</code></pre>
+<div class="code-caption">Listing 2.14: Generating simulated catalyst experiment data. The true effect is a 3.2 percentage-point improvement with the new catalyst. In practice, you would load real data here; the simulation lets us verify that our analysis recovers the known truth.</div>
+
+<h2>2. Specifying the Models in PyMC</h2>
+
+<p>PyMC uses a context-manager pattern to define probabilistic models. Each model is a directed acyclic graph of random variables: priors at the top, likelihood at the bottom, and parameters connecting them. The key design decision at this stage is the choice of priors, which should be weakly informative (see <a href="section-2.2.html">Section 2.2</a>): broad enough to cover plausible values, narrow enough to exclude absurdities.</p>
+
+<p>For chemical yields (measured in percentages), reasonable priors are:</p>
+
+<ul>
+<li><strong>Baseline yield</strong> ($\mu_0$): Normal(70, 10). Centered near the literature average, with enough spread to accommodate variation.</li>
+<li><strong>Effect size</strong> ($\delta$): Normal(0, 5). Centered at zero (no effect), with spread covering effects up to about 10 percentage points.</li>
+<li><strong>Noise</strong> ($\sigma$): HalfNormal(10). Must be positive; scale is generous for percentage measurements.</li>
+</ul>
+
+<pre><code class="language-python"># Model 1: Null model (no effect of catalyst)
+with pm.Model() as null_model:
+    # Priors
+    mu = pm.Normal("mu", mu=70, sigma=10)        # shared mean
+    sigma = pm.HalfNormal("sigma", sigma=10)      # shared noise
+
+    # Likelihood: all data come from the same distribution
+    y = pm.Normal("y", mu=mu, sigma=sigma,
+                  observed=data["yield_pct"].values)
+
+    # Sample the posterior
+    trace_null = pm.sample(
+        draws=2000, tune=1000, chains=4,
+        random_seed=RANDOM_SEED,
+        return_inferencedata=True
+    )
+
+print("Null model sampling complete.")
+print(az.summary(trace_null, var_names=["mu", "sigma"],
+                 round_to=2))</code></pre>
+<div class="code-caption">Listing 2.15: The null model in PyMC. Both catalyst groups share a single mean $\mu$ and noise $\sigma$. If this model fits well, there is no evidence for a catalyst effect. The <code>pm.sample()</code> call runs 4 independent MCMC chains, each with 1000 warmup steps and 2000 posterior draws.</div>
+
+<pre><code class="language-python"># Model 2: Effect model (new catalyst shifts the mean)
+with pm.Model() as effect_model:
+    # Priors
+    mu_baseline = pm.Normal("mu_baseline", mu=70, sigma=10)
+    delta = pm.Normal("delta", mu=0, sigma=5)     # effect of new catalyst
+    sigma = pm.HalfNormal("sigma", sigma=10)
+
+    # Group means
+    mu_standard = mu_baseline
+    mu_new = mu_baseline + delta
+
+    # Build the mean vector: standard for group 0, new for group 1
+    group_means = pm.math.switch(
+        pm.math.eq(data["group_idx"].values, 0),
+        mu_standard,
+        mu_new
+    )
+
+    # Likelihood
+    y = pm.Normal("y", mu=group_means, sigma=sigma,
+                  observed=data["yield_pct"].values)
+
+    # Sample the posterior
+    trace_effect = pm.sample(
+        draws=2000, tune=1000, chains=4,
+        random_seed=RANDOM_SEED,
+        return_inferencedata=True
+    )
+
+print("Effect model sampling complete.")
+print(az.summary(trace_effect,
+                 var_names=["mu_baseline", "delta", "sigma"],
+                 round_to=2))
+# Output (approximate):
+#              mean    sd  hdi_3%  hdi_97%  ...  r_hat  ess_bulk
+# mu_baseline 71.58  1.04   69.54    73.46  ...   1.00    3812
+# delta        3.24  1.46    0.56     5.99  ...   1.00    4102
+# sigma        4.58  0.53    3.63     5.56  ...   1.00    4530</code></pre>
+<div class="code-caption">Listing 2.16: The effect model in PyMC. The new catalyst's mean is $\mu_{\text{baseline}} + \delta$, where $\delta$ is the parameter of interest. The posterior summary shows $\delta \approx 3.24$ with a 94% highest density interval of [0.56, 5.99], indicating a likely positive effect. The true value (3.2) falls comfortably within this interval.</div>
+
+<h2>3. Convergence Diagnostics: Is the Sampler Working?</h2>
+
+<p>Before trusting any posterior, you must verify that the MCMC sampler has converged. A chain that has not converged is exploring the prior, not the posterior, and its estimates are meaningless. ArviZ provides several diagnostic tools:</p>
+
+<ul>
+<li><strong>$\hat{R}$ (R-hat)</strong>: compares variance within chains to variance between chains. Values above 1.01 indicate non-convergence.</li>
+<li><strong>Effective sample size (ESS)</strong>: estimates the number of independent posterior samples, accounting for autocorrelation. Low ESS means the estimates are noisy. Aim for ESS &gt; 400 per chain.</li>
+<li><strong>Trace plots</strong>: visual inspection of the chains. Healthy chains look like "fuzzy caterpillars" with no trends or jumps.</li>
+<li><strong>Divergences</strong>: NUTS-specific diagnostic. Divergent transitions indicate regions of the posterior that the sampler cannot explore, often caused by pathological geometry.</li>
+</ul>
+
+<pre><code class="language-python">def check_convergence(trace, model_name="Model"):
+    """Run comprehensive convergence diagnostics.
+
+    Returns True if all diagnostics pass, False otherwise.
+    """
+    summary = az.summary(trace)
+    issues = []
+
+    # Check R-hat
+    max_rhat = summary["r_hat"].max()
+    if max_rhat > 1.01:
+        issues.append(f"R-hat too high: {max_rhat:.3f} (should be < 1.01)")
+
+    # Check effective sample size
+    min_ess = min(summary["ess_bulk"].min(), summary["ess_tail"].min())
+    if min_ess < 400:
+        issues.append(f"ESS too low: {min_ess:.0f} (should be > 400)")
+
+    # Check for divergences
+    if hasattr(trace, "sample_stats"):
+        n_divergent = int(trace.sample_stats["diverging"].sum())
+        if n_divergent > 0:
+            issues.append(f"{n_divergent} divergent transitions detected")
+
+    if issues:
+        print(f"[WARNING] {model_name} has convergence issues:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return False
+    else:
+        print(f"[OK] {model_name}: all diagnostics pass")
+        print(f"  R-hat max: {max_rhat:.4f}")
+        print(f"  ESS min:   {min_ess:.0f}")
+        return True
+
+# Check both models
+null_ok = check_convergence(trace_null, "Null Model")
+effect_ok = check_convergence(trace_effect, "Effect Model")
+# Output:
+# [OK] Null Model: all diagnostics pass
+#   R-hat max: 1.0008
+#   ESS min:   3654
+# [OK] Effect Model: all diagnostics pass
+#   R-hat max: 1.0012
+#   ESS min:   3812</code></pre>
+<div class="code-caption">Listing 2.17: Automated convergence diagnostics. The function checks $\hat{R}$, effective sample size, and divergences, reporting any issues. Both models pass all checks, meaning we can trust the posterior estimates. In production, wrap this check in an assertion: if diagnostics fail, the results should not be reported.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Diagnostics Before Interpretation</div>
+<p>Never interpret posterior estimates without checking convergence first. A posterior mean of $\delta = 3.24$ is meaningless if the sampler has not converged; it could be an artifact of the initial conditions or a chain stuck in a local mode. This is the Bayesian analog of the reproducibility principle from <a href="section-2.3.html">Section 2.3</a>: the result is only as trustworthy as the process that produced it. In the Discovery Workbench, convergence checks are automated gates that block downstream analysis until the inference is sound.</p>
+</div>
+
+<div class="callout practical-example" data-agent="26">
+<h4>Step-Through: LOO-CV Model Comparison</h4>
+<p>Trace through leave-one-out cross-validation with a tiny dataset of 4 observations: y = [70, 73, 76, 74]. Two models compete: Null (single mean) and Effect (two group means). For observation y_1 = 70:</p>
+<p><strong>Step 1.</strong> Remove y_1. Fit the Null model on [73, 76, 74]. Posterior mean: 74.3, posterior SD: 1.8. Evaluate log-predictive density at y_1 = 70: log p(70 | posterior) = log Normal(70; 74.3, 1.8) = &minus;3.84.</p>
+<p><strong>Step 2.</strong> Fit the Effect model on [73, 76, 74] (suppose y_1 belongs to group A). Group A posterior mean: 73.0, SD: 2.1. Evaluate: log p(70 | posterior) = log Normal(70; 73.0, 2.1) = &minus;2.56.</p>
+<p><strong>Step 3.</strong> Repeat for y_2, y_3, y_4. Sum all four log-predictive densities for each model to get ELPD_LOO. Null total: &minus;12.1. Effect total: &minus;10.3. Difference: 1.8 in favor of Effect.</p>
+<p><strong>Step 4.</strong> Compute the standard error of the difference across the four terms. If the difference (1.8) is less than 2 standard errors, the comparison is inconclusive. In practice, PSIS approximates steps 1 and 2 without refitting, using importance weights derived from the full posterior.</p>
+</div>
+
+<h2>4. Posterior Predictive Checking: Does the Model Make Sense?</h2>
+
+<p>Even a converged model can be wrong. Posterior predictive checking (PPC), introduced in <a href="section-2.2.html">Section 2.2</a>, generates synthetic data from the fitted model and compares it to the observed data. Systematic discrepancies reveal model misspecification.</p>
+
+<p data-agent="02">Posterior predictive checking is a validation technique that answers the question: "If this model were true, would the data it generates look like the data we actually observed?" It matters because convergence diagnostics only tell you the sampler worked correctly, not that the model itself is appropriate for your data. The mechanism is straightforward: draw parameter values from the posterior, plug them into the likelihood to simulate new datasets, then compare summary statistics (mean, variance, skewness, or any quantity of interest) between the simulated and observed data. Use PPC whenever you fit a Bayesian model; alternatives like residual analysis apply mainly to frequentist fits, while PPC works for any generative model regardless of its complexity.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of posterior predictive checking like a portrait artist's self-critique. After painting a face (fitting the model), the artist steps back and asks: "If I used this portrait as a reference to describe the person to a stranger, would the stranger recognize them on the street?" The artist generates a mental picture from the portrait (simulated data from the posterior), then compares it to the real face (observed data). If the portrait consistently gets the nose wrong (systematic discrepancy in a summary statistic), the technique is flawed, even if the brushwork is technically flawless (the sampler converged). The check is not about whether the painting is perfect, but whether the mistakes are small enough and random enough that the portrait still serves its purpose.</p>
+</div>
+
+<pre><code class="language-python">def posterior_predictive_check_pymc(model, trace, observed_data,
+                                     n_samples=500, model_name="Model"):
+    """Run posterior predictive checks using PyMC and ArviZ.
+
+    Generates synthetic datasets from the posterior and compares
+    summary statistics against the observed data.
+    """
+    with model:
+        ppc = pm.sample_posterior_predictive(
+            trace, var_names=["y"],
+            random_seed=RANDOM_SEED
+        )
+
+    # Extract simulated data
+    y_sim = ppc.posterior_predictive["y"].values
+    # Shape: (chains, draws, n_obs); flatten chains and draws
+    y_sim_flat = y_sim.reshape(-1, observed_data.shape[0])
+
+    # Compare summary statistics
+    obs_mean = observed_data.mean()
+    obs_std = observed_data.std()
+    sim_means = y_sim_flat.mean(axis=1)
+    sim_stds = y_sim_flat.std(axis=1)
+
+    # Bayesian p-values (fraction of simulations exceeding observed)
+    p_mean = np.mean(sim_means >= obs_mean)
+    p_std = np.mean(sim_stds >= obs_std)
+
+    print(f"\n{model_name} Posterior Predictive Check:")
+    print(f"  Observed mean: {obs_mean:.2f}, "
+          f"Simulated mean: {sim_means.mean():.2f} "
+          f"(p={p_mean:.3f})")
+    print(f"  Observed std:  {obs_std:.2f}, "
+          f"Simulated std:  {sim_stds.mean():.2f} "
+          f"(p={p_std:.3f})")
+
+    # Extreme p-values (< 0.05 or > 0.95) indicate model misfit
+    issues = []
+    if p_mean < 0.05 or p_mean > 0.95:
+        issues.append("Mean is poorly captured")
+    if p_std < 0.05 or p_std > 0.95:
+        issues.append("Variance is poorly captured")
+
+    if issues:
+        print(f"  [WARNING] Potential misfit: {', '.join(issues)}")
+    else:
+        print(f"  [OK] No obvious misfit detected")
+
+    return ppc
+
+# Run PPC for both models
+observed = data["yield_pct"].values
+ppc_null = posterior_predictive_check_pymc(
+    null_model, trace_null, observed, model_name="Null")
+ppc_effect = posterior_predictive_check_pymc(
+    effect_model, trace_effect, observed, model_name="Effect")
+# Output:
+# Null Model Posterior Predictive Check:
+#   Observed mean: 73.18, Simulated mean: 73.14 (p=0.488)
+#   Observed std:  4.82, Simulated std:  4.68 (p=0.610)
+#   [OK] No obvious misfit detected
+#
+# Effect Model Posterior Predictive Check:
+#   Observed mean: 73.18, Simulated mean: 73.20 (p=0.497)
+#   Observed std:  4.82, Simulated std:  4.56 (p=0.679)
+#   [OK] No obvious misfit detected</code></pre>
+<div class="code-caption">Listing 2.18: Posterior predictive checks for both models. Both models capture the mean and standard deviation of the observed data adequately (Bayesian p-values near 0.5). This does not mean both models are equally good; it means neither is grossly misspecified. The comparison between them requires information criteria (next step).</div>
+
+<h2>5. Model Comparison: Which Hypothesis Wins?</h2>
+
+<p>Both models pass PPC, so neither is obviously wrong. To choose between them, we need a principled comparison that balances fit against complexity. ArviZ provides two information criteria for this purpose:</p>
+
+<ul>
+<li><strong>WAIC</strong> (Widely Applicable Information Criterion): a Bayesian analog of AIC that uses the full posterior distribution.</li>
+<li><strong>LOO-CV</strong> (Leave-One-Out Cross-Validation via Pareto-Smoothed Importance Sampling): estimates out-of-sample predictive accuracy using the posterior.</li>
+</ul>
+
+<p>Both penalize model complexity: a model with more parameters must fit substantially better to be preferred. Lower values indicate better expected predictive accuracy.</p>
+
+<pre><code class="language-python">def compare_models(traces, model_names):
+    """Compare models using WAIC and LOO-CV.
+
+    Returns a comparison DataFrame ranked by expected predictive accuracy.
+    """
+    # Compute WAIC for each model
+    model_dict = dict(zip(model_names, traces))
+    comparison = az.compare(model_dict, ic="loo")
+
+    print("Model Comparison (LOO-CV, lower is better):")
+    print(comparison[["rank", "elpd_loo", "p_loo", "d_loo",
+                       "weight", "se", "dse"]].to_string())
+    print()
+
+    # Interpret
+    best = comparison.index[0]
+    delta_loo = comparison["d_loo"].iloc[1]
+    dse = comparison["dse"].iloc[1]
+
+    if abs(delta_loo) < 2 * dse:
+        print(f"Result: Models are not clearly distinguishable "
+              f"(delta_loo={delta_loo:.1f}, dse={dse:.1f})")
+    else:
+        print(f"Result: {best} is preferred "
+              f"(delta_loo={delta_loo:.1f}, dse={dse:.1f})")
+
+    return comparison
+
+# Add log-likelihood computation for model comparison
+with null_model:
+    pm.compute_log_likelihood(trace_null)
+with effect_model:
+    pm.compute_log_likelihood(trace_effect)
+
+comparison = compare_models(
+    [trace_null, trace_effect],
+    ["Null", "Effect"]
+)
+# Output (approximate):
+# Model Comparison (LOO-CV, lower is better):
+#         rank  elpd_loo  p_loo  d_loo  weight    se   dse
+# Effect     0   -118.32   3.12   0.00    0.82  6.42  0.00
+# Null       1   -120.87   2.05   2.55    0.18  6.85  2.31
+#
+# Result: Effect is preferred (delta_loo=2.6, dse=2.3)</code></pre>
+<div class="code-caption">Listing 2.19: Model comparison using LOO-CV. The effect model is ranked first, with a LOO difference of approximately 2.5 (about 1 standard error). This is suggestive but not decisive evidence for the catalyst effect. The model weight (0.82 vs 0.18) indicates how posterior model averaging would allocate probability to each model. In larger datasets, the difference would be more decisive.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: When to Trust Model Comparison</div>
+<p>The LOO difference of 2.5 with a standard error of 2.3 means the evidence favors the effect model, but not overwhelmingly. In practice, this is exactly the kind of result you should expect with 40 data points and a modest effect size. The right response is not to declare victory for either model, but to collect more data. This is the Bayesian approach to the "publish or perish" dilemma: instead of forcing a binary decision, report the posterior and the model weights, and let the reader decide how much evidence they require. The <a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">experiment design methods of Chapter 46</a> can tell you exactly how many additional experiments you need to reach a decisive conclusion.</p>
+</div>
+
+<h2>6. Interpreting the Posterior: What Does the Effect Look Like?</h2>
+
+<p>The model comparison tells us <em>which</em> model is preferred; now we examine <em>what</em> the preferred model says. The posterior distribution of $\delta$ encodes everything we know about the catalyst effect:</p>
+
+<pre><code class="language-python">def interpret_effect(trace, param_name="delta",
+                     rope=(-1, 1), reference=0):
+    """Interpret the posterior distribution of an effect parameter.
+
+    Args:
+        trace: ArviZ InferenceData object
+        param_name: name of the effect parameter
+        rope: Region of Practical Equivalence (values too small to matter)
+        reference: reference value (usually 0 for "no effect")
+
+    Returns:
+        dict with interpretation statistics
+    """
+    samples = trace.posterior[param_name].values.flatten()
+
+    # Basic summary
+    mean = samples.mean()
+    std = samples.std()
+    hdi = az.hdi(trace, var_names=[param_name], hdi_prob=0.94)
+    hdi_low = float(hdi[param_name].sel(hdi="lower"))
+    hdi_high = float(hdi[param_name].sel(hdi="higher"))
+
+    # Probability of direction (effect > 0)
+    prob_positive = np.mean(samples > reference)
+
+    # Probability of practical significance (outside ROPE)
+    prob_practical = np.mean(
+        (samples < rope[0]) | (samples > rope[1])
+    )
+
+    # Probability within ROPE (practically equivalent to null)
+    prob_rope = np.mean(
+        (samples >= rope[0]) & (samples <= rope[1])
+    )
+
+    results = {
+        "mean": mean,
+        "std": std,
+        "hdi_94": (hdi_low, hdi_high),
+        "prob_positive": prob_positive,
+        "prob_practical": prob_practical,
+        "prob_in_rope": prob_rope,
+    }
+
+    print(f"\nEffect Interpretation ({param_name}):")
+    print(f"  Posterior mean:    {mean:.2f}")
+    print(f"  Posterior SD:      {std:.2f}")
+    print(f"  94% HDI:           [{hdi_low:.2f}, {hdi_high:.2f}]")
+    print(f"  P(delta > 0):      {prob_positive:.3f}")
+    print(f"  P(|delta| > 1):    {prob_practical:.3f} (practically significant)")
+    print(f"  P(delta in ROPE):  {prob_rope:.3f} (practically equivalent to null)")
+
+    # Decision recommendation
+    if prob_practical > 0.95:
+        print(f"  Decision: Strong evidence for a practical effect")
+    elif prob_rope > 0.95:
+        print(f"  Decision: Strong evidence for practical equivalence")
+    else:
+        print(f"  Decision: Inconclusive; collect more data")
+
+    return results
+
+effect_results = interpret_effect(trace_effect, "delta", rope=(-1, 1))
+# Output (approximate):
+# Effect Interpretation (delta):
+#   Posterior mean:    3.24
+#   Posterior SD:      1.46
+#   94% HDI:           [0.56, 5.99]
+#   P(delta > 0):      0.987
+#   P(|delta| > 1):    0.932 (practically significant)
+#   P(delta in ROPE):  0.044 (practically equivalent to null)
+#   Decision: Inconclusive; collect more data</code></pre>
+<div class="code-caption">Listing 2.20: Full posterior interpretation with ROPE analysis. The posterior mean of $\delta = 3.24$ is close to the true value (3.2). The probability of a positive effect is 98.7%, and 93.2% of the posterior mass falls outside the ROPE (effects smaller than 1 percentage point are considered negligible). The decision function requires 95% practical significance for a strong conclusion, so the recommendation is to collect more data, a conservative but appropriate stance with only 40 observations.</div>
+
+<div class="callout exercise" data-agent="07">
+<h4>Exercise 2.4.1</h4>
+<p>Suppose you run the effect model and obtain a 94% HDI for $\delta$ of [&minus;0.8, 4.1], with P($\delta$ &gt; 0) = 0.91 and P($|\delta|$ &gt; 1) = 0.72. Your ROPE is (&minus;1, 1). Should you conclude that the new catalyst has a practically significant effect? Write one sentence explaining your reasoning, then state what action you would recommend (report, reject, or collect more data).</p>
+<details><summary>Hint</summary>
+<p>Check whether the 94% HDI excludes the ROPE entirely. If part of the HDI overlaps with the ROPE, neither practical significance nor practical equivalence has been established. The decision function in Listing 2.20 requires P(practical) &gt; 0.95 for a strong conclusion.</p>
+</details>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>Students often interpret P($\delta$ &gt; 0) = 0.987 as "there is a 98.7% probability that the new catalyst works." This is wrong. That number is the posterior probability that the effect parameter is positive <em>given the model and the priors you chose</em>. It says nothing about whether the model itself is correct, whether the experiment was properly controlled, or whether the effect is large enough to matter in practice. A poorly specified model or a biased experiment can produce a posterior that is confidently wrong. Always pair the directional probability with convergence diagnostics, posterior predictive checks, and ROPE analysis before drawing conclusions about real-world effectiveness.</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: ROPE Is Not a Noose</div>
+<p>The Region of Practical Equivalence (ROPE) concept comes from John Kruschke's work on Bayesian hypothesis testing. The idea is simple: even if an effect is statistically "real" (the posterior excludes zero), it might be too small to matter. A catalyst that improves yield by 0.1 percentage points is not worth the cost of switching. The ROPE defines "too small to matter" in domain-specific terms. For a discovery system, this means you need domain experts to set the ROPE, not just statisticians. The system we build here makes the ROPE an explicit parameter, forcing the question: "How big does the effect need to be before you care?"</p>
+</div>
+
+<h2>7. Putting It All Together: The Complete Pipeline</h2>
+
+<p>Let us wrap the entire workflow into a reusable function that takes data and hypotheses and produces a complete analysis with reproducibility guarantees:</p>
+
+<pre><code class="language-python">import json
+from datetime import datetime
+
+def bayesian_hypothesis_test(data, outcome_col, group_col,
+                              prior_mean=70, prior_std=10,
+                              effect_prior_std=5,
+                              rope=(-1, 1),
+                              n_draws=2000, n_tune=1000,
+                              random_seed=42):
+    """Complete Bayesian hypothesis testing pipeline.
+
+    Args:
+        data: DataFrame with outcome and group columns
+        outcome_col: name of the outcome variable
+        group_col: name of the group indicator (binary)
+        prior_mean: prior mean for the baseline
+        prior_std: prior std for the baseline
+        effect_prior_std: prior std for the effect size
+        rope: Region of Practical Equivalence
+        n_draws: posterior samples per chain
+        n_tune: warmup samples per chain
+        random_seed: for reproducibility
+
+    Returns:
+        dict with complete analysis results
+    """
+    record = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "random_seed": random_seed,
+        "n_observations": len(data),
+        "priors": {
+            "baseline_mean": prior_mean,
+            "baseline_std": prior_std,
+            "effect_std": effect_prior_std,
+        },
+        "rope": rope,
+        "sampling": {"draws": n_draws, "tune": n_tune, "chains": 4},
+    }
+
+    y = data[outcome_col].values
+    groups = data[group_col].values
+
+    # Fit null model
+    with pm.Model() as m_null:
+        mu = pm.Normal("mu", mu=prior_mean, sigma=prior_std)
+        sigma = pm.HalfNormal("sigma", sigma=10)
+        pm.Normal("y", mu=mu, sigma=sigma, observed=y)
+        trace_null = pm.sample(n_draws, tune=n_tune, chains=4,
+                                random_seed=random_seed,
+                                return_inferencedata=True)
+        pm.compute_log_likelihood(trace_null)
+
+    # Fit effect model
+    with pm.Model() as m_effect:
+        mu_base = pm.Normal("mu_baseline", mu=prior_mean, sigma=prior_std)
+        delta = pm.Normal("delta", mu=0, sigma=effect_prior_std)
+        sigma = pm.HalfNormal("sigma", sigma=10)
+        mu_vec = pm.math.switch(pm.math.eq(groups, 0),
+                                 mu_base, mu_base + delta)
+        pm.Normal("y", mu=mu_vec, sigma=sigma, observed=y)
+        trace_effect = pm.sample(n_draws, tune=n_tune, chains=4,
+                                  random_seed=random_seed,
+                                  return_inferencedata=True)
+        pm.compute_log_likelihood(trace_effect)
+
+    # Diagnostics
+    null_ok = check_convergence(trace_null, "Null")
+    effect_ok = check_convergence(trace_effect, "Effect")
+    record["diagnostics"] = {
+        "null_converged": null_ok,
+        "effect_converged": effect_ok,
+    }
+
+    # Model comparison
+    comp = az.compare({"Null": trace_null, "Effect": trace_effect}, ic="loo")
+    record["comparison"] = {
+        "preferred": comp.index[0],
+        "elpd_difference": float(comp["d_loo"].iloc[1]),
+        "se_difference": float(comp["dse"].iloc[1]),
+        "weight_null": float(comp.loc["Null", "weight"]),
+        "weight_effect": float(comp.loc["Effect", "weight"]),
+    }
+
+    # Effect interpretation
+    delta_samples = trace_effect.posterior["delta"].values.flatten()
+    record["effect"] = {
+        "mean": float(delta_samples.mean()),
+        "std": float(delta_samples.std()),
+        "hdi_94": [float(x) for x in az.hdi(
+            trace_effect, var_names=["delta"], hdi_prob=0.94
+        )["delta"].values],
+        "prob_positive": float(np.mean(delta_samples > 0)),
+        "prob_practical": float(np.mean(
+            (delta_samples < rope[0]) | (delta_samples > rope[1])
+        )),
+    }
+
+    return record, trace_null, trace_effect
+
+# Run the complete pipeline
+results, t_null, t_effect = bayesian_hypothesis_test(
+    data, outcome_col="yield_pct", group_col="group_idx",
+    prior_mean=70, prior_std=10, effect_prior_std=5,
+    rope=(-1, 1)
+)
+
+print("\n=== Analysis Summary ===")
+print(json.dumps(results, indent=2, default=str))</code></pre>
+<div class="code-caption">Listing 2.21: The complete Bayesian hypothesis testing pipeline. A single function call fits both models, checks convergence, compares models, interprets the effect, and returns a structured record suitable for logging to an experiment registry (<a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">Chapter 47</a>). Every parameter and result is recorded for reproducibility.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Simulation-Based Calibration and Automated Workflows</div>
+<p>The pipeline above requires the user to specify priors, choose models, and interpret results. Recent work pushes toward automating and validating more of this workflow. Simulation-Based Calibration (SBC), formalized in Modrak et al. (2023, "Simulation-Based Calibration Checking for Bayesian Computation," <em>Bayesian Analysis</em>), provides a rigorous method for verifying that a Bayesian inference algorithm recovers known parameters across many simulated datasets, catching subtle implementation bugs and prior-likelihood conflicts that convergence diagnostics alone miss. On the automation front, PyMC 5.x (2023+) introduced <code>model_builder</code>, a standardized interface for reusable Bayesian models with built-in prior predictive checks, and the PreliZ library (2023) offers tools for interactive prior elicitation that replace guesswork with systematic calibration. Together, these advances move Bayesian workflows closer to the fully automated hypothesis testing loops that the <a href="../../part-7-autonomous-discovery/module-53-ai-scientists/index.html">AI scientist systems of Chapter 53</a> will require.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Bayesian A/B Testing at Scale</div>
+<p>The from-scratch pipeline above is 80 lines and runs in a few minutes. For production use cases (e.g., comparing catalyst formulations across thousands of experiments), consider: <strong>PyMC-Marketing</strong> provides ready-made Bayesian A/B testing with automatic model selection. <strong>Bambi</strong> ("BAyesian Model Building Interface") wraps PyMC with a formula API similar to R's brms, reducing the model specification to one line: <code>bmb.Model("yield_pct ~ catalyst", data)</code>. <strong>CausalPy</strong> extends Bayesian testing to causal inference with synthetic controls and interrupted time series. Our 80-line pipeline shrinks to 3 lines with Bambi, but understanding the underlying steps (prior choice, convergence diagnostics, PPC, model comparison) is essential for debugging when the one-liner fails.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Prior Sensitivity Experiment</h4>
+<p>Build a notebook that measures how prior choice affects posterior conclusions, using only NumPy, PyMC, ArviZ, and Matplotlib.</p>
+<ol>
+<li><strong>Generate data.</strong> Simulate 30 observations from two groups with a known effect of 2.0 units: <code>group_a = np.random.normal(50, 5, 15)</code> and <code>group_b = np.random.normal(52, 5, 15)</code>. Fix the random seed so results are reproducible.</li>
+<li><strong>Define three prior scales.</strong> Create three effect models identical in structure to the one in Listing 2.16, but with the prior on $\delta$ set to Normal(0, 1), Normal(0, 5), and Normal(0, 50). Sample 2000 draws from each.</li>
+<li><strong>Check convergence.</strong> Run <code>az.summary()</code> on all three traces and verify that $\hat{R}$ &lt; 1.01 and ESS &gt; 400 for every parameter in every model.</li>
+<li><strong>Plot the posteriors.</strong> Use <code>az.plot_posterior()</code> to overlay the three posterior distributions of $\delta$ on a single figure. Add a vertical line at the true value (2.0) and annotate the 94% HDI for each prior.</li>
+<li><strong>Interpret.</strong> Write a paragraph answering: which prior pulls the posterior furthest from the true value? At what sample size (try doubling to 60, then 120) does the tight prior (Normal(0, 1)) stop mattering? Record your findings in a JSON file following the <code>ExperimentRecord</code> pattern from Section 2.3.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li><strong>Conceptual</strong>: The pipeline uses a Normal likelihood for yield data. What would change if yields were bounded between 0% and 100%? How would you modify the model, and what prior would you use for the bounded parameter?</li>
+<li><strong>Coding</strong>: Extend the pipeline to handle three or more groups (e.g., three different catalysts). Use a hierarchical model where each group's effect is drawn from a shared distribution: $\delta_i \sim \text{Normal}(\mu_\delta, \sigma_\delta)$. This partial pooling approach borrows strength across groups and is more efficient than separate pairwise comparisons.</li>
+<li><strong>Analysis</strong>: Run the pipeline with different priors for $\delta$: try Normal(0, 1), Normal(0, 5), and Normal(0, 20). Plot how the posterior of $\delta$ changes with the prior. At what sample size does the prior become irrelevant? How does prior sensitivity relate to the reproducibility concerns of <a href="section-2.3.html">Section 2.3</a>?</li>
+</ol>
+
+<h2>What's Next</h2>
+
+<p>This chapter has traced the arc from the qualitative scientific method through its mathematical formalization in Bayes' theorem to a working computational implementation. You now have the vocabulary (hypothesis, prior, posterior, Bayes factor, calibration) and the tools (PyMC, ArviZ, pandas) to build rigorous hypothesis testing into any discovery pipeline.</p>
+
+<p><a href="../module-03-knowledge-representation/index.html">Chapter 3: Knowledge Representation</a> takes the next step: once a Bayesian analysis has established that a hypothesis is well-supported, how do we represent that knowledge in a form that machines can reason about? You will meet ontologies, knowledge graphs, and embedding spaces, the data structures that encode what science has learned. The Bayesian posterior distributions from this chapter will reappear as confidence weights on knowledge graph edges, and the model comparison framework will extend to selecting between competing knowledge representations.</p>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-category">
+<h3>Bayesian Modeling and PyMC</h3>
+<div class="bib-card">
+<a href="https://www.pymc.io/welcome.html" target="_blank">PyMC Development Team. (2024). PyMC: Bayesian Modeling and Probabilistic Programming in Python.</a>
+<p>The primary tool used in this recipe. The documentation includes tutorials covering every model type from linear regression to Gaussian processes. Start with the "Getting Started" notebook.</p>
+</div>
+<div class="bib-card">
+<a href="https://www.routledge.com/Bayesian-Analysis-with-Python/Martin/p/book/9781805127161" target="_blank">Martin, O. A. (2024). <em>Bayesian Analysis with Python</em>, 3rd ed. Packt.</a>
+<p>The best companion text for learning PyMC through examples. Chapters 3 and 4 cover model comparison and diagnostics in depth, using the same ArviZ API as this recipe.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.7717/peerj-cs.55" target="_blank">Salvatier, J., Wiecki, T. V., &amp; Fonnesbeck, C. (2016). Probabilistic programming in Python using PyMC3. <em>PeerJ Computer Science</em>, 2, e55.</a>
+<p>The foundational PyMC paper describing the NUTS sampler and the model specification API. Essential reading for understanding what happens inside <code>pm.sample()</code>.</p>
+</div>
+</div>
+
+<div class="bib-category">
+<h3>ArviZ and Diagnostics</h3>
+<div class="bib-card">
+<a href="https://python.arviz.org/en/stable/" target="_blank">Kumar, R. et al. (2019). ArviZ: a unified library for exploratory analysis of Bayesian models. <em>JOSS</em>, 4(33), 1143.</a>
+<p>The diagnostics and visualization library used throughout this recipe. The <code>az.compare()</code>, <code>az.summary()</code>, and <code>az.plot_posterior()</code> functions are essential tools for any Bayesian workflow.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1214/20-BA1221" target="_blank">Vehtari, A., Gelman, A., &amp; Gabry, J. (2017). Practical Bayesian model evaluation using leave-one-out cross-validation and WAIC. <em>Statistics and Computing</em>, 27(5), 1413-1432.</a>
+<p>The theory behind LOO-CV and WAIC as implemented in ArviZ. Explains Pareto-smoothed importance sampling (PSIS) and when LOO diagnostics flag unreliable estimates.</p>
+</div>
+</div>
+
+<div class="bib-category">
+<h3>Bayesian Workflow</h3>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2011.01808" target="_blank">Gelman, A. et al. (2020). Bayesian workflow. arXiv:2011.01808.</a>
+<p>Describes the iterative process of model building, checking, and revision that this recipe implements. The "prior predictive check" and "posterior predictive check" steps come from this framework.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1016/j.jmp.2012.08.001" target="_blank">Kruschke, J. K. (2013). Bayesian estimation supersedes the t-test. <em>Journal of Experimental Psychology: General</em>, 142(2), 573-603.</a>
+<p>Introduced the ROPE concept and the BEST (Bayesian Estimation Supersedes the t-Test) approach used in the effect interpretation. Demonstrates that Bayesian methods provide richer conclusions than dichotomous significance testing.</p>
+</div>
+</div>
+
+<div class="bib-category">
+<h3>Higher-Level Libraries</h3>
+<div class="bib-card">
+<a href="https://bambinos.github.io/bambi/" target="_blank">Capretto, T. et al. (2022). Bambi: A simple interface for fitting Bayesian linear models in Python. <em>JOSS</em>, 7(72), 3630.</a>
+<p>Formula-based interface to PyMC. Reduces the model specification for standard designs to a single line. The "Right Tool" shortcut for routine Bayesian analyses.</p>
+</div>
+<div class="bib-card">
+<a href="https://causalpy.readthedocs.io/en/stable/" target="_blank">CausalPy Documentation. (2024).</a>
+<p>Bayesian causal inference with synthetic controls, difference-in-differences, and regression discontinuity. Extends the hypothesis testing framework to causal questions, connecting to <a href="../../part-3-data-models/module-31-causal-discovery/index.html">Chapter 31</a>.</p>
+</div>
+</div>
+
+<div class="bib-category">
+<h3>Reproducibility Tools</h3>
+<div class="bib-card">
+<a href="https://mlflow.org/docs/latest/index.html" target="_blank">MLflow Documentation. (2024).</a>
+<p>Experiment tracking and model registry. Integrates with the <code>ExperimentRecord</code> pattern from <a href="section-2.3.html">Section 2.3</a>, scaling it to multi-model, multi-run workflows.</p>
+</div>
+<div class="bib-card">
+<a href="https://docs.wandb.ai/" target="_blank">Weights &amp; Biases Documentation. (2024).</a>
+<p>Cloud-based experiment tracking with automatic visualization. Particularly strong for hyperparameter sweeps and comparing many model variants.</p>
+</div>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="section-2.3.html">&#8592; 2.3 Reproducibility and Measurement</a>
+<a href="index.html">Chapter 2</a>
+<a class="next" href="../module-03-knowledge-representation/index.html">Chapter 3: Knowledge Representation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

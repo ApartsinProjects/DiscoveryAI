@@ -1,0 +1,1288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.3: Building a Claim Validator. End-to-end pipeline that extracts numerical claims, links them to MLflow artifacts, re-executes evaluation code, and produces scored validation reports." name="description"/>
+<title>Section 41.3: Building a Claim Validator | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Scientific Claim Validation</a></div>
+<h1>41.3 Building a Claim Validator</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I built a system that validates scientific claims automatically. Its first output was a validation report on its own paper. The irony was not lost on me, but the three discrepancies it found certainly were."</p>
+<cite>A Validator That Validated Itself Into an Existential Crisis</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section integrates all components from
+<a href="section-41.1.html">Section 41.1</a> (claim extraction, evidence mapping,
+citation checking) and <a href="section-41.2.html">Section 41.2</a> (reproducibility
+auditing, leakage detection, artifact verification). You should have working
+familiarity with the <code>Claim</code>, <code>ReproducibilityScore</code>, and
+<code>LeakageReport</code> dataclasses from those sections. Experience with the
+Discovery Workbench architecture from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>
+is helpful for understanding how the validator integrates as a workbench component.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The previous two sections built individual tools: an extractor that finds claims, a
+mapper that links them to evidence, a scorer that quantifies reproducibility, a detector
+that finds leakage. This section assembles those tools into a single, end-to-end claim
+validation pipeline. The pipeline accepts a paper (as text, PDF, or a DOI), produces a
+structured validation report with per-claim confidence ratings, and integrates with the
+Discovery Workbench as a reusable component. The recipe follows the pattern established
+throughout Part IV: we build from primitives, compose them into a pipeline, and wrap the
+pipeline in an interface that other systems can consume.
+</p>
+</div>
+
+<h2>1. Pipeline Architecture</h2>
+
+<p>
+The claim validator operates in five sequential stages, each consuming the output of the
+previous stage. The stages are: (1) <strong>ingestion</strong>, which converts a paper
+into structured text; (2) <strong>extraction</strong>, which identifies and parses claims;
+(3) <strong>evidence mapping</strong>, which links claims to artifacts and checks
+citations; (4) <strong>verification</strong>, which re-executes experiments and checks
+for leakage; and (5) <strong>scoring</strong>, which produces per-claim confidence
+ratings and an aggregate validation report.
+</p>
+
+<p data-agent="02">
+A claim validation pipeline is a software system that takes a scientific paper as input and produces a structured report scoring how well each factual assertion in the paper is supported by reproducible evidence. It matters because manual verification of numerical claims, artifact links, and citation integrity does not scale to the volume of modern scientific publishing; a single reviewer cannot cross-check every number against every code repository and dataset. The pipeline works by chaining specialized stages (ingestion, extraction, evidence mapping, verification, scoring) so that each stage's output becomes the next stage's input, accumulating evidence in a shared context object that grows richer at every step. Use a pipeline like this when you need systematic, repeatable auditing of quantitative claims across many papers; for one-off spot checks on a single figure, a manual inspection of the code repository is often faster.
+</p>
+
+<p>
+Each stage is implemented as an independent class with a <code>run()</code> method,
+following the pipeline pattern. Stages communicate through a shared
+<code>ValidationContext</code> object that accumulates results as the pipeline
+progresses. This design allows stages to be run independently (useful for debugging),
+swapped with alternative implementations (useful for different domains), and extended
+with new checks without modifying existing stages.
+</p>
+
+<pre><code class="language-python">"""
+Claim validation pipeline: end-to-end architecture.
+Five stages convert a paper into a scored validation report.
+"""
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+import json
+
+
+class ValidationStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class OverallVerdict(Enum):
+    VALIDATED = "validated"          # All claims pass
+    PARTIALLY_VALIDATED = "partial"  # Some claims fail
+    NOT_VALIDATED = "not_validated"  # Most claims fail
+    INSUFFICIENT_EVIDENCE = "insufficient"  # Cannot verify
+
+
+@dataclass
+class ClaimValidationResult:
+    """Validation result for a single claim."""
+    claim: Claim
+    evidence_strength: EvidenceStrength
+    reproducibility_score: Optional[ReproducibilityScore]
+    leakage_reports: list[LeakageReport]
+    citation_anomalies: list[CitationAnomaly]
+    artifact_integrity: list[ArtifactIntegrity]
+    confidence: float          # 0 to 1, overall confidence
+    verdict: str               # reproduced, partial, failed, etc.
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ValidationReport:
+    """Complete validation report for a paper."""
+    paper_id: str
+    paper_title: str
+    timestamp: str
+    overall_verdict: OverallVerdict
+    overall_confidence: float
+    total_claims: int
+    verified_claims: int
+    failed_claims: int
+    unverifiable_claims: int
+    claim_results: list[ClaimValidationResult]
+    pipeline_metadata: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        """Serialize report to a dictionary for JSON export."""
+        return {
+            "paper_id": self.paper_id,
+            "paper_title": self.paper_title,
+            "timestamp": self.timestamp,
+            "overall_verdict": self.overall_verdict.value,
+            "overall_confidence": round(
+                self.overall_confidence, 3
+            ),
+            "summary": {
+                "total_claims": self.total_claims,
+                "verified": self.verified_claims,
+                "failed": self.failed_claims,
+                "unverifiable": self.unverifiable_claims,
+            },
+            "claims": [
+                {
+                    "claim_id": cr.claim.claim_id,
+                    "summary": cr.claim.summary(),
+                    "confidence": round(cr.confidence, 3),
+                    "verdict": cr.verdict,
+                    "evidence_strength":
+                        cr.evidence_strength.value,
+                    "notes": cr.notes,
+                }
+                for cr in self.claim_results
+            ],
+        }
+
+    def save(self, path: str):
+        """Save report as JSON."""
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+
+@dataclass
+class ValidationContext:
+    """Shared context accumulating results across stages."""
+    paper_id: str = ""
+    paper_title: str = ""
+    raw_text: str = ""
+    claims: list[Claim] = field(default_factory=list)
+    artifacts: list[Artifact] = field(default_factory=list)
+    evidence_links: list[EvidenceLink] = field(
+        default_factory=list
+    )
+    citation_anomalies: list[CitationAnomaly] = field(
+        default_factory=list
+    )
+    reproducibility_scores: dict = field(
+        default_factory=dict
+    )  # claim_id -> ReproducibilityScore
+    leakage_reports: list[LeakageReport] = field(
+        default_factory=list
+    )
+    artifact_checks: list[ArtifactIntegrity] = field(
+        default_factory=list
+    )
+    stage_timings: dict = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+</code></pre>
+<div class="code-caption">Listing 41.15: Core data structures for the validation pipeline. The ValidationContext accumulates results across stages, while the ValidationReport provides the final output with per-claim confidence ratings and an overall verdict.</div>
+
+<h2>2. Pipeline Stages</h2>
+
+<p>
+Each stage is a class that implements a common interface: a <code>run()</code> method
+that accepts a <code>ValidationContext</code>, modifies it in place, and returns it.
+This pattern enables both sequential execution (the standard path) and selective
+re-execution (useful when only one stage needs updating).
+</p>
+
+<h3>2.1 Stage 1: Ingestion</h3>
+
+<pre><code class="language-python">"""
+Stage 1: Paper ingestion.
+Converts various input formats (text, PDF, DOI) into
+structured text for claim extraction.
+"""
+import time
+
+
+class IngestionStage:
+    """Convert paper input into structured text."""
+
+    def __init__(self, crossref: CrossrefClient = None):
+        self.crossref = crossref
+
+    def run(self, ctx: ValidationContext) -> ValidationContext:
+        """Ingest paper and populate context with text and metadata.
+
+        Supports three input modes:
+        - Direct text (ctx.raw_text already set)
+        - DOI (ctx.paper_id starts with "10.")
+        - File path (ctx.paper_id is a local path)
+        """
+        start = time.time()
+
+        if ctx.raw_text:
+            # Text already provided; extract title heuristically
+            lines = ctx.raw_text.strip().split("\n")
+            if not ctx.paper_title and lines:
+                ctx.paper_title = lines[0].strip()
+
+        elif ctx.paper_id.startswith("10."):
+            # DOI: fetch metadata from Crossref
+            if self.crossref is None:
+                ctx.errors.append(
+                    "Crossref client required for DOI ingestion"
+                )
+                return ctx
+            record = self.crossref.get_work(ctx.paper_id)
+            if record:
+                ctx.paper_title = record.title
+                # Note: Crossref does not provide full text;
+                # in production, use Unpaywall or CORE for OA
+                ctx.raw_text = (
+                    f"Title: {record.title}\n"
+                    f"Authors: {', '.join(record.authors)}\n"
+                    f"Year: {record.year}\n"
+                    f"Journal: {record.journal}\n"
+                )
+            else:
+                ctx.errors.append(
+                    f"Could not fetch DOI: {ctx.paper_id}"
+                )
+
+        elif Path(ctx.paper_id).exists():
+            # Local file: read text content
+            path = Path(ctx.paper_id)
+            ctx.paper_title = path.stem
+            if path.suffix == ".txt":
+                ctx.raw_text = path.read_text(encoding="utf-8")
+            elif path.suffix == ".pdf":
+                # Production: use PyMuPDF or pdfplumber
+                ctx.errors.append(
+                    "PDF parsing requires PyMuPDF; install with "
+                    "'pip install pymupdf'"
+                )
+
+        ctx.stage_timings["ingestion"] = time.time() - start
+        return ctx
+</code></pre>
+<div class="code-caption">Listing 41.16: Ingestion stage that normalizes paper input from DOI, text, or file path into a common ValidationContext representation. DOI-based ingestion retrieves metadata from Crossref.</div>
+
+<h3>2.2 Stage 2: Extraction</h3>
+
+<pre><code class="language-python">"""
+Stage 2: Claim extraction.
+Runs both regex and LLM extractors, then merges results.
+"""
+
+
+class ExtractionStage:
+    """Extract and merge claims from paper text."""
+
+    def __init__(self, llm_client=None):
+        self.regex_extractor = NumericalClaimExtractor()
+        self.llm_client = llm_client
+
+    def run(self, ctx: ValidationContext) -> ValidationContext:
+        """Extract claims from the paper text."""
+        start = time.time()
+
+        if not ctx.raw_text:
+            ctx.errors.append("No text available for extraction")
+            return ctx
+
+        # Regex extraction (always runs)
+        regex_claims = list(self.regex_extractor.extract(
+            ctx.raw_text, source_id=ctx.paper_id
+        ))
+
+        # LLM extraction (optional, runs if client available)
+        llm_claims = []
+        if self.llm_client is not None:
+            try:
+                llm_claims = extract_claims_with_llm(
+                    ctx.raw_text, self.llm_client
+                )
+            except Exception as e:
+                ctx.errors.append(
+                    f"LLM extraction failed: {e}"
+                )
+
+        # Merge and deduplicate
+        if llm_claims:
+            ctx.claims = merge_claims(regex_claims, llm_claims)
+        else:
+            ctx.claims = regex_claims
+
+        ctx.stage_timings["extraction"] = time.time() - start
+        return ctx
+</code></pre>
+<div class="code-caption">Listing 41.17: Extraction stage that runs both regex and LLM claim extractors and merges the results. The LLM extractor is optional, allowing the pipeline to run without API access (at the cost of recall).</div>
+
+<h3>2.3 Stage 3: Evidence Mapping</h3>
+
+<pre><code class="language-python">"""
+Stage 3: Evidence mapping.
+Links claims to artifacts and checks citation integrity.
+"""
+
+
+class EvidenceMappingStage:
+    """Map claims to supporting artifacts and check citations."""
+
+    def __init__(
+        self,
+        crossref: CrossrefClient,
+        openalex: OpenAlexClient,
+    ):
+        self.crossref = crossref
+        self.openalex = openalex
+        self.linker = ArtifactLinker()
+        self.anomaly_detector = CitationAnomalyDetector(
+            crossref, openalex
+        )
+
+    def run(self, ctx: ValidationContext) -> ValidationContext:
+        """Build evidence map and check citation integrity."""
+        start = time.time()
+
+        # Extract artifacts from paper text
+        ctx.artifacts = self.linker.extract_artifacts(
+            ctx.raw_text
+        )
+
+        # Verify artifact accessibility
+        for i, artifact in enumerate(ctx.artifacts):
+            ctx.artifacts[i] = self.linker.verify_accessibility(
+                artifact
+            )
+
+        # Link claims to artifacts
+        ctx.evidence_links = self.linker.link_claims_to_artifacts(
+            ctx.claims, ctx.artifacts
+        )
+
+        # Update claim evidence strength
+        for claim in ctx.claims:
+            claim_links = [
+                el for el in ctx.evidence_links
+                if el.claim_id == claim.claim_id
+            ]
+            accessible_links = [
+                el for el in claim_links
+                if any(
+                    a.accessible
+                    for a in ctx.artifacts
+                    if a.artifact_id == el.artifact_id
+                )
+            ]
+
+            if accessible_links:
+                claim.evidence_strength = (
+                    EvidenceStrength.MODERATE
+                )
+            elif claim_links:
+                claim.evidence_strength = EvidenceStrength.WEAK
+            else:
+                claim.evidence_strength = (
+                    EvidenceStrength.UNSUPPORTED
+                )
+            claim.linked_artifacts = [
+                el.artifact_id for el in claim_links
+            ]
+
+        # Citation anomaly detection (if DOI available)
+        if ctx.paper_id.startswith("10."):
+            try:
+                ctx.citation_anomalies = (
+                    self.anomaly_detector.detect_anomalies(
+                        ctx.paper_id
+                    )
+                )
+            except Exception as e:
+                ctx.errors.append(
+                    f"Citation check failed: {e}"
+                )
+
+        ctx.stage_timings["evidence_mapping"] = (
+            time.time() - start
+        )
+        return ctx
+</code></pre>
+<div class="code-caption">Listing 41.18: Evidence mapping stage that extracts artifacts, verifies their accessibility, links them to claims, and runs citation anomaly detection. Each claim's evidence strength is updated based on the available artifact links.</div>
+
+<h3>2.4 Stage 4: Verification</h3>
+
+<pre><code class="language-python">"""
+Stage 4: Verification.
+Re-executes experiments and checks for data leakage.
+"""
+import pandas as pd
+
+
+class VerificationStage:
+    """Re-execute experiments and verify claim validity."""
+
+    def __init__(
+        self,
+        mlflow_uri: str = None,
+        repo_path: str = None,
+    ):
+        self.mlflow_auditor = (
+            MLflowAuditor(mlflow_uri) if mlflow_uri else None
+        )
+        self.dvc_verifier = (
+            DVCVerifier(repo_path) if repo_path else None
+        )
+        self.repro_auditor = ReproducibilityAuditor(
+            confidence=0.95, min_runs=3
+        )
+        self.leakage_detector = LeakageDetector()
+
+    def run(self, ctx: ValidationContext) -> ValidationContext:
+        """Attempt to reproduce claimed results."""
+        start = time.time()
+
+        # Reproducibility scoring via MLflow
+        if self.mlflow_auditor:
+            for claim in ctx.claims:
+                if not claim.is_verifiable():
+                    continue
+                if claim.value.magnitude is None:
+                    continue
+
+                runs = self.mlflow_auditor.find_runs_for_claim(
+                    claim
+                )
+                if len(runs) >= 3:
+                    metric = (
+                        self.mlflow_auditor._normalize_metric(
+                            claim.predicate
+                        )
+                    )
+                    values = [
+                        r.metrics[metric]
+                        for r in runs
+                        if metric in r.metrics
+                    ]
+                    if values:
+                        score = self.repro_auditor.score_claim(
+                            claim.value.magnitude, values
+                        )
+                        ctx.reproducibility_scores[
+                            claim.claim_id
+                        ] = score
+
+        # Dataset integrity via DVC
+        if self.dvc_verifier:
+            ctx.artifact_checks = (
+                self.dvc_verifier.verify_all_tracked()
+            )
+
+        # Leakage detection (if data files are available)
+        self._run_leakage_checks(ctx)
+
+        ctx.stage_timings["verification"] = (
+            time.time() - start
+        )
+        return ctx
+
+    def _run_leakage_checks(self, ctx: ValidationContext):
+        """Run leakage detection if train/test data is available."""
+        # Look for standard data file names in artifacts
+        data_artifacts = [
+            a for a in ctx.artifacts
+            if a.artifact_type == ArtifactType.DATASET
+        ]
+
+        # Try loading train/test splits from known paths
+        train_paths = [
+            "data/train.csv", "train.csv",
+            "data/train.parquet"
+        ]
+        test_paths = [
+            "data/test.csv", "test.csv",
+            "data/test.parquet"
+        ]
+
+        train_df = None
+        test_df = None
+
+        for tp in train_paths:
+            if Path(tp).exists():
+                try:
+                    train_df = pd.read_csv(tp)
+                    break
+                except Exception:
+                    continue
+
+        for tp in test_paths:
+            if Path(tp).exists():
+                try:
+                    test_df = pd.read_csv(tp)
+                    break
+                except Exception:
+                    continue
+
+        if train_df is not None and test_df is not None:
+            # Guess target column (last column or 'label'/'target')
+            target_col = None
+            for candidate in ["label", "target", "y"]:
+                if candidate in train_df.columns:
+                    target_col = candidate
+                    break
+            if target_col is None:
+                target_col = train_df.columns[-1]
+
+            ctx.leakage_reports = self.leakage_detector.detect_all(
+                train_df, test_df, target_col
+            )
+</code></pre>
+<div class="code-caption">Listing 41.19: Verification stage that retrieves MLflow runs for each verifiable claim, computes reproducibility scores, checks DVC dataset integrity, and runs leakage detection on available data files.</div>
+
+<h3>2.5 Stage 5: Scoring and Report Generation</h3>
+
+<pre><code class="language-python">"""
+Stage 5: Scoring and report generation.
+Combines all evidence into per-claim confidence scores
+and an overall validation report.
+"""
+
+
+class ScoringStage:
+    """Compute final scores and generate validation report."""
+
+    # Weights for evidence components
+    WEIGHTS = {
+        "evidence_strength": 0.20,
+        "reproducibility": 0.35,
+        "leakage_clean": 0.20,
+        "artifact_integrity": 0.15,
+        "citation_clean": 0.10,
+    }
+
+    def run(self, ctx: ValidationContext) -> ValidationReport:
+        """Compute per-claim scores and overall verdict."""
+        start = time.time()
+        claim_results = []
+
+        for claim in ctx.claims:
+            result = self._score_claim(claim, ctx)
+            claim_results.append(result)
+
+        # Aggregate statistics
+        verified = sum(
+            1 for cr in claim_results
+            if cr.verdict == "reproduced"
+        )
+        failed = sum(
+            1 for cr in claim_results
+            if cr.verdict == "not_reproduced"
+        )
+        unverifiable = sum(
+            1 for cr in claim_results
+            if cr.verdict == "unverifiable"
+        )
+
+        # Overall confidence: weighted mean of claim confidences
+        if claim_results:
+            # Weight verifiable claims more heavily
+            weights = [
+                2.0 if cr.claim.is_verifiable() else 1.0
+                for cr in claim_results
+            ]
+            overall = sum(
+                cr.confidence * w
+                for cr, w in zip(claim_results, weights)
+            ) / sum(weights)
+        else:
+            overall = 0.0
+
+        # Overall verdict
+        if not claim_results:
+            verdict = OverallVerdict.INSUFFICIENT_EVIDENCE
+        elif failed == 0 and verified > 0:
+            verdict = OverallVerdict.VALIDATED
+        elif verified > failed:
+            verdict = OverallVerdict.PARTIALLY_VALIDATED
+        else:
+            verdict = OverallVerdict.NOT_VALIDATED
+
+        ctx.stage_timings["scoring"] = time.time() - start
+
+        return ValidationReport(
+            paper_id=ctx.paper_id,
+            paper_title=ctx.paper_title,
+            timestamp=datetime.utcnow().isoformat(),
+            overall_verdict=verdict,
+            overall_confidence=overall,
+            total_claims=len(ctx.claims),
+            verified_claims=verified,
+            failed_claims=failed,
+            unverifiable_claims=unverifiable,
+            claim_results=claim_results,
+            pipeline_metadata={
+                "stage_timings": ctx.stage_timings,
+                "errors": ctx.errors,
+                "artifacts_found": len(ctx.artifacts),
+                "evidence_links": len(ctx.evidence_links),
+            },
+        )
+
+    def _score_claim(
+        self, claim: Claim, ctx: ValidationContext
+    ) -> ClaimValidationResult:
+        """Compute confidence score for a single claim."""
+        components = {}
+
+        # 1. Evidence strength component
+        strength_scores = {
+            EvidenceStrength.STRONG: 1.0,
+            EvidenceStrength.MODERATE: 0.6,
+            EvidenceStrength.WEAK: 0.3,
+            EvidenceStrength.UNSUPPORTED: 0.0,
+        }
+        components["evidence_strength"] = strength_scores.get(
+            claim.evidence_strength, 0.0
+        )
+
+        # 2. Reproducibility component
+        repro = ctx.reproducibility_scores.get(claim.claim_id)
+        if repro is not None:
+            components["reproducibility"] = repro.score
+        elif claim.is_verifiable():
+            components["reproducibility"] = 0.0  # No data
+        else:
+            components["reproducibility"] = 0.5  # Not applicable
+
+        # 3. Leakage component (binary: clean or not)
+        critical_leakage = any(
+            lr.severity == "critical"
+            for lr in ctx.leakage_reports
+        )
+        components["leakage_clean"] = (
+            0.0 if critical_leakage else 1.0
+        )
+
+        # 4. Artifact integrity component
+        if ctx.artifact_checks:
+            intact = sum(
+                1 for ac in ctx.artifact_checks if ac.matches
+            )
+            components["artifact_integrity"] = (
+                intact / len(ctx.artifact_checks)
+            )
+        else:
+            components["artifact_integrity"] = 0.5  # Unknown
+
+        # 5. Citation integrity component
+        high_anomalies = sum(
+            1 for ca in ctx.citation_anomalies
+            if ca.severity == "high"
+        )
+        components["citation_clean"] = max(
+            0.0, 1.0 - high_anomalies * 0.3
+        )
+
+        # Weighted combination
+        confidence = sum(
+            components[k] * self.WEIGHTS[k]
+            for k in self.WEIGHTS
+        )
+
+        # Determine verdict
+        if repro is not None:
+            verdict = repro.verdict.value
+        elif not claim.is_verifiable():
+            verdict = "unverifiable"
+        elif components["evidence_strength"] == 0.0:
+            verdict = "unsupported"
+        else:
+            verdict = "pending"
+
+        # Generate notes
+        notes = self._generate_notes(
+            claim, components, ctx
+        )
+
+        return ClaimValidationResult(
+            claim=claim,
+            evidence_strength=claim.evidence_strength,
+            reproducibility_score=repro,
+            leakage_reports=ctx.leakage_reports,
+            citation_anomalies=ctx.citation_anomalies,
+            artifact_integrity=ctx.artifact_checks,
+            confidence=confidence,
+            verdict=verdict,
+            notes=notes,
+        )
+
+    def _generate_notes(
+        self, claim: Claim, components: dict,
+        ctx: ValidationContext
+    ) -> list[str]:
+        """Generate human-readable notes for a claim result."""
+        notes = []
+
+        if components["evidence_strength"] == 0.0:
+            notes.append(
+                "No supporting artifacts found for this claim."
+            )
+
+        repro = ctx.reproducibility_scores.get(claim.claim_id)
+        if repro and repro.verdict == (
+            ReproducibilityVerdict.NOT_REPRODUCED
+        ):
+            notes.append(
+                f"Claimed {repro.claimed_value} but reproduced "
+                f"mean is {repro.mean:.3f} "
+                f"(delta: {repro.delta:+.3f})."
+            )
+
+        if components["leakage_clean"] == 0.0:
+            notes.append(
+                "Critical data leakage detected; reported "
+                "metrics may be inflated."
+            )
+
+        if components["citation_clean"] < 0.5:
+            notes.append(
+                "Significant citation anomalies detected; "
+                "evidence chain may be compromised."
+            )
+
+        return notes
+</code></pre>
+<div class="code-caption">Listing 41.20: Scoring stage that combines evidence strength, reproducibility, leakage status, artifact integrity, and citation quality into a weighted per-claim confidence score. The weights reflect the relative importance of each evidence component, with reproducibility carrying the highest weight at 35%.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the weighted confidence score like a restaurant health inspection. The inspector checks five categories: food temperature (reproducibility, weighted highest because unsafe food is the most direct risk), ingredient sourcing records (evidence strength), pest control (leakage cleanliness), kitchen equipment calibration (artifact integrity), and posted permit validity (citation quality). Each category gets a score, and the categories carry different weights reflecting their relative danger. A restaurant that scores perfectly on permits but fails food temperature still gets a low overall grade. The weighted sum does not tell you whether the restaurant will make you sick on any given visit; it tells you how many of the checkable safety dimensions passed inspection. The same logic applies to the claim validator: a high confidence score means the checkable evidence dimensions look good, not that the claim is guaranteed to be true.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+The weight vector in the scoring stage encodes a value judgment: what matters most
+for scientific trust? We assign the highest weight (0.35) to reproducibility because a
+claim that cannot be reproduced is, by definition, not established science. Evidence
+strength (0.20) and leakage cleanliness (0.20) share the next tier because both affect
+whether the reported number means what it claims to mean. Artifact integrity (0.15) and
+citation quality (0.10) are supporting signals. These weights are configurable; a
+regulatory context might increase artifact integrity to 0.30, while a rapid literature
+survey might drop it to 0.05. The key design decision is making the weights explicit
+rather than implicit in the code logic.
+</p>
+</div>
+
+<h2>3. The Complete Pipeline</h2>
+
+<p>
+With all five stages defined, the pipeline itself is a thin orchestrator that runs
+each stage in sequence and handles errors gracefully.
+</p>
+
+<pre><code class="language-python">"""
+Complete claim validation pipeline.
+Orchestrates all five stages and handles errors.
+"""
+
+
+class ClaimValidationPipeline:
+    """End-to-end claim validation pipeline."""
+
+    def __init__(
+        self,
+        crossref_email: str,
+        mlflow_uri: str = None,
+        repo_path: str = None,
+        llm_client=None,
+    ):
+        """Initialize all pipeline stages.
+
+        Args:
+            crossref_email: Contact email for Crossref API.
+            mlflow_uri: MLflow tracking server URI.
+            repo_path: Path to Git/DVC repository.
+            llm_client: Optional LLM client for extraction.
+        """
+        crossref = CrossrefClient(crossref_email)
+        openalex = OpenAlexClient(crossref_email)
+
+        self.stages = [
+            ("ingestion", IngestionStage(crossref)),
+            ("extraction", ExtractionStage(llm_client)),
+            ("evidence_mapping", EvidenceMappingStage(
+                crossref, openalex
+            )),
+            ("verification", VerificationStage(
+                mlflow_uri, repo_path
+            )),
+        ]
+        self.scorer = ScoringStage()
+
+    def validate(
+        self,
+        paper_id: str = "",
+        paper_text: str = "",
+        paper_title: str = "",
+    ) -> ValidationReport:
+        """Run the full validation pipeline.
+
+        Args:
+            paper_id: DOI or file path for the paper.
+            paper_text: Direct text input (alternative to DOI).
+            paper_title: Optional title override.
+
+        Returns:
+            ValidationReport with per-claim results.
+        """
+        ctx = ValidationContext(
+            paper_id=paper_id,
+            paper_title=paper_title,
+            raw_text=paper_text,
+        )
+
+        # Run stages 1-4
+        for stage_name, stage in self.stages:
+            try:
+                ctx = stage.run(ctx)
+            except Exception as e:
+                ctx.errors.append(
+                    f"Stage '{stage_name}' failed: {e}"
+                )
+                # Continue to next stage; partial results
+                # are better than no results
+
+        # Stage 5: scoring (produces the final report)
+        try:
+            report = self.scorer.run(ctx)
+        except Exception as e:
+            # If scoring fails, return a minimal report
+            report = ValidationReport(
+                paper_id=paper_id,
+                paper_title=paper_title,
+                timestamp=datetime.utcnow().isoformat(),
+                overall_verdict=(
+                    OverallVerdict.INSUFFICIENT_EVIDENCE
+                ),
+                overall_confidence=0.0,
+                total_claims=len(ctx.claims),
+                verified_claims=0,
+                failed_claims=0,
+                unverifiable_claims=len(ctx.claims),
+                claim_results=[],
+                pipeline_metadata={
+                    "errors": ctx.errors + [str(e)],
+                },
+            )
+
+        return report
+
+    def validate_batch(
+        self, papers: list[dict]
+    ) -> list[ValidationReport]:
+        """Validate multiple papers.
+
+        Args:
+            papers: List of dicts with 'paper_id' and/or 'text'.
+
+        Returns:
+            List of ValidationReports.
+        """
+        return [
+            self.validate(
+                paper_id=p.get("paper_id", ""),
+                paper_text=p.get("text", ""),
+                paper_title=p.get("title", ""),
+            )
+            for p in papers
+        ]
+
+
+# --- Full demonstration ---
+def demo_validation():
+    """Demonstrate the complete validation pipeline."""
+
+    pipeline = ClaimValidationPipeline(
+        crossref_email="researcher@university.edu",
+        mlflow_uri="file:///mlruns",
+        repo_path=".",
+    )
+
+    abstract = (
+        "We present ClaimNet, a transformer model for "
+        "automated scientific claim verification. ClaimNet "
+        "achieves 94.7% accuracy on the SciFact benchmark "
+        "dataset, outperforming the previous state-of-the-art "
+        "by 3.2 percentage points. On FEVER, our model obtains "
+        "an F1 score of 89.3%. All improvements are "
+        "statistically significant (p < 0.001). Our code is "
+        "available at https://github.com/example/claimnet "
+        "and models are hosted on "
+        "https://huggingface.co/example/claimnet-base."
+    )
+
+    report = pipeline.validate(
+        paper_id="paper_demo_001",
+        paper_text=abstract,
+        paper_title="ClaimNet: Automated Scientific Claim "
+                    "Verification",
+    )
+
+    # Print summary
+    print(f"Paper: {report.paper_title}")
+    print(f"Verdict: {report.overall_verdict.value}")
+    print(f"Confidence: {report.overall_confidence:.3f}")
+    print(f"Claims: {report.total_claims} total, "
+          f"{report.verified_claims} verified, "
+          f"{report.failed_claims} failed")
+    print()
+    for cr in report.claim_results:
+        print(f"  [{cr.verdict}] {cr.claim.summary()} "
+              f"(confidence: {cr.confidence:.3f})")
+        for note in cr.notes:
+            print(f"    - {note}")
+
+    # Save report
+    report.save("validation_report.json")
+    return report
+</code></pre>
+<div class="code-caption">Listing 41.21: Complete claim validation pipeline that chains ingestion, extraction, evidence mapping, verification, and scoring into a single validate() call. Error handling ensures partial results are returned even when individual stages fail.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example</div>
+<p>
+<strong>Claim validation at a machine learning conference.</strong> A program committee
+integrates the claim validator into their review workflow. When a paper is submitted,
+the pipeline automatically extracts numerical claims from the abstract and results
+sections, checks whether the referenced GitHub repository exists and contains evaluation
+code, looks up the paper's cited references in Crossref to verify they exist, and searches
+OpenAlex for independent reproductions of the claimed results. The validation report
+is attached to the review form. Reviewers see that Paper #347 claims "93.2% on GLUE"
+but the GitHub repository returns a 404, the three cited baseline papers all share an
+author with the submission (self-citation rate of 60%), and no independent reproduction
+exists. Paper #892, by contrast, has an accessible repository, all citations resolve,
+a clean self-citation rate of 12%, and two independent groups have reported similar
+results. The reviewers still read both papers carefully, but the validation reports
+tell them where to focus their scrutiny.
+</p>
+</div>
+
+<h2>4. Integration with the Discovery Workbench</h2>
+
+<p>
+The claim validator integrates into the Discovery Workbench as a service component,
+following the architecture established in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.
+The workbench exposes the validator through a simple API: submit a paper (by DOI, text,
+or file), receive a structured validation report. Other workbench components consume
+these reports: the research agent from
+<a href="../module-40-research-agents/index.html">Chapter 40</a> uses validation
+scores to filter hypotheses, the knowledge graph from
+<a href="../module-38-knowledge-graphs/index.html">Chapter 38</a> annotates claim
+nodes with confidence ratings, and the literature mining pipeline from
+<a href="../module-36-literature-mining/index.html">Chapter 36</a> flags papers with
+low validation scores for manual review.
+</p>
+
+<pre><code class="language-python">"""
+Discovery Workbench integration for the claim validator.
+Wraps the pipeline as a service with caching and batch support.
+"""
+from functools import lru_cache
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ClaimValidatorService:
+    """Workbench service wrapper for claim validation."""
+
+    def __init__(self, config: dict):
+        """Initialize from workbench configuration.
+
+        Args:
+            config: Dictionary with keys:
+                - crossref_email: str
+                - mlflow_uri: str (optional)
+                - repo_path: str (optional)
+                - cache_dir: str (optional)
+                - max_claims_per_paper: int (default 50)
+        """
+        self.pipeline = ClaimValidationPipeline(
+            crossref_email=config["crossref_email"],
+            mlflow_uri=config.get("mlflow_uri"),
+            repo_path=config.get("repo_path"),
+        )
+        self.max_claims = config.get(
+            "max_claims_per_paper", 50
+        )
+        self._cache = {}
+
+    def validate_paper(
+        self, paper_id: str, text: str = ""
+    ) -> dict:
+        """Validate a paper and return a JSON-serializable report.
+
+        Results are cached by paper_id to avoid redundant
+        API calls to Crossref and OpenAlex.
+        """
+        cache_key = f"{paper_id}:{hash(text)}"
+        if cache_key in self._cache:
+            logger.info(f"Cache hit for {paper_id}")
+            return self._cache[cache_key]
+
+        report = self.pipeline.validate(
+            paper_id=paper_id,
+            paper_text=text,
+        )
+
+        result = report.to_dict()
+        self._cache[cache_key] = result
+        return result
+
+    def validate_claim_set(
+        self, claims_json: list[dict]
+    ) -> list[dict]:
+        """Validate a pre-extracted set of claims.
+
+        Useful when claims come from an external source
+        (e.g., a knowledge graph query or a literature
+        mining pipeline) rather than from a paper.
+        """
+        ctx = ValidationContext()
+        ctx.claims = [
+            Claim(
+                claim_id=c.get("id", f"ext_{i}"),
+                claim_type=ClaimType(
+                    c.get("type", "numerical")
+                ),
+                subject=c.get("subject", ""),
+                predicate=c.get("predicate", ""),
+                value=ClaimValue(
+                    magnitude=c.get("value"),
+                    text=str(c.get("value", "")),
+                ),
+                context=c.get("context", {}),
+                source_sentence=c.get("sentence", ""),
+            )
+            for i, c in enumerate(claims_json)
+        ]
+
+        # Run verification and scoring only
+        verification = VerificationStage(
+            mlflow_uri=self.pipeline.stages[3][1].mlflow_auditor
+            and "file:///mlruns",
+        )
+        ctx = verification.run(ctx)
+        report = ScoringStage().run(ctx)
+
+        return report.to_dict()
+
+    def get_summary_stats(self) -> dict:
+        """Return aggregate statistics across all validations."""
+        if not self._cache:
+            return {"total_papers": 0}
+
+        total = len(self._cache)
+        verdicts = [
+            r["overall_verdict"] for r in self._cache.values()
+        ]
+        return {
+            "total_papers": total,
+            "validated": verdicts.count("validated"),
+            "partially_validated": verdicts.count("partial"),
+            "not_validated": verdicts.count("not_validated"),
+            "insufficient": verdicts.count("insufficient"),
+            "avg_confidence": sum(
+                r["overall_confidence"]
+                for r in self._cache.values()
+            ) / total,
+        }
+</code></pre>
+<div class="code-caption">Listing 41.22: Discovery Workbench service wrapper that adds caching, batch support, and summary statistics to the claim validation pipeline. The service exposes a simple validate_paper() method that other workbench components consume.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut</div>
+<p>
+The <a href="https://github.com/allenai/scifact-evaluator" target="_blank">SciFact
+evaluator</a> combined with
+<a href="https://github.com/dwadden/multivers" target="_blank">MultiVerS</a> provides
+a production-ready scientific claim verification system in roughly 30 lines of integration
+code. MultiVerS handles claim detection and evidence retrieval using a pre-trained
+longformer model, while the SciFact evaluator scores claim-evidence pairs for entailment.
+Together, they replace the extraction and evidence mapping stages of our pipeline (about
+500 lines). Our from-scratch implementation is valuable for understanding the design space
+and for customizing the pipeline to non-standard claim formats, domain-specific datasets,
+and organizational MLflow/DVC infrastructure that off-the-shelf tools cannot access.
+</p>
+</div>
+
+<h2>5. Interpreting Validation Reports</h2>
+
+<p>
+A validation report is not a binary judgment. It is a structured assessment that
+highlights where evidence is strong, where it is weak, and where it is absent. Reading
+a validation report requires understanding what each component measures and what it
+does not.
+</p>
+
+<p>
+The <strong>overall confidence</strong> is a weighted average, not a probability. A
+confidence of 0.72 does not mean "there is a 72% chance this paper is correct." It
+means "across the evidence dimensions we checked, the paper scores 72% of the maximum
+possible evidence strength." This distinction matters: a paper could score 0.90 on our
+metrics and still contain a fundamental methodological flaw that our automated checks
+cannot detect.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is treating the overall confidence score as a probability of correctness, concluding that "0.85 confidence means 85% chance the paper's claims are true." This is wrong. The confidence score is a coverage metric over checked evidence dimensions, not a Bayesian posterior. A paper can score 0.95 while harboring a fundamental flaw (such as a flawed experimental design or a confounding variable) that no automated check in the pipeline is equipped to detect. Conversely, a paper scoring 0.40 may simply lack accessible artifacts, making verification impossible rather than indicating the claims are false.
+</p>
+</div>
+
+<p>
+The <strong>per-claim verdicts</strong> are the most actionable part of the report.
+A verdict of "reproduced" means the claim's numerical value falls within the
+statistical tolerance of our reproduction runs. A verdict of "not reproduced" means
+there is a statistically significant gap between the claimed and reproduced values.
+A verdict of "unverifiable" means we lack the artifacts or infrastructure to check.
+Each verdict comes with notes explaining the specific evidence that led to it.
+</p>
+
+<p>
+The most common validation outcome is not "fraud detected" or "paper confirmed." It is
+"evidence gaps identified." A typical report might show that 4 of 7 claims are
+verifiable, 3 of those 4 reproduce within tolerance, and 1 shows a discrepancy of
+2.3 percentage points. This is informative but not conclusive: the discrepancy could
+reflect a different random seed, a minor version difference in a library, or (less
+commonly) an error in the original experiment. The report surfaces the discrepancy;
+human judgment determines the response.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+Claim validation is not a replacement for peer review. It is a force multiplier.
+Peer reviewers bring domain expertise, methodological judgment, and the ability to
+assess whether the right experiment was run. Automated validators bring scale,
+consistency, and the ability to check every number against every artifact. The
+combination is strictly stronger than either alone. A reviewer who has already seen
+a validation report can spend their limited time on the questions that matter most
+rather than manually cross-referencing tables and code repositories.
+</p>
+</div>
+
+<h2>6. Limitations and Future Directions</h2>
+
+<p>
+The claim validator we have built has real capabilities and real limitations. On the
+capability side, it can extract numerical claims with high precision, verify citation
+integrity at scale, detect common data leakage patterns, and quantify reproducibility
+with statistical rigor. On the limitation side, it cannot detect novel leakage
+mechanisms, verify qualitative claims, assess whether the right experiment was
+designed, or determine whether reported results are the product of selective reporting
+(running many experiments and reporting only the best).
+</p>
+
+<p>
+Several directions extend the validator's reach. <strong>Semantic claim entailment</strong>,
+as explored in the SciFact dataset (Wadden et al., 2020), uses natural language
+inference to check whether evidence paragraphs support or refute claims. This handles
+qualitative claims that our numerical extraction pipeline misses.
+<strong>Cross-paper consistency checking</strong> compares claims about the same dataset
+across multiple papers, flagging results that are statistical outliers (e.g., a paper
+claiming 99.1% on ImageNet when the next best is 91.3%).
+<strong>Provenance-aware validation</strong>, building on the experiment registries of
+<a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">Chapter 47</a>,
+traces claims through the full computational provenance graph, from raw data to
+published figure, ensuring that no step in the chain introduces undocumented
+transformations.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+Google DeepMind's SAFE (Search-Augmented Factuality Evaluator), introduced by Wei et al. in 2024, pushes automated claim validation beyond the static pipeline approach taught here. SAFE decomposes long-form LLM responses into individual claims, then uses an LLM agent to issue multi-step Google Search queries that gather supporting or refuting evidence for each claim independently. On a benchmark of approximately 16,000 individual facts, SAFE matched or exceeded human annotator agreement rates while costing roughly 20 times less than human evaluation. The key architectural insight is that the verification agent is itself an LLM that can reason about what evidence to search for and how to interpret the results, rather than relying on fixed extraction patterns. This represents a shift from the rule-based pipeline stages in our validator toward adaptive, agent-driven verification that can handle claims the system was never explicitly programmed to check.
+</p>
+</div>
+
+<p>
+The deepest limitation is philosophical: validation can only check claims against
+available evidence. It cannot generate the evidence itself. A perfectly validated
+claim is not necessarily true; it is merely well-supported by the evidence that exists.
+The gap between "well-supported" and "true" is where science lives, and it is a gap
+that no automated system can fully close.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Minimal Claim Checker</h4>
+<p>
+Build a stripped-down claim validation pipeline using only Python standard libraries plus <code>requests</code>. (1) Write a function that uses a regular expression to extract numerical claims from a string, matching patterns like "achieves 94.7% accuracy" or "F1 score of 89.3%"; return each match as a dictionary with keys <code>metric</code>, <code>value</code>, and <code>sentence</code>. (2) For each extracted claim, use the Crossref REST API (<code>requests.get("https://api.crossref.org/works", params={"query": paper_title})</code>) to check whether the paper's cited references resolve to real DOIs; record how many return HTTP 200 vs. 404. (3) Check whether any GitHub URLs mentioned in the text are accessible by sending a HEAD request and recording the status code. (4) Combine the results into a simple score: start at 1.0, subtract 0.2 for each broken citation, subtract 0.3 for each inaccessible GitHub link, and clamp to [0, 1]. (5) Print a one-page report listing each claim, its extracted value, the citation check results, the repository accessibility status, and the final score. Test your pipeline on two or three real paper abstracts from arXiv (copy the abstract text directly) and compare your automated findings against what you observe by manually visiting the links.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+This chapter completes Part IV: Discovery Through Knowledge. We have built systems for
+mining the scientific literature (<a href="../module-36-literature-mining/index.html">Chapter 36</a>),
+retrieving relevant evidence (<a href="../module-37-rag-discovery/index.html">Chapter 37</a>),
+organizing knowledge into queryable graphs (<a href="../module-38-knowledge-graphs/index.html">Chapter 38</a>),
+generating hypotheses from accumulated knowledge (<a href="../module-39-hypothesis-generation/index.html">Chapter 39</a>),
+deploying autonomous research agents (<a href="../module-40-research-agents/index.html">Chapter 40</a>),
+and validating the claims those systems produce (this chapter). Part V shifts from
+knowledge to computation.
+<a href="../../part-5-simulation-optimization/module-42-differentiable-programming/index.html">Chapter 42: Differentiable Programming for Discovery</a>
+introduces gradient-based optimization as a discovery tool, where every step of a
+scientific computation is differentiable and therefore optimizable. The validated claims
+from this chapter become the ground truth against which the simulation and optimization
+systems of Part V measure their own outputs.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="section-41.2.html">&larr; Section 41.2: Reproducibility Auditing</a>
+<a href="../../part-5-simulation-optimization/module-42-differentiable-programming/index.html">Chapter 42: Differentiable Programming &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

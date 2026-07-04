@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.4: Building a Universal Force Field. Training MACE on molecular datasets, benchmarking against DFT, GNoME, FairChem, and integration with the Discovery Workbench." name="description"/>
+<title>Section 33.4: Building a Universal Force Field | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Scientific Machine Learning</a></div>
+<h1>Section 33.4: Building a Universal Force Field</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I trained on a million quantum calculations so you wouldn't have to run the million-and-first."</p>
+<cite>A Pre-Trained Potential, Saving Compute</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Quantum mechanical calculations (DFT, coupled cluster) give us the ground truth for
+molecular energies and forces, but they are too expensive for many practical applications:
+a single DFT calculation on a 100-atom system takes minutes to hours, making
+nanosecond-scale molecular dynamics or million-compound screening infeasible. Machine-learned
+force fields (MLFFs) replace the quantum calculation with a neural network that predicts
+energy and forces from atomic positions, achieving DFT-level accuracy at a fraction of the
+cost. This section walks through the complete recipe: preparing training data, training a
+MACE model, evaluating accuracy against DFT references, and deploying the model for
+molecular dynamics. We also survey the large-scale efforts (GNoME, FairChem) that are
+transforming materials discovery.
+</p>
+</div>
+
+<h2>1. The Force Field Problem</h2>
+
+<p>
+A force field maps atomic positions $\{\mathbf{r}_1, \ldots, \mathbf{r}_N\}$ and atomic
+numbers $\{Z_1, \ldots, Z_N\}$ to a potential energy $E$ and forces
+$\mathbf{F}_i = -\nabla_{\mathbf{r}_i} E$ on each atom. Classical force fields
+(AMBER, CHARMM, OPLS) use hand-crafted functional forms (harmonic bonds, Lennard-Jones
+interactions, Coulomb terms) with parameters fit to experimental data. These are fast
+but limited in accuracy, especially for bond breaking, charge transfer, and reactive
+chemistry.
+</p>
+
+<p>
+Machine-learned force fields use the equivariant architectures from
+<a href="section-33.3.html">Section 33.3</a> to learn $E(\{\mathbf{r}_i, Z_i\})$ directly
+from quantum mechanical reference data. The forces are obtained by automatic differentiation
+of the predicted energy, which guarantees energy conservation (the forces are the exact
+gradient of a scalar potential). This connects to the
+<a href="../../part-5-simulation-optimization/module-42-differentiable-programming/index.html">differentiable
+programming</a> paradigm of Chapter 42: the entire model, from atomic positions through
+the equivariant GNN to the predicted energy, is a differentiable computation graph.
+</p>
+
+<p data-agent="02">
+A machine-learned force field (MLFF) is a neural network that takes a set of atomic
+positions and element types as input and outputs a single scalar: the total potential
+energy of the system. It matters because it replaces quantum mechanical calculations
+that scale as $O(N^3)$ or worse with a fixed-cost neural network forward pass, cutting
+simulation time by factors of 1,000 to 10,000 while retaining near-quantum accuracy.
+The mechanism is straightforward: an equivariant graph neural network encodes each atom's
+local chemical environment (neighbors within a cutoff radius) into learned features, sums
+these atomic contributions to produce the total energy, and obtains forces by
+backpropagating through the energy with respect to atomic positions. Use an MLFF when you
+need DFT-level accuracy for systems too large or simulations too long for direct quantum
+calculation; fall back to classical force fields (AMBER, CHARMM) when speed matters more
+than accuracy for well-parameterized chemistries, or run full DFT when you need
+electronic structure details (band gaps, charge densities) that a potential energy surface
+alone cannot provide.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Energy Conservation by Construction</div>
+<p>
+A naive approach would train separate networks for energy and forces. But such a model
+does not guarantee that forces are the gradient of a potential; in molecular dynamics,
+this violation would cause the system to gain or lose energy over time, producing
+unphysical trajectories. By predicting energy $E_\theta$ and computing forces as
+$\mathbf{F}_i = -\nabla_{\mathbf{r}_i} E_\theta$, the model is <strong>conservative by
+construction</strong>. The force prediction accuracy comes "for free" from training on
+both energy and force labels, with the gradient relationship acting as an extremely
+strong regularizer. This architectural decision is non-negotiable for molecular dynamics
+applications.
+</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of a conservative force field like a topographic map of a mountain range. The map
+records elevation (energy) at every point on the landscape, and the steepness of the
+slope at any location (force) is fully determined by the elevation values around it.
+You never measure slope independently; you read it off the contour lines. If someone
+handed you a "slope map" drawn separately from an "elevation map," the two could
+contradict each other: a spot marked as flat on the slope map might sit on a steep
+hillside according to the elevation map. A hiker following the inconsistent slope map
+would appear to teleport uphill without effort, violating conservation of energy. By
+training the neural network to predict only the elevation map (energy) and deriving
+slopes (forces) mathematically from it, the model guarantees that any path a simulated
+atom takes through the energy landscape obeys the same conservation laws as a ball
+rolling downhill on real terrain.
+</p>
+</div>
+
+<h2>2. Preparing Training Data: DFT Calculations</h2>
+
+<p>
+The training data for an MLFF consists of molecular configurations (snapshots of atomic
+positions) labeled with DFT-computed energies and forces. Several established datasets
+are available:
+</p>
+
+<ul>
+<li><strong>rMD17</strong>: revised MD17 dataset containing 100,000 configurations each for
+10 small organic molecules (aspirin, benzene, ethanol, malonaldehyde, etc.), computed at
+the PBE/DFT level. The standard benchmark for small-molecule force field accuracy.</li>
+
+<li><strong>ANI-1x/ANI-2x</strong>: 5 million configurations of small organic molecules
+(H, C, N, O, S, F, Cl) at the wb97x/6-31G* level. Designed for training general organic
+chemistry force fields.</li>
+
+<li><strong>OC20/OC22</strong>: the Open Catalyst datasets containing millions of
+configurations of adsorbate-catalyst surface systems, computed at the RPBE/DFT level.
+The primary benchmark for catalysis applications.</li>
+
+<li><strong>MPtrj</strong>: 1.6 million inorganic crystal structures from the Materials
+Project, covering 89 elements. Used for training universal inorganic force fields like
+MACE-MP-0.</li>
+</ul>
+
+<p>
+For custom applications, you generate training data by running DFT calculations (using
+VASP, Quantum ESPRESSO, or the open-source PySCF/CP2K) on configurations sampled from
+molecular dynamics trajectories, random perturbations of equilibrium structures, or
+active learning selections (where the model identifies configurations it is most uncertain
+about, connecting to the <a href="../module-32-bayesian-discovery/index.html">Bayesian
+uncertainty quantification</a> ideas from Chapter 32).
+</p>
+
+<h2>3. Training a MACE Force Field: The Complete Recipe</h2>
+
+<p>
+We will train a MACE model on the rMD17 aspirin dataset, following the standard
+protocol from the MACE documentation. The setup requires the <code>mace-torch</code>
+package and an ASE-compatible dataset.
+</p>
+
+<pre><code class="language-python">"""Step 1: Prepare the rMD17 aspirin dataset for MACE training."""
+import numpy as np
+from ase.io import read, write
+
+# Download rMD17 aspirin (100k configs with DFT energies and forces)
+# Available at: http://www.sgdml.org/#datasets
+# For this recipe, we use the standard 950/50 train/test split
+configs = read("rmd17_aspirin.xyz", index=":")
+np.random.seed(42)
+indices = np.random.permutation(len(configs))
+
+train_configs = [configs[i] for i in indices[:950]]
+test_configs = [configs[i] for i in indices[950:1000]]
+
+# Write in extended XYZ format (ASE default)
+write("train.xyz", train_configs)
+write("test.xyz", test_configs)
+print(f"Training: {len(train_configs)} configs")
+print(f"Test:     {len(test_configs)} configs")
+print(f"Atoms per config: {len(train_configs[0])}")
+print(f"Elements: {set(train_configs[0].get_chemical_symbols())}")
+</code></pre>
+<div class="code-caption">Preparing the rMD17 aspirin dataset: 950 training configurations (the standard benchmark split) with DFT energies and forces in extended XYZ format. Each configuration has 21 atoms (C, H, O) with full 3D coordinates, total energy, and per-atom force vectors.</div>
+
+<pre><code class="language-python">"""Step 2: Train MACE using the command-line interface."""
+# The MACE CLI handles model construction, training, and evaluation.
+# This is equivalent to approximately 500 lines of custom training code.
+
+# Save this as train_mace.sh and run it:
+training_command = """
+mace_run_train \
+    --name="mace_aspirin" \
+    --train_file="train.xyz" \
+    --valid_file="test.xyz" \
+    --config_type_weights='{"Default":1.0}' \
+    --model="MACE" \
+    --hidden_irreps='128x0e + 128x1o + 128x2e' \
+    --r_max=5.0 \
+    --batch_size=10 \
+    --max_num_epochs=200 \
+    --swa \
+    --start_swa=160 \
+    --ema \
+    --ema_decay=0.99 \
+    --amsgrad \
+    --restart_latest \
+    --device=cuda \
+    --loss='huber' \
+    --energy_weight=1.0 \
+    --forces_weight=100.0 \
+    --seed=42
+"""
+print(training_command)
+</code></pre>
+<div class="code-caption">MACE training configuration: hidden_irreps specifies 128 scalar, 128 vector, and 128 rank-2 tensor features per layer. The force weight (100x energy weight) reflects that force accuracy is typically the bottleneck for molecular dynamics. SWA (stochastic weight averaging) and EMA (exponential moving average) improve generalization. Training takes approximately 30 minutes on a single A100 GPU for this dataset size.</div>
+
+<pre><code class="language-python">"""Step 3: Evaluate the trained model against DFT reference."""
+from mace.calculators import MACECalculator
+from ase.io import read
+import numpy as np
+
+# Load trained model as an ASE calculator
+calc = MACECalculator(
+    model_paths=["mace_aspirin_swa.model"],
+    device="cuda",
+    default_dtype="float64",
+)
+
+# Evaluate on test set
+test_configs = read("test.xyz", index=":")
+energy_errors = []
+force_errors = []
+
+for atoms in test_configs:
+    # DFT reference values (stored in atoms.info and atoms.arrays)
+    e_dft = atoms.info["energy"]           # eV
+    f_dft = atoms.arrays["forces"]         # eV/Angstrom
+
+    # MACE predictions
+    atoms.calc = calc
+    e_mace = atoms.get_potential_energy()
+    f_mace = atoms.get_forces()
+
+    energy_errors.append(abs(e_mace - e_dft))
+    force_errors.append(np.sqrt(np.mean((f_mace - f_dft) ** 2)))
+
+print(f"Energy MAE:  {np.mean(energy_errors) * 1000:.2f} meV")
+print(f"Force RMSE:  {np.mean(force_errors) * 1000:.2f} meV/A")
+
+# Typical results for MACE on rMD17 aspirin (950 training configs):
+# Energy MAE:  ~2.2 meV  (chemical accuracy threshold: 43 meV = 1 kcal/mol)
+# Force RMSE:  ~7.5 meV/A
+</code></pre>
+<div class="code-caption">Evaluation of the trained MACE model: energy MAE of approximately 2.2 meV is well below chemical accuracy (1 kcal/mol = 43 meV), and force RMSE of approximately 7.5 meV/Angstrom enables stable molecular dynamics trajectories. The MACECalculator integrates seamlessly with ASE for downstream simulations.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Running Molecular Dynamics with the Trained Force Field</div>
+<p>
+Once trained, the MACE model serves as an ASE calculator for molecular dynamics.
+A 1-nanosecond simulation of aspirin at 300 K, requiring 1 million timesteps with
+a 1 fs timestep, takes approximately 2 hours with MACE on a single GPU. The equivalent
+DFT simulation would take approximately 10,000 GPU-hours, a speedup of 5,000x. This
+enables studies of rare events, conformational sampling, and thermodynamic property
+computation that are simply infeasible with DFT.
+</p>
+</div>
+
+<pre><code class="language-python">"""Step 4: Molecular dynamics with the trained MACE potential."""
+from ase.io import read
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
+from ase.md.langevin import Langevin
+from ase import units
+from mace.calculators import MACECalculator
+
+# Setup
+atoms = read("train.xyz", index=0)  # start from first training config
+atoms.calc = MACECalculator(
+    model_paths=["mace_aspirin_swa.model"],
+    device="cuda",
+    default_dtype="float64",
+)
+
+# Initialize velocities at 300 K
+MaxwellBoltzmannDistribution(atoms, temperature_K=300)
+
+# Langevin dynamics: NVT ensemble at 300 K
+dyn = Langevin(
+    atoms,
+    timestep=1.0 * units.fs,
+    temperature_K=300,
+    friction=0.01 / units.fs,
+)
+
+# Run 10,000 steps (10 ps) and log energy
+energies = []
+def log_energy():
+    energies.append(atoms.get_potential_energy())
+
+dyn.attach(log_energy, interval=10)
+dyn.run(steps=10000)
+
+print(f"Ran {len(energies)} logged steps")
+print(f"Energy range: {min(energies):.3f} to {max(energies):.3f} eV")
+print(f"Energy std:   {np.std(energies):.4f} eV")
+</code></pre>
+<div class="code-caption">Molecular dynamics with Langevin thermostat at 300 K using the trained MACE potential. The energy should fluctuate around its mean with a standard deviation proportional to $\sqrt{k_B T / C_v}$ (the canonical ensemble prediction), confirming that the conservative force field produces physically correct thermodynamic behavior.</div>
+
+<h2>4. GNoME and FairChem: Discovery at Planetary Scale</h2>
+
+<p>
+Individual force fields trained on specific molecules are useful, but the transformative
+impact of machine-learned potentials comes from <strong>universal</strong> models trained
+across the periodic table. Two efforts exemplify this vision:
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that a "universal" machine-learned force field trained across
+many elements can replace DFT for any chemistry. In practice, these models generalize
+well only within the distribution of their training data (typically ambient-condition,
+thermodynamically stable phases); for unusual bonding environments, extreme pressures,
+exotic oxidation states, or f-electron systems, the model can produce silently wrong
+predictions with no error flag, so targeted DFT calculations and fine-tuning remain
+essential before trusting results in unfamiliar chemical regimes.
+</p>
+</div>
+
+<h3>GNoME (Google DeepMind, 2023)</h3>
+<p>
+Graph Networks for Materials Exploration (GNoME) trained a GNN on the Materials Project
+database and used it to screen 2.2 million candidate crystal structures for thermodynamic
+stability. Of these, approximately 380,000 were predicted to be stable, expanding the
+known stable inorganic materials by an order of magnitude. Subsequent DFT validation
+confirmed over 90% of the predictions. The impact was immediate: materials scientists
+could now search a database of predicted-stable materials for specific properties
+(band gap, ionic conductivity, catalytic activity) rather than synthesizing candidates
+blindly. This work connects directly to the high-throughput
+<a href="../../part-5-simulation-optimization/module-45-optimization/index.html">optimization
+strategies</a> of Chapter 45 and the
+<a href="../../part-6-scientific-domains/module-49-chemistry-materials/index.html">materials
+discovery pipelines</a> of Chapter 49.
+</p>
+
+<h3>FairChem / Open Catalyst (Meta FAIR, 2020-present)</h3>
+<p>
+The Open Catalyst Project provides the largest public dataset and benchmark for
+ML-based catalyst discovery. The OC20 dataset contains 260 million DFT-computed
+structures of adsorbates on catalyst surfaces. FairChem models (EquiformerV2, eSCN,
+GemNet-OC) trained on this data can predict adsorption energies with sufficient accuracy
+to screen catalyst candidates for applications including CO2 reduction, hydrogen
+evolution, and ammonia synthesis. The project also released pre-trained models as
+<a href="https://fair-chem.github.io/">open-source tools</a>, enabling researchers to
+evaluate new catalyst designs without running their own DFT calculations.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Foundation Force Fields (2024-2026)</div>
+<p>
+The convergence of large-scale DFT datasets and equivariant architectures has produced
+foundation force fields that generalize across chemistry. <strong>MACE-MP-0</strong>
+(Batatia et al., 2024) was trained on the MPtrj dataset covering 89 elements and achieves
+useful accuracy across inorganic materials without fine-tuning. <strong>MACE-OFF</strong>
+(Kov&aacute;cs et al., 2025) targets organic molecules with DFT-level accuracy for drug-like
+compounds. <strong>JMP-L</strong> (Shoghi et al., 2024) is a joint multi-domain pre-trained
+model covering both molecular and materials domains. More recently,
+<strong>OMat24</strong> (Barroso-Luque et al., 2025) from Meta FAIR introduced a training
+set of over 100 million DFT calculations spanning diverse inorganic bulk and surface
+chemistries; models trained on OMat24 combined with the Alexandria dataset set new
+state-of-the-art accuracy on the Matbench Discovery leaderboard for predicting
+thermodynamic stability of inorganic crystals, surpassing previous GNoME results.
+These foundation potentials follow
+the same paradigm as <a href="../module-27-foundation-models/index.html">language foundation
+models</a> (Chapter 27): pre-train on diverse data, then fine-tune on specific tasks
+with minimal additional data. The fine-tuning cost is typically 10 to 100x cheaper than
+training from scratch, democratizing access to accurate force fields.
+</p>
+</div>
+
+<h2>5. Using Pre-trained MACE Foundation Models</h2>
+
+<p>
+For many applications, you do not need to train a force field from scratch. Pre-trained
+MACE foundation models provide out-of-the-box predictions for a wide range of chemistries:
+</p>
+
+<pre><code class="language-python">"""Using MACE-MP-0: a pre-trained universal inorganic force field."""
+from mace.calculators import mace_mp
+
+# Load the pre-trained MACE-MP-0 model (downloads automatically)
+calc = mace_mp(model="medium", device="cuda", default_dtype="float64")
+
+# Example: compute energy and forces of a lithium cobalt oxide unit cell
+from ase.build import bulk
+atoms = bulk("LiCoO2", crystalstructure="rocksalt", a=4.2, cubic=True)
+atoms.calc = calc
+
+energy = atoms.get_potential_energy()
+forces = atoms.get_forces()
+stress = atoms.get_stress()
+
+print(f"Energy: {energy:.4f} eV")
+print(f"Max force: {np.max(np.abs(forces)):.4f} eV/A")
+print(f"Pressure: {-np.mean(stress[:3]) * 160.2:.1f} GPa")
+</code></pre>
+<div class="code-caption">MACE-MP-0 provides instant energy, force, and stress predictions for any inorganic material without training. The "medium" model balances accuracy and speed; "large" provides higher accuracy at 3x computational cost. This enables rapid screening of materials properties before committing to expensive DFT calculations.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Full Pipeline with MACE</div>
+<p>
+The complete workflow from data preparation through model training to molecular dynamics
+is approximately 50 lines of configuration plus library calls, compared to the thousands
+of lines needed to implement an equivariant GNN, train it with mixed-precision and
+distributed data parallel, and interface it with an MD engine. The MACE ecosystem
+handles: (1) data loading from ASE-compatible formats, (2) model construction with
+configurable irreps and interaction layers, (3) training with SWA, EMA, and learning
+rate scheduling, (4) evaluation with standard metrics (MAE, RMSE per atom), and
+(5) deployment as an ASE calculator for seamless integration with existing simulation
+workflows.
+</p>
+</div>
+
+<h2>6. Integration with the Discovery Workbench</h2>
+
+<p>
+A force field trained in this section becomes a component of the Discovery Workbench:
+the platform-wide scientific ML surrogate that replaces expensive simulations with
+fast neural network inference. The integration follows the
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">system
+architecture</a> patterns from Chapter 6:
+</p>
+
+<pre><code class="language-python">"""Discovery Workbench integration: register a trained MACE model."""
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+@dataclass
+class ForceFieldConfig:
+    """Configuration for a registered ML force field."""
+    name: str
+    model_path: Path
+    model_type: str = "mace"
+    elements: list[str] = field(default_factory=list)
+    cutoff: float = 5.0
+    training_dataset: str = ""
+    energy_mae_mev: Optional[float] = None
+    force_rmse_mev_ang: Optional[float] = None
+
+class SurrogateRegistry:
+    """Registry of trained ML surrogates in the Discovery Workbench."""
+
+    def __init__(self):
+        self._models: dict[str, ForceFieldConfig] = {}
+
+    def register(self, config: ForceFieldConfig):
+        """Register a trained force field for downstream use."""
+        self._models[config.name] = config
+        print(f"Registered force field: {config.name}")
+        print(f"  Elements: {config.elements}")
+        print(f"  Energy MAE: {config.energy_mae_mev:.1f} meV")
+        print(f"  Force RMSE: {config.force_rmse_mev_ang:.1f} meV/A")
+
+    def get_calculator(self, name: str, device: str = "cuda"):
+        """Return an ASE calculator for the named force field."""
+        from mace.calculators import MACECalculator
+        config = self._models[name]
+        return MACECalculator(
+            model_paths=[str(config.model_path)],
+            device=device,
+            default_dtype="float64",
+        )
+
+# Register our trained aspirin model
+registry = SurrogateRegistry()
+registry.register(ForceFieldConfig(
+    name="aspirin_mace",
+    model_path=Path("mace_aspirin_swa.model"),
+    elements=["C", "H", "O"],
+    training_dataset="rMD17_aspirin_950",
+    energy_mae_mev=2.2,
+    force_rmse_mev_ang=7.5,
+))
+</code></pre>
+<div class="code-caption">Discovery Workbench integration: a surrogate registry tracks trained force fields with their accuracy metrics, training provenance, and supported elements. Downstream components (molecular dynamics runners, property predictors, screening pipelines) retrieve ASE calculators by name. This pattern extends naturally to other scientific ML surrogates (PINNs, neural operators) beyond force fields.</div>
+
+<h2>7. Validation Checklist for Production Force Fields</h2>
+
+<p>
+Before deploying a force field for production molecular dynamics or materials screening,
+validate it against these criteria:
+</p>
+
+<ol>
+<li><strong>Energy and force accuracy</strong>: report MAE/RMSE on a held-out test set.
+For molecular dynamics, force RMSE below 30 meV/angstrom is typically sufficient; for
+thermodynamic properties (free energies, phase diagrams), below 10 meV/angstrom is
+preferred.</li>
+
+<li><strong>Energy conservation</strong>: run NVE (microcanonical) molecular dynamics for
+100 ps and verify that total energy drift is below 1 meV/atom/ps. Significant drift
+indicates numerical issues or model instabilities.</li>
+
+<li><strong>Stability under MD</strong>: run NVT dynamics at the target temperature for
+at least 1 ns. Check for unphysical bond breaking, atomic collisions, or temperature
+instabilities.</li>
+
+<li><strong>Extrapolation detection</strong>: monitor the model's internal uncertainty
+estimates (if available) or track the maximum atomic force during dynamics. Spikes
+indicate the model has encountered configurations outside its training distribution.</li>
+
+<li><strong>Physical property validation</strong>: compute at least one measurable physical
+property (radial distribution function, vibrational frequencies, bulk modulus) and compare
+against experimental values or high-level quantum chemistry references.</li>
+</ol>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+The name "universal force field" is somewhat aspirational. Even MACE-MP-0, trained on 1.6
+million inorganic structures covering 89 elements, can produce catastrophic predictions
+for unusual bonding environments (high-pressure phases, exotic oxidation states, f-electron
+systems). The Materials Project training data is heavily biased toward thermodynamically
+stable phases at ambient conditions. "Universal" means "covers most of the periodic table
+for common chemistries." For truly exotic materials, you still need targeted DFT data and
+fine-tuning. The analogy to language models holds: GPT can write about most topics
+competently, but you would not trust it to draft a legal brief without domain adaptation.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Compare Pre-trained MACE-MP-0 Against Experimental Bulk Properties</h4>
+<p>
+Using only a laptop with Python, ASE, and the <code>mace-torch</code> package (CPU mode
+is sufficient), validate MACE-MP-0 predictions for a simple material:
+</p>
+<ol>
+<li><strong>Install dependencies:</strong> run
+<code>pip install mace-torch ase</code>. No GPU is required; the "small" pre-trained
+model runs on CPU in under a second per evaluation.</li>
+<li><strong>Build a silicon crystal:</strong> use
+<code>ase.build.bulk("Si", "diamond", a=5.43)</code> to create the unit cell, then
+attach the MACE-MP-0 calculator with
+<code>mace_mp(model="small", device="cpu")</code>.</li>
+<li><strong>Compute the equation of state:</strong> scale the lattice parameter from
+5.2 to 5.7 angstroms in 15 steps, recording the energy at each volume. Use
+<code>atoms.cell *= scale</code> and <code>atoms.positions *= scale</code> to rescale
+uniformly.</li>
+<li><strong>Fit and extract the bulk modulus:</strong> use
+<code>ase.eos.EquationOfState(volumes, energies, eos="birchmurnaghan")</code> to fit
+the curve and extract the equilibrium volume $V_0$ and bulk modulus $B_0$.</li>
+<li><strong>Compare with experiment:</strong> the experimental values for silicon are
+$a_0 = 5.431$ angstrom and $B_0 = 97.8$ GPa. Compute the relative error for both
+quantities and discuss whether the pre-trained model is accurate enough to screen
+candidate materials without running DFT.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual:</strong> Explain why computing forces as the gradient of the
+predicted energy ($\mathbf{F}_i = -\nabla_{\mathbf{r}_i} E_\theta$) is preferable to
+training a separate force-prediction network. What physical property would be violated
+by the separate-network approach, and what observable consequence would this have in a
+molecular dynamics simulation?</li>
+
+<li><strong>Coding:</strong> Using the pre-trained MACE-MP-0 model, compute the equation
+of state (energy vs. volume) for silicon by uniformly scaling the lattice parameter from
+5.0 to 5.8 angstroms in 20 steps. Fit the Birch-Murnaghan equation of state to your
+data and extract the equilibrium lattice parameter and bulk modulus. Compare with the
+experimental values ($a_0 = 5.431$ angstrom, $B_0 = 97.8$ GPa). What is the relative
+error?</li>
+
+<li><strong>Analysis:</strong> Train two MACE models on the rMD17 aspirin dataset: one
+with $\ell_{\max} = 1$ (vectors only) and one with $\ell_{\max} = 2$ (vectors and rank-2
+tensors). Compare their force RMSE, training time, and inference speed. At what training
+set size does the $\ell_{\max} = 2$ model's superior accuracy justify its additional
+computational cost? This connects to the accuracy-efficiency trade-offs discussed in
+<a href="../../part-5-simulation-optimization/module-45-optimization/index.html">Chapter 45</a>.</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-33.3.html">&larr; Section 33.3</a>
+<a href="index.html">Chapter 33</a>
+<a href="../module-34-generative-models/index.html">Chapter 34 &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

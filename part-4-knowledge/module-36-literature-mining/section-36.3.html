@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 36.3: Building a Literature Miner. A complete 500+ paper domain miner with topic clustering, gap detection, trend analysis, and Discovery Workbench integration." name="description"/>
+<title>Section 36.3: Building a Literature Miner | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 36: Literature Mining</a></div>
+<h1>36.3 Building a Literature Miner</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I mapped 847 papers into 14 topic clusters and found 6 structural holes. Three of them were genuine research gaps. Two were just fields that do not like each other. One was a conference that stopped publishing proceedings."</p>
+<cite>A Research Gap Detector With Sociological Instincts</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section synthesizes everything from the preceding two sections. You should have worked through
+<a href="section-36.1.html">Section 36.1</a> (citation networks, PageRank, Louvain communities,
+structural holes) and <a href="section-36.2.html">Section 36.2</a> (PDF parsing, NER, relation
+extraction, semantic search). The recipe here combines all of those components into a single
+pipeline. Familiarity with the Discovery Workbench architecture from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a> is helpful
+for the integration section at the end.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+This section builds a complete, reusable literature mining pipeline. Give it a research topic and
+it will: (1) harvest 500+ papers from OpenAlex with full citation metadata; (2) build and analyze
+the citation network using PageRank and Louvain community detection; (3) extract knowledge
+(entities, relations, claims) from available abstracts; (4) build a semantic search index over
+the corpus; (5) identify research gaps through structural hole analysis; and (6) generate a
+trend report showing how the field has evolved over time. The pipeline is modular: each stage
+produces serializable output that can be inspected, debugged, or replaced independently.
+</p>
+</div>
+
+<h2>1. Pipeline Architecture</h2>
+
+<p>
+The literature miner follows a six-stage pipeline design. Each stage reads from and writes to a
+shared <code>MiningState</code> object that accumulates results as the pipeline progresses. This
+design makes it easy to resume from any stage if an earlier stage fails (for example, if an API
+rate limit interrupts harvesting) and to swap individual stages without affecting the rest.
+</p>
+
+<p data-agent="02">
+A staged pipeline is a software architecture where computation is divided into discrete, sequential steps that each transform a shared data structure and persist their output before the next step begins. This matters because literature mining involves unreliable external APIs, expensive computations, and iterative tuning: without stage boundaries, a failure in minute eight of a twelve-minute run forces a complete restart. The mechanism is straightforward: each stage function receives the <code>MiningState</code> object, mutates it by adding its results, and writes a checkpoint file to disk before returning. Use a staged pipeline whenever your workflow involves three or more sequential transformations with different failure modes; for simpler two-step tasks (such as "fetch papers, then rank them"), a single script with error handling is sufficient.
+</p>
+
+<p>
+The stages are:
+</p>
+
+<ol>
+<li><strong>Harvest</strong>: Query OpenAlex for papers matching the research topic, paginating through results up to the configured limit.</li>
+<li><strong>Graph</strong>: Build the citation network, compute PageRank and betweenness centrality, detect communities with Louvain.</li>
+<li><strong>Extract</strong>: Run NER and claim extraction on abstracts (full-text extraction from PDFs is optional and slower).</li>
+<li><strong>Embed</strong>: Encode abstracts into dense vectors and build a semantic search index.</li>
+<li><strong>Analyze</strong>: Identify structural holes, compute trend curves, rank the most influential and bridging papers.</li>
+<li><strong>Report</strong>: Generate a summary with community profiles, gap analysis, and trend visualizations.</li>
+</ol>
+
+<pre><code class="language-python">import json
+import logging
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MiningConfig:
+    """Configuration for a literature mining run."""
+    topic: str
+    email: str                      # For OpenAlex polite pool
+    max_papers: int = 500
+    year_range: tuple[int, int] = (2018, 2026)
+    louvain_resolution: float = 1.0
+    min_community_size: int = 5
+    embedding_model: str = "all-MiniLM-L6-v2"
+    output_dir: str = "./mining_output"
+    resume_from: str | None = None  # Stage name to resume from
+
+
+@dataclass
+class MiningState:
+    """Accumulated state across pipeline stages."""
+    config: MiningConfig
+    papers: list[Paper] = field(default_factory=list)
+    graph_stats: dict = field(default_factory=dict)
+    communities: dict = field(default_factory=dict)
+    community_info: list[dict] = field(default_factory=list)
+    top_papers_pagerank: list[dict] = field(default_factory=list)
+    bridging_papers: list[dict] = field(default_factory=list)
+    structural_holes: list[dict] = field(default_factory=list)
+    trend_data: dict = field(default_factory=dict)
+    entity_counts: dict = field(default_factory=dict)
+    claims_summary: dict = field(default_factory=dict)
+    timestamp: str = field(
+        default_factory=lambda: datetime.now().isoformat()
+    )
+
+    def save_checkpoint(self, stage_name: str):
+        """Save state to disk after each stage for resumability."""
+        output_path = Path(self.config.output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        checkpoint = {
+            "stage": stage_name,
+            "timestamp": self.timestamp,
+            "config": asdict(self.config),
+            "num_papers": len(self.papers),
+            "graph_stats": self.graph_stats,
+            "num_communities": len(self.communities),
+            "num_gaps": len(self.structural_holes),
+        }
+        with open(output_path / f"checkpoint_{stage_name}.json", "w") as f:
+            json.dump(checkpoint, f, indent=2)
+        logger.info(f"Checkpoint saved: {stage_name}")
+</code></pre>
+<div class="code-caption">Listing 36.15: Pipeline configuration and state management with checkpoint support for resumable multi-stage literature mining runs.</div>
+
+<h2>2. Stage 1: Harvesting Papers</h2>
+
+<p>
+The harvesting stage uses the OpenAlex client from <a href="section-36.1.html">Section 36.1</a>
+to collect papers matching the configured topic. We apply year-range filters and require that
+papers have at least one citation to filter out preprints and working drafts that have not yet
+been evaluated by the community.
+</p>
+
+<pre><code class="language-python">def stage_harvest(state: MiningState) -> MiningState:
+    """Stage 1: Harvest papers from OpenAlex."""
+    config = state.config
+    client = OpenAlexClient(email=config.email)
+
+    logger.info(f"Harvesting up to {config.max_papers} papers on '{config.topic}'")
+
+    year_filter = (
+        f"publication_year:{config.year_range[0]}-{config.year_range[1]}"
+    )
+    papers = list(client.search_works(
+        query=config.topic,
+        filters={
+            "publication_year": f">{config.year_range[0]-1}",
+            "type": "article",
+            "cited_by_count": ">0",
+        },
+        max_results=config.max_papers,
+    ))
+
+    state.papers = papers
+    logger.info(f"Harvested {len(papers)} papers "
+                f"({config.year_range[0]}-{config.year_range[1]})")
+
+    # Save raw paper data for debugging
+    output_path = Path(config.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    with open(output_path / "papers_raw.jsonl", "w") as f:
+        for p in papers:
+            f.write(json.dumps(asdict(p), default=str) + "\n")
+
+    state.save_checkpoint("harvest")
+    return state
+</code></pre>
+<div class="code-caption">Listing 36.16: Paper harvesting stage with year-range filtering, minimum citation threshold, and JSONL output for inspection and debugging.</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common mistake is believing that harvesting more papers always produces better analysis. In practice, setting <code>max_papers</code> too high (say, 5,000+) degrades community detection quality because the citation graph becomes so dense that Louvain merges distinct subcommunities into a few giant clusters, and structural hole scores converge toward zero. The pipeline works best with a focused corpus of 300 to 1,500 papers; if your initial query returns tens of thousands of results, narrow the topic, tighten the year range, or add concept filters rather than simply raising the limit.
+</p>
+</div>
+
+<h2>3. Stage 2: Building the Citation Graph</h2>
+
+<p>
+The graph stage constructs the citation network and computes all the network metrics from
+<a href="section-36.1.html">Section 36.1</a>: PageRank for influence, betweenness centrality
+for bridging, and Louvain for community structure. We also compute basic graph statistics
+(density, diameter, connected components) that characterize the field's cohesion.
+</p>
+
+<pre><code class="language-python">def stage_graph(state: MiningState) -> MiningState:
+    """Stage 2: Build citation graph and compute network metrics."""
+    import networkx as nx
+    from community import community_louvain
+
+    # Build the directed citation graph
+    G = build_citation_graph(state.papers)
+    logger.info(f"Citation graph: {G.number_of_nodes()} nodes, "
+                f"{G.number_of_edges()} edges")
+
+    # Basic graph statistics
+    G_undirected = G.to_undirected()
+    components = list(nx.connected_components(G_undirected))
+    largest_cc = max(components, key=len)
+
+    state.graph_stats = {
+        "num_nodes": G.number_of_nodes(),
+        "num_edges": G.number_of_edges(),
+        "density": round(nx.density(G), 6),
+        "num_components": len(components),
+        "largest_component_size": len(largest_cc),
+        "avg_clustering": round(
+            nx.average_clustering(G_undirected), 4
+        ),
+    }
+
+    # PageRank: identify most influential papers
+    state.top_papers_pagerank = rank_papers_by_influence(G, top_k=25)
+
+    # Betweenness centrality: identify bridging papers
+    state.bridging_papers = find_bridging_papers(G, top_k=15)
+
+    # Louvain community detection
+    G_clean = G_undirected.copy()
+    G_clean.remove_nodes_from(list(nx.isolates(G_clean)))
+
+    if G_clean.number_of_nodes() > 0:
+        partition = community_louvain.best_partition(
+            G_clean,
+            resolution=state.config.louvain_resolution,
+            random_state=42,
+        )
+        Q = community_louvain.modularity(partition, G_clean)
+        state.graph_stats["modularity"] = round(Q, 4)
+
+        # Group by community and filter small ones
+        import collections
+        raw_communities = collections.defaultdict(list)
+        for node_id, comm_id in partition.items():
+            raw_communities[comm_id].append(node_id)
+
+        state.communities = {
+            k: v for k, v in raw_communities.items()
+            if len(v) >= state.config.min_community_size
+        }
+
+        # Label communities
+        papers_by_id = {p.openalex_id: p for p in state.papers}
+        state.community_info = label_communities(
+            state.communities, G, papers_by_id
+        )
+
+        logger.info(f"Detected {len(state.communities)} communities "
+                     f"(Q={Q:.3f})")
+
+    state.save_checkpoint("graph")
+    return state
+</code></pre>
+<div class="code-caption">Listing 36.17: Graph analysis stage computing PageRank influence scores, betweenness centrality for bridging papers, and Louvain community structure with modularity scoring.</div>
+
+<h2>4. Stage 3: Knowledge Extraction</h2>
+
+<p>
+The extraction stage processes each paper's abstract through the NER and claim-evidence pipelines
+from <a href="section-36.2.html">Section 36.2</a>. For a 500-paper corpus, abstract-level
+extraction takes about 2 to 5 minutes on a CPU. Full-text PDF extraction is available as an
+optional mode but requires downloading PDFs (which may not be openly accessible) and takes
+roughly 30 seconds per paper with Docling.
+</p>
+
+<pre><code class="language-python">import collections
+import re
+
+
+def stage_extract(state: MiningState) -> MiningState:
+    """Stage 3: Extract entities and claims from paper abstracts."""
+    ner = ScientificNER()
+
+    all_entity_types = collections.Counter()
+    all_claim_types = collections.Counter()
+    total_entities = 0
+    total_claims = 0
+    papers_with_abstracts = 0
+
+    for i, paper in enumerate(state.papers):
+        if not paper.abstract:
+            continue
+        papers_with_abstracts += 1
+
+        # Entity extraction
+        entities = ner.extract_entities(paper.abstract, section_name="abstract")
+        for e in entities:
+            all_entity_types[e.label] += 1
+            total_entities += 1
+
+        # Claim-evidence extraction
+        sentences = _split_sentences(paper.abstract)
+        claims = extract_claims_and_evidence(sentences, context_window=2)
+        for c in claims:
+            all_claim_types[c.claim_type] += 1
+            total_claims += 1
+
+        if (i + 1) % 100 == 0:
+            logger.info(f"Extracted from {i + 1}/{len(state.papers)} papers")
+
+    state.entity_counts = {
+        "total_entities": total_entities,
+        "papers_processed": papers_with_abstracts,
+        "entities_per_paper": round(
+            total_entities / max(papers_with_abstracts, 1), 1
+        ),
+        "by_type": dict(all_entity_types.most_common(20)),
+    }
+
+    state.claims_summary = {
+        "total_claims": total_claims,
+        "claims_per_paper": round(
+            total_claims / max(papers_with_abstracts, 1), 2
+        ),
+        "by_type": dict(all_claim_types.most_common()),
+    }
+
+    logger.info(f"Extracted {total_entities} entities, {total_claims} claims "
+                f"from {papers_with_abstracts} abstracts")
+
+    state.save_checkpoint("extract")
+    return state
+</code></pre>
+<div class="code-caption">Listing 36.18: Knowledge extraction stage processing paper abstracts through NER and claim-evidence pipelines with aggregate statistics for the mining report.</div>
+
+<h2>5. Stage 4: Embedding and Search Index</h2>
+
+<p>
+The embedding stage encodes all paper abstracts into dense vectors and persists the search index
+to disk. This index enables two capabilities: semantic search (finding papers relevant to a
+natural language query) and embedding-based clustering (an alternative to citation-based community
+detection that captures topical similarity even when papers do not cite each other).
+</p>
+
+<pre><code class="language-python">def stage_embed(state: MiningState) -> MiningState:
+    """Stage 4: Build semantic search index from paper abstracts."""
+    search_index = PaperSearchIndex(model_name=state.config.embedding_model)
+    search_index.build_index(state.papers)
+
+    # Save embeddings to disk for reuse
+    output_path = Path(state.config.output_dir)
+    if search_index.embeddings is not None:
+        np.save(
+            output_path / "paper_embeddings.npy",
+            search_index.embeddings,
+        )
+        # Save paper IDs in matching order
+        with open(output_path / "paper_ids.json", "w") as f:
+            json.dump(
+                [p.openalex_id for p in search_index.papers], f
+            )
+
+    logger.info(f"Embedded {len(search_index.papers)} papers, "
+                f"shape={search_index.embeddings.shape}")
+
+    state.save_checkpoint("embed")
+    return state
+</code></pre>
+<div class="code-caption">Listing 36.19: Embedding stage encoding paper abstracts into dense vectors and persisting the index as numpy arrays for fast reload.</div>
+
+<h2>6. Stage 5: Gap and Trend Analysis</h2>
+
+<p>
+The analysis stage produces the most actionable outputs: structural holes that indicate research
+gaps, and trend curves that show how different topics have grown or declined over time. Structural
+hole detection reuses the algorithm from <a href="section-36.1.html">Section 36.1</a>. Trend
+analysis counts papers per community per year and fits simple growth curves to identify
+accelerating, plateauing, and declining research areas.
+</p>
+
+<pre><code class="language-python">def stage_analyze(state: MiningState) -> MiningState:
+    """Stage 5: Identify research gaps and temporal trends."""
+    # Structural hole analysis
+    G = build_citation_graph(state.papers)
+    state.structural_holes = find_structural_holes(
+        G, state.communities, state.community_info,
+        min_shared_concepts=1,
+    )
+    logger.info(f"Found {len(state.structural_holes)} structural holes")
+
+    # Trend analysis: papers per community per year
+    papers_by_id = {p.openalex_id: p for p in state.papers}
+    trend_data = {}
+
+    for info in state.community_info:
+        comm_id = info["id"]
+        year_counts = collections.Counter()
+        for pid in info["member_ids"]:
+            paper = papers_by_id.get(pid)
+            if paper and paper.year:
+                year_counts[paper.year] += 1
+
+        years = sorted(year_counts.keys())
+        counts = [year_counts[y] for y in years]
+
+        # Compute growth rate (linear regression slope)
+        if len(years) >= 3:
+            x = np.array(years, dtype=float)
+            y = np.array(counts, dtype=float)
+            slope = np.polyfit(x, y, 1)[0]
+            trend_label = (
+                "accelerating" if slope > 2 else
+                "growing" if slope > 0.5 else
+                "stable" if slope > -0.5 else
+                "declining"
+            )
+        else:
+            slope = 0.0
+            trend_label = "insufficient_data"
+
+        trend_data[str(comm_id)] = {
+            "community_label": info["top_concepts"][:3],
+            "years": years,
+            "counts": counts,
+            "slope": round(slope, 2),
+            "trend": trend_label,
+            "total_papers": info["size"],
+        }
+
+    state.trend_data = trend_data
+    state.save_checkpoint("analyze")
+    return state
+</code></pre>
+<div class="code-caption">Listing 36.20: Gap and trend analysis stage identifying structural holes between communities and fitting linear growth models to per-community publication counts over time.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of structural hole detection like scanning a library floor plan. Each reading room represents a research community, and the hallways between rooms represent citations. Most rooms have busy hallways connecting them to their neighbors, but occasionally you find two rooms on the same topic (say, both studying nutrition) with no hallway between them. Patrons in each room are reading similar books but never encounter each other's work. The structural hole algorithm measures exactly this: it counts the hallways you would <em>expect</em> between two rooms given their sizes and topics, compares that to the hallways that actually exist, and flags the pairs with the largest deficit. Just as a librarian might install a new corridor or a shared bulletin board between those rooms, a researcher can write a paper that bridges the two disconnected communities.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Gaps Are Not Always Opportunities</div>
+<p>
+A structural hole between two research communities can mean three different things: (1) a
+genuine research gap where cross-pollination would be valuable; (2) a methodological incompatibility
+where the two communities use fundamentally different approaches that do not transfer; or
+(3) a social gap where the communities publish in different venues and simply have not discovered
+each other's work. The distinction requires domain expertise. The pipeline flags candidates;
+a human researcher evaluates which ones represent real opportunities. The concept overlap filter
+(requiring shared OpenAlex concepts) helps by filtering out structurally disconnected communities
+that work on unrelated problems, but it cannot distinguish between genuine methodological
+barriers and mere sociological separation.
+</p>
+</div>
+
+<h2>7. Stage 6: Report Generation</h2>
+
+<p>
+The final stage assembles a human-readable report from the accumulated state. The report
+includes: a summary of the corpus, the top communities with their labels, the most influential
+and bridging papers, identified research gaps, and trend analysis. We generate both a structured
+JSON report (for programmatic consumption) and a Markdown summary (for human reading).
+</p>
+
+<pre><code class="language-python">def stage_report(state: MiningState) -> str:
+    """Stage 6: Generate a structured mining report."""
+    output_path = Path(state.config.output_dir)
+
+    # Build the report
+    report_lines = [
+        f"# Literature Mining Report: {state.config.topic}",
+        f"",
+        f"**Generated**: {state.timestamp}",
+        f"**Corpus**: {len(state.papers)} papers "
+        f"({state.config.year_range[0]}-{state.config.year_range[1]})",
+        f"",
+        f"## Citation Network Statistics",
+        f"",
+    ]
+
+    for key, value in state.graph_stats.items():
+        report_lines.append(f"- **{key.replace('_', ' ').title()}**: {value}")
+
+    # Top communities
+    report_lines.extend([
+        f"",
+        f"## Research Communities ({len(state.community_info)} detected)",
+        f"",
+    ])
+    for info in state.community_info[:10]:
+        concepts_str = ", ".join(info["top_concepts"][:4])
+        trend = state.trend_data.get(str(info["id"]), {})
+        trend_label = trend.get("trend", "unknown")
+        report_lines.append(
+            f"### Community {info['id']}: {concepts_str} "
+            f"({info['size']} papers, trend: {trend_label})"
+        )
+        report_lines.append(f"- **Top paper**: {info['top_paper'][:100]}")
+        report_lines.append(f"")
+
+    # Most influential papers
+    report_lines.extend([f"## Most Influential Papers (by PageRank)", f""])
+    for i, p in enumerate(state.top_papers_pagerank[:10], 1):
+        report_lines.append(
+            f"{i}. **{p['title'][:80]}** ({p['year']}) "
+            f"[PR: {p['pagerank']:.5f}, Citations: {p['citations']}]"
+        )
+
+    # Bridging papers
+    report_lines.extend([f"", f"## Bridging Papers (Interdisciplinary Connectors)", f""])
+    for i, b in enumerate(state.bridging_papers[:7], 1):
+        report_lines.append(
+            f"{i}. **{b['title'][:80]}** ({b['year']}) "
+            f"[Betweenness: {b['betweenness']:.4f}]"
+        )
+
+    # Research gaps
+    report_lines.extend([f"", f"## Research Gaps (Structural Holes)", f""])
+    if state.structural_holes:
+        for i, gap in enumerate(state.structural_holes[:5], 1):
+            report_lines.append(
+                f"{i}. Communities {gap['community_a']} and {gap['community_b']} "
+                f"(gap score: {gap['gap_score']:.2f})"
+            )
+            report_lines.append(
+                f"   - Shared concepts: {', '.join(gap['shared_concepts'])}"
+            )
+            report_lines.append(
+                f"   - Cross-citations: {gap['cross_citations']} "
+                f"(expected: {gap['expected_citations']})"
+            )
+    else:
+        report_lines.append("No significant structural holes detected.")
+
+    # Knowledge extraction summary
+    report_lines.extend([f"", f"## Knowledge Extraction Summary", f""])
+    report_lines.append(
+        f"- **Entities extracted**: {state.entity_counts.get('total_entities', 0)} "
+        f"({state.entity_counts.get('entities_per_paper', 0)} per paper)"
+    )
+    report_lines.append(
+        f"- **Claims extracted**: {state.claims_summary.get('total_claims', 0)} "
+        f"({state.claims_summary.get('claims_per_paper', 0)} per paper)"
+    )
+
+    # Write the Markdown report
+    report_text = "\n".join(report_lines)
+    report_path = output_path / "mining_report.md"
+    report_path.write_text(report_text, encoding="utf-8")
+
+    # Write structured JSON report
+    json_report = {
+        "topic": state.config.topic,
+        "timestamp": state.timestamp,
+        "corpus_size": len(state.papers),
+        "graph_stats": state.graph_stats,
+        "communities": [
+            {k: v for k, v in info.items() if k != "member_ids"}
+            for info in state.community_info
+        ],
+        "top_papers": state.top_papers_pagerank[:15],
+        "bridging_papers": state.bridging_papers[:10],
+        "structural_holes": state.structural_holes[:10],
+        "trends": state.trend_data,
+        "entity_counts": state.entity_counts,
+        "claims_summary": state.claims_summary,
+    }
+    json_path = output_path / "mining_report.json"
+    with open(json_path, "w") as f:
+        json.dump(json_report, f, indent=2, default=str)
+
+    logger.info(f"Report saved to {report_path} and {json_path}")
+    return report_text
+</code></pre>
+<div class="code-caption">Listing 36.21: Report generation stage producing both Markdown (for human reading) and JSON (for programmatic consumption) summaries of the complete mining analysis.</div>
+
+<h2>8. The Complete Pipeline Runner</h2>
+
+<p>
+With all six stages defined, the pipeline runner orchestrates them in sequence, with resumability
+support. If a run is interrupted (by an API rate limit, a network error, or a crash), you can
+restart from the last completed stage without re-doing earlier work.
+</p>
+
+<pre><code class="language-python">STAGES = [
+    ("harvest", stage_harvest),
+    ("graph", stage_graph),
+    ("extract", stage_extract),
+    ("embed", stage_embed),
+    ("analyze", stage_analyze),
+    ("report", stage_report),
+]
+
+
+def run_literature_miner(config: MiningConfig) -> MiningState:
+    """Run the complete literature mining pipeline."""
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+
+    state = MiningState(config=config)
+
+    # Determine which stage to start from
+    start_idx = 0
+    if config.resume_from:
+        stage_names = [name for name, _ in STAGES]
+        if config.resume_from in stage_names:
+            start_idx = stage_names.index(config.resume_from)
+            logger.info(f"Resuming from stage: {config.resume_from}")
+            # Load checkpoint data here if needed
+        else:
+            logger.warning(f"Unknown stage '{config.resume_from}', "
+                          f"starting from beginning")
+
+    # Run stages in sequence
+    for i, (stage_name, stage_fn) in enumerate(STAGES):
+        if i < start_idx:
+            logger.info(f"Skipping stage: {stage_name}")
+            continue
+
+        logger.info(f"{'='*60}")
+        logger.info(f"Stage {i+1}/{len(STAGES)}: {stage_name}")
+        logger.info(f"{'='*60}")
+
+        try:
+            result = stage_fn(state)
+            if isinstance(result, MiningState):
+                state = result
+            logger.info(f"Stage '{stage_name}' completed successfully")
+        except Exception as e:
+            logger.error(f"Stage '{stage_name}' failed: {e}")
+            logger.info(f"Resume with: resume_from='{stage_name}'")
+            raise
+
+    return state
+
+
+# Run the complete pipeline
+if __name__ == "__main__":
+    config = MiningConfig(
+        topic="large language models scientific discovery",
+        email="researcher@university.edu",
+        max_papers=500,
+        year_range=(2020, 2026),
+        output_dir="./mining_llm_discovery",
+    )
+    state = run_literature_miner(config)
+    print(f"\nMining complete: {len(state.papers)} papers analyzed")
+    print(f"Communities: {len(state.communities)}")
+    print(f"Gaps found: {len(state.structural_holes)}")
+</code></pre>
+<div class="code-caption">Listing 36.22: Complete pipeline runner with sequential stage execution, error handling, and resume-from-stage support for interrupted runs.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Mining the AI-for-Drug-Discovery Landscape</div>
+<p>
+A pharmaceutical company used this pipeline to map the AI-for-drug-discovery landscape. Configuration:
+<code>topic="artificial intelligence drug discovery"</code>, <code>max_papers=800</code>,
+<code>year_range=(2019, 2026)</code>. The pipeline completed in 12 minutes (8 minutes for
+API harvesting, 1 minute for graph analysis, 2 minutes for NER, 1 minute for embeddings and
+reporting). Results: 783 papers formed a citation graph with 4,200 internal edges and modularity
+$Q = 0.38$. Louvain detected 11 communities, the four largest being: molecular generation with
+generative models (198 papers, accelerating trend), protein structure prediction (142 papers,
+stable after the AlphaFold plateau), virtual screening with graph neural networks (127 papers,
+growing), and clinical trial optimization (89 papers, growing). The most significant structural
+hole was between the molecular generation community and the clinical trial community (gap score
+0.78, shared concepts: "machine learning," "optimization," "pharmacology"). This suggested an
+opportunity for generative models that optimize not just molecular properties but also clinical
+trial feasibility. The team subsequently wrote a research proposal targeting this gap.
+</p>
+</div>
+
+<h2>9. Visualization: Trend Dashboard</h2>
+
+<p>
+Numbers and tables communicate findings to analysts, but stakeholders need visuals. The trend
+dashboard plots publication counts per community over time, making it immediately clear which
+research areas are growing, which have plateaued, and which are declining.
+</p>
+
+<pre><code class="language-python">import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+
+
+def plot_trend_dashboard(
+    state: MiningState, output_path: str = "trend_dashboard.png"
+):
+    """Generate a multi-panel trend dashboard from mining results."""
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    # Panel 1: Publication trends per community
+    ax = axes[0, 0]
+    cmap = cm.get_cmap("tab10", len(state.trend_data))
+    for i, (comm_id, trend) in enumerate(state.trend_data.items()):
+        label = ", ".join(trend["community_label"][:2])[:30]
+        ax.plot(trend["years"], trend["counts"], "o-",
+                color=cmap(i), label=f"C{comm_id}: {label}", linewidth=2)
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Papers per Year")
+    ax.set_title("Publication Trends by Community")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: Community sizes (bar chart)
+    ax = axes[0, 1]
+    comm_labels = [
+        f"C{info['id']}" for info in state.community_info[:12]
+    ]
+    comm_sizes = [info["size"] for info in state.community_info[:12]]
+    colors = [cmap(i) for i in range(len(comm_labels))]
+    ax.barh(comm_labels, comm_sizes, color=colors)
+    ax.set_xlabel("Number of Papers")
+    ax.set_title("Community Sizes")
+    ax.invert_yaxis()
+
+    # Panel 3: Gap scores (top structural holes)
+    ax = axes[1, 0]
+    if state.structural_holes:
+        gap_labels = [
+            f"C{g['community_a']}-C{g['community_b']}"
+            for g in state.structural_holes[:8]
+        ]
+        gap_scores = [g["gap_score"] for g in state.structural_holes[:8]]
+        ax.barh(gap_labels, gap_scores, color="coral")
+        ax.set_xlabel("Gap Score (1 = completely disconnected)")
+        ax.set_title("Top Research Gaps (Structural Holes)")
+        ax.set_xlim(0, 1)
+        ax.invert_yaxis()
+    else:
+        ax.text(0.5, 0.5, "No significant gaps detected",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_title("Research Gaps")
+
+    # Panel 4: Corpus growth over time (aggregate)
+    ax = axes[1, 1]
+    year_counts = collections.Counter()
+    for paper in state.papers:
+        if paper.year:
+            year_counts[paper.year] += 1
+    years = sorted(year_counts.keys())
+    counts = [year_counts[y] for y in years]
+    ax.bar(years, counts, color="steelblue", alpha=0.8)
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Papers Published")
+    ax.set_title("Overall Corpus Growth")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.suptitle(
+        f"Literature Mining Dashboard: {state.config.topic}",
+        fontsize=14, fontweight="bold"
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Dashboard saved to {output_path}")
+</code></pre>
+<div class="code-caption">Listing 36.23: Four-panel trend dashboard showing per-community publication trends, community sizes, top structural holes, and overall corpus growth over time.</div>
+
+<h2>10. Integration with the Discovery Workbench</h2>
+
+<p>
+The literature miner produces three types of output that plug into the broader Discovery Workbench
+architecture introduced in <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.
+</p>
+
+<p>
+<strong>Structured JSON</strong> (the mining report) feeds into the hypothesis generation system
+of <a href="../module-39-hypothesis-generation/index.html">Chapter 39</a>. The identified gaps
+become candidate hypotheses: "if community A's methods were applied to community B's problems,
+what would happen?" The claim-evidence pairs become inputs for the claim validation pipeline of
+<a href="../module-41-claim-validation/index.html">Chapter 41</a>.
+</p>
+
+<p>
+<strong>Paper embeddings</strong> (the numpy array of abstract vectors) become the retrieval
+index for the RAG system of <a href="../module-37-rag-discovery/index.html">Chapter 37</a>.
+When a researcher asks a question, the RAG system retrieves the most relevant papers from
+this embedding index, feeds their abstracts (or full text) to a language model, and generates
+a cited answer.
+</p>
+
+<p>
+<strong>The citation graph</strong> (as a NetworkX object or serialized edge list) becomes the
+foundation for the knowledge graph of <a href="../module-38-knowledge-graphs/index.html">Chapter 38</a>.
+Entities and relations extracted from papers become nodes and edges in a larger knowledge graph
+that connects papers, authors, methods, datasets, and findings into a single queryable structure.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: OpenAlex PyAlex Client</div>
+<p>
+The <a href="https://github.com/J535D165/pyalex">pyalex</a> library provides a Pythonic wrapper
+around the OpenAlex API with built-in pagination, filtering, and polite-pool support. The entire
+OpenAlex harvesting stage above (Listings 36.1 and 36.16, roughly 80 lines) reduces to about 10
+lines: <code>import pyalex; pyalex.config.email = "..."; works = pyalex.Works().search("topic").filter(...).get()</code>.
+PyAlex handles cursor pagination, rate limiting, and response parsing internally. For production
+literature mining, start with pyalex and drop down to raw HTTP only if you need features it does
+not expose (such as custom cursor management for extremely large result sets).
+</p>
+</div>
+
+<div class="callout warning">
+<div class="callout-title">Warning: API Rate Limits and Data Freshness</div>
+<p>
+OpenAlex's polite pool allows roughly 10 requests per second (100,000 per day). Semantic Scholar
+is more restrictive: 1 request per second without an API key, 10 per second with one. Crossref
+varies by endpoint but averages around 50 requests per second. For a 500-paper harvest, OpenAlex
+completes in about 1 minute; Semantic Scholar may take 10 minutes. Plan your pipeline accordingly,
+and always cache API responses to avoid redundant requests during development and debugging.
+Also note that OpenAlex data is typically 1 to 3 months behind the latest publications; for
+cutting-edge preprints, supplement with direct arXiv API queries.
+</p>
+</div>
+
+<h2>11. Extending the Pipeline</h2>
+
+<p>
+The six-stage pipeline is a starting point. Several extensions increase its value for specific
+use cases:
+</p>
+
+<p>
+<strong>Author collaboration networks.</strong> OpenAlex provides author metadata for each paper.
+Building a co-authorship graph (where nodes are authors and edges connect co-authors) reveals
+research groups, collaboration patterns, and key individuals who bridge different teams. The
+same Louvain algorithm partitions the author network into research groups.
+</p>
+
+<p>
+<strong>Temporal community evolution.</strong> Running Louvain separately on papers from each
+year (or two-year window) and tracking how communities split, merge, grow, and shrink over time
+reveals the dynamics of a field. A community that splits into two subcommunities often signals
+a maturing area where specialization is emerging.
+</p>
+
+<p>
+<strong>Full-text PDF processing.</strong> Replacing abstract-only extraction with the full-text
+pipeline from <a href="section-36.2.html">Section 36.2</a> dramatically increases entity and
+relation yield (5 to 10 times more entities per paper), but requires access to PDFs and
+significantly more compute time.
+</p>
+
+<p>
+<strong>LLM-powered summarization.</strong> Passing community profiles and gap analyses to a
+large language model generates natural-language summaries of each community and narrative
+descriptions of identified gaps. This transforms the structured output into prose that
+non-technical stakeholders can read. We build this capability in the
+<a href="../module-37-rag-discovery/index.html">RAG systems</a> chapter.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+In 2024, Liang et al. introduced SciMON (Scientific Inspiration Machines Optimized for Novelty), a system that combines dense retrieval over millions of Semantic Scholar abstracts with LLM-guided reasoning to automatically generate novel research directions from gaps in the literature (published at ACL 2024). Unlike the structural hole approach in this section, which flags disconnected communities and leaves interpretation to the researcher, SciMON retrieves papers relevant to a user-specified problem, identifies underexplored intersections using citation and embedding signals, and then prompts a language model to synthesize concrete research proposals grounded in the retrieved evidence. This points toward a future where literature mining pipelines do not merely detect gaps but actively propose how to fill them, with cited justifications that a researcher can evaluate and refine.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Mine and Map a Micro-Field in 30 Minutes</h4>
+<p>
+Pick a narrow research topic you are curious about (for example, "graph neural networks for antibiotics") and build a mini literature map using only free tools and standard Python libraries.
+</p>
+<ol>
+<li><strong>Harvest 100 papers.</strong> Use the <code>requests</code> library to query the OpenAlex API directly: <code>requests.get("https://api.openalex.org/works", params={"search": "your topic", "filter": "cited_by_count:>0", "per_page": 100, "mailto": "you@example.com"})</code>. Save the JSON response to a file.</li>
+<li><strong>Build the citation graph.</strong> Parse the <code>referenced_works</code> field from each result. Using <code>networkx</code>, create a directed graph where each edge represents a citation. Compute PageRank with <code>nx.pagerank(G)</code> and print the top 10 most influential papers by title.</li>
+<li><strong>Detect communities.</strong> Install <code>python-louvain</code> (<code>pip install python-louvain</code>), convert the graph to undirected, and run <code>community_louvain.best_partition(G_undirected)</code>. Print each community's size and the titles of its top two PageRank papers to generate rough topic labels.</li>
+<li><strong>Find gaps.</strong> For each pair of communities with at least 3 members, count the actual cross-community edges and compare to the expected count (product of sizes divided by total nodes). Pairs where actual edges are less than 20% of expected are candidate structural holes.</li>
+<li><strong>Visualize.</strong> Use <code>matplotlib</code> to create a bar chart of community sizes and a scatter plot of PageRank vs. publication year. Save both as PNG files and write a three-sentence summary of what you found: the dominant community, the fastest-growing one, and the most promising gap.</li>
+</ol>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+The literature miner extracts, structures, and analyzes the scientific knowledge locked in
+papers. But retrieving that knowledge at query time, answering a researcher's specific question
+by finding and synthesizing relevant passages from hundreds of papers, requires a different
+architecture. <a href="../module-37-rag-discovery/index.html">Chapter 37: Retrieval-Augmented
+Discovery Systems</a> builds on the embeddings, extracted text, and citation structures from this
+chapter to create systems where researchers can ask questions in natural language and receive
+cited, evidence-backed answers drawn from the literature.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="section-36.2.html">&larr; 36.2 Knowledge Extraction from Papers</a>
+<a href="../module-37-rag-discovery/index.html">Chapter 37: Retrieval-Augmented Discovery &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

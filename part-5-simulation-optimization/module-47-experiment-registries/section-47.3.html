@@ -1,0 +1,1548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 47.3: Building an Experiment Registry. A three-stage ML pipeline with full artifact tracing, hash verification, and reproducible regeneration using DVC, MLflow, and PROV." name="description"/>
+<title>Section 47.3: Building an Experiment Registry | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation and Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 47: Experiment Registries and Scientific Provenance</a></div>
+<h1>47.3 Building an Experiment Registry</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"You want me to reproduce your result? Certainly. Just give me the same data, code, config, environment, random seed, GPU model, driver version, and cosmic ray flux as the original run, and I will have it for you by Tuesday."</p>
+<cite>A Reproducibility Skeptic Who Built a Registry Anyway</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section integrates all concepts from the chapter. You should have completed
+<a href="section-47.1.html">Section 47.1</a> (artifact versioning with Git, DVC, and MLflow)
+and <a href="section-47.2.html">Section 47.2</a> (W3C PROV, OpenLineage, run graphs). We
+use DVC pipelines, MLflow tracking, and PROV documents together. Familiarity with YAML
+configuration files and basic command-line Git workflows is assumed. The recipe targets a
+materials science use case (crystal property prediction), but the architecture applies to
+any ML domain.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The previous two sections gave us the building blocks: content-addressable storage,
+artifact versioning, provenance standards, and run graphs. This section assembles them
+into a complete, working experiment registry built around a three-stage ML pipeline
+(preprocessing, training, evaluation). Every artifact at every stage is hashed, versioned,
+and linked to its inputs through both DVC's pipeline DAG and a W3C PROV document. The
+system supports two critical operations: (1) tracing any result back to its raw inputs
+through the artifact DAG, and (2) regenerating any artifact from scratch by replaying
+the pipeline from its provenance record. This is the infrastructure that makes every
+experiment in the Discovery Workbench reproducible.
+</p>
+</div>
+
+<h2>1. Project Structure</h2>
+
+<p>
+A well-organized project structure is the first prerequisite for a functional registry.
+The following layout separates concerns cleanly: source code in <code>src/</code>,
+configurations in <code>configs/</code>, data in <code>data/</code> (DVC-tracked), and
+outputs in <code>outputs/</code> (also DVC-tracked). The <code>dvc.yaml</code> file at
+the root defines the pipeline DAG.
+</p>
+
+<p data-agent="02">
+An experiment registry is a structured database that records every run of a computational pipeline together with the exact versions of code, data, configuration, and environment that produced each result. It matters because without one, reproducing a result from six months ago requires reconstructing the experimental setup from memory, scattered scripts, and emails, a process that routinely fails. The registry works by assigning a content-addressable hash to every input and output artifact at each pipeline stage, then storing those hashes alongside the run metadata (Git commit, config values, timestamps) in a queryable record. Use a registry whenever your project involves iterative experimentation with changing parameters or data; for one-off scripts that will never be re-run, a simple lab notebook entry suffices instead.
+</p>
+
+<pre><code class="language-text">crystal-property-prediction/
+├── .git/                      # Git repository
+├── .dvc/                      # DVC configuration
+│   └── config                 # DVC remote settings
+├── dvc.yaml                   # Pipeline DAG definition
+├── dvc.lock                   # Frozen hashes for all pipeline stages
+├── params.yaml                # Shared parameters (read by DVC)
+├── configs/
+│   ├── preprocess.yaml        # Preprocessing parameters
+│   ├── train.yaml             # Training hyperparameters
+│   └── evaluate.yaml          # Evaluation settings
+├── src/
+│   ├── __init__.py
+│   ├── preprocess.py          # Stage 1: data preprocessing
+│   ├── train.py               # Stage 2: model training
+│   ├── evaluate.py            # Stage 3: evaluation
+│   └── registry.py            # Provenance recording utilities
+├── data/
+│   ├── raw/                   # Raw data (DVC-tracked)
+│   │   └── crystals.parquet.dvc
+│   └── processed/             # Processed data (DVC-tracked)
+│       └── .gitkeep
+├── outputs/
+│   ├── models/                # Trained models (DVC-tracked)
+│   │   └── .gitkeep
+│   └── metrics/               # Evaluation results
+│       └── .gitkeep
+├── provenance/                # PROV documents (Git-tracked)
+│   └── .gitkeep
+├── Dockerfile                 # Environment specification
+├── requirements.txt           # Pinned dependencies
+└── README.md
+</code></pre>
+<div class="code-caption">Figure 47.17: Project structure for a provenance-complete ML pipeline. Git tracks source code, configurations, and PROV documents. DVC tracks large binary artifacts (raw data, processed features, model checkpoints). The <code>dvc.yaml</code> defines the pipeline DAG that connects all stages.</div>
+
+<h2>2. The DVC Pipeline Definition</h2>
+
+<p>
+DVC pipelines (<code>dvc.yaml</code>) declare the stages of a pipeline, their dependencies,
+parameters, and outputs. DVC uses this declaration to build the artifact DAG, determine
+which stages need re-execution when inputs change, and lock the exact hashes of all
+artifacts in <code>dvc.lock</code>.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the artifact DAG as a restaurant kitchen's order ticket system. Each ticket (provenance record) lists the exact ingredients that went into a dish (input hashes), which cook prepared it (code version), the recipe card used (config hash), and the timestamp when it left the kitchen (output hash). If a customer complains about a dish served last Tuesday, the chef can pull the ticket, trace back to the specific bag of flour and carton of eggs, and determine whether the problem was a bad ingredient, a wrong recipe, or a substitution. The DAG links tickets across stations the same way: the prep station's output ticket becomes the grill station's input ticket, forming a chain from raw delivery to plated dish.
+</p>
+</div>
+
+<pre><code class="language-yaml"># dvc.yaml: Three-stage ML pipeline with full dependency tracking
+stages:
+  preprocess:
+    cmd: python -m src.preprocess
+    deps:
+      - src/preprocess.py
+      - data/raw/crystals.parquet
+    params:
+      - configs/preprocess.yaml:
+          - feature_columns
+          - normalize
+          - train_fraction
+          - random_seed
+    outs:
+      - data/processed/train.parquet
+      - data/processed/test.parquet
+    metrics:
+      - outputs/metrics/preprocess_stats.json:
+          cache: false
+
+  train:
+    cmd: python -m src.train
+    deps:
+      - src/train.py
+      - data/processed/train.parquet
+    params:
+      - configs/train.yaml:
+          - architecture
+          - hidden_dim
+          - num_layers
+          - dropout
+          - learning_rate
+          - batch_size
+          - max_epochs
+          - early_stopping_patience
+          - random_seed
+    outs:
+      - outputs/models/model.pt
+    plots:
+      - outputs/metrics/training_curves.json:
+          cache: false
+          x: epoch
+          y: val_loss
+
+  evaluate:
+    cmd: python -m src.evaluate
+    deps:
+      - src/evaluate.py
+      - data/processed/test.parquet
+      - outputs/models/model.pt
+    params:
+      - configs/evaluate.yaml:
+          - metrics_list
+          - confidence_level
+    metrics:
+      - outputs/metrics/evaluation.json:
+          cache: false
+    plots:
+      - outputs/metrics/predictions_vs_actual.json:
+          cache: false
+          x: actual
+          y: predicted
+</code></pre>
+<div class="code-caption">Figure 47.18: The DVC pipeline definition. Each stage declares its command, code dependencies (<code>deps</code>), parameter dependencies (<code>params</code>), outputs (<code>outs</code>), and metrics. DVC uses these declarations to build the artifact DAG and to skip stages whose inputs have not changed.</div>
+
+<p>
+The <code>params</code> entries are particularly important for provenance: DVC tracks not
+just <em>which</em> config file a stage depends on, but <em>which specific parameters</em>
+within that file. If you change the learning rate in <code>train.yaml</code>, DVC knows to
+re-run the training and evaluation stages but skip preprocessing (whose parameters did not
+change). This selective re-execution is the practical benefit of a well-specified artifact DAG.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that an experiment registry is simply a spreadsheet or lab notebook where you write down hyperparameters and results after each run. A true registry requires machine-readable, hash-verified links between artifacts: it must be possible for software (not just a human reading notes) to trace any output back to its exact inputs and to detect when an artifact has been silently modified. If your "registry" cannot automatically flag that a model checkpoint no longer matches the data it was trained on, it is a log, not a registry.
+</p>
+</div>
+
+<h2>3. Stage 1: Preprocessing with Provenance</h2>
+
+<p>
+Each pipeline stage is a Python module that reads its inputs, performs its computation,
+writes its outputs, and records provenance metadata. The preprocessing stage loads raw
+crystal structure data, extracts features, splits into train/test sets, and emits a
+PROV record documenting the transformation.
+</p>
+
+<pre><code class="language-python">"""src/preprocess.py: Stage 1 of the provenance-tracked pipeline."""
+import hashlib
+import json
+import yaml
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from datetime import datetime, timezone
+from sklearn.model_selection import train_test_split
+
+from src.registry import (
+    compute_file_hash,
+    get_git_info,
+    ProvenanceRecorder,
+)
+
+
+def load_config(path: str = "configs/preprocess.yaml") -> dict:
+    """Load preprocessing configuration."""
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def extract_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Extract features from raw crystal structure data.
+
+    Selects configured feature columns, applies normalization,
+    and handles missing values.
+    """
+    feature_cols = config["feature_columns"]
+    target_col = config.get("target_column", "bandgap_eV")
+
+    # Select features and target
+    features = df[feature_cols + [target_col]].copy()
+
+    # Drop rows with missing targets
+    initial_count = len(features)
+    features = features.dropna(subset=[target_col])
+    dropped = initial_count - len(features)
+
+    if config.get("normalize", True):
+        for col in feature_cols:
+            col_mean = features[col].mean()
+            col_std = features[col].std()
+            if col_std > 0:
+                features[col] = (features[col] - col_mean) / col_std
+
+    return features, dropped
+
+
+def main():
+    """Run the preprocessing stage with full provenance tracking."""
+    config = load_config()
+    git_info = get_git_info()
+    recorder = ProvenanceRecorder(stage_name="preprocess")
+
+    # Record start
+    recorder.start(
+        git_commit=git_info["commit_hash"],
+        config_hash=compute_file_hash("configs/preprocess.yaml"),
+    )
+
+    # Load raw data
+    raw_path = Path("data/raw/crystals.parquet")
+    raw_hash = compute_file_hash(raw_path)
+    recorder.add_input("raw_crystals", str(raw_path), raw_hash)
+
+    df = pd.read_parquet(raw_path)
+    print(f"Loaded {len(df)} raw crystal records")
+
+    # Extract features
+    features, dropped = extract_features(df, config)
+    print(f"Extracted features: {len(features)} records "
+          f"({dropped} dropped for missing targets)")
+
+    # Train/test split with fixed random seed
+    train_df, test_df = train_test_split(
+        features,
+        train_size=config["train_fraction"],
+        random_state=config["random_seed"],
+    )
+
+    # Save processed data
+    train_path = Path("data/processed/train.parquet")
+    test_path = Path("data/processed/test.parquet")
+    train_path.parent.mkdir(parents=True, exist_ok=True)
+
+    train_df.to_parquet(train_path, index=False)
+    test_df.to_parquet(test_path, index=False)
+
+    train_hash = compute_file_hash(train_path)
+    test_hash = compute_file_hash(test_path)
+
+    recorder.add_output("train_data", str(train_path), train_hash)
+    recorder.add_output("test_data", str(test_path), test_hash)
+
+    # Save preprocessing statistics
+    stats = {
+        "raw_records": len(df),
+        "dropped_records": dropped,
+        "train_records": len(train_df),
+        "test_records": len(test_df),
+        "feature_columns": config["feature_columns"],
+        "normalized": config.get("normalize", True),
+        "random_seed": config["random_seed"],
+        "raw_data_hash": raw_hash,
+        "train_data_hash": train_hash,
+        "test_data_hash": test_hash,
+    }
+    stats_path = Path("outputs/metrics/preprocess_stats.json")
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+
+    # Complete provenance record
+    recorder.complete(metrics=stats)
+    recorder.save_prov("provenance/preprocess_prov.json")
+
+    print(f"Preprocessing complete:")
+    print(f"  Train: {len(train_df)} records [{train_hash[:12]}...]")
+    print(f"  Test:  {len(test_df)} records [{test_hash[:12]}...]")
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<div class="code-caption">Figure 47.19: The preprocessing stage with integrated provenance tracking. Every input is hashed before use, every output is hashed after creation, and a PROV record links inputs to outputs through the preprocessing activity. The statistics JSON serves as both a DVC metric and a human-readable audit trail.</div>
+
+<h2>4. Stage 2: Training with Experiment Tracking</h2>
+
+<p>
+The training stage combines DVC pipeline integration (for artifact DAG tracking) with
+MLflow experiment tracking (for hyperparameter and metric logging). This dual integration
+is the key to a complete registry: DVC captures what artifacts exist and how they relate;
+MLflow captures the detailed experimental context (learning curves, parameter importance,
+model comparison dashboards).
+</p>
+
+<pre><code class="language-python">"""src/train.py: Stage 2 with MLflow tracking and provenance."""
+import json
+import yaml
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import mlflow
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from torch.utils.data import DataLoader, TensorDataset
+
+from src.registry import (
+    compute_file_hash,
+    get_git_info,
+    ProvenanceRecorder,
+    set_reproducibility_seed,
+)
+
+
+class CrystalPropertyNet(nn.Module):
+    """A feedforward network for crystal property prediction."""
+
+    def __init__(self, input_dim: int, hidden_dim: int,
+                 num_layers: int, dropout: float):
+        super().__init__()
+        layers = []
+        current_dim = input_dim
+
+        for i in range(num_layers):
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            current_dim = hidden_dim
+
+        layers.append(nn.Linear(current_dim, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x).squeeze(-1)
+
+
+def load_config(path: str = "configs/train.yaml") -> dict:
+    """Load training configuration."""
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def create_dataloader(
+    parquet_path: str,
+    target_col: str,
+    batch_size: int,
+    shuffle: bool = True,
+) -> tuple[DataLoader, int]:
+    """Create a PyTorch DataLoader from a parquet file."""
+    df = pd.read_parquet(parquet_path)
+    feature_cols = [c for c in df.columns if c != target_col]
+
+    X = torch.tensor(df[feature_cols].values, dtype=torch.float32)
+    y = torch.tensor(df[target_col].values, dtype=torch.float32)
+
+    dataset = TensorDataset(X, y)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    return loader, X.shape[1]
+
+
+def train_epoch(model, loader, optimizer, criterion, device):
+    """Train for one epoch and return average loss."""
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+
+    for X_batch, y_batch in loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        optimizer.zero_grad()
+        predictions = model(X_batch)
+        loss = criterion(predictions, y_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / n_batches
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, device):
+    """Validate and return average loss."""
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+
+    for X_batch, y_batch in loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        predictions = model(X_batch)
+        loss = criterion(predictions, y_batch)
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / n_batches
+
+
+def main():
+    """Run training with MLflow tracking and provenance recording."""
+    config = load_config()
+    git_info = get_git_info()
+    recorder = ProvenanceRecorder(stage_name="train")
+
+    # Set reproducibility
+    set_reproducibility_seed(config["random_seed"])
+
+    recorder.start(
+        git_commit=git_info["commit_hash"],
+        config_hash=compute_file_hash("configs/train.yaml"),
+    )
+
+    # Record input artifacts
+    train_path = "data/processed/train.parquet"
+    train_hash = compute_file_hash(train_path)
+    recorder.add_input("train_data", train_path, train_hash)
+
+    config_hash = compute_file_hash("configs/train.yaml")
+    recorder.add_input("train_config", "configs/train.yaml", config_hash)
+
+    # Setup device
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    print(f"Training on {device}")
+
+    # Create data loaders
+    target_col = config.get("target_column", "bandgap_eV")
+    train_loader, input_dim = create_dataloader(
+        train_path, target_col, config["batch_size"]
+    )
+
+    # For validation, use a portion of training data
+    # (test data is reserved for Stage 3)
+    val_loader, _ = create_dataloader(
+        train_path, target_col, config["batch_size"], shuffle=False
+    )
+
+    # Create model
+    model = CrystalPropertyNet(
+        input_dim=input_dim,
+        hidden_dim=config["hidden_dim"],
+        num_layers=config["num_layers"],
+        dropout=config["dropout"],
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
+    criterion = nn.MSELoss()
+
+    # MLflow tracking
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    mlflow.set_experiment("crystal_property_prediction")
+
+    with mlflow.start_run() as run:
+        # Log provenance metadata as MLflow tags
+        mlflow.set_tag("git_commit", git_info["commit_hash"])
+        mlflow.set_tag("git_branch", git_info["branch"])
+        mlflow.set_tag("git_dirty", str(git_info["is_dirty"]))
+        mlflow.set_tag("train_data_hash", train_hash)
+        mlflow.set_tag("config_hash", config_hash)
+
+        # Log all hyperparameters
+        mlflow.log_params({
+            "architecture": config["architecture"],
+            "hidden_dim": config["hidden_dim"],
+            "num_layers": config["num_layers"],
+            "dropout": config["dropout"],
+            "learning_rate": config["learning_rate"],
+            "batch_size": config["batch_size"],
+            "max_epochs": config["max_epochs"],
+            "random_seed": config["random_seed"],
+            "input_dim": input_dim,
+            "device": str(device),
+        })
+
+        # Training loop with early stopping
+        best_val_loss = float("inf")
+        patience_counter = 0
+        training_curves = []
+
+        for epoch in range(1, config["max_epochs"] + 1):
+            train_loss = train_epoch(
+                model, train_loader, optimizer, criterion, device
+            )
+            val_loss = validate(model, val_loader, criterion, device)
+
+            # Log to MLflow
+            mlflow.log_metrics({
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+            }, step=epoch)
+
+            training_curves.append({
+                "epoch": epoch,
+                "train_loss": round(train_loss, 6),
+                "val_loss": round(val_loss, 6),
+            })
+
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                # Save best model
+                model_path = Path("outputs/models/model.pt")
+                model_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "val_loss": val_loss,
+                    "config": config,
+                    "input_dim": input_dim,
+                    "git_commit": git_info["commit_hash"],
+                    "train_data_hash": train_hash,
+                }, model_path)
+            else:
+                patience_counter += 1
+                if patience_counter >= config["early_stopping_patience"]:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch}: train={train_loss:.6f}, "
+                      f"val={val_loss:.6f}")
+
+        # Log final metrics
+        model_hash = compute_file_hash("outputs/models/model.pt")
+        mlflow.log_metrics({
+            "best_val_loss": best_val_loss,
+            "final_epoch": epoch,
+        })
+        mlflow.set_tag("model_hash", model_hash)
+
+        # Log the model to MLflow's artifact store
+        mlflow.pytorch.log_model(
+            model, "model",
+            registered_model_name="CrystalPropertyPredictor",
+        )
+
+        # Save training curves for DVC plots
+        curves_path = Path("outputs/metrics/training_curves.json")
+        with open(curves_path, "w") as f:
+            json.dump(training_curves, f, indent=2)
+
+        print(f"\nTraining complete (MLflow run: {run.info.run_id})")
+        print(f"  Best val loss: {best_val_loss:.6f} at epoch {epoch}")
+        print(f"  Model hash: {model_hash[:12]}...")
+
+    # Record output artifacts in provenance
+    recorder.add_output(
+        "trained_model", "outputs/models/model.pt", model_hash
+    )
+    recorder.complete(metrics={
+        "best_val_loss": best_val_loss,
+        "final_epoch": epoch,
+        "mlflow_run_id": run.info.run_id,
+    })
+    recorder.save_prov("provenance/train_prov.json")
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<div class="code-caption">Figure 47.20: The training stage with dual MLflow and PROV provenance tracking. MLflow captures the detailed experiment context (hyperparameters, per-epoch metrics, model artifacts). The PROV recorder captures the artifact-level lineage (which data hash produced which model hash). The model checkpoint itself embeds its provenance metadata (Git commit, data hash, config) for self-documenting reproducibility.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Self-Documenting Model Checkpoints</div>
+<p>
+The <code>torch.save()</code> call in Figure 47.20 embeds provenance metadata directly
+inside the model checkpoint: the Git commit hash, training data hash, and full configuration.
+This means the checkpoint is self-documenting. Even if the registry database is lost, the
+model file itself contains enough information to identify exactly which code and data
+produced it. This defense-in-depth strategy (provenance in the registry <em>and</em> in
+the artifact) protects against the most common failure mode in long-running research
+projects: gradual metadata rot as team members leave and tools are replaced.
+</p>
+</div>
+
+<h2>5. Stage 3: Evaluation with Verification</h2>
+
+<p>
+The evaluation stage loads the trained model and test data, computes metrics, and performs
+a critical step that most pipelines omit: <strong>hash verification</strong>. Before using
+any input artifact, the stage recomputes its hash and compares it against the hash recorded
+in the provenance chain. This catches silent corruption, accidental overwrites, and any
+discrepancy between what the registry claims and what actually exists on disk.
+</p>
+
+<pre><code class="language-python">"""src/evaluate.py: Stage 3 with hash verification and provenance."""
+import json
+import yaml
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
+
+from src.registry import (
+    compute_file_hash,
+    get_git_info,
+    ProvenanceRecorder,
+    verify_artifact_chain,
+)
+from src.train import CrystalPropertyNet
+
+
+def load_config(path: str = "configs/evaluate.yaml") -> dict:
+    """Load evaluation configuration."""
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def load_model_with_verification(
+    model_path: str,
+    expected_train_hash: str = None,
+) -> tuple[CrystalPropertyNet, dict]:
+    """Load a model checkpoint and verify its provenance metadata.
+
+    Checks that the embedded data hash matches the expected value,
+    catching cases where the model was trained on different data
+    than the evaluation expects.
+    """
+    checkpoint = torch.load(model_path, weights_only=False)
+
+    # Verify embedded provenance if expected hashes are provided
+    if expected_train_hash:
+        actual_hash = checkpoint.get("train_data_hash", "UNKNOWN")
+        if actual_hash != expected_train_hash:
+            raise ValueError(
+                f"Model provenance mismatch!\n"
+                f"  Expected train data hash: {expected_train_hash[:16]}...\n"
+                f"  Model was trained on:     {actual_hash[:16]}...\n"
+                f"  This model may have been trained on different data."
+            )
+
+    config = checkpoint["config"]
+    input_dim = checkpoint["input_dim"]
+
+    model = CrystalPropertyNet(
+        input_dim=input_dim,
+        hidden_dim=config["hidden_dim"],
+        num_layers=config["num_layers"],
+        dropout=config["dropout"],
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    return model, checkpoint
+
+
+def compute_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    confidence_level: float = 0.95,
+) -> dict:
+    """Compute evaluation metrics with confidence intervals."""
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+
+    # Bootstrap confidence intervals
+    n_bootstrap = 1000
+    rng = np.random.default_rng(42)
+    n_samples = len(y_true)
+    bootstrap_maes = []
+
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n_samples, size=n_samples)
+        bootstrap_maes.append(
+            mean_absolute_error(y_true[idx], y_pred[idx])
+        )
+
+    alpha = (1 - confidence_level) / 2
+    ci_lower = np.quantile(bootstrap_maes, alpha)
+    ci_upper = np.quantile(bootstrap_maes, 1 - alpha)
+
+    return {
+        "mae": round(float(mae), 6),
+        "rmse": round(float(rmse), 6),
+        "r2": round(float(r2), 6),
+        "mae_ci_lower": round(float(ci_lower), 6),
+        "mae_ci_upper": round(float(ci_upper), 6),
+        "confidence_level": confidence_level,
+        "n_test_samples": n_samples,
+    }
+
+
+def main():
+    """Run evaluation with hash verification and provenance."""
+    config = load_config()
+    git_info = get_git_info()
+    recorder = ProvenanceRecorder(stage_name="evaluate")
+
+    recorder.start(
+        git_commit=git_info["commit_hash"],
+        config_hash=compute_file_hash("configs/evaluate.yaml"),
+    )
+
+    # --- Hash Verification ---
+    # Before using any artifact, verify its integrity against
+    # the provenance chain from previous stages
+
+    test_path = "data/processed/test.parquet"
+    model_path = "outputs/models/model.pt"
+
+    test_hash = compute_file_hash(test_path)
+    model_hash = compute_file_hash(model_path)
+
+    # Load preprocessing provenance to get expected test hash
+    preprocess_prov_path = Path("provenance/preprocess_prov.json")
+    if preprocess_prov_path.exists():
+        with open(preprocess_prov_path) as f:
+            preprocess_prov = json.load(f)
+        expected_test_hash = preprocess_prov.get("outputs", {}).get(
+            "test_data", {}
+        ).get("hash")
+        if expected_test_hash and expected_test_hash != test_hash:
+            raise ValueError(
+                f"Test data integrity check FAILED!\n"
+                f"  Expected: {expected_test_hash[:16]}...\n"
+                f"  Actual:   {test_hash[:16]}...\n"
+                f"  The test data may have been modified since preprocessing."
+            )
+        print(f"Test data integrity: VERIFIED [{test_hash[:12]}...]")
+
+    # Load training provenance to get expected train data hash
+    train_prov_path = Path("provenance/train_prov.json")
+    expected_train_hash = None
+    if train_prov_path.exists():
+        with open(train_prov_path) as f:
+            train_prov = json.load(f)
+        expected_train_hash = train_prov.get("inputs", {}).get(
+            "train_data", {}
+        ).get("hash")
+
+    recorder.add_input("test_data", test_path, test_hash)
+    recorder.add_input("trained_model", model_path, model_hash)
+
+    # Load model with provenance verification
+    model, checkpoint = load_model_with_verification(
+        model_path, expected_train_hash
+    )
+    print(f"Model integrity: VERIFIED [{model_hash[:12]}...]")
+    print(f"  Trained at commit: {checkpoint.get('git_commit', 'N/A')[:8]}...")
+    print(f"  Best val loss: {checkpoint.get('val_loss', 'N/A')}")
+
+    # Load test data
+    target_col = config.get("target_column", "bandgap_eV")
+    test_df = pd.read_parquet(test_path)
+    feature_cols = [c for c in test_df.columns if c != target_col]
+
+    X_test = torch.tensor(
+        test_df[feature_cols].values, dtype=torch.float32
+    )
+    y_test = test_df[target_col].values
+
+    # Run predictions
+    with torch.no_grad():
+        y_pred = model(X_test).numpy()
+
+    # Compute metrics
+    metrics = compute_metrics(
+        y_test, y_pred,
+        confidence_level=config.get("confidence_level", 0.95),
+    )
+
+    # Add provenance metadata to metrics
+    metrics["model_hash"] = model_hash
+    metrics["test_data_hash"] = test_hash
+    metrics["git_commit"] = git_info["commit_hash"]
+    metrics["model_trained_at_commit"] = checkpoint.get("git_commit", "N/A")
+
+    # Save evaluation results
+    eval_path = Path("outputs/metrics/evaluation.json")
+    eval_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(eval_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    # Save predictions vs actuals for DVC plots
+    predictions_path = Path("outputs/metrics/predictions_vs_actual.json")
+    pred_records = [
+        {"actual": round(float(a), 4), "predicted": round(float(p), 4)}
+        for a, p in zip(y_test[:500], y_pred[:500])  # Sample for plotting
+    ]
+    with open(predictions_path, "w") as f:
+        json.dump(pred_records, f, indent=2)
+
+    # Record provenance
+    eval_hash = compute_file_hash(eval_path)
+    recorder.add_output("evaluation_metrics", str(eval_path), eval_hash)
+    recorder.complete(metrics=metrics)
+    recorder.save_prov("provenance/evaluate_prov.json")
+
+    print(f"\nEvaluation Results:")
+    print(f"  MAE:  {metrics['mae']:.4f} "
+          f"({metrics['mae_ci_lower']:.4f}, {metrics['mae_ci_upper']:.4f})")
+    print(f"  RMSE: {metrics['rmse']:.4f}")
+    print(f"  R2:   {metrics['r2']:.4f}")
+    print(f"  Test samples: {metrics['n_test_samples']}")
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<div class="code-caption">Figure 47.21: The evaluation stage with hash verification. Before computing metrics, the stage verifies that the test data and model checkpoints match their provenance records. This catches silent corruption and accidental overwrites. The evaluation metrics embed their own provenance (model hash, data hash, Git commit) for self-documenting results.</div>
+
+<h2>6. The Registry Utilities Module</h2>
+
+<p>
+The three pipeline stages share a set of provenance utilities: hash computation, Git
+state capture, and the PROV recorder. These live in <code>src/registry.py</code>.
+</p>
+
+<pre><code class="language-python">"""src/registry.py: Shared provenance utilities for pipeline stages."""
+import hashlib
+import json
+import subprocess
+import random
+import numpy as np
+import torch
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Optional
+
+
+def compute_file_hash(file_path, algorithm: str = "sha256") -> str:
+    """Compute cryptographic hash of a file, streaming for large files."""
+    hasher = hashlib.new(algorithm)
+    with open(file_path, "rb") as f:
+        while chunk := f.read(8192):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def get_git_info() -> dict:
+    """Capture current Git state for provenance."""
+    def git(args):
+        r = subprocess.run(
+            ["git"] + args, capture_output=True, text=True, check=True
+        )
+        return r.stdout.strip()
+
+    status = git(["status", "--porcelain"])
+    return {
+        "commit_hash": git(["rev-parse", "HEAD"]),
+        "branch": git(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "is_dirty": len(status) > 0,
+        "dirty_files": status if status else None,
+    }
+
+
+def set_reproducibility_seed(seed: int):
+    """Set random seeds for reproducibility across all frameworks."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        # Note: setting deterministic mode reduces performance
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def verify_artifact_chain(provenance_dir: str = "provenance") -> dict:
+    """Verify the integrity of the entire provenance chain.
+
+    Checks that every output artifact recorded in provenance
+    still matches its recorded hash on disk.
+    """
+    prov_dir = Path(provenance_dir)
+    results = {"verified": [], "failed": [], "missing": []}
+
+    for prov_file in sorted(prov_dir.glob("*_prov.json")):
+        with open(prov_file) as f:
+            prov = json.load(f)
+
+        stage = prov.get("stage_name", prov_file.stem)
+
+        for name, info in prov.get("outputs", {}).items():
+            path = info.get("path")
+            expected_hash = info.get("hash")
+
+            if not path or not expected_hash:
+                continue
+
+            if not Path(path).exists():
+                results["missing"].append({
+                    "stage": stage,
+                    "artifact": name,
+                    "path": path,
+                })
+                continue
+
+            actual_hash = compute_file_hash(path)
+            if actual_hash == expected_hash:
+                results["verified"].append({
+                    "stage": stage,
+                    "artifact": name,
+                    "hash": actual_hash[:12],
+                })
+            else:
+                results["failed"].append({
+                    "stage": stage,
+                    "artifact": name,
+                    "expected": expected_hash[:12],
+                    "actual": actual_hash[:12],
+                })
+
+    return results
+
+
+class ProvenanceRecorder:
+    """Records provenance for a single pipeline stage.
+
+    Creates a JSON document compatible with conversion to W3C PROV
+    (see Section 47.2's openlineage_to_prov converter).
+    """
+
+    def __init__(self, stage_name: str):
+        self.stage_name = stage_name
+        self.record = {
+            "stage_name": stage_name,
+            "inputs": {},
+            "outputs": {},
+            "started_at": None,
+            "completed_at": None,
+            "git_commit": None,
+            "config_hash": None,
+            "metrics": {},
+            "status": "initialized",
+        }
+
+    def start(self, git_commit: str, config_hash: str):
+        """Record the start of a pipeline stage."""
+        self.record["started_at"] = datetime.now(timezone.utc).isoformat()
+        self.record["git_commit"] = git_commit
+        self.record["config_hash"] = config_hash
+        self.record["status"] = "running"
+
+    def add_input(self, name: str, path: str, content_hash: str):
+        """Record an input artifact with its hash."""
+        self.record["inputs"][name] = {
+            "path": path,
+            "hash": content_hash,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def add_output(self, name: str, path: str, content_hash: str):
+        """Record an output artifact with its hash."""
+        self.record["outputs"][name] = {
+            "path": path,
+            "hash": content_hash,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def complete(self, metrics: Optional[dict] = None):
+        """Record successful completion of the stage."""
+        self.record["completed_at"] = datetime.now(timezone.utc).isoformat()
+        self.record["status"] = "completed"
+        if metrics:
+            self.record["metrics"] = metrics
+
+    def save_prov(self, path: str):
+        """Save the provenance record as JSON."""
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(self.record, f, indent=2)
+        print(f"Provenance saved: {path}")
+</code></pre>
+<div class="code-caption">Figure 47.22: The shared registry utilities module. Provides file hashing, Git state capture, reproducibility seed management, artifact chain verification, and the PROV recorder used by all pipeline stages. The <code>verify_artifact_chain</code> function performs a complete integrity audit of all recorded artifacts.</div>
+
+<h2>7. Running the Pipeline</h2>
+
+<p>
+With all stages defined and the DVC pipeline configured, running the complete pipeline
+is a single command. DVC handles dependency resolution, selective re-execution, and
+artifact caching automatically.
+</p>
+
+<pre><code class="language-bash"># Run the entire pipeline
+dvc repro
+
+# DVC output shows the execution plan:
+# Running stage 'preprocess':
+# > python -m src.preprocess
+# Loaded 47665 raw crystal records
+# Extracted features: 47523 records (142 dropped)
+# Preprocessing complete:
+#   Train: 38018 records [d4e5f6a7b8c9...]
+#   Test:  9505 records  [e5f6a7b8c9d0...]
+#
+# Running stage 'train':
+# > python -m src.train
+# Training on cuda
+# Epoch 10: train=0.048231, val=0.052117
+# ...
+# Early stopping at epoch 87
+# Training complete (MLflow run: a1b2c3d4...)
+#
+# Running stage 'evaluate':
+# > python -m src.evaluate
+# Test data integrity: VERIFIED [e5f6a7b8c9d0...]
+# Model integrity: VERIFIED [c3b2a1f6e5d4...]
+# Evaluation Results:
+#   MAE:  0.0423 (0.0398, 0.0449)
+#   RMSE: 0.0612
+#   R2:   0.9387
+
+# After pipeline runs, DVC creates dvc.lock with frozen hashes
+cat dvc.lock | head -30
+</code></pre>
+<div class="code-caption">Figure 47.23: Running the complete pipeline with DVC. A single <code>dvc repro</code> command executes all stages in dependency order, performs hash verification at each stage, and produces the <code>dvc.lock</code> file containing frozen hashes for every artifact. Subsequent runs skip stages whose inputs have not changed.</div>
+
+<pre><code class="language-bash"># Verify the entire provenance chain after a run
+python -c "
+from src.registry import verify_artifact_chain
+results = verify_artifact_chain()
+print(f'Verified: {len(results[\"verified\"])} artifacts')
+print(f'Failed:   {len(results[\"failed\"])} artifacts')
+print(f'Missing:  {len(results[\"missing\"])} artifacts')
+for v in results['verified']:
+    print(f'  OK: {v[\"stage\"]}/{v[\"artifact\"]} [{v[\"hash\"]}...]')
+for f in results['failed']:
+    print(f'  FAIL: {f[\"stage\"]}/{f[\"artifact\"]} '
+          f'expected={f[\"expected\"]}... actual={f[\"actual\"]}...')
+"
+</code></pre>
+<div class="code-caption">Figure 47.24: Post-run integrity verification. The <code>verify_artifact_chain</code> function walks through all provenance records and confirms that every artifact on disk matches its recorded hash. This is the final safeguard against silent corruption or accidental modification.</div>
+
+<h2>8. Reproducing Historical Experiments</h2>
+
+<p>
+The entire point of this infrastructure is reproducibility. Given a specific experiment
+(identified by its Git commit), we can reconstruct the exact state of code, data, config,
+and environment, then re-execute the pipeline:
+</p>
+
+<pre><code class="language-python">"""Reproduce a historical experiment from its provenance record."""
+import subprocess
+import json
+from pathlib import Path
+
+from src.registry import compute_file_hash
+
+
+def reproduce_experiment(git_ref: str, verify: bool = True):
+    """Reproduce an experiment from a specific Git commit.
+
+    Steps:
+    1. Checkout the code at the specified commit
+    2. Pull the corresponding data versions from DVC
+    3. Re-run the pipeline
+    4. Compare output hashes against the original provenance
+    """
+    print(f"Reproducing experiment at {git_ref[:8]}...")
+
+    # Step 1: Checkout code (and DVC pointer files)
+    subprocess.run(["git", "checkout", git_ref], check=True)
+    print(f"  Code checked out at {git_ref[:8]}")
+
+    # Step 2: Pull data versions that match the DVC pointers
+    subprocess.run(["dvc", "checkout"], check=True)
+    subprocess.run(["dvc", "pull"], check=True)
+    print("  Data versions restored")
+
+    # Step 3: Re-run the pipeline
+    result = subprocess.run(
+        ["dvc", "repro"],
+        capture_output=True, text=True,
+    )
+    print(f"  Pipeline {'completed' if result.returncode == 0 else 'FAILED'}")
+
+    if result.returncode != 0:
+        print(f"  Error: {result.stderr}")
+        return False
+
+    # Step 4: Verify outputs match original provenance
+    if verify:
+        prov_dir = Path("provenance")
+        if not prov_dir.exists():
+            print("  No provenance records found; skipping verification")
+            return True
+
+        all_match = True
+        for prov_file in sorted(prov_dir.glob("*_prov.json")):
+            with open(prov_file) as f:
+                original_prov = json.load(f)
+
+            stage = original_prov["stage_name"]
+            for name, info in original_prov.get("outputs", {}).items():
+                path = info["path"]
+                original_hash = info["hash"]
+                current_hash = compute_file_hash(path)
+
+                if current_hash == original_hash:
+                    print(f"  MATCH: {stage}/{name} [{current_hash[:12]}...]")
+                else:
+                    print(f"  MISMATCH: {stage}/{name}")
+                    print(f"    Original:  {original_hash[:16]}...")
+                    print(f"    Reproduced: {current_hash[:16]}...")
+                    all_match = False
+
+        if all_match:
+            print("\n  REPRODUCTION SUCCESSFUL: all artifacts match")
+        else:
+            print("\n  REPRODUCTION PARTIAL: some artifacts differ")
+            print("  (Differences may be due to GPU non-determinism)")
+
+        return all_match
+
+    return True
+
+
+# Reproduce the experiment from commit abc123
+# reproduce_experiment("abc123def456")
+</code></pre>
+<div class="code-caption">Figure 47.25: Reproducing a historical experiment. The function restores the exact code and data state at a given commit, re-runs the pipeline, and verifies that the outputs match the original provenance records. Mismatches (typically from GPU floating-point non-determinism) are flagged but not treated as failures.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The GPU Non-Determinism Problem</div>
+<p>
+A computational chemistry team built a full provenance pipeline following this chapter's
+recipe. When they attempted to reproduce a six-month-old experiment, the preprocessing and
+evaluation stages produced bit-identical outputs, but the model training stage produced a
+model with a slightly different hash. Investigation revealed that GPU floating-point
+operations (particularly cuDNN convolutions and atomicAdd reductions) do not guarantee
+deterministic ordering of operations, leading to rounding differences that accumulate over
+training epochs. The team addressed this by: (1) setting
+<code>torch.backends.cudnn.deterministic = True</code> (which sacrifices ~10% training speed
+for determinism), (2) recording the GPU model and driver version in provenance metadata, and
+(3) defining "reproduced" as "metrics within a tolerance band" rather than "bit-identical
+checkpoints." This pragmatic definition matches scientific practice: reproducibility means
+consistent conclusions, not identical floating-point representations.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Reproducibility Is About Conclusions, Not Bits</div>
+<p>
+Bit-for-bit reproducibility of model training is achievable on CPUs with fixed seeds, but
+impractical on GPUs without significant performance penalties. The more robust standard is
+<em>conclusion-level reproducibility</em>: re-running the experiment produces the same
+scientific conclusions (similar metrics, same feature importances, equivalent predictions)
+even if the exact floating-point values differ. The provenance infrastructure in this chapter
+supports both standards: hash comparison for preprocessing and evaluation (which are
+typically deterministic), and metric-band comparison for training (which is subject to
+hardware-level non-determinism). Define your reproducibility standard explicitly in your
+project's documentation, and configure your verification scripts accordingly.
+</p>
+</div>
+
+<h2>9. Discovery Workbench Integration</h2>
+
+<p>
+The experiment registry integrates with the Discovery Workbench (introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>)
+as a core infrastructure service. The Workbench uses the registry to track all experiments
+initiated through its interface, enabling researchers to browse experiment histories, compare
+runs, and reproduce results directly from the Workbench UI.
+</p>
+
+<pre><code class="language-python">"""Discovery Workbench experiment registry integration."""
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+
+from src.registry import compute_file_hash, get_git_info
+
+
+@dataclass
+class WorkbenchExperiment:
+    """A complete experiment record for the Discovery Workbench."""
+    experiment_id: str
+    name: str
+    description: str
+    created_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    git_commit: str = ""
+    config_hashes: dict = field(default_factory=dict)
+    data_hashes: dict = field(default_factory=dict)
+    model_hashes: dict = field(default_factory=dict)
+    metrics: dict = field(default_factory=dict)
+    provenance_files: list = field(default_factory=list)
+    tags: dict = field(default_factory=dict)
+    status: str = "created"
+
+
+class WorkbenchRegistry:
+    """Experiment registry for the Discovery Workbench.
+
+    Provides a high-level API for registering, querying, and
+    reproducing experiments through the Workbench interface.
+    """
+
+    def __init__(self, registry_path: str = "workbench_registry.json"):
+        self.registry_path = Path(registry_path)
+        self.experiments: dict[str, WorkbenchExperiment] = {}
+        if self.registry_path.exists():
+            self._load()
+
+    def _load(self):
+        """Load the registry from disk."""
+        with open(self.registry_path) as f:
+            data = json.load(f)
+        for exp_id, exp_data in data.items():
+            self.experiments[exp_id] = WorkbenchExperiment(**exp_data)
+
+    def _save(self):
+        """Persist the registry to disk."""
+        data = {
+            exp_id: asdict(exp)
+            for exp_id, exp in self.experiments.items()
+        }
+        with open(self.registry_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def register_experiment(
+        self,
+        name: str,
+        description: str,
+        tags: dict = None,
+    ) -> WorkbenchExperiment:
+        """Register a new experiment in the Workbench."""
+        git_info = get_git_info()
+        exp_id = f"exp_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+        experiment = WorkbenchExperiment(
+            experiment_id=exp_id,
+            name=name,
+            description=description,
+            git_commit=git_info["commit_hash"],
+            tags=tags or {},
+        )
+        self.experiments[exp_id] = experiment
+        self._save()
+        return experiment
+
+    def record_pipeline_run(
+        self,
+        experiment_id: str,
+        provenance_dir: str = "provenance",
+    ):
+        """Record a completed pipeline run in the experiment."""
+        exp = self.experiments[experiment_id]
+        prov_dir = Path(provenance_dir)
+
+        for prov_file in sorted(prov_dir.glob("*_prov.json")):
+            with open(prov_file) as f:
+                prov = json.load(f)
+
+            exp.provenance_files.append(str(prov_file))
+
+            # Aggregate hashes from all stages
+            for name, info in prov.get("inputs", {}).items():
+                if "data" in name:
+                    exp.data_hashes[name] = info["hash"]
+            for name, info in prov.get("outputs", {}).items():
+                if "model" in name:
+                    exp.model_hashes[name] = info["hash"]
+                if "data" in name:
+                    exp.data_hashes[name] = info["hash"]
+
+            # Collect metrics
+            exp.metrics.update(prov.get("metrics", {}))
+
+        exp.status = "completed"
+        self._save()
+
+    def compare_experiments(
+        self, exp_id_a: str, exp_id_b: str
+    ) -> dict:
+        """Compare two experiments: what changed, what improved?"""
+        a = self.experiments[exp_id_a]
+        b = self.experiments[exp_id_b]
+
+        # Find data differences
+        data_changed = {
+            k: (a.data_hashes.get(k, "N/A"), b.data_hashes.get(k, "N/A"))
+            for k in set(a.data_hashes) | set(b.data_hashes)
+            if a.data_hashes.get(k) != b.data_hashes.get(k)
+        }
+
+        # Find metric differences
+        metric_deltas = {}
+        for key in set(a.metrics) | set(b.metrics):
+            val_a = a.metrics.get(key)
+            val_b = b.metrics.get(key)
+            if isinstance(val_a, (int, float)) and isinstance(val_b, (int, float)):
+                metric_deltas[key] = {
+                    "a": val_a,
+                    "b": val_b,
+                    "delta": round(val_b - val_a, 6),
+                }
+
+        return {
+            "experiments": (exp_id_a, exp_id_b),
+            "data_changed": data_changed,
+            "model_changed": a.model_hashes != b.model_hashes,
+            "git_commits": (a.git_commit[:8], b.git_commit[:8]),
+            "metric_deltas": metric_deltas,
+        }
+
+    def list_experiments(
+        self, tag_filter: dict = None
+    ) -> list[WorkbenchExperiment]:
+        """List experiments, optionally filtered by tags."""
+        results = list(self.experiments.values())
+        if tag_filter:
+            results = [
+                exp for exp in results
+                if all(
+                    exp.tags.get(k) == v
+                    for k, v in tag_filter.items()
+                )
+            ]
+        return sorted(results, key=lambda e: e.created_at, reverse=True)
+
+
+# Example usage within the Discovery Workbench
+registry = WorkbenchRegistry()
+
+# Register and run an experiment
+exp = registry.register_experiment(
+    name="Crystal bandgap prediction v12",
+    description="Transformer with 6 layers, lr=0.0005",
+    tags={"domain": "materials", "target": "bandgap"},
+)
+print(f"Registered: {exp.experiment_id}")
+
+# After running the pipeline (dvc repro)...
+registry.record_pipeline_run(exp.experiment_id)
+
+# Compare with a previous experiment
+# comparison = registry.compare_experiments("exp_20260414_103000", exp.experiment_id)
+</code></pre>
+<div class="code-caption">Figure 47.26: Discovery Workbench registry integration. The <code>WorkbenchRegistry</code> provides experiment registration, pipeline run recording, experiment comparison, and tag-based search. It aggregates provenance from all pipeline stages into a unified experiment record that the Workbench UI can browse and query.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: MLflow + DVC in Production</div>
+<p>
+The custom <code>WorkbenchRegistry</code> above illustrates the concepts, but for production
+deployments, the combination of MLflow (experiment tracking, model registry, UI) and DVC
+(data versioning, pipeline DAG, reproducibility) provides the same functionality with less
+custom code. MLflow's <code>mlflow.search_runs()</code> replaces <code>list_experiments</code>;
+<code>mlflow.get_run()</code> replaces the provenance lookups; and <code>dvc repro</code>
+replaces the reproduction logic. The DAGsHub platform integrates both tools with a GitHub-like
+UI for browsing experiments, comparing runs, and visualizing the artifact DAG, reducing the
+custom code in this section to approximately 50 lines of integration glue.
+</p>
+</div>
+
+<h2>10. Putting It All Together: The Complete Workflow</h2>
+
+<p>
+Here is the end-to-end workflow that a researcher follows when using the provenance-complete
+pipeline:
+</p>
+
+<ol>
+<li><strong>Configure</strong>: edit <code>configs/train.yaml</code> with new hyperparameters.</li>
+<li><strong>Commit</strong>: <code>git add configs/ &amp;&amp; git commit -m "Increase layers to 8"</code></li>
+<li><strong>Run</strong>: <code>dvc repro</code> (DVC skips unchanged stages, runs only what is needed).</li>
+<li><strong>Review</strong>: <code>dvc metrics show</code> and <code>mlflow ui</code> to inspect results.</li>
+<li><strong>Compare</strong>: <code>dvc metrics diff</code> against the previous commit.</li>
+<li><strong>Version</strong>: <code>git add dvc.lock outputs/metrics/ provenance/ &amp;&amp; git commit</code></li>
+<li><strong>Push</strong>: <code>git push &amp;&amp; dvc push</code> to share code and data.</li>
+<li><strong>Reproduce</strong>: any collaborator runs <code>git pull &amp;&amp; dvc pull &amp;&amp; dvc repro</code>.</li>
+</ol>
+
+<p>
+At every step, the artifact DAG is maintained, hashes are verified, and PROV records are
+generated. The cost is modest: approximately 20 lines of instrumentation per pipeline stage
+(the <code>ProvenanceRecorder</code> calls). The benefit is that every result in the project
+is traceable back to its raw inputs, verifiable through hash comparison, and reproducible
+through pipeline replay.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Provenance Saves a Paper Revision</div>
+<p>
+Six months after submitting a paper on crystal property prediction, a reviewer asked the
+team to re-run their analysis with a different train/test split to test for data leakage.
+Without provenance infrastructure, this request would require reconstructing the exact
+experimental setup from memory, emails, and scattered scripts. With the registry, the team
+ran three commands: <code>git checkout paper-submission-v1</code> to restore the code,
+<code>dvc pull</code> to restore the data, and then modified the split parameter and ran
+<code>dvc repro</code>. The new results confirmed no data leakage, and the revision was
+submitted within a day. The reviewer's request, which could have delayed the paper by
+weeks, became a routine operation.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+The 2024 paper "Towards Reproducible Machine Learning Research in Natural Language Processing" (Rogers et al., ACL 2024) surveyed over 800 NLP papers and found that fewer than 14% provided sufficient provenance metadata for independent reproduction, even when code was released. In response, the ML community has converged on integrated provenance platforms that go beyond DVC and MLflow. The open source project <strong>MLRun</strong> (Iguazio, 2023+) unifies data versioning, pipeline orchestration, model serving, and lineage tracking into a single framework with automatic provenance capture, eliminating the manual instrumentation shown in this section. Similarly, <strong>Weights &amp; Biases Launch</strong> (2024) introduced declarative job definitions with environment-hash pinning, capturing not just code and data versions but also the exact container image, GPU driver, and CUDA toolkit version. These systems push toward "zero-instrumentation provenance," where the platform itself records everything needed for reproduction without the developer adding any tracking code to their pipeline stages.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Minimal Experiment Registry in 30 Minutes</h4>
+<p>
+Build a working experiment registry for a toy ML pipeline using only Python standard libraries plus scikit-learn. (1) Create a project directory with three folders: <code>data/</code>, <code>models/</code>, and <code>provenance/</code>. Write a script that generates a synthetic regression dataset using <code>sklearn.datasets.make_regression</code> and saves it as a CSV file. (2) Write a <code>registry.py</code> module containing a <code>compute_file_hash(path)</code> function (using <code>hashlib.sha256</code>) and a <code>ProvenanceRecorder</code> class that stores input hashes, output hashes, timestamps, and parameter values in a dictionary, then serializes to JSON. (3) Write a <code>train.py</code> script that loads the CSV, trains a <code>sklearn.linear_model.Ridge</code> model, saves it with <code>joblib.dump</code>, and uses your <code>ProvenanceRecorder</code> to record the input data hash, output model hash, and hyperparameters (alpha, random seed). (4) Write a <code>verify.py</code> script that loads the provenance JSON, recomputes the hash of the model file on disk, and prints whether it matches the recorded hash. Deliberately modify the model file (append a byte) and run <code>verify.py</code> again to confirm it detects the corruption. (5) Run the pipeline twice with different alpha values, then write a <code>compare.py</code> script that loads both provenance JSONs and prints a side-by-side diff of parameters and metrics. You now have a functioning registry that demonstrates the core principles of this section: content-addressable hashing, provenance recording, integrity verification, and experiment comparison.
+</p>
+</div>
+
+<h2>11. Advanced Topics</h2>
+
+<h3>Distributed Provenance</h3>
+
+<p>
+When experiments span multiple machines (local development, cloud training, cluster
+evaluation), the provenance chain must be assembled from distributed records. The
+OpenLineage event model from <a href="section-47.2.html">Section 47.2</a> handles this
+naturally: each machine emits events to a centralized lineage backend (Marquez, Atlan, or
+a custom collector), and the backend assembles the complete run graph. The key requirement
+is that every event includes the same <code>run_id</code>, linking distributed stages into
+a coherent pipeline execution.
+</p>
+
+<h3>Provenance for LLM Experiments</h3>
+
+<p>
+Large language model experiments introduce additional provenance challenges. The "data"
+artifact is often a prompt template, a set of few-shot examples, or a system message, none
+of which fit the traditional "dataset on disk" model. The "model" is often an API endpoint
+(GPT-4, Claude) whose weights are not accessible for hashing. The provenance record for
+LLM experiments should capture: the exact prompt text (hashed for content addressing), the
+API model identifier and version, the sampling parameters (temperature, top-p), and the raw
+API response (including token counts and finish reason). The
+<a href="../../part-2-software-engineering/module-22-mlops-llmops/index.html">LLMOps infrastructure</a>
+from Chapter 22 provides the tracking layer; the provenance standards from this chapter
+provide the interchange format.
+</p>
+
+<h3>Regulatory Compliance</h3>
+
+<p>
+Regulated domains (clinical trials, financial modeling, safety-critical AI) require
+provenance that meets specific standards: FDA 21 CFR Part 11 for electronic records,
+GDPR Article 22 for automated decision-making, and the EU AI Act for high-risk AI systems.
+The tamper-evident provenance chain from <a href="section-47.2.html">Section 47.2</a>
+provides the foundation. For full compliance, add: (1) digital signatures on provenance
+documents (not just hash chains), (2) external timestamping through a trusted authority,
+(3) role-based access controls on the registry, and (4) audit log retention policies
+that match your regulatory timeline (typically 10+ years for clinical data).
+</p>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+This chapter completes Part V: Discovery Through Simulation and Optimization. We have
+built the infrastructure that makes computational experiments reproducible, traceable, and
+verifiable. <a href="../../part-6-scientific-domains/module-48-biology-medicine/index.html">Part VI:
+Discovery in Scientific Domains</a> applies every technique from Parts I through V to
+specific scientific fields. <a href="../../part-6-scientific-domains/module-48-biology-medicine/index.html">Chapter 48:
+Discovery AI for Biology and Medicine</a> is first, bringing together foundation models,
+knowledge graphs, experiment design, and the provenance infrastructure from this chapter
+to tackle drug discovery, genomics, and clinical research.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="section-47.2.html">&larr; Section 47.2: Data Lineage and Provenance Standards</a>
+<a href="../../part-6-scientific-domains/module-48-biology-medicine/index.html">Chapter 48: Discovery AI for Biology and Medicine &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,1218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 40.3: Building a Research Agent Team. A complete recipe for a multi-agent research team with debate and ranking, using OpenAI Agents SDK, LangGraph, PaperQA2, DSPy, and MLflow." name="description"/>
+<title>Section 40.3: Building a Research Agent Team | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 40: Research Agents</a></div>
+<h1>40.3 Building a Research Agent Team</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The generator proposed twelve hypotheses, the reviewer rejected eleven, the ranker declared the survivor 'barely adequate,' and the meta-reviewer called the entire exercise 'a productive failure.' Science is working as intended."</p>
+<cite>A Multi-Agent Team With Realistic Expectations</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section is the capstone recipe for the chapter. You should have worked through
+the four agent roles and memory systems in <a href="section-40.1.html">Section 40.1</a>
+and the architectural analysis of Coscientist, ChemCrow, and AI Co-Scientist in
+<a href="section-40.2.html">Section 40.2</a>. The multi-agent coordination patterns from
+<a href="../../part-2-software-engineering/module-17-multi-agent-teams/index.html">Chapter 17</a>
+(workflow graphs, debate loops, human gates) are applied directly. You will need
+working installations of the OpenAI Agents SDK, LangGraph, PaperQA2, DSPy, and MLflow
+to run the code.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Sections 40.1 and 40.2 gave you the components: individual agent roles, memory systems,
+stopping criteria, and architectural patterns from landmark systems. This section
+assembles them into a <strong>working multi-agent research team</strong> modeled on AI
+Co-Scientist's generate-debate-rank loop. The team takes a research question as input
+and produces a ranked list of critiqued hypotheses with supporting literature evidence.
+We build the system incrementally: first the individual agents using OpenAI Agents SDK,
+then the debate loop using LangGraph, then the literature integration using PaperQA2,
+then structured pipelines using DSPy, and finally experiment tracking using MLflow.
+By the end, you have a system that you can point at any scientific domain and get
+actionable research directions.
+</p>
+</div>
+
+<h2>1. Architecture Overview</h2>
+
+<p>
+Our research agent team follows the AI Co-Scientist pattern with modifications for
+practicality. The team has five roles:
+</p>
+
+<ol>
+<li><strong>Literature Scout</strong>: Retrieves and synthesizes relevant papers using PaperQA2.</li>
+<li><strong>Hypothesis Generator</strong>: Proposes candidate hypotheses grounded in the literature.</li>
+<li><strong>Critic</strong>: Debates each hypothesis, identifying weaknesses and alternative explanations.</li>
+<li><strong>Ranker</strong>: Conducts pairwise tournaments to order hypotheses by quality.</li>
+<li><strong>Meta-Reviewer</strong>: Synthesizes the ranked list into a research brief with recommendations.</li>
+</ol>
+
+<p data-agent="02">
+Elo rating, the scoring system used in the ranking stage, is a method originally developed for chess that assigns each competitor a numerical strength estimate and updates it after every head-to-head match. It matters here because it converts noisy pairwise LLM judgments ("hypothesis A is better than B") into a single ranked list with calibrated confidence, something simple vote-counting cannot achieve when judges disagree. The mechanism works by adjusting each hypothesis's score after every comparison: the winner gains points and the loser loses points, with the magnitude determined by how surprising the outcome was relative to the current ratings. Use Elo-style tournaments when you have more than four candidates and need a robust ranking from an unreliable judge; for three or fewer candidates, direct scoring on a rubric is simpler and sufficient.
+</p>
+
+<p>
+The data flow follows a directed acyclic graph with one feedback edge:
+</p>
+
+$$
+\text{Question} \xrightarrow{\text{scout}} \text{Literature}
+\xrightarrow{\text{generate}} \text{Hypotheses}
+\xrightarrow{\text{debate}} \text{Critiqued Hypotheses}
+\xrightarrow{\text{rank}} \text{Ranked List}
+\xrightarrow{\text{review}} \text{Brief}
+$$
+
+<p>
+The feedback edge connects the meta-reviewer back to the generator: if the reviewer
+determines that the current hypothesis set is insufficiently diverse or that a
+promising direction was not explored, the generator produces a targeted second wave
+of hypotheses. We cap this outer loop at two iterations to control cost.
+</p>
+
+<h2>2. Agent Definitions with OpenAI Agents SDK</h2>
+
+<p>
+The OpenAI Agents SDK provides a lightweight framework for defining agents with system
+prompts, tools, and handoff rules. Each agent is a Python object with a
+<code>run()</code> method. We define all five agents and their typed interfaces:
+</p>
+
+<pre><code class="language-python">"""
+Research agent team using OpenAI Agents SDK.
+Each agent has a focused system prompt, typed output, and tool set.
+"""
+from pydantic import BaseModel, Field
+from agents import Agent, Runner, function_tool
+from paperqa import Settings, ask
+
+
+# ── Typed interfaces ──────────────────────────────────────────────
+
+class LiteratureReport(BaseModel):
+    """Output from the Literature Scout agent."""
+    summary: str = Field(description="Synthesis of key findings")
+    papers: list[dict] = Field(description="List of cited papers")
+    gaps: list[str] = Field(description="Identified knowledge gaps")
+    key_methods: list[str] = Field(description="Dominant methods in field")
+
+
+class HypothesisCandidate(BaseModel):
+    """A single hypothesis with supporting reasoning."""
+    id: str
+    statement: str = Field(description="The hypothesis statement")
+    reasoning: str = Field(description="Why this hypothesis is plausible")
+    testable_prediction: str = Field(description="How to test it")
+    grounding: list[str] = Field(description="Papers that support it")
+    novelty_claim: str = Field(description="What makes this new")
+
+
+class CritiqueReport(BaseModel):
+    """Output from the Critic agent for a single hypothesis."""
+    hypothesis_id: str
+    strengths: list[str]
+    weaknesses: list[str]
+    alternative_explanations: list[str]
+    missing_evidence: list[str]
+    revised_statement: str | None = Field(
+        default=None,
+        description="Improved hypothesis if revision is warranted",
+    )
+    verdict: str = Field(description="'promising', 'needs_work', 'weak'")
+
+
+class RankedHypotheses(BaseModel):
+    """Output from the tournament ranking."""
+    rankings: list[dict] = Field(
+        description="Hypotheses ordered by Elo rating"
+    )
+    total_comparisons: int
+    consensus_score: float = Field(
+        description="Agreement rate among pairwise judgments"
+    )
+
+
+class ResearchBrief(BaseModel):
+    """Final output: a research brief with recommendations."""
+    title: str
+    executive_summary: str
+    top_hypotheses: list[dict]
+    recommended_experiments: list[str]
+    estimated_effort: str
+    gaps_for_future_work: list[str]
+    bibliography: list[dict]
+
+
+# ── Tool definitions ──────────────────────────────────────────────
+
+@function_tool
+async def search_literature(query: str, max_papers: int = 10) -> str:
+    """Search scientific literature using PaperQA2."""
+    answer = await ask(
+        query,
+        settings=Settings(
+            llm="gpt-4o",
+            summary_llm="gpt-4o-mini",
+            paper_directory="./papers/",
+            max_sources=max_papers,
+        ),
+    )
+    return answer.formatted_answer
+
+
+@function_tool
+async def check_novelty(hypothesis: str) -> str:
+    """Check whether a hypothesis is already known in the literature."""
+    answer = await ask(
+        f"Has this hypothesis or finding been previously reported? "
+        f"Hypothesis: {hypothesis}",
+        settings=Settings(
+            llm="gpt-4o",
+            summary_llm="gpt-4o-mini",
+            paper_directory="./papers/",
+        ),
+    )
+    return answer.formatted_answer
+
+
+# ── Agent definitions ─────────────────────────────────────────────
+
+literature_scout = Agent(
+    name="Literature Scout",
+    instructions=(
+        "You are a scientific literature review agent. Search for papers "
+        "relevant to the research question. Synthesize findings into a "
+        "structured report with cited sources. Identify knowledge gaps "
+        "that represent opportunities for new research.\n\n"
+        "Rules:\n"
+        "- Cite every claim with author, year, and title.\n"
+        "- Distinguish established findings from preliminary results.\n"
+        "- Identify the dominant methods and their limitations.\n"
+        "- List at least 3 knowledge gaps."
+    ),
+    tools=[search_literature],
+    output_type=LiteratureReport,
+)
+
+hypothesis_generator = Agent(
+    name="Hypothesis Generator",
+    instructions=(
+        "You are a scientific hypothesis generation agent. Given a "
+        "literature review, propose novel hypotheses that address the "
+        "identified knowledge gaps. Each hypothesis must be:\n"
+        "1. Specific and falsifiable.\n"
+        "2. Grounded in existing evidence (cite papers).\n"
+        "3. Novel (not a restatement of known findings).\n"
+        "4. Testable with available methods.\n\n"
+        "Generate exactly 6 hypotheses with diverse approaches. "
+        "Vary your reasoning: some should extend existing work, "
+        "some should challenge assumptions, and some should propose "
+        "new mechanisms."
+    ),
+    output_type=list[HypothesisCandidate],
+)
+
+critic = Agent(
+    name="Hypothesis Critic",
+    instructions=(
+        "You are a scientific reviewer agent. For each hypothesis, "
+        "provide a thorough critique:\n"
+        "- Identify logical gaps or unstated assumptions.\n"
+        "- Propose alternative explanations for the same observations.\n"
+        "- List specific evidence that would strengthen or weaken it.\n"
+        "- Suggest revisions only if the core idea has merit.\n\n"
+        "Be constructively skeptical. Your goal is to improve "
+        "the hypotheses, not to reject them all."
+    ),
+    tools=[check_novelty],
+    output_type=list[CritiqueReport],
+)
+
+meta_reviewer = Agent(
+    name="Meta-Reviewer",
+    instructions=(
+        "You are a research strategy agent. Given ranked hypotheses "
+        "with critiques, produce a research brief that:\n"
+        "1. Summarizes the top 3 hypotheses and why they ranked highest.\n"
+        "2. Recommends concrete experiments to test each.\n"
+        "3. Estimates effort (computational vs. experimental).\n"
+        "4. Identifies gaps that the current set does not cover.\n"
+        "5. Provides a bibliography of key references.\n\n"
+        "Write for a principal investigator who needs to decide "
+        "which direction to pursue."
+    ),
+    output_type=ResearchBrief,
+)
+</code></pre>
+<div class="code-caption">Five research agents defined with OpenAI Agents SDK: each has a focused system prompt, typed Pydantic output, and specific tools. The Literature Scout uses PaperQA2 for retrieval; the Critic uses a novelty checker.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the generate-debate-rank loop as a newspaper editorial meeting. A group of reporters (generators) pitch story ideas. The editor (critic) challenges each pitch: "What's your source? Could the opposite be true? Is this actually new?" Then the editorial board (ranker) votes on which stories make the front page by comparing them two at a time. If the editor-in-chief (meta-reviewer) decides the slate is too narrow, the reporters go back and pitch a second round of ideas informed by what was missing. The mechanism that makes this work is not any single role's brilliance; it is the structured alternation between divergent thinking (generate many candidates) and convergent filtering (critique and rank them down), repeated until quality stabilizes.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Typed Outputs as Coordination Protocol</div>
+<p>
+The Pydantic models (<code>LiteratureReport</code>, <code>HypothesisCandidate</code>,
+<code>CritiqueReport</code>) are not just validation schemas. They are the
+<strong>coordination protocol</strong> between agents. Each model defines exactly what one
+agent produces and what the next agent consumes. This prevents the "telephone game"
+problem where information degrades as it passes through multiple agents. When the
+Hypothesis Generator receives a <code>LiteratureReport</code> with structured
+<code>gaps</code> and <code>key_methods</code>, it can address the gaps using the methods
+rather than having to parse free-form text. This principle was introduced in
+<a href="../../part-2-software-engineering/module-17-multi-agent-teams/index.html">Chapter 17</a>
+(MetaGPT's structured artifacts) and reaches its full potential in research workflows
+where precision matters.
+</p>
+</div>
+
+<h2>3. The Debate Loop with LangGraph</h2>
+
+<p>
+The Agents SDK defines individual agents; LangGraph connects them into a stateful
+workflow with conditional edges, persistence, and streaming. The debate loop is the
+heart of the system: hypotheses are generated, critiqued, and then compared in a
+pairwise tournament. LangGraph's <code>StateGraph</code> makes this loop explicit and
+debuggable.
+</p>
+
+<pre><code class="language-python">"""
+Research team workflow using LangGraph for the debate-and-rank loop.
+"""
+from typing import TypedDict, Annotated
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+import random
+import json
+
+
+class ResearchState(TypedDict):
+    """Typed state flowing through the research workflow."""
+    question: str
+    literature: dict | None
+    hypotheses: list[dict]
+    critiques: list[dict]
+    rankings: list[dict]
+    brief: dict | None
+    generation: int
+    max_generations: int
+    total_cost_usd: float
+
+
+# ── Node functions ────────────────────────────────────────────────
+
+async def scout_node(state: ResearchState) -> dict:
+    """Run the literature scout agent."""
+    result = await Runner.run(
+        literature_scout,
+        input=f"Research question: {state['question']}",
+    )
+    return {
+        "literature": result.final_output.model_dump(),
+        "total_cost_usd": state["total_cost_usd"] + _estimate_cost(result),
+    }
+
+
+async def generate_node(state: ResearchState) -> dict:
+    """Run the hypothesis generator."""
+    lit = state["literature"]
+    context = (
+        f"Research question: {state['question']}\n\n"
+        f"Literature summary: {lit['summary']}\n\n"
+        f"Knowledge gaps: {lit['gaps']}\n\n"
+        f"Key methods: {lit['key_methods']}"
+    )
+
+    # on generation > 0, include feedback from meta-reviewer
+    if state["generation"] > 0 and state["brief"]:
+        context += (
+            f"\n\nPrevious round feedback: "
+            f"{state['brief'].get('gaps_for_future_work', [])}"
+        )
+
+    result = await Runner.run(hypothesis_generator, input=context)
+    new_hypotheses = [h.model_dump() for h in result.final_output]
+
+    # combine with survivors from previous generation
+    survivors = [
+        h for h in state["hypotheses"]
+        if h.get("elo_rating", 1200) > 1250
+    ]
+    combined = survivors + new_hypotheses
+
+    return {
+        "hypotheses": combined,
+        "total_cost_usd": state["total_cost_usd"] + _estimate_cost(result),
+    }
+
+
+async def debate_node(state: ResearchState) -> dict:
+    """Run the critic on all hypotheses."""
+    hypotheses_text = "\n\n".join(
+        f"Hypothesis {h['id']}: {h['statement']}\n"
+        f"Reasoning: {h['reasoning']}"
+        for h in state["hypotheses"]
+    )
+    result = await Runner.run(
+        critic,
+        input=(
+            f"Research question: {state['question']}\n\n"
+            f"Hypotheses to critique:\n{hypotheses_text}"
+        ),
+    )
+    return {
+        "critiques": [c.model_dump() for c in result.final_output],
+        "total_cost_usd": state["total_cost_usd"] + _estimate_cost(result),
+    }
+
+
+async def rank_node(state: ResearchState) -> dict:
+    """Run pairwise tournament ranking on hypotheses."""
+    hypotheses = state["hypotheses"]
+    critiques = {c["hypothesis_id"]: c for c in state["critiques"]}
+
+    # initialize Elo ratings
+    elo = {h["id"]: h.get("elo_rating", 1200.0) for h in hypotheses}
+    comparisons = 0
+
+    # 3 rounds of random pairwise comparisons
+    for _ in range(3):
+        indices = list(range(len(hypotheses)))
+        random.shuffle(indices)
+        for i in range(0, len(indices) - 1, 2):
+            h_a = hypotheses[indices[i]]
+            h_b = hypotheses[indices[i + 1]]
+
+            # LLM-as-judge comparison
+            winner = await _judge_pair(
+                h_a, h_b,
+                critiques.get(h_a["id"]),
+                critiques.get(h_b["id"]),
+            )
+
+            # update Elo
+            k = 32.0
+            e_a = 1.0 / (1.0 + 10 ** ((elo[h_b["id"]] - elo[h_a["id"]]) / 400))
+            if winner == "A":
+                elo[h_a["id"]] += k * (1.0 - e_a)
+                elo[h_b["id"]] -= k * (1.0 - e_a)
+            else:
+                elo[h_a["id"]] -= k * e_a
+                elo[h_b["id"]] += k * e_a
+            comparisons += 1
+
+    # build ranked list
+    for h in hypotheses:
+        h["elo_rating"] = elo[h["id"]]
+    hypotheses.sort(key=lambda h: h["elo_rating"], reverse=True)
+
+    return {
+        "hypotheses": hypotheses,
+        "rankings": [
+            {"id": h["id"], "elo": h["elo_rating"], "statement": h["statement"]}
+            for h in hypotheses
+        ],
+    }
+
+
+async def review_node(state: ResearchState) -> dict:
+    """Run the meta-reviewer to produce the final brief."""
+    top_3 = state["rankings"][:3]
+    critiques_for_top = [
+        c for c in state["critiques"]
+        if c["hypothesis_id"] in {h["id"] for h in top_3}
+    ]
+
+    result = await Runner.run(
+        meta_reviewer,
+        input=(
+            f"Research question: {state['question']}\n\n"
+            f"Top ranked hypotheses: {json.dumps(top_3, indent=2)}\n\n"
+            f"Critiques: {json.dumps(critiques_for_top, indent=2)}\n\n"
+            f"Full literature report: {json.dumps(state['literature'])}"
+        ),
+    )
+    return {
+        "brief": result.final_output.model_dump(),
+        "generation": state["generation"] + 1,
+        "total_cost_usd": state["total_cost_usd"] + _estimate_cost(result),
+    }
+
+
+async def _judge_pair(h_a, h_b, crit_a, crit_b) -> str:
+    """Pairwise hypothesis comparison with position-bias mitigation."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI()
+
+    # forward comparison: A then B
+    resp_forward = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{
+            "role": "system",
+            "content": (
+                "Compare two scientific hypotheses. Consider novelty, "
+                "feasibility, testability, and critique severity. "
+                'Return JSON: {"winner": "A" or "B"}'
+            ),
+        }, {
+            "role": "user",
+            "content": (
+                f"Hypothesis A: {h_a['statement']}\n"
+                f"Critique A: {crit_a['weaknesses'] if crit_a else 'N/A'}\n\n"
+                f"Hypothesis B: {h_b['statement']}\n"
+                f"Critique B: {crit_b['weaknesses'] if crit_b else 'N/A'}"
+            ),
+        }],
+        response_format={"type": "json_object"},
+    )
+    forward = json.loads(resp_forward.choices[0].message.content)["winner"]
+
+    # reverse comparison: B then A (position-bias mitigation)
+    resp_reverse = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{
+            "role": "system",
+            "content": (
+                "Compare two scientific hypotheses. Consider novelty, "
+                "feasibility, testability, and critique severity. "
+                'Return JSON: {"winner": "A" or "B"}'
+            ),
+        }, {
+            "role": "user",
+            "content": (
+                f"Hypothesis A: {h_b['statement']}\n"
+                f"Critique A: {crit_b['weaknesses'] if crit_b else 'N/A'}\n\n"
+                f"Hypothesis B: {h_a['statement']}\n"
+                f"Critique B: {crit_a['weaknesses'] if crit_a else 'N/A'}"
+            ),
+        }],
+        response_format={"type": "json_object"},
+    )
+    reverse = json.loads(resp_reverse.choices[0].message.content)["winner"]
+
+    # reconcile: reverse maps B->A for original, A->B for original
+    reverse_mapped = "A" if reverse == "B" else "B"
+
+    if forward == reverse_mapped:
+        return forward  # consistent judgment
+    else:
+        return "A"  # draw defaults to first (arbitrary but stable)
+
+
+def _estimate_cost(result) -> float:
+    """Estimate API cost from a Runner result."""
+    # rough estimate: $0.01 per 1K tokens for GPT-4o-mini
+    tokens = getattr(result, "total_tokens", 2000)
+    return tokens * 0.01 / 1000
+
+
+# ── Workflow graph ────────────────────────────────────────────────
+
+def should_continue(state: ResearchState) -> str:
+    """Decide whether to run another generation or finish."""
+    if state["generation"] >= state["max_generations"]:
+        return "end"
+    if state.get("brief") and not state["brief"].get("gaps_for_future_work"):
+        return "end"  # no gaps identified; done
+    return "continue"
+
+
+def build_research_pipeline() -> StateGraph:
+    """Build the complete research agent team as a LangGraph workflow."""
+    graph = StateGraph(ResearchState)
+
+    # add nodes
+    graph.add_node("scout", scout_node)
+    graph.add_node("generate", generate_node)
+    graph.add_node("debate", debate_node)
+    graph.add_node("rank", rank_node)
+    graph.add_node("review", review_node)
+
+    # linear flow: scout -> generate -> debate -> rank -> review
+    graph.set_entry_point("scout")
+    graph.add_edge("scout", "generate")
+    graph.add_edge("generate", "debate")
+    graph.add_edge("debate", "rank")
+    graph.add_edge("rank", "review")
+
+    # conditional: loop back or finish
+    graph.add_conditional_edges(
+        "review",
+        should_continue,
+        {"continue": "generate", "end": END},
+    )
+
+    return graph.compile()
+</code></pre>
+<div class="code-caption">The complete LangGraph workflow: five nodes connected in a generate-debate-rank loop with conditional feedback. Position-bias mitigation in the judge uses double-blind comparisons.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Running the Research Team</div>
+<p>
+A materials science group wants to explore new approaches for predicting battery
+electrolyte stability. They instantiate the pipeline and run it:
+</p>
+<pre><code class="language-python">import asyncio
+
+async def main():
+    pipeline = build_research_pipeline()
+
+    initial_state: ResearchState = {
+        "question": (
+            "What novel computational approaches could improve "
+            "prediction of solid electrolyte stability in "
+            "all-solid-state lithium batteries?"
+        ),
+        "literature": None,
+        "hypotheses": [],
+        "critiques": [],
+        "rankings": [],
+        "brief": None,
+        "generation": 0,
+        "max_generations": 2,
+        "total_cost_usd": 0.0,
+    }
+
+    result = await pipeline.ainvoke(initial_state)
+
+    print(f"Total cost: ${result['total_cost_usd']:.2f}")
+    print(f"Generations completed: {result['generation']}")
+    print(f"\nTop hypothesis: {result['rankings'][0]['statement']}")
+    print(f"\nResearch brief:\n{result['brief']['executive_summary']}")
+
+asyncio.run(main())
+</code></pre>
+<div class="code-caption">Running the research team pipeline on a materials science question. The system produces a ranked hypothesis list and a research brief in approximately 8 to 15 minutes.</div>
+<p>
+The Literature Scout finds 12 relevant papers, identifies three knowledge gaps
+(limited coverage of grain boundary effects, no graph neural network models for
+interface stability, and lack of transfer learning from molecular dynamics simulations).
+The Generator produces 6 hypotheses across these gaps. The Critic flags two hypotheses
+as restating known approaches. The Ranker conducts 27 pairwise comparisons (with 54
+LLM calls for position-bias mitigation). The Meta-Reviewer produces a brief
+recommending the top hypothesis (graph neural networks on grain boundary structures)
+with two proposed experiments and a cost estimate. Total cost: approximately $4.50
+in API calls. Total wall-clock time: 12 minutes.
+</p>
+</div>
+
+<h2>4. Structured Pipelines with DSPy</h2>
+
+<p>
+The agents defined above use hand-written system prompts. DSPy offers an alternative:
+define agent modules <strong>declaratively</strong> and let the framework optimize the
+prompts through compilation. This is particularly valuable for the research team because
+the quality of outputs depends heavily on prompt wording, and DSPy can automatically
+find better prompts through few-shot optimization.
+</p>
+
+<pre><code class="language-python">"""
+Research agent modules using DSPy for automatic prompt optimization.
+"""
+import dspy
+
+
+class HypothesisSignature(dspy.Signature):
+    """Generate a scientific hypothesis from a literature review."""
+    literature_summary: str = dspy.InputField(
+        desc="Summary of relevant literature with citations"
+    )
+    knowledge_gaps: list[str] = dspy.InputField(
+        desc="Identified gaps in current research"
+    )
+    hypothesis: str = dspy.OutputField(
+        desc="A specific, falsifiable hypothesis"
+    )
+    reasoning: str = dspy.OutputField(
+        desc="Why this hypothesis is plausible given the evidence"
+    )
+    testable_prediction: str = dspy.OutputField(
+        desc="A concrete prediction that would confirm or refute this"
+    )
+
+
+class CritiqueSignature(dspy.Signature):
+    """Critique a scientific hypothesis for logical and evidential gaps."""
+    hypothesis: str = dspy.InputField(desc="The hypothesis to critique")
+    reasoning: str = dspy.InputField(desc="The supporting reasoning")
+    weaknesses: list[str] = dspy.OutputField(
+        desc="Logical gaps, unstated assumptions, or missing evidence"
+    )
+    alternative_explanations: list[str] = dspy.OutputField(
+        desc="Other explanations for the same observations"
+    )
+    verdict: str = dspy.OutputField(
+        desc="'promising', 'needs_work', or 'weak'"
+    )
+
+
+class ResearchTeamDSPy(dspy.Module):
+    """Multi-agent research team implemented as a DSPy module.
+
+    Uses ChainOfThought for generation and critique, enabling
+    DSPy to optimize prompts through compilation.
+    """
+
+    def __init__(self, num_hypotheses: int = 6):
+        super().__init__()
+        self.num_hypotheses = num_hypotheses
+        self.generator = dspy.ChainOfThought(HypothesisSignature)
+        self.critic = dspy.ChainOfThought(CritiqueSignature)
+
+    def forward(
+        self, literature_summary: str, knowledge_gaps: list[str]
+    ) -> dspy.Prediction:
+        # generate multiple hypotheses
+        hypotheses = []
+        for i in range(self.num_hypotheses):
+            h = self.generator(
+                literature_summary=literature_summary,
+                knowledge_gaps=knowledge_gaps,
+            )
+            hypotheses.append({
+                "hypothesis": h.hypothesis,
+                "reasoning": h.reasoning,
+                "prediction": h.testable_prediction,
+            })
+
+        # critique each hypothesis
+        critiques = []
+        for h in hypotheses:
+            c = self.critic(
+                hypothesis=h["hypothesis"],
+                reasoning=h["reasoning"],
+            )
+            critiques.append({
+                "hypothesis": h["hypothesis"],
+                "weaknesses": c.weaknesses,
+                "alternatives": c.alternative_explanations,
+                "verdict": c.verdict,
+            })
+
+        # filter to promising hypotheses
+        promising = [
+            {"hypothesis": c["hypothesis"], "critique": c}
+            for c in critiques
+            if c["verdict"] in ("promising", "needs_work")
+        ]
+
+        return dspy.Prediction(
+            hypotheses=hypotheses,
+            critiques=critiques,
+            promising=promising,
+        )
+
+
+def compile_research_team():
+    """Compile the research team with DSPy optimization.
+
+    Uses a small set of examples to optimize prompts for
+    hypothesis quality and critique thoroughness.
+    """
+    # configure DSPy with an LLM
+    lm = dspy.LM("openai/gpt-4o-mini")
+    dspy.configure(lm=lm)
+
+    # create training examples (domain expert provides these)
+    trainset = [
+        dspy.Example(
+            literature_summary=(
+                "Graph neural networks have shown promise for molecular "
+                "property prediction. Most approaches use message-passing "
+                "on 2D molecular graphs. Recent work on 3D-aware models "
+                "improves binding affinity prediction."
+            ),
+            knowledge_gaps=[
+                "No GNN models for solid-state interface stability",
+                "Limited transfer learning across battery chemistries",
+            ],
+        ).with_inputs("literature_summary", "knowledge_gaps"),
+    ]
+
+    # compile: DSPy finds better prompts through bootstrapping
+    team = ResearchTeamDSPy(num_hypotheses=4)
+    optimizer = dspy.BootstrapFewShot(
+        metric=lambda example, pred, trace=None: (
+            len(pred.promising) >= 1  # at least one promising hypothesis
+            and all(
+                len(c["weaknesses"]) >= 2  # thorough critiques
+                for c in pred.critiques
+            )
+        ),
+        max_bootstrapped_demos=3,
+    )
+    compiled_team = optimizer.compile(team, trainset=trainset)
+    return compiled_team
+</code></pre>
+<div class="code-caption">The research team reimplemented as a DSPy module with typed signatures and automatic prompt optimization. The compiler finds prompts that consistently produce thorough critiques and at least one promising hypothesis.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DSPy vs. Hand-Written Prompts</div>
+<p>
+The hand-written system prompts in Section 2 required careful engineering: word choices,
+rule lists, and formatting instructions. DSPy's
+<a href="https://dspy.ai/" target="_blank">declarative signatures</a> replace all of that
+with typed input/output fields and a metric function. The <code>BootstrapFewShot</code>
+optimizer then finds prompts that satisfy the metric on your training examples.
+In practice, DSPy-optimized prompts produce 10 to 30 percent more consistent outputs
+than hand-written prompts (Khattab et al., 2024), particularly for structured
+generation tasks where the output must follow a specific schema. The trade-off:
+compilation requires training examples (minimum 5 to 10 for reliable optimization),
+and the optimized prompts are opaque (you cannot easily inspect or modify them).
+For research teams that iterate frequently on their agent configurations, DSPy's
+declarative approach saves significant prompt engineering time.
+</p>
+</div>
+
+<h2>5. Experiment Tracking with MLflow</h2>
+
+<p>
+A research agent team run involves dozens of LLM calls, multiple intermediate outputs,
+and non-trivial cost. Without tracking, you cannot compare different configurations
+(What happens with 4 hypotheses vs. 8? With GPT-4o vs. GPT-4o-mini for the critic?),
+diagnose failures, or demonstrate reproducibility. MLflow provides the experiment
+tracking infrastructure:
+</p>
+
+<pre><code class="language-python">"""
+MLflow integration for tracking research agent team runs.
+"""
+import mlflow
+from datetime import datetime
+import json
+
+
+class TrackedResearchPipeline:
+    """Wraps the research pipeline with MLflow experiment tracking."""
+
+    def __init__(self, pipeline, experiment_name: str = "research_agents"):
+        self.pipeline = pipeline
+        mlflow.set_experiment(experiment_name)
+
+    async def run(
+        self,
+        question: str,
+        max_generations: int = 2,
+        config: dict | None = None,
+    ) -> dict:
+        """Run the pipeline with full MLflow tracking."""
+        config = config or {}
+
+        with mlflow.start_run(run_name=f"research_{datetime.now():%Y%m%d_%H%M}"):
+            # log configuration
+            mlflow.log_params({
+                "question": question[:250],  # MLflow param length limit
+                "max_generations": max_generations,
+                "generator_model": config.get("generator_model", "gpt-4o"),
+                "critic_model": config.get("critic_model", "gpt-4o-mini"),
+                "judge_model": config.get("judge_model", "gpt-4o-mini"),
+                "num_hypotheses": config.get("num_hypotheses", 6),
+                "tournament_rounds": config.get("tournament_rounds", 3),
+                "position_bias_mitigation": True,
+            })
+
+            # run the pipeline
+            initial_state: ResearchState = {
+                "question": question,
+                "literature": None,
+                "hypotheses": [],
+                "critiques": [],
+                "rankings": [],
+                "brief": None,
+                "generation": 0,
+                "max_generations": max_generations,
+                "total_cost_usd": 0.0,
+            }
+
+            result = await self.pipeline.ainvoke(initial_state)
+
+            # log metrics
+            mlflow.log_metrics({
+                "total_cost_usd": result["total_cost_usd"],
+                "num_hypotheses_generated": len(result["hypotheses"]),
+                "num_promising": sum(
+                    1 for c in result["critiques"]
+                    if c["verdict"] == "promising"
+                ),
+                "generations_completed": result["generation"],
+                "top_elo_rating": (
+                    result["rankings"][0]["elo"]
+                    if result["rankings"] else 0
+                ),
+            })
+
+            # log artifacts
+            mlflow.log_dict(result["literature"], "literature_report.json")
+            mlflow.log_dict(
+                {"rankings": result["rankings"]}, "rankings.json"
+            )
+            if result["brief"]:
+                mlflow.log_dict(result["brief"], "research_brief.json")
+                mlflow.log_text(
+                    result["brief"]["executive_summary"],
+                    "executive_summary.txt",
+                )
+
+            # log the full state for reproducibility
+            # (exclude embeddings and large objects)
+            serializable = {
+                k: v for k, v in result.items()
+                if k not in ("literature",)
+            }
+            mlflow.log_dict(serializable, "full_state.json")
+
+        return result
+
+
+# usage:
+# tracked = TrackedResearchPipeline(build_research_pipeline())
+# result = await tracked.run(
+#     "What computational approaches improve battery electrolyte prediction?",
+#     config={"generator_model": "gpt-4o", "num_hypotheses": 8},
+# )
+</code></pre>
+<div class="code-caption">MLflow tracking wrapper for the research pipeline: logs configuration, cost, hypothesis counts, Elo ratings, and full artifacts for every run, enabling comparison across configurations.</div>
+
+<p>
+With MLflow tracking, you can answer practical questions that would otherwise require
+guesswork: "Does using GPT-4o for the critic instead of GPT-4o-mini produce better
+rankings?" (Compare <code>top_elo_rating</code> across runs.) "Is the second generation
+worth the cost?" (Compare <code>total_cost_usd</code> against the Elo improvement from
+generation 1 to generation 2.) "How many hypotheses should we generate?" (Run a sweep
+over <code>num_hypotheses</code> and plot promising-hypothesis count against cost.)
+</p>
+
+<h2>6. Cost Control and Evaluation</h2>
+
+<p>
+A research agent team run is expensive. Each generation involves literature search
+(~$0.50), hypothesis generation (6 x ~$0.05 = ~$0.30), critique (6 x ~$0.10 = ~$0.60),
+tournament ranking (15 pairs x 2 directions x ~$0.02 = ~$0.60), and meta-review
+(~$0.20). A two-generation run costs approximately $4 to $6. This is far cheaper than
+a human researcher's time for the same task, but it adds up quickly during development
+and tuning.
+</p>
+
+<p>
+Three strategies control cost without sacrificing quality:
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is assuming that adding more agents, more tournament rounds, or more generation cycles will monotonically improve output quality. In practice, multi-agent research teams exhibit diminishing returns quickly: beyond two generation cycles and three tournament rounds, additional iterations tend to produce consensus around safe, incremental hypotheses rather than bold ones, because the debate loop systematically penalizes ideas that are easy to critique (which often correlates with novelty). More agents does not mean better science; it means more expensive convergence toward the median.
+</p>
+</div>
+
+<p>
+<strong>Model tiering.</strong> Use the most capable model (GPT-4o, Claude Sonnet) only for
+tasks where quality matters most: hypothesis generation and the meta-review. Use a
+cheaper model (GPT-4o-mini, Claude Haiku) for tasks where consistency matters more than
+creativity: the critic and the tournament judge. This typically reduces cost by 60 to
+70 percent with minimal quality loss.
+</p>
+
+<p>
+<strong>Early termination.</strong> If the first generation produces three hypotheses rated
+"promising" by the critic and the meta-reviewer identifies no significant gaps, skip
+the second generation. The <code>should_continue</code> function in the LangGraph workflow
+implements this check.
+</p>
+
+<p>
+<strong>Caching.</strong> Literature search results, paper extractions, and novelty checks
+are deterministic for the same inputs. Cache them across runs so that repeated
+experiments on the same topic do not re-query PaperQA2. LangGraph's built-in
+checkpointing provides workflow-level caching; for tool-level caching, wrap each tool
+with a simple hash-based cache:
+</p>
+
+<pre><code class="language-python">import hashlib
+import json
+from pathlib import Path
+
+
+class ToolCache:
+    """File-based cache for deterministic tool calls."""
+
+    def __init__(self, cache_dir: str = ".cache/tools"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.hits = 0
+        self.misses = 0
+
+    def _key(self, tool_name: str, **kwargs) -> str:
+        """Compute a cache key from the tool name and arguments."""
+        content = json.dumps(
+            {"tool": tool_name, **kwargs}, sort_keys=True
+        )
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def get(self, tool_name: str, **kwargs) -> str | None:
+        """Retrieve a cached result, or None if not cached."""
+        key = self._key(tool_name, **kwargs)
+        path = self.cache_dir / f"{key}.json"
+        if path.exists():
+            self.hits += 1
+            return json.loads(path.read_text())
+        self.misses += 1
+        return None
+
+    def set(self, tool_name: str, result: str, **kwargs):
+        """Cache a tool result."""
+        key = self._key(tool_name, **kwargs)
+        path = self.cache_dir / f"{key}.json"
+        path.write_text(json.dumps(result))
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0.0
+</code></pre>
+<div class="code-caption">A file-based tool cache that stores deterministic tool results by hashing the tool name and arguments. Reduces API costs on repeated runs by avoiding redundant literature searches and novelty checks.</div>
+
+<p>
+For evaluation, research agent teams present a unique challenge: there is no ground
+truth to compare against. You cannot automatically determine whether a generated
+hypothesis is truly novel or scientifically valuable. Three proxy metrics help:
+</p>
+
+<ul>
+<li><strong>Consistency</strong>: Run the same question three times. Do the top-ranked hypotheses overlap? High consistency suggests the system reliably identifies strong directions. Low consistency may indicate that the tournament ranking is unstable (too few rounds) or that the generation is too stochastic (temperature too high).</li>
+<li><strong>Expert alignment</strong>: Have a domain expert rate the top 3 hypotheses from each run on a 1-to-5 scale for novelty, feasibility, and impact. Compare against hypotheses generated by the expert independently. This is expensive but is the gold standard for evaluating research agent output.</li>
+<li><strong>Literature grounding</strong>: Check whether each hypothesis's cited references actually exist and actually support the claimed reasoning. The novelty checker tool from Section 2 automates part of this, but manual spot-checks are essential for high-stakes applications.</li>
+</ul>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Meta-Cost of Agent Development</div>
+<p>
+Building and tuning a research agent team requires running it many times: testing
+prompt variations, adjusting tournament parameters, experimenting with model choices.
+Each run costs $4 to $6, and you might need 50 to 100 runs during development. That
+is $200 to $600 in API costs before the system is ready for production use. This
+development cost must be factored into the decision to build a custom research agent
+team versus using an existing tool like PaperQA2 for focused literature review. The
+custom team is worth the investment when you need the full generate-debate-rank loop
+for hypothesis exploration; for simpler tasks, a single-agent approach with PaperQA2
+or a DSPy pipeline is more cost-effective.
+</p>
+</div>
+
+<h2>7. Integration with the Discovery Workbench</h2>
+
+<p>
+The research agent team from this section plugs into the Discovery Workbench
+(see <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>)
+as a hypothesis generation service. The Workbench dispatches a research question, the
+team returns a <code>ResearchBrief</code>, and the Workbench stores the brief alongside
+the knowledge graph, experiment registry, and provenance chain:
+</p>
+
+<pre><code class="language-python">"""
+Discovery Workbench integration for the research agent team.
+"""
+from dataclasses import dataclass
+
+
+@dataclass
+class WorkbenchResearchRequest:
+    """A research question from the Discovery Workbench."""
+    question: str
+    domain: str
+    budget_usd: float = 10.0
+    max_generations: int = 2
+    priority: str = "normal"  # "normal", "urgent", "background"
+
+
+async def workbench_research_handler(
+    request: WorkbenchResearchRequest,
+) -> ResearchBrief:
+    """Handle a research request from the Discovery Workbench.
+
+    This function is registered as a Workbench service endpoint.
+    """
+    # configure based on budget
+    if request.budget_usd < 2.0:
+        config = {
+            "generator_model": "gpt-4o-mini",
+            "critic_model": "gpt-4o-mini",
+            "num_hypotheses": 4,
+        }
+        max_gen = 1
+    else:
+        config = {
+            "generator_model": "gpt-4o",
+            "critic_model": "gpt-4o-mini",
+            "num_hypotheses": 6,
+        }
+        max_gen = request.max_generations
+
+    pipeline = build_research_pipeline()
+    tracked = TrackedResearchPipeline(pipeline)
+    result = await tracked.run(
+        question=request.question,
+        max_generations=max_gen,
+        config=config,
+    )
+
+    return ResearchBrief(**result["brief"])
+</code></pre>
+<div class="code-caption">Workbench integration: the research agent team is exposed as a service that accepts a question and budget, selects an appropriate configuration, runs the pipeline with tracking, and returns a structured brief.</div>
+
+<p>
+The research briefs accumulate in the Workbench's knowledge base, where they can be
+cross-referenced against the knowledge graph from
+<a href="../module-38-knowledge-graphs/index.html">Chapter 38</a> and the hypothesis
+generation outputs from
+<a href="../module-39-hypothesis-generation/index.html">Chapter 39</a>. Over time, the
+Workbench builds a record of which research directions were explored, which hypotheses
+were ranked highest, and which were eventually validated or refuted. This record feeds
+back into the literature agent's semantic memory, creating a positive feedback loop
+where the system becomes more effective as it accumulates domain experience.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Autonomous Research Loops</div>
+<p>
+The pipeline in this section generates hypotheses but does not test them. The
+logical next step is <strong>closing the loop</strong>: automatically translating the top
+hypothesis into a computational experiment, running it, and feeding results back into
+the next generation. Google DeepMind's <strong>AI Co-Scientist</strong> (Gottweis et al., 2025)
+demonstrated this at scale, using a multi-agent system with a "tournament of ideas"
+ranking mechanism (similar to the Elo tournament here) to propose novel drug
+repurposing candidates and gene targets for acute myeloid leukemia, subsequently
+validated through wet-lab experiments. Separately, Sakana AI's
+<strong>The AI Scientist</strong> (Lu et al., 2024) closed the full loop from idea generation
+through experiment execution, paper writing, and automated peer review, though
+reviewers noted that the generated papers sometimes contained errors that the
+automated review failed to catch. The key unsolved challenge remains
+<strong>experiment design</strong>: translating a natural language hypothesis into a rigorous
+experimental protocol with appropriate controls, sample sizes, and success criteria.
+This is the subject of
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Minimal Debate Loop in 30 Minutes</h4>
+<p>
+You do not need the full stack to experience the generate-debate-rank pattern. Using only Python, Pydantic, and a single LLM API client, build a stripped-down version:
+</p>
+<ol>
+<li>Define two Pydantic models: <code>Hypothesis</code> (with fields <code>statement</code>, <code>reasoning</code>, <code>testable_prediction</code>) and <code>Critique</code> (with fields <code>strengths</code>, <code>weaknesses</code>, <code>verdict</code>). These are your coordination protocol.</li>
+<li>Write a <code>generate(question: str, n: int) -> list[Hypothesis]</code> function that prompts an LLM to produce <code>n</code> hypotheses for a research question of your choice and parses the response into your Pydantic model.</li>
+<li>Write a <code>critique(hypothesis: Hypothesis) -> Critique</code> function that prompts the LLM to critique a single hypothesis, returning structured output. Run it on each generated hypothesis.</li>
+<li>Write a <code>rank(pairs: list[tuple]) -> dict[str, float]</code> function that takes all pairs of hypotheses, asks the LLM which is stronger, and maintains an Elo dictionary updated after each comparison. Print the final ranking.</li>
+<li>Run the full loop on a question such as "What mechanisms could explain the recent decline in insect populations?" Compare the top-ranked hypothesis across three runs to gauge consistency. Vary the number of hypotheses (3 vs. 6) and observe how ranking stability changes.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual</strong>: The pipeline uses the same LLM family for generation and critique.
+This creates a risk of <em>shared blind spots</em>: if GPT-4o has a systematic bias in
+chemistry reasoning, both the generator and critic will share it. Propose an
+architecture modification that mitigates this risk. Consider using models from
+different providers, human reviewers at specific checkpoints, or external knowledge
+bases as cross-checks.
+</li>
+<li>
+<strong>Coding</strong>: Implement the full pipeline from this section and run it on three
+research questions from different domains: one in biology, one in materials science,
+and one in computational social science. Compare the results along three dimensions:
+hypothesis novelty (judged by you), critique thoroughness (number and quality of
+weaknesses identified), and cost (from MLflow tracking). Which domain produces the
+best results, and why?
+</li>
+<li>
+<strong>Coding</strong>: Add a <strong>human gate</strong> between the rank and review nodes. When the
+pipeline reaches the ranking step, it should pause execution, display the ranked
+hypotheses to a human expert (via a simple CLI interface), and allow the expert to
+(a) approve the rankings, (b) re-order them, or (c) add a new hypothesis. Use
+LangGraph's <code>interrupt_before</code> mechanism to implement the pause. How does
+human intervention affect the quality of the final research brief?
+</li>
+<li>
+<strong>Analysis</strong>: Run the pipeline 5 times on the same research question and
+measure consistency: what fraction of the time does the same hypothesis appear in
+the top 3? Vary the number of tournament rounds (1, 3, 5, 10) and plot consistency
+against cost. What is the minimum number of rounds needed for stable rankings?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+Research agents generate hypotheses and produce research briefs, but their outputs are
+only as trustworthy as the evidence behind them.
+<a href="../module-41-claim-validation/index.html">Chapter 41: Scientific Claim Validation</a>
+tackles the problem of verifying whether claims (whether produced by AI agents or by
+human researchers) are actually supported by evidence, reproducible, and statistically
+sound. The reviewer agent from this chapter catches some errors; the validation
+pipeline in Chapter 41 systematically checks every claim against its cited sources,
+detects contradictions in the literature, and assesses reproducibility risk. Together,
+these chapters complete the knowledge discovery pipeline: generate hypotheses
+(Chapter 39), develop them with research agents (this chapter), and validate the
+resulting claims (Chapter 41).
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-40.2.html">&#8592; 40.2 AI Scientists and Coscientist</a>
+<a href="index.html">Chapter 40</a>
+<a href="../module-41-claim-validation/index.html">Chapter 41: Scientific Claim Validation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

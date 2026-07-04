@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.2: Repository-Level Reasoning. Dependency graphs, call graphs, symbol tables, issue-to-patch search, and test-guided program repair for AI-assisted software engineering." name="description"/>
+<title>Section 8.2: Repository-Level Reasoning | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Foundations of AI Assisted Software Engineering</a></div>
+<h1>8.2 Repository-Level Reasoning</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I understood every function in isolation. It was the 47 transitive dependencies that surprised me."</p>
+<cite>A Call Graph That Mapped Its Own Complexity</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+In <a href="section-8.1.html">Section 8.1</a>, we saw how code foundation models learn
+to process code as token sequences. Now we move from individual files to entire
+repositories. This section assumes familiarity with graph concepts (nodes, edges,
+directed graphs) as introduced in
+<a href="../../part-1-foundations/module-03-knowledge-representation/index.html">Chapter 3: Knowledge Representation</a>.
+Experience with Python's <code>ast</code> module and basic command-line git is helpful
+but not required.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A single file tells you what a function does. A repository tells you <em>why</em> it
+exists, <em>who</em> calls it, <em>what</em> breaks if it changes, and <em>where</em>
+the tests live. To reason about software at the repository level, AI tools need
+structured representations that capture these relationships: dependency graphs
+showing which modules import which, call graphs mapping function invocations,
+and symbol tables indexing every definition and reference. These graph structures
+transform a flat collection of files into a navigable knowledge base. They are
+the foundation for the issue-to-patch pipelines that power modern coding agents
+and the context engineering techniques we explore in
+<a href="../module-11-context-engineering/index.html">Chapter 11</a>.
+</p>
+</div>
+
+<h2>1. Three Graphs Every Repository Contains</h2>
+
+<p>
+Every non-trivial repository implicitly encodes at least three graph structures.
+Making them explicit is the first step toward repository-level AI reasoning.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misunderstanding is that "repository-level reasoning" means feeding an entire
+repository into an LLM's context window. In reality, no current model can ingest a full
+production codebase (often millions of tokens), and even if it could, raw file contents
+lack the structural relationships needed for sound reasoning. Repository-level reasoning
+instead means building graph representations that let an AI selectively retrieve only
+the relevant code fragments for a given task.
+</p>
+</div>
+
+<p>
+The <strong>dependency graph</strong> $G_{\text{dep}} = (V_{\text{mod}}, E_{\text{imp}})$
+captures module-level import relationships. Each node $v \in V_{\text{mod}}$ is a
+module (typically a file), and each directed edge $(u, v) \in E_{\text{imp}}$ means
+module $u$ imports from module $v$. This graph answers questions like "if I change
+module $v$, which modules might be affected?" (the answer: all modules in the
+transitive closure of the reverse edges from $v$).
+</p>
+
+<p data-agent="02">
+A dependency graph is a directed graph where each node represents a module (source file
+or package) and each edge represents an import statement from one module to another. It
+matters because changes propagate along these edges: modifying a low-level utility module
+can silently break every module that imports it, directly or transitively. The mechanism
+is straightforward: a parser walks each source file, extracts import statements, and
+records an edge from the importing file to the imported target. Use the dependency graph
+when you need to assess the blast radius of a code change or prioritize review effort;
+for finer-grained analysis of which specific functions are affected, the call graph
+(described next) is more appropriate.
+</p>
+
+<p>
+The <strong>call graph</strong> $G_{\text{call}} = (V_{\text{func}}, E_{\text{call}})$
+operates at finer granularity. Each node is a function or method, and each directed
+edge $(f, g)$ means function $f$ calls function $g$. Call graphs can be constructed
+<em>statically</em> (by analyzing source code without running it) or <em>dynamically</em>
+(by instrumenting the program during execution). Static call graphs over-approximate
+(they include calls that might never execute), while dynamic call graphs
+under-approximate (they miss calls not exercised by the test inputs).
+</p>
+
+<p>
+The <strong>symbol table</strong> $T_{\text{sym}}$ is a mapping from identifiers to their
+definitions and all reference locations. For each symbol $s$, the table stores
+its kind (function, class, variable, parameter), its defining location (file, line,
+column), and every location where it is referenced. Symbol tables power the
+"go to definition" and "find all references" features in IDEs, and they are equally
+valuable for AI tools that need to understand the scope and usage of every name in
+a codebase.
+</p>
+
+<p>
+Let us build all three from a small Python project:
+</p>
+
+<pre><code class="language-python">import ast
+import os
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class SymbolInfo:
+    """Information about a single symbol in the repository."""
+    name: str
+    kind: str           # "function", "class", "variable", "import"
+    file: str
+    line: int
+    references: list[tuple[str, int]] = field(default_factory=list)
+
+
+class RepoGraph:
+    """Build dependency, call, and symbol graphs from a Python project."""
+
+    def __init__(self, root: str):
+        self.root = Path(root)
+        self.dep_edges: list[tuple[str, str]] = []     # (importer, imported)
+        self.call_edges: list[tuple[str, str]] = []    # (caller, callee)
+        self.symbols: dict[str, SymbolInfo] = {}
+
+    def analyze(self) -> None:
+        """Parse all Python files and extract graph structures."""
+        for py_file in self.root.rglob("*.py"):
+            rel = str(py_file.relative_to(self.root))
+            try:
+                tree = ast.parse(py_file.read_text(encoding="utf-8"))
+            except SyntaxError:
+                continue
+            self._extract_imports(tree, rel)
+            self._extract_definitions(tree, rel)
+            self._extract_calls(tree, rel)
+
+    def _extract_imports(self, tree: ast.Module, file: str) -> None:
+        """Extract import edges for the dependency graph."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.dep_edges.append((file, alias.name))
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    self.dep_edges.append((file, node.module))
+
+    def _extract_definitions(self, tree: ast.Module, file: str) -> None:
+        """Extract function and class definitions for the symbol table."""
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                key = f"{file}::{node.name}"
+                self.symbols[key] = SymbolInfo(
+                    name=node.name,
+                    kind="function",
+                    file=file,
+                    line=node.lineno,
+                )
+            elif isinstance(node, ast.ClassDef):
+                key = f"{file}::{node.name}"
+                self.symbols[key] = SymbolInfo(
+                    name=node.name,
+                    kind="class",
+                    file=file,
+                    line=node.lineno,
+                )
+
+    def _extract_calls(self, tree: ast.Module, file: str) -> None:
+        """Extract function call edges for the call graph."""
+        current_func = None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                current_func = f"{file}::{node.name}"
+            elif isinstance(node, ast.Call):
+                callee = self._resolve_call_name(node)
+                if callee and current_func:
+                    self.call_edges.append((current_func, callee))
+
+    @staticmethod
+    def _resolve_call_name(node: ast.Call) -> str | None:
+        """Extract the name of the called function from a Call node."""
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            return node.func.attr
+        return None
+
+    def impact_set(self, changed_file: str) -> set[str]:
+        """Compute the set of files potentially affected by a change.
+
+        Uses the reverse dependency graph to find all transitive importers.
+        """
+        reverse = defaultdict(set)
+        for importer, imported in self.dep_edges:
+            # Map module names to files (simplified)
+            reverse[imported].add(importer)
+
+        affected = set()
+        queue = [changed_file]
+        while queue:
+            current = queue.pop()
+            if current in affected:
+                continue
+            affected.add(current)
+            # Also check module name form
+            module_name = current.replace("/", ".").replace(".py", "")
+            for dep in reverse.get(module_name, set()):
+                queue.append(dep)
+        return affected
+</code></pre>
+<div class="code-caption">Listing 8.5: A repository graph analyzer that extracts dependency edges, call edges, and symbol definitions from a Python project using the <code>ast</code> module.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Graphs Reduce the Context Problem</div>
+<p>
+A large repository might contain millions of tokens, far exceeding any model's
+context window. Repository graphs solve this by enabling <strong>targeted retrieval</strong>:
+instead of feeding the entire codebase to the model, we traverse the graph from the
+point of interest (a bug report, a failing test, a feature request) and collect only
+the relevant nodes. For an average 100-file project, the call graph typically
+identifies 5 to 15 files relevant to a given issue, reducing context by 85% or more.
+This is the core idea behind the retrieval strategies in
+<a href="../module-11-context-engineering/index.html">Chapter 11</a>.
+</p>
+</div>
+
+<h2>2. Parsing Code with Tree-sitter</h2>
+
+<p>
+The <code>ast</code> module works for Python, but real repositories are polyglot. A
+web application might mix Python, TypeScript, SQL, HTML, and YAML. Tree-sitter is
+an incremental parsing library that supports 100+ languages with a uniform API,
+making it the backbone of modern code intelligence tools including GitHub's code
+navigation, Neovim's syntax highlighting, and several coding agents' context
+retrieval.
+</p>
+
+<p>
+Tree-sitter produces a <strong>concrete syntax tree</strong> (CST), not an abstract syntax
+tree (AST). The CST preserves every token including whitespace and comments, which
+matters for code generation (the AI needs to produce syntactically valid output
+with correct formatting) and for precise code editing (modifications must preserve
+surrounding whitespace).
+</p>
+
+<pre><code class="language-python">import tree_sitter_python as tspython
+from tree_sitter import Language, Parser
+
+# Initialize the Python parser
+PY_LANGUAGE = Language(tspython.language())
+parser = Parser(PY_LANGUAGE)
+
+source = b"""
+class DataProcessor:
+    def __init__(self, config: dict):
+        self.config = config
+        self.pipeline = []
+
+    def add_step(self, step: callable) -> 'DataProcessor':
+        self.pipeline.append(step)
+        return self
+
+    def run(self, data):
+        for step in self.pipeline:
+            data = step(data)
+        return data
+"""
+
+tree = parser.parse(source)
+
+
+def extract_functions(node, depth=0):
+    """Walk the CST and extract function definitions with their signatures."""
+    results = []
+    if node.type == "function_definition":
+        name_node = node.child_by_field_name("name")
+        params_node = node.child_by_field_name("parameters")
+        if name_node and params_node:
+            results.append({
+                "name": name_node.text.decode(),
+                "params": params_node.text.decode(),
+                "start_line": node.start_point[0],
+                "end_line": node.end_point[0],
+            })
+    for child in node.children:
+        results.extend(extract_functions(child, depth + 1))
+    return results
+
+
+functions = extract_functions(tree.root_node)
+for f in functions:
+    print(f"  {f['name']}{f['params']}  "
+          f"(lines {f['start_line']}-{f['end_line']})")
+
+# Output:
+#   __init__(self, config: dict)  (lines 3-5)
+#   add_step(self, step: callable)  (lines 7-9)
+#   run(self, data)  (lines 11-14)
+</code></pre>
+<div class="code-caption">Listing 8.6: Using Tree-sitter to parse Python source code into a concrete syntax tree and extract function signatures with line ranges.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Rope for Python Refactoring Graphs</div>
+<p>
+Building a complete symbol table with cross-references from scratch requires
+handling imports, scoping rules, and dynamic dispatch. The <code>rope</code> library
+does this in a few lines for Python:
+</p>
+<pre><code class="language-python">from rope.base.project import Project
+from rope.refactor.rename import Rename
+
+project = Project("/path/to/repo")
+resource = project.get_resource("src/processor.py")
+
+# Find all references to a function
+from rope.contrib.findit import find_occurrences
+refs = find_occurrences(project, resource, offset=142)
+# Returns every file and line where the symbol at offset 142 is used
+</code></pre>
+<p>
+This replaces roughly 200 lines of manual AST walking, import resolution, and
+scope tracking with 5 lines of library calls.
+</p>
+</div>
+
+<h2>3. Issue-to-Patch Search</h2>
+
+<p>
+The most practically important application of repository graphs is the
+<strong>issue-to-patch pipeline</strong>: given a bug report or feature request (an "issue"),
+automatically produce a code change (a "patch") that resolves it. This pipeline
+has discrete stages, each of which can be formalized as a search problem.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the issue-to-patch pipeline like diagnosing a plumbing problem in a large
+building. Stage 1 (localization) is the plumber reading the tenant's complaint ("no
+hot water on floor 3") and tracing the building's pipe diagram to identify which
+pipes, valves, and junctions could be responsible. Stage 2 (context assembly) is
+gathering the relevant blueprints for just those pipes, not the entire building plan.
+Stage 3 (patch generation) is proposing a fix (replace a valve, reroute a pipe).
+Stage 4 (validation) is turning on every faucet in the building to verify the fix
+solved the complaint without causing leaks elsewhere. The pipe diagram is the
+repository graph; without it, the plumber would have to tear open every wall.
+</p>
+</div>
+
+<p>
+<strong>Stage 1: Localization.</strong> Given an issue description in natural language,
+identify which files and functions in the repository are relevant. This is a
+retrieval problem: we embed the issue text and the repository's code elements
+(function signatures, docstrings, class names) into a shared vector space and
+retrieve the closest matches. Graph structure improves retrieval: if function
+$f$ is relevant and $f$ calls $g$, then $g$ is likely relevant too.
+</p>
+
+<p>
+<strong>Stage 2: Context assembly.</strong> Once we have identified the relevant code
+locations, we assemble a context window that gives the LLM enough information to
+generate a correct patch. This includes the target function, its callers and callees
+(from the call graph), type definitions it references (from the symbol table),
+relevant test files, and the issue description itself. The total context must
+fit within the model's window, so prioritization is essential.
+</p>
+
+<p>
+<strong>Stage 3: Patch generation.</strong> The LLM generates a candidate patch, typically
+as a unified diff or as complete replacement code for the affected functions. Multiple
+candidates may be generated (recall pass@k from Section 8.1) and ranked by the
+model's confidence or by additional heuristics.
+</p>
+
+<p>
+<strong>Stage 4: Validation.</strong> Each candidate patch is applied to the repository and
+the test suite is run. Patches that break existing tests are rejected. Patches that
+pass all existing tests but do not add new tests for the fix are flagged for human
+review. The ideal patch passes all existing tests and includes a new test that fails
+before the fix and passes after.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+
+
+@dataclass
+class Issue:
+    """A simplified representation of a GitHub issue."""
+    title: str
+    body: str
+    labels: list[str]
+
+
+@dataclass
+class PatchCandidate:
+    """A candidate patch generated by a code model."""
+    file_path: str
+    original_code: str
+    patched_code: str
+    explanation: str
+    confidence: float
+
+
+def localize_issue(issue: Issue,
+                   repo_graph: RepoGraph,
+                   top_k: int = 10) -> list[str]:
+    """Identify files most relevant to an issue using keyword + graph search.
+
+    A production system would use embedding similarity;
+    this simplified version uses keyword matching augmented
+    with graph-based expansion.
+    """
+    keywords = set(issue.title.lower().split()
+                   + issue.body.lower().split())
+    # Remove common stop words
+    keywords -= {"the", "a", "an", "is", "in", "to", "and", "of",
+                 "for", "on", "with", "this", "that", "it"}
+
+    # Score each symbol by keyword overlap
+    scores: dict[str, float] = {}
+    for key, sym in repo_graph.symbols.items():
+        name_tokens = set(sym.name.lower().split("_"))
+        overlap = len(keywords & name_tokens)
+        if overlap > 0:
+            scores[sym.file] = scores.get(sym.file, 0) + overlap
+
+    # Expand via dependency graph: if file F is relevant,
+    # boost files that import F or that F imports
+    expanded_scores = dict(scores)
+    for f, score in scores.items():
+        for neighbor in repo_graph.impact_set(f):
+            expanded_scores[neighbor] = (
+                expanded_scores.get(neighbor, 0) + score * 0.3
+            )
+
+    # Return top-k files sorted by score
+    ranked = sorted(expanded_scores.items(),
+                    key=lambda x: x[1], reverse=True)
+    return [f for f, _ in ranked[:top_k]]
+
+
+def validate_patch(patch: PatchCandidate,
+                   test_runner: callable) -> dict:
+    """Validate a patch by running the test suite.
+
+    Returns a dict with pass/fail status and test results.
+    """
+    # Apply the patch (in a real system, use a temp worktree)
+    results = {
+        "tests_passed": False,
+        "new_failures": [],
+        "has_new_test": False,
+    }
+
+    try:
+        test_output = test_runner(patch.file_path, patch.patched_code)
+        results["tests_passed"] = test_output["all_passed"]
+        results["new_failures"] = test_output.get("failures", [])
+        results["has_new_test"] = test_output.get("new_tests", 0) > 0
+    except Exception as e:
+        results["error"] = str(e)
+
+    return results
+</code></pre>
+<div class="code-caption">Listing 8.7: A simplified issue-to-patch pipeline showing localization via keyword matching with graph expansion, and patch validation through test execution.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: SWE-bench and Real-World Issue Resolution</div>
+<p>
+The SWE-bench benchmark (Jimenez et al., 2024) operationalizes the issue-to-patch
+pipeline on real GitHub issues from popular Python repositories like Django, Flask,
+scikit-learn, and matplotlib. Each instance consists of a GitHub issue, the complete
+repository state before the fix, and the developer's actual patch (including tests)
+as ground truth. As of mid-2026, the best coding agents resolve approximately 60%
+of SWE-bench Verified instances, with the most successful approaches combining
+repository-graph-guided retrieval, multi-step reasoning, and iterative test-driven
+refinement. The gap between agent and human performance is narrowing but remains
+meaningful for complex, multi-file issues that require understanding architectural
+intent rather than just local code patterns.
+</p>
+</div>
+
+<h2>4. Test-Guided Program Repair</h2>
+
+<p>
+Test-guided program repair takes the validation step further: instead of using tests
+only to filter generated patches, it uses <strong>failing tests as the specification</strong>
+for the repair itself. Given a failing test, the repair system identifies which code
+the test exercises (via the call graph), generates candidate patches for that code,
+and iterates until a patch makes the test pass without breaking other tests.
+</p>
+
+<p>
+The formal setup: let $T_{\text{pass}}$ be the set of currently passing tests and
+$T_{\text{fail}}$ be the set of failing tests (indicating the bug). A correct repair
+is a patch $p$ such that:
+</p>
+
+$$\forall t \in T_{\text{pass}} \cup T_{\text{fail}}: \text{run}(t, \text{apply}(p, \text{repo})) = \text{PASS}$$
+
+<p>
+The challenge is that many patches satisfy $T_{\text{fail}}$ (they make the failing
+test pass) but violate some $t \in T_{\text{pass}}$ (they break existing functionality).
+These are <strong>plausible but incorrect</strong> patches. A strong test suite reduces this
+risk but cannot eliminate it entirely, because tests are themselves incomplete
+specifications. This is why the best repair systems generate patches that include
+new tests: if the repair is correct, the new tests should encode the invariant that
+was violated.
+</p>
+
+<pre><code class="language-python">import subprocess
+import tempfile
+import shutil
+from pathlib import Path
+
+
+def test_guided_repair(repo_path: str,
+                       failing_test: str,
+                       generate_patch: callable,
+                       max_attempts: int = 5) -> PatchCandidate | None:
+    """Iteratively generate and test patches until one passes.
+
+    Args:
+        repo_path: Path to the repository root
+        failing_test: The test identifier (e.g., "tests/test_auth.py::test_login")
+        generate_patch: A callable that takes (repo_path, test_id, feedback)
+            and returns a PatchCandidate
+        max_attempts: Maximum number of repair attempts
+
+    Returns:
+        A validated PatchCandidate, or None if all attempts fail
+    """
+    feedback = f"Failing test: {failing_test}"
+
+    for attempt in range(max_attempts):
+        # Generate a candidate patch
+        patch = generate_patch(repo_path, failing_test, feedback)
+        if patch is None:
+            continue
+
+        # Apply patch in an isolated copy
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp) / "repo"
+            shutil.copytree(repo_path, work_dir)
+
+            # Write the patched file
+            patched_file = work_dir / patch.file_path
+            patched_file.write_text(patch.patched_code, encoding="utf-8")
+
+            # Run the full test suite
+            result = subprocess.run(
+                ["python", "-m", "pytest", "--tb=short", "-q"],
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            if result.returncode == 0:
+                print(f"Repair succeeded on attempt {attempt + 1}")
+                return patch
+
+            # Extract failure info to guide the next attempt
+            feedback = (
+                f"Attempt {attempt + 1} failed.\n"
+                f"Test output:\n{result.stdout[-1000:]}\n"
+                f"Errors:\n{result.stderr[-500:]}"
+            )
+            print(f"Attempt {attempt + 1}: {result.stdout.splitlines()[-1]}")
+
+    return None  # All attempts exhausted
+</code></pre>
+<div class="code-caption">Listing 8.8: An iterative test-guided repair loop that generates candidate patches, applies them in isolation, runs the test suite, and feeds failure information back into the next generation attempt.</div>
+
+<p>
+Notice the feedback loop: each failed attempt produces diagnostic information (test
+output, error messages) that is fed back to the patch generator. This is the
+<strong>generate-test-refine</strong> cycle that characterizes modern coding agents. The
+agent does not need to get the patch right on the first try; it learns from each
+failure. This iterative approach connects directly to the exploration-exploitation
+framework from <a href="../../part-1-foundations/module-01-discovery-as-search/section-1.2.html">Section 1.2</a>:
+each attempt explores a different region of patch space, and the feedback signal
+guides exploitation toward promising regions.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: SWE-agent and Learning to Navigate Repositories</div>
+<p>
+SWE-agent (Yang et al., 2024) introduced an agent-computer interface (ACI) designed
+specifically for repository-level coding tasks, achieving strong results on SWE-bench
+by giving the LLM a curated set of commands for searching, navigating, and editing
+code within a repository. Building on this direction, OpenAI's SWE-bench Verified
+leaderboard saw a significant jump in 2025 when systems began combining repository
+graph traversal with execution-based feedback and learned retrieval policies. CodeR
+(Chen et al., 2025) further advanced the field by pre-training a retrieval model on
+repository structure so that the localizer learns which graph paths are most
+informative for different bug categories, rather than relying on fixed heuristics.
+These systems demonstrate that the graph representations taught in this section are
+not static scaffolding but active components that agents can learn to traverse more
+effectively with experience.
+</p>
+</div>
+
+<h2>5. Building a Repository Map</h2>
+
+<p>
+Coding agents need a compact summary of a repository's structure that fits within
+a context window and provides enough information for the model to navigate to
+relevant code. This summary, often called a <strong>repository map</strong>, combines
+elements from all three graph structures into a human-readable (and LLM-readable)
+format.
+</p>
+
+<pre><code class="language-python">def generate_repo_map(repo_graph: RepoGraph,
+                      max_depth: int = 2) -> str:
+    """Generate a concise repository map showing file structure and key symbols.
+
+    The map shows each file with its classes and top-level functions,
+    annotated with dependency and call information.
+    """
+    lines = ["# Repository Map\n"]
+
+    # Group symbols by file
+    file_symbols: dict[str, list[SymbolInfo]] = {}
+    for key, sym in repo_graph.symbols.items():
+        file_symbols.setdefault(sym.file, []).append(sym)
+
+    # Sort files for consistent output
+    for file_path in sorted(file_symbols.keys()):
+        symbols = file_symbols[file_path]
+        lines.append(f"## {file_path}")
+
+        # Show imports (dependencies)
+        deps = [imp for src, imp in repo_graph.dep_edges
+                if src == file_path]
+        if deps:
+            lines.append(f"  imports: {', '.join(deps[:5])}")
+
+        # Show classes and functions
+        classes = [s for s in symbols if s.kind == "class"]
+        functions = [s for s in symbols if s.kind == "function"]
+
+        for cls in classes:
+            lines.append(f"  class {cls.name} (line {cls.line})")
+            # Find methods belonging to this class
+            methods = [s for s in functions
+                       if s.line > cls.line
+                       and s.name != cls.name]
+            for m in methods[:max_depth * 3]:
+                # Count outgoing calls
+                call_key = f"{file_path}::{m.name}"
+                callees = [c for caller, c in repo_graph.call_edges
+                           if caller == call_key]
+                call_info = (f" -> {', '.join(callees[:3])}"
+                             if callees else "")
+                lines.append(f"    def {m.name} (line {m.line})"
+                             f"{call_info}")
+
+        # Top-level functions (not inside classes)
+        for func in functions:
+            if not any(func.line > c.line for c in classes):
+                lines.append(f"  def {func.name} (line {func.line})")
+
+        lines.append("")
+
+    return "\n".join(lines)
+</code></pre>
+<div class="code-caption">Listing 8.9: Generating a repository map that summarizes files, classes, functions, dependencies, and call relationships into a compact text format suitable for LLM context windows.</div>
+
+<p>
+A well-constructed repository map serves as the AI agent's mental model of the
+codebase. It answers the question "where should I look?" before the agent reads any
+file in full. This two-stage approach (map first, then read relevant files) mirrors
+how experienced developers navigate unfamiliar codebases: scan the directory structure,
+read the README, then dive into specific files. We formalize this retrieval strategy
+as part of the Discovery Workbench's code analysis pipeline in
+<a href="../module-16-ai-implementation/index.html">Chapter 16</a>.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Map Is Not the Territory</div>
+<p>
+Repository maps are lossy compressions. A function signature tells you <em>what</em>
+a function accepts and returns, but not <em>how</em> it behaves. A class name like
+<code>DataProcessor</code> communicates intent, but the actual processing logic could
+be anything. Good naming conventions and docstrings increase the information density
+of the map, which is why coding standards matter even more in the age of AI-assisted
+development: the AI reads your code before it writes new code.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Query a Repository Graph</h4>
+<p>
+Put the concepts from this section into practice by building a repository graph
+for a real open-source project and using it to answer structural questions.
+</p>
+<ol>
+<li>Clone a small Python project (for example, <code>httpx</code> or <code>flask</code>)
+and copy the <code>RepoGraph</code> class from Listing 8.5 into a script called
+<code>analyze_repo.py</code>.</li>
+<li>Run <code>graph = RepoGraph("path/to/repo"); graph.analyze()</code> and print the
+number of dependency edges, call edges, and symbols found. Compare these counts to
+your intuition about the project's size.</li>
+<li>Pick a core module (e.g., <code>flask/app.py</code>) and call
+<code>graph.impact_set("flask/app.py")</code>. Print the result. How many files does
+a change to this module potentially affect?</li>
+<li>Adapt the <code>generate_repo_map</code> function from Listing 8.9 to produce a
+map for the project. Save it to a text file and review it. Can you locate the
+project's main entry point and its key abstractions from the map alone?</li>
+<li>Write a short function that, given a function name, returns its callers and
+callees from the call graph. Test it on two or three functions and verify the results
+by reading the source code.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Explain why a static call graph over-approximates while a dynamic
+call graph under-approximates. Give a concrete Python example where the two graphs
+differ, using polymorphism or dynamic dispatch.
+</li>
+<li>
+<strong>(Coding)</strong> Extend the <code>RepoGraph</code> class from Listing 8.5 to compute
+a <strong>change impact score</strong> for each file: the number of files in its transitive
+reverse-dependency closure. Run it on a small open-source Python project (e.g.,
+<code>httpx</code> or <code>fastapi</code>) and identify the five files with the highest
+impact scores. Explain why high-impact files deserve more careful AI-generated patches.
+</li>
+<li>
+<strong>(Analysis)</strong> The issue-to-patch pipeline in Listing 8.7 uses keyword matching
+for localization. Propose an embedding-based alternative that encodes function
+signatures and issue text into a shared vector space. What embedding model would you
+use? How would you handle the vocabulary mismatch between natural-language issue
+descriptions and code identifiers?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+Repository graphs and issue-to-patch pipelines give AI tools the ability to reason
+about code at scale. But tools alone are not enough; the developer must decide how
+to collaborate with them. In <a href="section-8.3.html">Section 8.3: Human-AI Collaboration Patterns</a>,
+we examine the spectrum of collaboration modes, from passive autocomplete to
+autonomous agents, and analyze the trade-offs each mode presents for productivity,
+code quality, and developer learning.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-8.1.html">&larr; 8.1 Code Foundation Models</a>
+<a href="index.html">Chapter 8</a>
+<a href="section-8.3.html">8.3 Human-AI Collaboration Patterns &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

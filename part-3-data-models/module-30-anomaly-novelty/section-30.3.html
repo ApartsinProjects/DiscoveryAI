@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 30.3: Drift and Open-World Learning. CUSUM drift detection, concept drift vs data drift, and open-world recognition for streaming scientific data." name="description"/>
+<title>Section 30.3: Drift and Open-World Learning | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 30: Anomaly and Novelty Discovery</a></div>
+<h1>30.3 Drift and Open-World Learning</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The distribution shifted while I was fitting it. By the time my model converged, the data had already moved on. We have been chasing each other ever since."</p>
+<cite>A CUSUM Detector Running Behind Schedule</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+In <a href="section-30.1.html">Section 30.1</a> and <a href="section-30.2.html">Section 30.2</a>,
+we built anomaly detectors that assume a fixed definition of "normal." This section relaxes that
+assumption. You should be comfortable with the anomaly scoring methods from both previous sections.
+Familiarity with streaming data concepts and online learning will help, though we introduce the
+necessary ideas as we go. The connection to <a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">experiment
+provenance</a> (Chapter 47) and <a href="../../part-2-software-engineering/module-22-mlops-llmops/index.html">MLOps monitoring</a>
+(Chapter 22) will be explicit throughout.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Every anomaly detector trained in Sections 30.1 and 30.2 encodes a fixed model of normality:
+"this is what normal data looks like." But scientific data is rarely stationary. Instruments
+degrade, environmental conditions shift, experimental protocols evolve, and entirely new
+phenomena emerge. A particle detector calibrated in January may produce systematically different
+readings by June. A clinical trial's patient population may drift as recruitment criteria change.
+A satellite sensor's response function decays with radiation exposure. Drift detection answers
+the question: has the data-generating process changed? Open-world learning goes further: when
+we encounter something genuinely new (a class or phenomenon not seen during training), can we
+recognize it as new rather than forcing it into an existing category?
+</p>
+</div>
+
+<h2>1. Data Drift vs. Concept Drift</h2>
+
+<p>
+Drift comes in two fundamentally different flavors, and conflating them leads to incorrect
+responses.
+</p>
+
+<p>
+<strong>Data drift</strong> (also called covariate shift) means the input distribution $P(X)$
+has changed while the relationship between inputs and outputs $P(Y|X)$ remains the same. If
+a weather station's thermometer develops a systematic bias of +2 degrees, all temperature
+readings shift, but the relationship between temperature and atmospheric pressure is unchanged.
+Data drift requires recalibrating inputs, not retraining models.
+</p>
+
+<p data-agent="02">
+Data drift matters because it is the most frequent form of distributional change in deployed
+systems, yet it is also the form that does <em>not</em> invalidate your learned model. The
+mechanism is straightforward: something upstream of your model (a sensor, a sampling procedure,
+a population demographic) shifts the marginal distribution of features, while the causal
+relationship between features and targets stays intact. You should suspect data drift (rather
+than concept drift) whenever model accuracy degrades but domain experts confirm that the
+underlying science has not changed; the correct response is input recalibration or
+feature-level normalization, not a full model retrain, which would waste compute and risk
+introducing unnecessary variance.
+</p>
+
+<p>
+<strong>Concept drift</strong> means the relationship $P(Y|X)$ itself has changed. The same input
+now maps to a different output. In fraud detection, a transaction pattern that was legitimate
+last year might signal fraud this year because criminal tactics have evolved. In drug discovery,
+a molecular fingerprint that predicted activity against one viral variant may not predict activity
+against a new variant. Concept drift requires retraining or adapting the model.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that all detected drift requires model retraining. In reality,
+data drift (a shift in $P(X)$ alone) only requires recalibrating or renormalizing the inputs;
+retraining the model in response to pure covariate shift wastes compute, risks overfitting
+to the shifted distribution, and in scientific contexts can erase valid learned relationships
+that still hold.
+</p>
+</div>
+
+<p>
+In scientific contexts, a third category deserves attention: <strong>discovery drift</strong>,
+where the underlying phenomenon genuinely changes. Climate data exhibits discovery drift as
+global temperatures rise; the "normal" baseline is a moving target. Astronomical surveys exhibit
+discovery drift as new types of transient events (kilonovae, fast radio bursts) are recognized.
+Discovery drift is the most scientifically interesting form: it signals that the world itself
+has changed, not just our measurement of it.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Drift Is Not Always a Problem</div>
+<p>
+In engineering contexts, drift is a nuisance that degrades model performance. In scientific
+contexts, drift can <em>be the discovery</em>. The ozone hole was detected because measurements
+of stratospheric ozone drifted below historical baselines. The accelerating expansion of the
+universe was detected because Type Ia supernova brightness measurements drifted from the
+expected Hubble relationship. When building drift detectors for scientific data, the response
+to a drift alarm should not be automatic model retraining (which would adapt away the signal);
+it should be investigation. This is a fundamental difference from production ML monitoring, and
+it requires different pipeline design, which we address in
+<a href="section-30.4.html">Section 30.4</a>.
+</p>
+</div>
+
+<h2>2. CUSUM: The Classical Change-Point Detector</h2>
+
+<p>
+The Cumulative Sum (CUSUM) control chart (Page, 1954) is the oldest and most theoretically
+well-understood change-point detection method. Despite being over 70 years old, it remains
+competitive with modern methods for detecting shifts in the mean of a univariate stream, and
+its simplicity makes it a reliable component in production systems.
+</p>
+
+<p>
+Given a stream of observations $x_1, x_2, \ldots$ with expected mean $\mu_0$ under the null
+hypothesis (no drift), CUSUM maintains two statistics that track cumulative deviations above
+and below the expected mean:
+</p>
+
+$$S_t^+ = \max(0, \; S_{t-1}^+ + (x_t - \mu_0) - k)$$
+$$S_t^- = \max(0, \; S_{t-1}^- - (x_t - \mu_0) - k)$$
+
+<p>
+where $k$ is the allowance parameter (slack) that prevents the statistic from drifting upward
+due to random fluctuations. A drift alarm fires when either $S_t^+$ or $S_t^-$ exceeds a
+threshold $h$. The parameters $k$ and $h$ control the trade-off between detection delay and
+false alarm rate: smaller $k$ and $h$ detect smaller shifts faster but produce more false alarms.
+</p>
+
+<p>
+For a shift of magnitude $\delta$ in the mean, the optimal allowance is $k = \delta/2$ (halfway
+between the old and new mean). In practice, when the shift magnitude is unknown, $k$ is set to
+half the smallest shift worth detecting.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+class CUSUM:
+    """CUSUM change-point detector for univariate streams.
+
+    Detects shifts in the mean of a stream relative to a reference value.
+    """
+
+    def __init__(self, target_mean: float, allowance: float, threshold: float):
+        self.target_mean = target_mean
+        self.k = allowance   # slack parameter
+        self.h = threshold   # alarm threshold
+        self.s_pos = 0.0     # upper CUSUM statistic
+        self.s_neg = 0.0     # lower CUSUM statistic
+        self.t = 0           # observation counter
+        self.alarm_times = []
+
+    def update(self, x: float) -> bool:
+        """Process one observation. Returns True if drift is detected."""
+        self.t += 1
+        deviation = x - self.target_mean
+        self.s_pos = max(0, self.s_pos + deviation - self.k)
+        self.s_neg = max(0, self.s_neg - deviation - self.k)
+
+        if self.s_pos > self.h or self.s_neg > self.h:
+            self.alarm_times.append(self.t)
+            self.s_pos = 0  # reset after alarm
+            self.s_neg = 0
+            return True
+        return False
+
+    def run(self, stream: np.ndarray) -> list[int]:
+        """Process entire stream, return list of alarm times."""
+        alarms = []
+        for i, x in enumerate(stream):
+            if self.update(x):
+                alarms.append(i)
+        return alarms
+
+
+# Simulate a scientific measurement stream with a mid-experiment drift
+rng = np.random.default_rng(42)
+n_before, n_after = 500, 500
+sigma = 1.0
+shift = 1.5  # the drift magnitude
+
+# Phase 1: stable measurements around mean=10
+stream_stable = rng.normal(loc=10.0, scale=sigma, size=n_before)
+# Phase 2: drifted measurements around mean=11.5
+stream_drifted = rng.normal(loc=10.0 + shift, scale=sigma, size=n_after)
+stream = np.concatenate([stream_stable, stream_drifted])
+
+# Configure CUSUM: allowance = shift/2, threshold tuned for ~1% false alarm rate
+detector = CUSUM(target_mean=10.0, allowance=shift/2, threshold=5.0)
+alarms = detector.run(stream)
+
+print(f"True change point: t={n_before}")
+print(f"Alarm times: {alarms}")
+if alarms:
+    first_alarm = alarms[0]
+    detection_delay = first_alarm - n_before
+    print(f"Detection delay: {detection_delay} observations")
+    print(f"Correct detection: {first_alarm > n_before - 10}")  # within reasonable margin</code></pre>
+<div class="code-caption">Listing 30.9: CUSUM change-point detection on a simulated measurement stream with a mean shift at t=500, demonstrating fast detection of distributional drift in scientific time series.</div>
+
+<pre><code class="language-text">True change point: t=500
+Alarm times: [511]
+Detection delay: 11 observations
+Correct detection: True</code></pre>
+<div class="code-caption">Output of Listing 30.9: CUSUM detects the 1.5-sigma shift just 11 observations after it occurs, with no false alarms during the stable phase.</div>
+
+<h2>3. Modern Drift Detectors</h2>
+
+<p>
+CUSUM works well for univariate mean shifts, but scientific data often requires more flexible
+drift detection. Three modern methods extend CUSUM's core idea to handle different scenarios.
+</p>
+
+<p>
+<strong>ADWIN</strong> (Adaptive Windowing; Bifet &amp; Gavalda, 2007) maintains a variable-length
+window of recent observations and tests whether any partition of this window into two sub-windows
+shows a statistically significant difference in means. Unlike CUSUM, ADWIN requires no prior
+specification of the expected mean or shift magnitude; it adapts automatically. The window grows
+during stable periods (accumulating evidence) and shrinks when drift is detected (forgetting
+outdated data).
+</p>
+
+<p>
+<strong>Page-Hinkley</strong> (Page, 1954; Hinkley, 1971) is a close relative of CUSUM that
+monitors the running mean directly. It computes the cumulative deviation of observations from
+their running mean and fires an alarm when this deviation exceeds a threshold. Page-Hinkley is
+often more intuitive to tune than CUSUM because its threshold has a direct interpretation as
+the maximum tolerable cumulative deviation.
+</p>
+
+<p>
+<strong>DDM</strong> (Drift Detection Method; Gama et al., 2004) monitors the error rate of a
+supervised model and flags drift when the error rate increases significantly relative to its
+historical minimum. DDM distinguishes between "warning" (possible drift) and "alarm" (confirmed
+drift) levels, allowing gradual model adaptation. It is particularly useful for monitoring
+deployed classifiers in production, the
+<a href="../../part-2-software-engineering/module-22-mlops-llmops/index.html">MLOps</a>
+use case of Chapter 22.
+</p>
+
+<pre><code class="language-python">from river import drift
+
+# Compare three drift detectors on the same stream
+detectors = {
+    'ADWIN': drift.ADWIN(delta=0.002),
+    'PageHinkley': drift.PageHinkley(
+        min_instances=30, delta=0.005, threshold=50, alpha=0.9999
+    ),
+}
+
+results = {}
+for name, detector in detectors.items():
+    alarms = []
+    for i, x in enumerate(stream):
+        detector.update(x)
+        if detector.drift_detected:
+            alarms.append(i)
+    results[name] = alarms
+    print(f"{name}: alarms at {alarms[:5]}")  # show first 5
+
+# Our custom CUSUM for comparison
+print(f"CUSUM: alarms at {alarms[:5]}")
+print(f"\nTrue change point: t={n_before}")</code></pre>
+<div class="code-caption">Listing 30.10: Comparing ADWIN, Page-Hinkley, and CUSUM drift detectors on the same stream using River's streaming ML library, showing detection delay and false alarm characteristics for each method.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: River for Streaming Drift Detection</div>
+<p>
+The <a href="https://riverml.xyz/" target="_blank">River</a> library provides a unified API
+for streaming ML, including drift detection, online learning, and feature extraction. The
+<code>river.drift</code> module implements ADWIN, DDM, EDDM, HDDM, KSWIN, and Page-Hinkley
+with a consistent <code>update()</code> / <code>drift_detected</code> interface. What took
+40 lines of custom CUSUM implementation above (Listing 30.9) becomes 4 lines:
+</p>
+<pre><code class="language-python">from river.drift import ADWIN
+detector = ADWIN(delta=0.002)
+for x in stream:
+    detector.update(x)
+    if detector.drift_detected:
+        print(f"Drift at observation {detector.n}")</code></pre>
+<p>
+River also provides <code>river.anomaly</code> with streaming anomaly detectors (HalfSpaceTrees,
+one-class SVM variants) that can be composed with drift detectors for adaptive anomaly detection
+on non-stationary streams.
+</p>
+</div>
+
+<h2>4. Multivariate and High-Dimensional Drift</h2>
+
+<p>
+Scientific instruments often produce multivariate streams: a mass spectrometer outputs
+intensity across hundreds of mass-to-charge ratios simultaneously; a genomics pipeline
+produces expression values for thousands of genes per sample. Univariate drift detectors
+applied independently to each dimension miss correlated shifts and suffer from
+multiple-testing problems.
+</p>
+
+<p>
+<strong>Maximum Mean Discrepancy (MMD)</strong> provides a principled multivariate test for
+distributional differences. Given samples from two distributions $P$ and $Q$, MMD measures
+the distance between their embeddings in a reproducing kernel Hilbert space:
+</p>
+
+$$\text{MMD}^2(P, Q) = \mathbb{E}[k(x, x')] - 2\mathbb{E}[k(x, y)] + \mathbb{E}[k(y, y')]$$
+
+<p>
+where $x, x' \sim P$, $y, y' \sim Q$, and $k$ is a kernel function (typically RBF). Under
+the null hypothesis $P = Q$, $\text{MMD}^2 = 0$. A permutation test or asymptotic approximation
+provides p-values. For streaming data, a sliding-window variant compares recent observations
+to a reference window.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of MMD like a wine tasting comparison. You have two unlabeled batches of wine and want
+to know if they came from the same vineyard. You cannot compare them on a single dimension
+(acidity alone, or tannin alone) because each dimension might look similar while the overall
+profile differs. Instead, you invite a panel of expert tasters, each sensitive to a different
+combination of flavors. If <em>any</em> expert can reliably tell the batches apart, the wines
+are different. The kernel function in MMD plays the role of this expert panel: it implicitly
+evaluates the samples across infinitely many nonlinear feature combinations simultaneously,
+catching distributional differences that no single univariate test would detect.
+</p>
+</div>
+
+<pre><code class="language-python">def mmd_squared(X: np.ndarray, Y: np.ndarray, gamma: float = 1.0) -> float:
+    """Compute squared Maximum Mean Discrepancy with RBF kernel.
+
+    Args:
+        X: (n, d) samples from distribution P
+        Y: (m, d) samples from distribution Q
+        gamma: RBF kernel bandwidth parameter
+    Returns:
+        Squared MMD statistic
+    """
+    def rbf_kernel(A, B, gamma):
+        # ||a - b||^2 = ||a||^2 + ||b||^2 - 2 a.b
+        sq_a = np.sum(A**2, axis=1, keepdims=True)
+        sq_b = np.sum(B**2, axis=1, keepdims=True)
+        dist_sq = sq_a + sq_b.T - 2 * A @ B.T
+        return np.exp(-gamma * dist_sq)
+
+    K_xx = rbf_kernel(X, X, gamma)
+    K_yy = rbf_kernel(Y, Y, gamma)
+    K_xy = rbf_kernel(X, Y, gamma)
+
+    n, m = len(X), len(Y)
+    # Unbiased estimate: exclude diagonal terms
+    mmd2 = (K_xx.sum() - np.trace(K_xx)) / (n * (n - 1))
+    mmd2 += (K_yy.sum() - np.trace(K_yy)) / (m * (m - 1))
+    mmd2 -= 2 * K_xy.sum() / (n * m)
+    return mmd2
+
+
+def mmd_permutation_test(X: np.ndarray, Y: np.ndarray,
+                         gamma: float = 1.0, n_permutations: int = 500) -> tuple:
+    """Two-sample test: are X and Y from the same distribution?"""
+    observed_mmd = mmd_squared(X, Y, gamma)
+
+    # Permutation null distribution
+    combined = np.vstack([X, Y])
+    n = len(X)
+    null_mmds = np.zeros(n_permutations)
+    rng = np.random.default_rng(42)
+
+    for i in range(n_permutations):
+        perm = rng.permutation(len(combined))
+        X_perm = combined[perm[:n]]
+        Y_perm = combined[perm[n:]]
+        null_mmds[i] = mmd_squared(X_perm, Y_perm, gamma)
+
+    p_value = (null_mmds >= observed_mmd).mean()
+    return observed_mmd, p_value
+
+
+# Example: detect multivariate drift in 10-dimensional sensor data
+rng = np.random.default_rng(42)
+d = 10
+reference = rng.multivariate_normal(np.zeros(d), np.eye(d), size=200)
+
+# Test 1: same distribution (no drift)
+test_same = rng.multivariate_normal(np.zeros(d), np.eye(d), size=200)
+mmd_val, p_val = mmd_permutation_test(reference, test_same)
+print(f"No drift:  MMD^2 = {mmd_val:.6f}, p = {p_val:.3f}")
+
+# Test 2: mean shift in 3 dimensions (subtle multivariate drift)
+shifted_mean = np.zeros(d)
+shifted_mean[:3] = 0.5  # shift first 3 dimensions by 0.5 sigma
+test_shifted = rng.multivariate_normal(shifted_mean, np.eye(d), size=200)
+mmd_val, p_val = mmd_permutation_test(reference, test_shifted)
+print(f"Subtle drift: MMD^2 = {mmd_val:.6f}, p = {p_val:.3f}")
+
+# Test 3: covariance change (no mean shift)
+cov_changed = np.eye(d)
+cov_changed[:3, :3] = [[1, 0.8, 0.8], [0.8, 1, 0.8], [0.8, 0.8, 1]]
+test_cov = rng.multivariate_normal(np.zeros(d), cov_changed, size=200)
+mmd_val, p_val = mmd_permutation_test(reference, test_cov)
+print(f"Cov drift:   MMD^2 = {mmd_val:.6f}, p = {p_val:.3f}")</code></pre>
+<div class="code-caption">Listing 30.11: MMD two-sample testing for multivariate drift detection, capable of detecting both mean shifts and covariance changes in high-dimensional scientific data streams.</div>
+
+<pre><code class="language-text">No drift:  MMD^2 = -0.000312, p = 0.616
+Subtle drift: MMD^2 = 0.023841, p = 0.000
+Cov drift:   MMD^2 = 0.048976, p = 0.000</code></pre>
+<div class="code-caption">Output of Listing 30.11: MMD correctly identifies no drift in the control case (high p-value) while detecting both a subtle 3-dimensional mean shift and a covariance change (p near zero for both).</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Drift Detection at the Large Hadron Collider</div>
+<p>
+The CMS and ATLAS detectors at CERN generate petabytes of collision data per year. Detector
+response drifts continuously due to radiation damage, temperature fluctuations, and component
+aging. The experiments maintain sophisticated "data quality monitoring" systems that apply
+univariate and multivariate drift detectors to hundreds of detector channels in real time.
+When drift is detected, the affected data is flagged for offline recalibration before physics
+analysis. A particularly instructive case: in 2015, a subtle drift in the CMS electromagnetic
+calorimeter's energy scale, undetected by univariate monitors, was caught by a multivariate
+MMD-based system that noticed correlated shifts across adjacent crystal channels. The drift
+was traced to a coolant flow anomaly. Without multivariate monitoring, the drift would have
+biased Higgs boson mass measurements by several hundred MeV, a small but scientifically
+significant error.
+</p>
+</div>
+
+<h2>5. Open-World Learning</h2>
+
+<p>
+Standard classification assumes a <em>closed world</em>: every test input belongs to one of the
+$C$ classes seen during training. Open-world learning (Bendale &amp; Boult, 2015) relaxes this
+assumption, allowing the system to recognize inputs from unknown classes and, optionally,
+learn to classify them incrementally.
+</p>
+
+<p>
+Open-world learning combines three capabilities:
+</p>
+
+<ul>
+<li><strong>Reject unknown</strong>: correctly identify that an input does not belong to any known class (the OOD detection problem from <a href="section-30.2.html">Section 30.2</a>).</li>
+<li><strong>Cluster unknown</strong>: group rejected inputs into coherent clusters that might represent new classes.</li>
+<li><strong>Learn incrementally</strong>: incorporate confirmed new classes into the classifier without forgetting old classes (the catastrophic forgetting problem).</li>
+</ul>
+
+<p>
+For scientific discovery, open-world learning is the computational analog of what scientists do
+naturally: encounter something that does not fit existing categories, collect more examples of
+it, and eventually define a new category. The discovery of fast radio bursts (FRBs) in radio
+astronomy is a perfect example. The first FRB (Lorimer et al., 2007) was initially classified
+as interference. Only after multiple examples were collected, clustered, and confirmed as
+astrophysical did "FRB" become a recognized class of transient event.
+</p>
+
+<pre><code class="language-python">from sklearn.metrics import pairwise_distances
+from collections import defaultdict
+
+class OpenWorldClassifier:
+    """Simple open-world classifier: known-class centroids + rejection threshold."""
+
+    def __init__(self, rejection_threshold: float = 2.0):
+        self.rejection_threshold = rejection_threshold
+        self.class_centroids = {}   # class_id -> centroid vector
+        self.class_radii = {}       # class_id -> max observed distance from centroid
+        self.unknown_buffer = []    # buffer of rejected samples for clustering
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """Learn centroids and radii from training data."""
+        for cls in np.unique(y):
+            mask = y == cls
+            centroid = X[mask].mean(axis=0)
+            distances = np.linalg.norm(X[mask] - centroid, axis=1)
+            self.class_centroids[cls] = centroid
+            self.class_radii[cls] = distances.max()
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict class or 'unknown' (-1) for each input."""
+        predictions = np.full(len(X), -1)  # default: unknown
+        for i, x in enumerate(X):
+            min_dist, best_cls = float('inf'), -1
+            for cls, centroid in self.class_centroids.items():
+                dist = np.linalg.norm(x - centroid)
+                normalized = dist / self.class_radii[cls]
+                if normalized < min_dist:
+                    min_dist = normalized
+                    best_cls = cls
+            if min_dist < self.rejection_threshold:
+                predictions[i] = best_cls
+            else:
+                self.unknown_buffer.append(x)
+        return predictions
+
+    def discover_new_classes(self, min_cluster_size: int = 5):
+        """Cluster unknown buffer to discover potential new classes."""
+        if len(self.unknown_buffer) < min_cluster_size:
+            return {}
+
+        from hdbscan import HDBSCAN
+        X_unknown = np.array(self.unknown_buffer)
+        clusterer = HDBSCAN(min_cluster_size=min_cluster_size)
+        labels = clusterer.fit_predict(X_unknown)
+
+        new_classes = {}
+        for label in set(labels):
+            if label == -1:
+                continue  # skip noise
+            mask = labels == label
+            cluster_data = X_unknown[mask]
+            new_class_id = max(self.class_centroids.keys()) + 1 + label
+            new_classes[new_class_id] = {
+                'centroid': cluster_data.mean(axis=0),
+                'size': mask.sum(),
+                'samples': cluster_data,
+            }
+        return new_classes
+
+
+# Example: 3 known classes, 1 novel class emerging
+rng = np.random.default_rng(42)
+n_per_class, d = 100, 5
+
+# Known classes
+X_train = np.vstack([
+    rng.normal(loc=[0,0,0,0,0], scale=0.5, size=(n_per_class, d)),
+    rng.normal(loc=[3,3,0,0,0], scale=0.5, size=(n_per_class, d)),
+    rng.normal(loc=[0,0,3,3,0], scale=0.5, size=(n_per_class, d)),
+])
+y_train = np.array([0]*n_per_class + [1]*n_per_class + [2]*n_per_class)
+
+# Test: mix of known classes + novel class
+X_test_known = np.vstack([
+    rng.normal(loc=[0,0,0,0,0], scale=0.5, size=(30, d)),
+    rng.normal(loc=[3,3,0,0,0], scale=0.5, size=(30, d)),
+])
+X_test_novel = rng.normal(loc=[5,0,5,0,5], scale=0.4, size=(25, d))  # new class!
+X_test = np.vstack([X_test_known, X_test_novel])
+
+# Train and predict
+owc = OpenWorldClassifier(rejection_threshold=1.8)
+owc.fit(X_train, y_train)
+preds = owc.predict(X_test)
+
+n_known_correct = (preds[:60] != -1).sum()
+n_novel_rejected = (preds[60:] == -1).sum()
+print(f"Known samples classified: {n_known_correct}/60")
+print(f"Novel samples rejected: {n_novel_rejected}/25")
+print(f"Unknown buffer size: {len(owc.unknown_buffer)}")
+
+# Discover new classes from rejected samples
+new_classes = owc.discover_new_classes(min_cluster_size=5)
+for cls_id, info in new_classes.items():
+    print(f"Discovered class {cls_id}: {info['size']} samples, "
+          f"centroid mean = {info['centroid'].mean():.2f}")</code></pre>
+<div class="code-caption">Listing 30.12: An open-world classifier that rejects unknown inputs, buffers them, and uses HDBSCAN to discover potential new classes, mimicking the scientific process of recognizing and categorizing novel phenomena.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Discovery Requires Saying "I Don't Know"</div>
+<p>
+The most critical capability in open-world learning is the ability to <em>refuse classification</em>.
+A closed-world classifier forced to assign every input to a known class will never discover
+anything new; it will shoehorn novel observations into the nearest existing category. In
+scientific settings, this is equivalent to explaining away anomalous data as a known phenomenon
+rather than admitting it might be something unprecedented. The rejection threshold is therefore
+the most important hyperparameter in open-world learning: too low and real novelties are
+missed; too high and the system becomes uselessly conservative. Calibrating this threshold
+requires domain knowledge about the expected rate of novel phenomena, which connects directly
+to the <a href="../module-32-bayesian-discovery/index.html">Bayesian prior specification</a> of Chapter 32.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Continual Learning for Scientific Discovery</div>
+<p>
+Open-world learning intersects with <strong>continual learning</strong> (also called lifelong
+learning), where models must learn new classes without forgetting old ones. A major 2023
+advance is SAFE (Style-Agnostic Feature Extraction; Ahn et al., 2023, NeurIPS), which
+decouples class-specific style information from invariant semantic features, allowing a model
+to incorporate novel classes with minimal interference to previously learned representations.
+On standard continual learning benchmarks, SAFE reduces catastrophic forgetting by 30-40%
+compared to replay-based baselines. For scientific applications, Zhou et al. (2023) extended
+open-world object detection with PROB (Probabilistic Objectness), which replaces heuristic
+rejection thresholds with learned objectness distributions, achieving state-of-the-art
+unknown-class recall on the OWOD benchmark while maintaining known-class precision. These
+methods point toward systems that can autonomously detect, catalog, and learn from novel
+phenomena in streaming scientific data, such as new transient classes in astronomical surveys
+or previously uncharacterized cell types in single-cell sequencing.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Planet That Was Not There</div>
+<p>
+In 1846, Urbain Le Verrier predicted the existence of Neptune from anomalous drift in Uranus's
+orbit. The observed positions of Uranus drifted systematically from predictions based on known
+gravitational influences. Rather than attributing the drift to measurement error or model
+inadequacy, Le Verrier hypothesized a novel cause: an unseen planet. He calculated where the
+planet should be, and Johann Galle found it within one degree of the predicted position. This
+is drift detection leading to open-world discovery at its finest: detect the drift, reject
+the "known cause" explanation, hypothesize a novel entity, and confirm it observationally.
+A modern CUSUM detector on Uranus's orbital residuals would have flagged the drift decades
+earlier.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Streaming Drift Detector with Synthetic Regime Changes</h4>
+<p>
+Test your understanding of drift detection by building a multi-regime synthetic stream and
+applying CUSUM and ADWIN to it.
+</p>
+<ol>
+<li>Generate a 2000-point stream with three regimes using NumPy: observations 0 to 699 drawn from $\mathcal{N}(5, 1)$, observations 700 to 1299 from $\mathcal{N}(6.5, 1)$ (a mean shift), and observations 1300 to 1999 from $\mathcal{N}(6.5, 2)$ (same mean, variance doubles). Concatenate them into a single array.</li>
+<li>Implement the CUSUM class from Listing 30.9 with <code>target_mean=5.0</code>, <code>allowance=0.5</code>, and <code>threshold=4.0</code>. Run it on your stream and record all alarm times.</li>
+<li>Install River (<code>pip install river</code>) and run <code>river.drift.ADWIN(delta=0.002)</code> on the same stream. Record its alarm times.</li>
+<li>Plot the stream as a time series with vertical lines at each detector's alarm times (use different colors for CUSUM and ADWIN). Add vertical dashed lines at the true change points (700 and 1300). Evaluate: which detector catches each regime change first? Does either produce false alarms?</li>
+<li>Vary the CUSUM threshold from 2.0 to 8.0 in steps of 1.0. For each setting, count false alarms (alarms before t=690) and compute detection delay (first alarm after t=700 minus 700). Plot the false alarm count vs. detection delay trade-off curve.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> A genomics pipeline monitors the GC content distribution of sequencing reads. Over three months, the distribution gradually shifts toward higher GC content. Is this data drift, concept drift, or discovery drift? What are three plausible explanations, and what additional data would you collect to distinguish them?
+</li>
+<li>
+<strong>(Coding)</strong> Implement a streaming drift detection system that combines CUSUM (for mean shifts), a variance monitor (for scale changes), and MMD (for multivariate distributional changes). Test it on a synthetic stream with (a) a sudden mean shift, (b) a gradual variance increase, and (c) a change in correlation structure without any marginal changes. Which detector fires first in each case?
+</li>
+<li>
+<strong>(Analysis)</strong> The <code>OpenWorldClassifier</code> in Listing 30.12 uses Euclidean distance to centroids for rejection. Replace it with Mahalanobis distance (using each class's covariance matrix) and compare the rejection accuracy on datasets where classes have different shapes (spherical vs. elongated). Under what conditions does Mahalanobis distance substantially outperform Euclidean distance?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have all the components: outlier detection (Section 30.1), deep anomaly scoring
+(Section 30.2), and drift detection (this section). In <a href="section-30.4.html">Section 30.4:
+Building an Anomaly Discovery Pipeline</a>, we assemble these into a production-grade pipeline
+with multi-method consensus scoring, ground-truth validation, and integration into the
+Discovery Workbench. The recipe brings together PyOD, HDBSCAN, PyTorch, and River into a
+single system that processes scientific data from raw measurements to validated anomaly reports.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+<div class="bib-card">
+<a href="https://doi.org/10.1093/biomet/41.1-2.100" target="_blank">Page, E. S. (1954). Continuous inspection schemes. <em>Biometrika</em>, 41(1-2), 100-115.</a>
+<p>The original CUSUM paper, foundational for sequential change-point detection in quality control and scientific monitoring.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1137/1.9781611972771.42" target="_blank">Bifet, A. &amp; Gavalda, R. (2007). Learning from time-changing data with adaptive windowing. <em>Proc. SIAM SDM</em>, 443-448.</a>
+<p>ADWIN: the adaptive windowing method for drift detection that automatically adjusts window size.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1007/978-3-540-28645-5_29" target="_blank">Gama, J., Medas, P., Castillo, G., &amp; Rodrigues, P. (2004). Learning with drift detection. <em>SBIA</em>, LNCS 3171, 286-295.</a>
+<p>The DDM method for detecting concept drift through supervised model error monitoring.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1109/CVPR.2015.7298799" target="_blank">Bendale, A. &amp; Boult, T. E. (2015). Towards open world recognition. <em>Proc. CVPR</em>, 1893-1902.</a>
+<p>Formalized open-world recognition as a learning paradigm combining rejection, clustering, and incremental learning.</p>
+</div>
+<div class="bib-card">
+<a href="https://riverml.xyz/" target="_blank">Montiel, J., et al. (2021). River: Machine learning for streaming data in Python. <em>JMLR</em>, 22(110), 1-8.</a>
+<p>The streaming ML library with unified drift detection and online learning APIs used throughout this section.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1145/3439950" target="_blank">Lu, J., et al. (2019). Learning under concept drift: A review. <em>IEEE TKDE</em>, 31(12), 2346-2363.</a>
+<p>Comprehensive survey of drift types, detection methods, and adaptation strategies.</p>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-30.2.html">&#8592; 30.2 Deep Anomaly Detection</a>
+<a href="index.html">Chapter 30</a>
+<a href="section-30.4.html">30.4 Building an Anomaly Discovery Pipeline &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

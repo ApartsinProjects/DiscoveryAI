@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 52.2: Causal Inference in Social Data. Difference-in-differences, synthetic control, SUTVA violations, network interference, and exposure mapping for social and economic systems." name="description"/>
+<title>Section 52.2: Causal Inference in Social Data | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Discovery in Scientific Domains</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 52: Discovery AI for Social and Economic Systems</a></div>
+<h1>52.2 Causal Inference in Social Data</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I controlled for every variable I could think of. The treatment effect vanished. Then my colleague pointed out that I had also controlled for the mechanism through which the treatment works."</p>
+<cite>A Regression That Adjusted Away Its Own Answer</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Causal inference in social systems faces challenges that the idealized settings of <a href="../../part-3-data-models/module-31-causal-discovery/index.html">Chapter 31</a> deliberately set aside. People talk to each other, so treating one person spills over onto their neighbors. Policies roll out gradually, so pre-treatment trends must be verified. Randomized experiments on populations raise ethical concerns that laboratory experiments do not. This section introduces the workhorse identification strategies of applied social science (difference-in-differences, synthetic control, regression discontinuity) and then confronts the fundamental problem of network interference, where the Stable Unit Treatment Value Assumption (SUTVA) breaks down because one unit's treatment status affects another unit's outcome.</p>
+</div>
+
+<h2>1. The Challenge of Observational Social Data</h2>
+
+<p><strong>What.</strong> Observational social data comes from settings where the researcher does not control treatment assignment. Governments choose which cities receive a program. Individuals self-select into job training. Companies decide whether to adopt a technology. The fundamental problem is that treated and untreated units differ systematically in ways that also affect the outcome.</p>
+
+<p><strong>Why.</strong> Randomized controlled trials, the gold standard for causal inference, are often infeasible in social settings. You cannot randomly assign cities to different minimum wage laws for a decade. You cannot randomly imprison some individuals to study the effect of incarceration. You cannot randomly assign children to different school quality levels. Observational methods are not a fallback; they are the primary tool for answering the most important social science questions.</p>
+
+<p><strong>How.</strong> Each identification strategy exploits a specific feature of the data-generating process to construct a credible counterfactual. Difference-in-differences exploits parallel trends. Synthetic control constructs a weighted counterfactual from donor units. Regression discontinuity exploits an arbitrary threshold. The credibility of each strategy depends entirely on the plausibility of its identifying assumption.</p>
+
+<p><strong>When.</strong> Choose the strategy based on the data structure. DiD requires panel data with a clear treatment timing. Synthetic control requires a single treated unit with many potential donors. RDD requires a running variable with a cutoff that determines treatment. All three require careful validation of their identifying assumptions before estimation.</p>
+
+<h2>2. Difference-in-Differences</h2>
+
+<p>Difference-in-differences (DiD) compares the change in outcomes over time between treated and untreated groups. The key identifying assumption is <strong>parallel trends</strong>: in the absence of treatment, the treated group would have followed the same trajectory as the control group.</p>
+
+<p data-agent="02">DiD is the most widely used quasi-experimental method in economics and policy evaluation, precisely because its data requirements are modest: you need repeated observations on treated and untreated groups, before and after a policy change. It matters because it allows researchers to control for all time-invariant differences between groups (such as geography or institutional culture) and all group-invariant changes over time (such as macroeconomic shocks), isolating the causal effect without randomization. The mechanism works by computing a "double subtraction": first subtract pre-treatment from post-treatment outcomes within each group to remove permanent group differences, then subtract the control group's change from the treated group's change to remove common time trends. Use DiD when you have panel data with a sharp treatment date and plausible parallel pre-trends; prefer synthetic control when only a single unit is treated, or regression discontinuity when treatment assignment follows a threshold rule rather than a before/after comparison.</p>
+
+<p>Formally, for unit $i$ in group $g \in \{0, 1\}$ at time $t \in \{0, 1\}$ (pre and post treatment):</p>
+
+$$Y_{it} = \alpha + \beta \cdot \text{Post}_t + \gamma \cdot \text{Treated}_g + \delta \cdot (\text{Post}_t \times \text{Treated}_g) + \epsilon_{it}$$
+
+<p>The coefficient $\delta$ is the DiD estimator: the average treatment effect on the treated (ATT). It equals the difference in the before-after change between the treated and control groups:</p>
+
+$$\hat{\delta}_{\text{DiD}} = (\bar{Y}_{1,\text{post}} - \bar{Y}_{1,\text{pre}}) - (\bar{Y}_{0,\text{post}} - \bar{Y}_{0,\text{pre}})$$
+
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+import statsmodels.formula.api as smf
+from dataclasses import dataclass
+
+
+@dataclass
+class DiDResult:
+    """Results from a difference-in-differences analysis."""
+    att: float
+    se: float
+    ci_lower: float
+    ci_upper: float
+    p_value: float
+    pre_trend_test_p: float
+    n_treated: int
+    n_control: int
+
+
+def difference_in_differences(
+    panel: pd.DataFrame,
+    outcome: str,
+    treatment_col: str,
+    time_col: str,
+    unit_col: str,
+    treatment_time: int,
+    covariates: list = None,
+) -> DiDResult:
+    """
+    Estimate the ATT using difference-in-differences with
+    optional covariates and a pre-trend test.
+
+    Parameters
+    ----------
+    panel : DataFrame in long format (one row per unit-time)
+    outcome : name of the outcome variable
+    treatment_col : binary column indicating treated group
+    time_col : time period column
+    unit_col : unit identifier column
+    treatment_time : the period when treatment begins
+    covariates : optional list of control variable names
+    """
+    df = panel.copy()
+    df["post"] = (df[time_col] >= treatment_time).astype(int)
+    df["treated_post"] = df[treatment_col] * df["post"]
+
+    # Main DiD regression with unit and time fixed effects
+    formula = f"{outcome} ~ treated_post + C({unit_col}) + C({time_col})"
+    if covariates:
+        formula += " + " + " + ".join(covariates)
+
+    model = smf.ols(formula, data=df).fit(
+        cov_type="cluster", cov_kwds={"groups": df[unit_col]}
+    )
+
+    att = model.params["treated_post"]
+    se = model.bse["treated_post"]
+    p_val = model.pvalues["treated_post"]
+    ci = model.conf_int().loc["treated_post"]
+
+    # Pre-trend test: interaction of treated with each pre-period
+    pre_data = df[df[time_col] < treatment_time].copy()
+    pre_data["time_trend"] = pre_data[time_col] - treatment_time
+    pre_data["treated_trend"] = (
+        pre_data[treatment_col] * pre_data["time_trend"]
+    )
+
+    pre_formula = (
+        f"{outcome} ~ treated_trend + C({unit_col}) + C({time_col})"
+    )
+    pre_model = smf.ols(pre_formula, data=pre_data).fit(
+        cov_type="cluster", cov_kwds={"groups": pre_data[unit_col]}
+    )
+    pre_trend_p = pre_model.pvalues.get("treated_trend", 1.0)
+
+    return DiDResult(
+        att=att,
+        se=se,
+        ci_lower=ci[0],
+        ci_upper=ci[1],
+        p_value=p_val,
+        pre_trend_test_p=pre_trend_p,
+        n_treated=df[df[treatment_col] == 1][unit_col].nunique(),
+        n_control=df[df[treatment_col] == 0][unit_col].nunique(),
+    )
+
+
+# Synthetic panel data: effect of a job training program
+np.random.seed(42)
+n_units = 200
+n_periods = 10
+treatment_period = 6
+
+units = np.arange(n_units)
+treated = np.random.binomial(1, 0.4, n_units)
+
+rows = []
+for i in units:
+    unit_fe = np.random.normal(0, 2)  # Unit fixed effect
+    for t in range(n_periods):
+        time_fe = 0.5 * t  # Common time trend
+        treatment_effect = (
+            3.0 * treated[i] * (t >= treatment_period)  # True ATT = 3.0
+        )
+        noise = np.random.normal(0, 1)
+        y = 10 + unit_fe + time_fe + treatment_effect + noise
+        rows.append({
+            "unit": i, "time": t, "treated": treated[i], "outcome": y
+        })
+
+panel_data = pd.DataFrame(rows)
+
+result = difference_in_differences(
+    panel_data, "outcome", "treated", "time", "unit",
+    treatment_time=treatment_period,
+)
+
+print(f"ATT estimate: {result.att:.3f} (true: 3.000)")
+print(f"Standard error: {result.se:.3f}")
+print(f"95% CI: [{result.ci_lower:.3f}, {result.ci_upper:.3f}]")
+print(f"Pre-trend test p-value: {result.pre_trend_test_p:.3f}")
+print(f"  (p > 0.05 supports parallel trends assumption)")</code></pre>
+<div class="code-caption">Figure 52.7: Difference-in-differences estimation with clustered standard errors and a pre-trend validation test. The pre-trend test checks whether treated and control groups were diverging before treatment; a non-significant result (p > 0.05) supports the parallel trends assumption.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Pre-Trend Test Is Necessary but Not Sufficient</div>
+<p>Passing the pre-trend test means that treated and control groups moved in parallel <em>before</em> treatment. This is necessary for DiD validity but not sufficient: the groups could have been on parallel paths that would have diverged at exactly the treatment time for reasons unrelated to treatment. The pre-trend test cannot rule out this scenario. Always supplement statistical tests with domain-specific arguments about why the parallel trends assumption is credible. This connects to the refutation testing philosophy from <a href="../../part-3-data-models/module-31-causal-discovery/index.html">Chapter 31</a>: stress-test your assumptions, do not just check a p-value.</p>
+</div>
+
+<h2>3. Synthetic Control Method</h2>
+
+<p>When only a single unit receives treatment (a specific state passes a law, a single country implements a policy), DiD requires choosing comparison units subjectively. The synthetic control method (Abadie and Gardeazabal, 2003) constructs an optimal comparison unit as a weighted combination of untreated "donor" units, chosen to match the treated unit's pre-treatment trajectory.</p>
+
+<p>Formally, we seek weights $w_j \geq 0$ with $\sum_j w_j = 1$ that minimize the distance between the treated unit's pre-treatment outcomes and the weighted average of donor outcomes:</p>
+
+$$\min_{\mathbf{w}} \| \mathbf{X}_1 - \mathbf{X}_0 \mathbf{w} \|_V = \sqrt{(\mathbf{X}_1 - \mathbf{X}_0 \mathbf{w})' V (\mathbf{X}_1 - \mathbf{X}_0 \mathbf{w})}$$
+
+<p>where $\mathbf{X}_1$ is the vector of pre-treatment characteristics for the treated unit, $\mathbf{X}_0$ is the matrix of characteristics for donor units, and $V$ is a positive definite weighting matrix.</p>
+
+<pre><code class="language-python">from scipy.optimize import minimize
+
+
+def synthetic_control(
+    panel: pd.DataFrame,
+    treated_unit: int,
+    outcome: str,
+    time_col: str,
+    unit_col: str,
+    treatment_time: int,
+    predictors: list = None,
+) -> dict:
+    """
+    Construct a synthetic control unit and estimate the treatment effect.
+
+    Parameters
+    ----------
+    panel : DataFrame in long format
+    treated_unit : identifier of the treated unit
+    outcome : outcome variable name
+    treatment_time : period when treatment begins
+
+    Returns
+    -------
+    dict with weights, synthetic outcomes, treatment effects
+    """
+    # Separate treated and donor units
+    treated_data = panel[panel[unit_col] == treated_unit]
+    donor_data = panel[panel[unit_col] != treated_unit]
+    donor_units = donor_data[unit_col].unique()
+
+    # Pre-treatment outcomes matrix
+    pre_treated = (
+        treated_data[treated_data[time_col] < treatment_time]
+        .set_index(time_col)[outcome]
+        .values
+    )
+
+    pre_donors = np.column_stack([
+        donor_data[
+            (donor_data[unit_col] == u)
+            & (donor_data[time_col] < treatment_time)
+        ].set_index(time_col)[outcome].values
+        for u in donor_units
+    ])
+
+    n_donors = len(donor_units)
+
+    # Optimize weights to minimize pre-treatment RMSE
+    def objective(w):
+        synthetic = pre_donors @ w
+        return np.sum((pre_treated - synthetic) ** 2)
+
+    # Constraints: weights sum to 1, all non-negative
+    constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
+    bounds = [(0, 1)] * n_donors
+    w0 = np.ones(n_donors) / n_donors
+
+    result = minimize(
+        objective, w0, method="SLSQP",
+        bounds=bounds, constraints=constraints,
+    )
+    optimal_weights = result.x
+
+    # Construct synthetic control for all periods
+    all_times = sorted(panel[time_col].unique())
+    synthetic_outcomes = {}
+    treated_outcomes = {}
+
+    for t in all_times:
+        treated_outcomes[t] = treated_data[
+            treated_data[time_col] == t
+        ][outcome].values[0]
+
+        donor_vals = np.array([
+            donor_data[
+                (donor_data[unit_col] == u)
+                & (donor_data[time_col] == t)
+            ][outcome].values[0]
+            for u in donor_units
+        ])
+        synthetic_outcomes[t] = donor_vals @ optimal_weights
+
+    # Treatment effects (post-treatment gaps)
+    effects = {
+        t: treated_outcomes[t] - synthetic_outcomes[t]
+        for t in all_times if t >= treatment_time
+    }
+    pre_fit_rmse = np.sqrt(np.mean([
+        (treated_outcomes[t] - synthetic_outcomes[t]) ** 2
+        for t in all_times if t < treatment_time
+    ]))
+
+    # Identify top donor weights
+    top_donors = sorted(
+        zip(donor_units, optimal_weights),
+        key=lambda x: x[1], reverse=True
+    )[:5]
+
+    return {
+        "weights": dict(zip(donor_units, optimal_weights)),
+        "top_donors": top_donors,
+        "treated_outcomes": treated_outcomes,
+        "synthetic_outcomes": synthetic_outcomes,
+        "effects": effects,
+        "avg_effect": np.mean(list(effects.values())),
+        "pre_fit_rmse": pre_fit_rmse,
+    }
+
+
+# Synthetic data: one treated region among 20
+np.random.seed(42)
+n_regions = 20
+n_years = 15
+treat_year = 10
+
+rows = []
+for region in range(n_regions):
+    base = np.random.normal(50, 5)
+    trend = np.random.normal(1.5, 0.3)
+    for year in range(n_years):
+        y = base + trend * year + np.random.normal(0, 1)
+        if region == 0 and year >= treat_year:
+            y += 5.0  # True effect on treated unit
+        rows.append({
+            "region": region, "year": year, "gdp_growth": y
+        })
+
+region_panel = pd.DataFrame(rows)
+
+sc_result = synthetic_control(
+    region_panel, treated_unit=0, outcome="gdp_growth",
+    time_col="year", unit_col="region", treatment_time=treat_year,
+)
+
+print(f"Pre-treatment fit RMSE: {sc_result['pre_fit_rmse']:.3f}")
+print(f"Average treatment effect: {sc_result['avg_effect']:.3f} (true: 5.0)")
+print(f"Top donor weights: {sc_result['top_donors'][:3]}")</code></pre>
+<div class="code-caption">Figure 52.8: Synthetic control method for single-unit policy evaluation. The algorithm finds non-negative weights over donor regions that minimize pre-treatment prediction error, then uses the gap between treated and synthetic outcomes post-treatment as the estimated effect.</div>
+
+<h2>4. SUTVA Violations and Network Interference</h2>
+
+<p>The Stable Unit Treatment Value Assumption (SUTVA) states that one unit's outcome depends only on its own treatment status, not on the treatment status of other units. In social systems, SUTVA almost always fails. Vaccinating your neighbor protects you (herd immunity). Training a worker benefits their coworkers through knowledge spillovers. Regulating one bank changes the risk exposure of every bank it trades with.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of SUTVA violations like a shared sprinkler system in a garden. If you fertilize only your own plot, the standard assumption says your neighbor's tomatoes are unaffected. But the fertilizer dissolves into the shared irrigation water and feeds every plot downstream. Measuring the "effect of fertilizer on your plot" now conflates two things: the direct boost from the fertilizer you applied, and the indirect boost every plot gets through the shared water. The exposure mapping framework below is like installing separate water meters on each plot so you can measure how much fertilizer each one actually received through the pipes, regardless of where it was originally applied.</p>
+</div>
+
+<p>When SUTVA fails, the standard potential outcomes framework collapses. Instead of two potential outcomes per unit ($Y_i(0)$ and $Y_i(1)$), we have $2^n$ potential outcomes for each unit, one for every possible treatment assignment of all $n$ units in the network. Estimation becomes intractable without structure.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Interference Makes Effects Contagious</div>
+<p>Under interference, the treatment effect on unit $i$ depends not just on whether $i$ is treated, but on how many of $i$'s neighbors are treated. This means a single treatment effect number (the ATE) is no longer well-defined. Instead, we need to estimate a <em>family</em> of effects: the direct effect of treating unit $i$, the spillover effect of treating $i$'s neighbors, and the interaction between these two. The exposure mapping framework below provides a tractable way to decompose these effects. This is the network analog of the heterogeneous treatment effects from <a href="../../part-3-data-models/module-31-causal-discovery/index.html">Chapter 31</a>, with the network itself as the source of heterogeneity.</p>
+</div>
+
+<h3>4.1 Exposure Mapping</h3>
+
+<p>The exposure mapping approach (Aronow and Samii, 2017) reduces the $2^n$ potential outcomes to a manageable set by defining each unit's "exposure" as a low-dimensional summary of the network treatment configuration. The most common summary is the fraction of neighbors treated:</p>
+
+$$E_i(\mathbf{Z}) = \frac{\sum_{j \in \mathcal{N}(i)} Z_j}{|\mathcal{N}(i)|}$$
+
+<p>where $\mathbf{Z}$ is the treatment vector and $\mathcal{N}(i)$ is the set of $i$'s neighbors. Under the partial interference assumption (Hudgens and Halloran, 2008), we can then define:</p>
+
+<ul>
+<li><strong>Direct effect</strong>: the effect of treating $i$, holding neighbors' exposure fixed</li>
+<li><strong>Spillover effect</strong>: the effect of changing neighbors' exposure, holding $i$'s treatment fixed</li>
+<li><strong>Total effect</strong>: the combined effect of treating $i$ and exposing their neighbors</li>
+</ul>
+
+<pre><code class="language-python">import networkx as nx
+from sklearn.linear_model import LinearRegression
+
+
+@dataclass
+class InterferenceEffects:
+    """Estimated direct, spillover, and total treatment effects."""
+    direct_effect: float
+    spillover_effect: float
+    total_effect: float
+    direct_se: float
+    spillover_se: float
+    n_units: int
+
+
+def estimate_with_interference(
+    G: nx.Graph,
+    treatment: dict,
+    outcome: dict,
+    covariates: pd.DataFrame = None,
+) -> InterferenceEffects:
+    """
+    Estimate direct and spillover effects using exposure mapping.
+
+    Models outcome as:
+        Y_i = alpha + beta_1 * Z_i + beta_2 * E_i + beta_3 * Z_i * E_i
+              + gamma * X_i + epsilon_i
+
+    where Z_i is own treatment, E_i is neighborhood exposure.
+
+    Parameters
+    ----------
+    G : social/economic network (undirected)
+    treatment : dict mapping node -> 0/1 treatment indicator
+    outcome : dict mapping node -> outcome value
+    covariates : optional DataFrame indexed by node
+    """
+    nodes = list(G.nodes())
+    n = len(nodes)
+
+    # Compute exposure for each unit
+    exposure = {}
+    for node in nodes:
+        neighbors = list(G.neighbors(node))
+        if neighbors:
+            treated_neighbors = sum(
+                treatment.get(n, 0) for n in neighbors
+            )
+            exposure[node] = treated_neighbors / len(neighbors)
+        else:
+            exposure[node] = 0.0
+
+    # Build regression matrix
+    Z = np.array([treatment.get(n, 0) for n in nodes])
+    E = np.array([exposure[n] for n in nodes])
+    Y = np.array([outcome[n] for n in nodes])
+    ZE = Z * E  # Interaction term
+
+    X_matrix = np.column_stack([Z, E, ZE, np.ones(n)])
+    col_names = ["treatment", "exposure", "interaction", "intercept"]
+
+    if covariates is not None:
+        cov_matrix = covariates.loc[nodes].values
+        X_matrix = np.column_stack([X_matrix, cov_matrix])
+
+    # OLS estimation
+    model = smf.ols(
+        "Y ~ treatment + exposure + interaction",
+        data=pd.DataFrame({
+            "Y": Y, "treatment": Z,
+            "exposure": E, "interaction": ZE,
+        }),
+    ).fit(cov_type="HC1")  # Heteroskedasticity-robust SEs
+
+    direct = model.params["treatment"]
+    spillover = model.params["exposure"]
+    direct_se = model.bse["treatment"]
+    spillover_se = model.bse["exposure"]
+
+    # Total effect: direct + spillover at mean exposure among treated
+    mean_exposure_treated = np.mean(E[Z == 1])
+    interaction = model.params.get("interaction", 0)
+    total = direct + spillover * mean_exposure_treated
+
+    return InterferenceEffects(
+        direct_effect=direct,
+        spillover_effect=spillover,
+        total_effect=total,
+        direct_se=direct_se,
+        spillover_se=spillover_se,
+        n_units=n,
+    )
+
+
+# Simulate an experiment with interference
+np.random.seed(42)
+G_social = nx.watts_strogatz_graph(500, 6, 0.1, seed=42)
+
+# Random treatment assignment
+treatment = {n: int(np.random.random() < 0.3) for n in G_social.nodes()}
+
+# Generate outcomes with true direct and spillover effects
+true_direct = 2.0
+true_spillover = 1.5
+outcome = {}
+for node in G_social.nodes():
+    neighbors = list(G_social.neighbors(node))
+    neighbor_exposure = (
+        sum(treatment.get(n, 0) for n in neighbors) / len(neighbors)
+        if neighbors else 0
+    )
+    y = (
+        5.0
+        + true_direct * treatment[node]
+        + true_spillover * neighbor_exposure
+        + np.random.normal(0, 1)
+    )
+    outcome[node] = y
+
+effects = estimate_with_interference(G_social, treatment, outcome)
+print(f"Direct effect: {effects.direct_effect:.3f} "
+      f"(true: {true_direct}, SE: {effects.direct_se:.3f})")
+print(f"Spillover effect: {effects.spillover_effect:.3f} "
+      f"(true: {true_spillover}, SE: {effects.spillover_se:.3f})")
+print(f"Total effect: {effects.total_effect:.3f}")</code></pre>
+<div class="code-caption">Figure 52.9: Exposure mapping for interference-aware causal inference. The model decomposes the treatment effect into a direct component (own treatment) and a spillover component (neighbors' treatment exposure), recovering both from observational data.</div>
+
+<div class="callout warning">
+<div class="callout-title">Warning: Exposure Mapping Requires a Known Network</div>
+<p>Exposure mapping assumes you observe the complete network of interference. If the network is partially observed (missing edges, unobserved nodes) or if interference operates through channels not captured by the network (shared media exposure, market-level shocks), the exposure variable is measured with error. This attenuates spillover estimates toward zero. Always conduct sensitivity analysis on the network specification: does the result change when you use 2-hop neighbors instead of 1-hop? When you use a different network (trade vs. geographic proximity)?</p>
+</div>
+
+<h2>5. Regression Discontinuity Design</h2>
+
+<p>Regression discontinuity (RD) exploits settings where treatment is determined by whether a continuous "running variable" exceeds a threshold. Students with test scores above 80 receive a scholarship. Firms with fewer than 50 employees are exempt from a regulation. Cities with population above 100,000 receive federal funding.</p>
+
+<p>The key insight: units just above and just below the threshold are nearly identical in all respects except treatment status. The discontinuity in the outcome at the threshold therefore estimates the causal effect of treatment.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent mistake is treating the RD estimate as a global average treatment effect that applies to everyone in the sample. It does not. The RD estimate is a <em>local</em> average treatment effect (LATE) valid only at the cutoff: it tells you the causal effect for units whose running variable places them right at the threshold, not for units far from it. A scholarship effect estimated at the score cutoff of 80 may differ substantially from the effect on students scoring 95, because those students have different baseline characteristics and opportunity costs. Generalizing an RD estimate beyond a narrow window around the cutoff requires additional assumptions that the design itself does not provide.</p>
+</div>
+
+$$\tau_{\text{RD}} = \lim_{x \downarrow c} E[Y | X = x] - \lim_{x \uparrow c} E[Y | X = x]$$
+
+<pre><code class="language-python">from sklearn.linear_model import LinearRegression
+
+
+def regression_discontinuity(
+    data: pd.DataFrame,
+    running_var: str,
+    outcome: str,
+    cutoff: float,
+    bandwidth: float = None,
+    poly_order: int = 1,
+) -> dict:
+    """
+    Sharp regression discontinuity design with local linear regression.
+
+    Parameters
+    ----------
+    data : DataFrame with running variable and outcome
+    running_var : name of the running variable
+    outcome : name of the outcome variable
+    cutoff : treatment threshold
+    bandwidth : window around cutoff (uses IK optimal if None)
+    poly_order : polynomial order for local regression
+    """
+    df = data.copy()
+    df["centered"] = df[running_var] - cutoff
+    df["treated"] = (df[running_var] >= cutoff).astype(int)
+
+    # Simple bandwidth selection: Imbens-Kalyanaraman style
+    if bandwidth is None:
+        std_x = df["centered"].std()
+        n = len(df)
+        bandwidth = 1.84 * std_x * n ** (-1 / 5)  # Rule of thumb
+
+    # Restrict to bandwidth window
+    in_window = df[df["centered"].abs() <= bandwidth].copy()
+    n_left = (in_window["treated"] == 0).sum()
+    n_right = (in_window["treated"] == 1).sum()
+
+    # Local polynomial regression on each side
+    # Y = alpha + beta * (X - c) + tau * D + gamma * D * (X - c) + eps
+    features = ["treated", "centered"]
+    in_window["treated_centered"] = (
+        in_window["treated"] * in_window["centered"]
+    )
+    features.append("treated_centered")
+
+    if poly_order >= 2:
+        in_window["centered_sq"] = in_window["centered"] ** 2
+        in_window["treated_centered_sq"] = (
+            in_window["treated"] * in_window["centered_sq"]
+        )
+        features.extend(["centered_sq", "treated_centered_sq"])
+
+    formula = f"{outcome} ~ " + " + ".join(features)
+    model = smf.ols(formula, data=in_window).fit(cov_type="HC1")
+
+    tau = model.params["treated"]
+    se = model.bse["treated"]
+    p_val = model.pvalues["treated"]
+
+    return {
+        "tau": tau,
+        "se": se,
+        "p_value": p_val,
+        "ci_lower": tau - 1.96 * se,
+        "ci_upper": tau + 1.96 * se,
+        "bandwidth": bandwidth,
+        "n_left": n_left,
+        "n_right": n_right,
+        "n_total": len(in_window),
+    }
+
+
+# Synthetic RD data: scholarship effect on college enrollment
+np.random.seed(42)
+n_students = 2000
+test_scores = np.random.normal(80, 10, n_students)
+scholarship = (test_scores >= 80).astype(int)
+enrollment = (
+    0.3 + 0.005 * test_scores
+    + 0.15 * scholarship  # True RD effect = 0.15
+    + np.random.normal(0, 0.1, n_students)
+)
+
+rd_data = pd.DataFrame({
+    "test_score": test_scores,
+    "enrollment": enrollment,
+})
+
+rd_result = regression_discontinuity(
+    rd_data, "test_score", "enrollment", cutoff=80.0
+)
+
+print(f"RD estimate: {rd_result['tau']:.4f} (true: 0.1500)")
+print(f"SE: {rd_result['se']:.4f}")
+print(f"95% CI: [{rd_result['ci_lower']:.4f}, {rd_result['ci_upper']:.4f}]")
+print(f"Bandwidth: {rd_result['bandwidth']:.2f}")
+print(f"Observations in window: {rd_result['n_total']}")</code></pre>
+<div class="code-caption">Figure 52.10: Sharp regression discontinuity design with local linear regression. The estimated treatment effect captures the jump in enrollment probability at the scholarship cutoff score of 80.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Evaluating a Tax Incentive</div>
+<p>A government economist evaluates a tax credit for small businesses with fewer than 250 employees. Using administrative data on 80,000 firms, she applies an RD design at the 250-employee threshold. The RD estimate shows the tax credit increases R&D spending by 12% (95% CI: 7% to 17%). She validates the design by testing for manipulation of the running variable (McCrary density test) and checking that pre-treatment covariates (industry, age, revenue) are smooth through the threshold. A placebo test at fake cutoffs (200, 300 employees) produces null effects, confirming that the 250-employee discontinuity is specific to the policy.</p>
+</div>
+
+<h2>6. Sensitivity Analysis for Social Data</h2>
+
+<p>Every observational causal estimate rests on untestable assumptions. Sensitivity analysis quantifies how robust your conclusions are to violations of these assumptions. The E-value (VanderWeele and Ding, 2017) answers: how strong would an unmeasured confounder need to be to explain away the observed effect?</p>
+
+<pre><code class="language-python">def compute_e_value(point_estimate: float, ci_lower: float) -> dict:
+    """
+    Compute the E-value for a risk ratio or rate ratio.
+
+    The E-value is the minimum strength of association that
+    an unmeasured confounder would need to have with both
+    the treatment and the outcome to fully explain away
+    the observed effect.
+
+    Parameters
+    ----------
+    point_estimate : observed risk ratio (must be > 1)
+    ci_lower : lower bound of 95% CI for the risk ratio
+    """
+    def e_value_formula(rr):
+        if rr <= 1:
+            return 1.0
+        return rr + np.sqrt(rr * (rr - 1))
+
+    e_point = e_value_formula(point_estimate)
+    e_ci = e_value_formula(max(ci_lower, 1.0))
+
+    return {
+        "e_value_point": e_point,
+        "e_value_ci": e_ci,
+        "interpretation": (
+            f"An unmeasured confounder would need a risk ratio "
+            f"of at least {e_point:.2f} with both treatment and "
+            f"outcome to explain away the point estimate, or "
+            f"{e_ci:.2f} to move the CI to include the null."
+        ),
+    }
+
+
+# Example: job training program with RR = 1.8, 95% CI [1.3, 2.5]
+e_result = compute_e_value(1.8, 1.3)
+print(f"E-value (point): {e_result['e_value_point']:.2f}")
+print(f"E-value (CI): {e_result['e_value_ci']:.2f}")
+print(f"\n{e_result['interpretation']}")</code></pre>
+<div class="code-caption">Figure 52.11: E-value computation for sensitivity analysis. Higher E-values indicate more robust findings: an E-value of 3.0 means a confounder would need a 3x association with both treatment and outcome to explain away the result.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Classical two-period, two-group DiD breaks down when treatment rolls out to different units at different times ("staggered adoption"). Callaway and Sant'Anna (2021) showed that the standard two-way fixed effects estimator can produce severely biased estimates under treatment effect heterogeneity, because it implicitly uses already-treated units as controls for newly-treated units. Their <code>did</code> R package (with a Python port via <code>csdid</code>) estimates group-time average treatment effects that avoid this contamination. Building on this, Roth et al. (2023, "What's Trending in Difference-in-Differences?", <em>Journal of Econometrics</em>) provide a comprehensive guide to the new DiD toolkit, covering honest inference under pre-trend violations, sensitivity analysis for parallel trends, and diagnostics for staggered designs. These methods have rapidly become the standard: any new DiD analysis with staggered treatment timing should use the Callaway-Sant'Anna or Sun-Abraham estimator rather than the textbook two-way fixed effects specification shown above.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DoWhy for Complete Causal Pipelines</div>
+<p>The individual estimators above (DiD, synthetic control, RD) each required 50-80 lines of implementation. DoWhy wraps all of these (and more) in a unified four-step workflow:</p>
+<pre><code class="language-python">import dowhy
+
+# 1. Model: specify the causal graph
+model = dowhy.CausalModel(
+    data=df,
+    treatment="job_training",
+    outcome="earnings",
+    common_causes=["education", "age", "prior_income"],
+)
+
+# 2. Identify: find the estimand
+estimand = model.identify_effect()
+
+# 3. Estimate: compute the effect
+estimate = model.estimate_effect(
+    estimand, method_name="backdoor.econml.dml.DML",
+    method_params={"init_params": {"model_y": LGBMRegressor(),
+                                    "model_t": LGBMClassifier()}}
+)
+
+# 4. Refute: stress-test the result
+refutation = model.refute_estimate(
+    estimand, estimate, method_name="random_common_cause"
+)</code></pre>
+<p>DoWhy handles graph-based identification, multiple estimation strategies (IPW, DML, IV, DiD), and built-in refutation tests (placebo treatment, random common cause, data subset). The full pipeline from Chapter 31 applies directly here, reducing 200+ lines of custom code to roughly 15 lines. The custom implementations above exist to show the mechanics that DoWhy automates.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: DiD with Real-World Policy Data</h4>
+<p>Build a difference-in-differences analysis of a simulated state-level policy change using only Python, pandas, and statsmodels. This project walks through the full workflow from data construction to robustness checks.</p>
+<p><strong>Step 1.</strong> Create a synthetic panel of 50 U.S. states observed quarterly over 5 years (1,000 rows). Assign 10 states as "treated" starting in quarter 12. Generate outcomes with a known true effect of 4.0 plus state fixed effects and a common linear time trend.</p>
+<p><strong>Step 2.</strong> Estimate the basic DiD using <code>statsmodels.formula.api.ols</code> with the formula <code>outcome ~ treated_post + C(state) + C(quarter)</code>. Cluster standard errors at the state level. Verify the ATT estimate is close to 4.0.</p>
+<p><strong>Step 3.</strong> Plot pre-treatment trends for treated vs. control groups using matplotlib. Compute the average outcome per group per quarter and overlay the two lines. Visually confirm they are parallel before the treatment date.</p>
+<p><strong>Step 4.</strong> Run a placebo test: re-estimate the model pretending treatment began 4 quarters earlier (quarter 8 instead of 12). The placebo ATT should be near zero and statistically insignificant.</p>
+<p><strong>Step 5.</strong> Add a confounder: introduce a variable correlated with both treatment assignment and the outcome (for example, baseline GDP). Re-estimate with and without controlling for it, and compare how the ATT changes. This demonstrates why covariate selection matters even in a DiD framework.</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+Causal estimates tell us what happened in the past: this policy had this effect on this
+population. But policymakers need to know what <em>will</em> happen if they implement a
+new policy, in a different context, at a different time.
+<a href="section-52.3.html">Section 52.3: Policy Simulation</a> bridges this gap by
+building agent-based models that embed causal mechanisms in a forward-looking simulation.
+The treatment effects estimated here become the behavioral parameters of simulated agents,
+and the network structure from <a href="section-52.1.html">Section 52.1</a> determines
+how simulated policies propagate through the population.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="section-52.1.html">&larr; 52.1 Network Analysis and Market Discovery</a>
+<a href="section-52.3.html">52.3 Policy Simulation &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

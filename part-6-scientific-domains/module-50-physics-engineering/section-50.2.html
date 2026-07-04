@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 50.2: Physics-Informed Learning. PDE residual losses for inverse problems, recovering thermal diffusivity with PINNs, Noether's theorem as conservation-law prior, and simulation-based inference." name="description"/>
+<title>Section 50.2: Physics-Informed Learning | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Discovery in Scientific Domains</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 50: Discovery AI for Physics and Engineering</a></div>
+<h1>50.2 Physics-Informed Learning</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I embedded the Navier-Stokes equations in my loss function, and now my gradients are as turbulent as the flow I am trying to model."</p>
+<cite>A PINN That Discovered Spectral Bias Before Its Optimizer Did</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+<a href="../../part-3-data-models/module-33-scientific-ml/index.html">Chapter 33</a>
+introduced physics-informed neural networks (PINNs) for solving forward PDE problems.
+This section focuses on the <em>inverse</em> problem: given sparse, noisy observations
+of a physical system, recover the unknown parameters or governing equations. Inverse
+problems are central to physics and engineering discovery because the quantities we
+want to know (thermal conductivity of a material, diffusion coefficient of a chemical,
+elastic modulus of a structure) are rarely measured directly. Instead, we observe their
+effects (temperature fields, concentration profiles, displacement patterns) and must
+infer the underlying parameters. PINNs turn this inference task into an optimization
+problem that neural networks solve naturally.
+</p>
+</div>
+
+<h2>1. The Inverse Problem Framework</h2>
+
+<p>
+A <strong>forward problem</strong> takes known parameters and initial/boundary conditions
+and computes the solution of a PDE. An <strong>inverse problem</strong> takes
+(possibly sparse and noisy) observations of the solution and infers unknown parameters,
+boundary conditions, or even the form of the governing equation.
+</p>
+
+<p data-agent="02">
+An inverse problem is, precisely, the task of deducing causes from observed effects: given
+measurements of a system's behavior (temperatures, displacements, concentrations), determine
+the hidden parameters or laws that produced that behavior. It matters because the quantities
+scientists and engineers care about most (material properties, reaction rates, source
+locations) are almost never measured directly; they must be inferred from indirect
+observations. The mechanism is to embed the known physics (a PDE or conservation law) as a
+constraint inside an optimization loop, so the optimizer searches only the subspace of
+solutions that are physically consistent with the governing equations. Use an inverse
+problem formulation rather than pure curve fitting whenever you have a known or partially
+known physical model, because the physics constraint dramatically reduces the amount of
+data needed and prevents nonphysical solutions; resort to purely data-driven methods only
+when no reliable physical model exists.
+</p>
+
+<p>
+Consider the heat equation in one spatial dimension:
+</p>
+
+$$\frac{\partial u}{\partial t} = \alpha \frac{\partial^2 u}{\partial x^2}$$
+
+<p>
+In the forward problem, $\alpha$ (the thermal diffusivity) is known, and we solve for
+$u(x, t)$. In the inverse problem, $\alpha$ is unknown, and we have temperature
+measurements $\{(x_i, t_i, u_i)\}_{i=1}^N$ at scattered locations. The goal is to
+recover $\alpha$ from the data.
+</p>
+
+<p>
+The PINN approach treats both the solution $u(x, t)$ and the unknown parameter
+$\alpha$ as optimization targets. The network $\hat{u}_\theta(x, t)$ approximates the
+temperature field, while $\alpha$ is an additional trainable parameter. The total loss
+function combines three terms:
+</p>
+
+$$\mathcal{L} = \underbrace{\mathcal{L}_{\text{data}}}_{\text{fit observations}} + \underbrace{\lambda_r \mathcal{L}_{\text{PDE}}}_{\text{satisfy physics}} + \underbrace{\lambda_b \mathcal{L}_{\text{BC}}}_{\text{boundary conditions}}$$
+
+<p>
+where:
+</p>
+
+$$\mathcal{L}_{\text{data}} = \frac{1}{N} \sum_{i=1}^{N} \left| \hat{u}_\theta(x_i, t_i) - u_i \right|^2$$
+
+$$\mathcal{L}_{\text{PDE}} = \frac{1}{M} \sum_{j=1}^{M} \left| \frac{\partial \hat{u}_\theta}{\partial t}(x_j, t_j) - \alpha \frac{\partial^2 \hat{u}_\theta}{\partial x^2}(x_j, t_j) \right|^2$$
+
+<p>
+The PDE residual is evaluated at <em>collocation points</em> $(x_j, t_j)$ sampled
+throughout the domain. These points do not require data; the PDE itself provides
+the supervision signal. Automatic differentiation (covered in
+<a href="../../part-5-simulation-optimization/module-42-differentiable-programming/index.html">Chapter 42</a>)
+computes the required partial derivatives $\partial \hat{u}/\partial t$ and
+$\partial^2 \hat{u}/\partial x^2$ exactly through the network.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Physics as Infinite Supervision</div>
+<p>
+In a standard supervised learning problem, the supervision signal comes only from
+labeled data points. In a PINN, the PDE provides an additional supervision signal
+at <em>every point in the domain</em>, not just where data is available. This is
+why PINNs can solve inverse problems from remarkably sparse data: 50 scattered
+temperature measurements can suffice to recover $\alpha$ when the heat equation
+provides millions of collocation-point constraints. The PDE acts as an infinitely
+dense regularizer that restricts the network to solutions consistent with the
+known physics.
+</p>
+</div>
+
+<h2>2. Inverse Heat Equation with DeepXDE</h2>
+
+<p>
+<a href="https://deepxde.readthedocs.io/" target="_blank">DeepXDE</a> provides a
+high-level API for both forward and inverse PINN problems. Let us solve the inverse
+heat equation: recover the thermal diffusivity $\alpha$ from sparse temperature
+measurements.
+</p>
+
+<pre><code class="language-python">import deepxde as dde
+import numpy as np
+
+# True diffusivity (what we want to recover)
+alpha_true = 0.4
+
+# Define the computational domain: x in [0, 1], t in [0, 1]
+geom = dde.geometry.Interval(0, 1)
+timedomain = dde.geometry.TimeDomain(0, 1)
+geomtime = dde.geometry.GeometryXTime(geom, timedomain)
+
+# The unknown parameter: initialized far from the true value
+alpha = dde.Variable(1.0)  # trainable scalar
+
+# Define the PDE residual
+def heat_equation(x, u):
+    """PDE residual: du/dt - alpha * d2u/dx2 = 0"""
+    du_t = dde.grad.jacobian(u, x, i=0, j=1)   # du/dt
+    du_xx = dde.grad.hessian(u, x, i=0, j=0)    # d2u/dx2
+    return du_t - alpha * du_xx
+
+# Exact solution for generating observation data
+def exact_solution(x):
+    """u(x,t) = sin(pi*x) * exp(-alpha_true * pi^2 * t)"""
+    return np.sin(np.pi * x[:, 0:1]) * np.exp(
+        -alpha_true * np.pi**2 * x[:, 1:2]
+    )
+
+# Boundary conditions: u(0,t) = u(1,t) = 0
+bc = dde.icbc.DirichletBC(
+    geomtime, lambda x: 0, lambda _, on_boundary: on_boundary
+)
+
+# Initial condition: u(x,0) = sin(pi*x)
+ic = dde.icbc.IC(
+    geomtime,
+    lambda x: np.sin(np.pi * x[:, 0:1]),
+    lambda _, on_initial: on_initial,
+)
+
+# Sparse observation data (simulating sensor measurements)
+n_observations = 50
+rng = np.random.default_rng(42)
+observe_x = rng.uniform(0.1, 0.9, (n_observations, 1))
+observe_t = rng.uniform(0.1, 0.9, (n_observations, 1))
+observe_pts = np.hstack([observe_x, observe_t])
+observe_u = exact_solution(observe_pts)
+
+# Add 2% Gaussian noise to observations
+observe_u += 0.02 * rng.standard_normal(observe_u.shape)
+
+# PointSetBC enforces data matching at observation points
+observe_bc = dde.icbc.PointSetBC(observe_pts, observe_u, component=0)
+</code></pre>
+<div class="code-caption">Setting up the inverse heat equation problem in DeepXDE with a trainable diffusivity parameter and 50 noisy observations.</div>
+
+<pre><code class="language-python"># Assemble the PDE problem
+data = dde.data.TimePDE(
+    geomtime,
+    heat_equation,
+    [bc, ic, observe_bc],
+    num_domain=2000,     # collocation points for PDE residual
+    num_boundary=100,
+    num_initial=100,
+    num_test=500,
+)
+
+# Network architecture: 2 inputs (x, t) -> 1 output (u)
+net = dde.nn.FNN(
+    layer_sizes=[2, 64, 64, 64, 1],
+    activation="tanh",
+    kernel_initializer="Glorot normal",
+)
+
+# Build and train the model
+model = dde.Model(data, net)
+
+# Phase 1: Adam optimizer for broad convergence
+model.compile(
+    "adam",
+    lr=1e-3,
+    external_trainable_variables=[alpha],
+)
+losshistory, train_state = model.train(
+    iterations=10000,
+    display_every=2000,
+)
+
+# Phase 2: L-BFGS for fine-tuning
+model.compile(
+    "L-BFGS",
+    external_trainable_variables=[alpha],
+)
+losshistory, train_state = model.train()
+
+# Check recovered parameter
+alpha_recovered = alpha.numpy()
+print(f"True alpha:      {alpha_true:.4f}")
+print(f"Recovered alpha: {alpha_recovered:.4f}")
+print(f"Relative error:  {abs(alpha_recovered - alpha_true) / alpha_true:.2%}")
+</code></pre>
+<div class="code-caption">Training the inverse PINN in two phases (Adam then L-BFGS) and recovering the thermal diffusivity with sub-1% relative error from 50 noisy measurements.</div>
+
+<p>
+On this problem, the two-phase training strategy (Adam for 10,000 iterations followed
+by L-BFGS for fine-tuning) typically recovers $\alpha$ with relative error below 1%,
+even with 2% observation noise and only 50 measurement points. The key is that 2,000
+collocation points enforce the heat equation throughout the domain, providing orders
+of magnitude more supervision than the 50 data points alone.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Material Property Identification</div>
+<p>
+A thermal engineer places 20 thermocouples on a composite panel and heats one edge.
+The recorded temperature histories contain the information needed to recover the
+panel's thermal diffusivity, which varies spatially due to internal defects. By
+modeling $\alpha(x, y)$ as a second neural network and using the 2D heat equation
+as the physics constraint, a PINN can produce a spatial map of thermal diffusivity,
+effectively performing nondestructive evaluation. This technique has been validated
+experimentally by Cai et al. (2021) on carbon fiber composites, recovering diffusivity
+maps that agree with ultrasonic measurements to within 5%.
+</p>
+</div>
+
+<h2>3. Inverse PINNs in JAX</h2>
+
+<p>
+DeepXDE provides convenience, but understanding the mechanics requires seeing the raw
+computation. Here is the same inverse problem implemented directly in JAX, exposing
+every gradient computation.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+from jax import random, grad, jit, vmap
+import optax
+
+def init_network(key, layer_sizes):
+    """Initialize a simple feedforward network."""
+    params = []
+    for in_dim, out_dim in zip(layer_sizes[:-1], layer_sizes[1:]):
+        key, subkey = random.split(key)
+        w = random.normal(subkey, (in_dim, out_dim)) * jnp.sqrt(2.0 / in_dim)
+        key, subkey = random.split(key)
+        b = jnp.zeros(out_dim)
+        params.append((w, b))
+    return params
+
+def forward(params, x, t):
+    """Network forward pass: (x, t) -> u."""
+    h = jnp.stack([x, t], axis=-1)
+    for w, b in params[:-1]:
+        h = jnp.tanh(h @ w + b)
+    w, b = params[-1]
+    return (h @ w + b).squeeze(-1)
+
+def pde_residual(params, alpha, x, t):
+    """Compute du/dt - alpha * d2u/dx2 at a single point."""
+    u_fn = lambda x_, t_: forward(params, x_, t_)
+
+    # First derivatives
+    du_dt = grad(u_fn, argnums=1)(x, t)
+
+    # Second derivative w.r.t. x
+    du_dx = grad(u_fn, argnums=0)
+    d2u_dx2 = grad(du_dx, argnums=0)(x, t)
+
+    return du_dt - alpha * d2u_dx2
+
+# Vectorize over batches of points
+pde_residual_batch = vmap(pde_residual, in_axes=(None, None, 0, 0))
+
+@jit
+def loss_fn(params, log_alpha, x_data, t_data, u_data,
+            x_colloc, t_colloc, x_bc, t_bc):
+    """Total PINN loss: data + PDE residual + boundary."""
+    alpha = jnp.exp(log_alpha)  # ensure positivity
+
+    # Data loss
+    u_pred = vmap(forward, in_axes=(None, 0, 0))(params, x_data, t_data)
+    loss_data = jnp.mean((u_pred - u_data)**2)
+
+    # PDE residual loss
+    residuals = pde_residual_batch(params, alpha, x_colloc, t_colloc)
+    loss_pde = jnp.mean(residuals**2)
+
+    # Boundary loss (u = 0 at x=0 and x=1)
+    u_bc = vmap(forward, in_axes=(None, 0, 0))(params, x_bc, t_bc)
+    loss_bc = jnp.mean(u_bc**2)
+
+    return loss_data + 10.0 * loss_pde + 10.0 * loss_bc
+
+# Training loop
+key = random.PRNGKey(0)
+params = init_network(key, [2, 64, 64, 64, 1])
+log_alpha = jnp.log(jnp.array(1.0))  # initial guess
+
+optimizer = optax.adam(1e-3)
+opt_state = optimizer.init((params, log_alpha))
+
+grad_fn = jit(grad(loss_fn, argnums=(0, 1)))
+
+for step in range(10000):
+    grads = grad_fn(
+        params, log_alpha,
+        x_data, t_data, u_data,
+        x_colloc, t_colloc, x_bc, t_bc,
+    )
+    updates, opt_state = optimizer.update(grads, opt_state)
+    params, log_alpha = optax.apply_updates((params, log_alpha), updates)
+
+    if step % 2000 == 0:
+        alpha_est = float(jnp.exp(log_alpha))
+        print(f"Step {step:5d} | alpha = {alpha_est:.4f}")
+
+print(f"\nRecovered alpha: {float(jnp.exp(log_alpha)):.4f}")
+print(f"True alpha:      {alpha_true:.4f}")
+</code></pre>
+<div class="code-caption">Raw JAX implementation of an inverse PINN, showing explicit gradient computation through the PDE residual with vmap for batched evaluation.</div>
+
+<p>
+The JAX implementation makes several design choices visible. We parameterize $\alpha$
+as $\exp(\log \alpha)$ to enforce positivity without constrained optimization. The
+<code>vmap</code> transform vectorizes the per-point PDE residual over the collocation
+batch. And <code>grad</code> computes the exact derivatives $\partial u / \partial t$
+and $\partial^2 u / \partial x^2$ through the network, with no finite differences
+and no discretization error.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: DeepXDE Replaces 60 Lines of JAX</div>
+<p>
+The JAX implementation above requires about 80 lines of code for what DeepXDE
+accomplishes in 20 lines. DeepXDE handles domain geometry, collocation point
+sampling, boundary/initial condition enforcement, multi-phase training, and
+result visualization automatically. Use the JAX approach when you need custom
+loss terms, unusual architectures, or integration with other JAX-based pipelines.
+Use DeepXDE when the problem fits its supported PDE types and you want rapid
+prototyping.
+</p>
+</div>
+
+<h2>4. Noether's Theorem as a Structural Prior</h2>
+
+<p>
+<strong>Noether's theorem</strong> is one of the deepest results in theoretical
+physics: every continuous symmetry of a physical system corresponds to a conserved
+quantity. Time-translation symmetry gives conservation of energy. Spatial-translation
+symmetry gives conservation of momentum. Rotational symmetry gives conservation of
+angular momentum. For discovery AI, Noether's theorem provides
+<em>structural priors</em> that constrain the space of possible physical laws.
+</p>
+
+<p>
+The connection to machine learning is through <strong>Lagrangian and Hamiltonian
+neural networks</strong>. Instead of learning the dynamics $\dot{x} = f(x)$ directly,
+we learn the Lagrangian $L(q, \dot{q})$ or Hamiltonian $H(q, p)$, and derive the
+dynamics through the Euler-Lagrange or Hamilton's equations. This architectural choice
+automatically ensures energy conservation, because the Hamiltonian is a constant of
+motion by construction.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+from jax import grad, jit, vmap
+
+def hamiltonian_nn(params, q, p):
+    """
+    Neural network that outputs a scalar Hamiltonian H(q, p).
+    The dynamics are derived from Hamilton's equations:
+        dq/dt =  dH/dp
+        dp/dt = -dH/dq
+    """
+    x = jnp.concatenate([q, p])
+    for w, b in params[:-1]:
+        x = jnp.tanh(x @ w + b)
+    w, b = params[-1]
+    H = (x @ w + b).squeeze()
+    return H
+
+def hamiltonian_dynamics(params, q, p):
+    """
+    Derive equations of motion from the Hamiltonian.
+    Energy conservation is guaranteed by construction.
+    """
+    dH_dq = grad(hamiltonian_nn, argnums=1)(params, q, p)
+    dH_dp = grad(hamiltonian_nn, argnums=2)(params, q, p)
+
+    dq_dt = dH_dp    # Hamilton's first equation
+    dp_dt = -dH_dq   # Hamilton's second equation
+
+    return dq_dt, dp_dt
+
+def rollout(params, q0, p0, dt, n_steps):
+    """Symplectic Euler integration preserving Hamiltonian structure."""
+    q, p = q0, p0
+    trajectory = [(q, p)]
+
+    for _ in range(n_steps):
+        dq, dp = hamiltonian_dynamics(params, q, p)
+        p = p + dp * dt      # update momentum first
+        dq, _ = hamiltonian_dynamics(params, q, p)
+        q = q + dq * dt      # then update position
+        trajectory.append((q, p))
+
+    return trajectory
+</code></pre>
+<div class="code-caption">A Hamiltonian neural network that guarantees energy conservation by deriving dynamics from a learned scalar Hamiltonian via automatic differentiation.</div>
+
+<p>
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of Noether's theorem like double-entry bookkeeping in accounting. Every legitimate
+transaction (symmetry) forces two ledger entries that must balance (conserved quantity).
+You cannot record revenue without a corresponding asset change; the <em>structure</em>
+of the bookkeeping system makes embezzlement visible, not a rule that someone checks
+after the fact. Similarly, a Hamiltonian neural network does not add a penalty that
+says "please conserve energy"; the architecture itself forces every change in position
+to be balanced by a corresponding change in momentum, so energy conservation is a
+structural guarantee rather than an aspirational loss term. Just as double-entry
+bookkeeping catches errors that a single-column ledger would miss, the Hamiltonian
+architecture catches unphysical trajectories that a generic neural ODE would silently
+produce.
+</p>
+</div>
+
+<p>
+The Hamiltonian Neural Network (HNN) architecture, introduced by Greydanus et al.
+(2019), dramatically improves long-term prediction accuracy for conservative systems.
+A standard neural ODE trained on pendulum data drifts in energy over time, producing
+unphysical spiraling trajectories. The HNN, by construction, preserves energy exactly
+(up to integration error), producing closed orbits that match the true physics even
+over thousands of time steps.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Symmetry as Architecture</div>
+<p>
+Noether's theorem tells us <em>what</em> to conserve; Hamiltonian/Lagrangian network
+architectures tell us <em>how</em> to conserve it. The pattern generalizes beyond
+energy: if you know your system conserves momentum, angular momentum, or any
+other quantity, you can design network architectures that preserve those quantities
+by construction. This is fundamentally different from adding a conservation penalty
+to the loss function (which is approximate and can be violated during training).
+Architectural constraints are exact and cannot be violated regardless of the
+training procedure.
+</p>
+</div>
+
+<h2>5. Simulation-Based Inference</h2>
+
+<p>
+Not every inverse problem in physics has a tractable likelihood function. In many
+settings, we have a forward simulator (particle physics Monte Carlo, cosmological
+N-body simulation, climate model) that maps parameters $\theta$ to observables $x$,
+but evaluating $p(x | \theta)$ analytically is impossible. <strong>Simulation-based
+inference</strong> (SBI) addresses this by learning the posterior $p(\theta | x)$
+directly from simulated parameter-observation pairs.
+</p>
+
+<p>
+The three main SBI approaches are:
+</p>
+
+<p>
+<strong>Neural Posterior Estimation (NPE)</strong> trains a conditional density
+estimator (typically a normalizing flow) to approximate $p(\theta | x)$ from
+simulated pairs $\{(\theta_i, x_i)\}$. Given a new observation $x_{\text{obs}}$,
+the trained network immediately produces the posterior without additional
+simulations.
+</p>
+
+<p>
+<strong>Neural Likelihood Estimation (NLE)</strong> learns $p(x | \theta)$ instead,
+then combines with a prior via Bayes' rule. This is useful when the prior changes
+between analyses but the likelihood does not.
+</p>
+
+<p>
+<strong>Neural Ratio Estimation (NRE)</strong> learns the likelihood-to-evidence
+ratio $r(x, \theta) = p(x | \theta) / p(x)$ using a binary classifier, avoiding
+explicit density estimation entirely.
+</p>
+
+<pre><code class="language-python">import torch
+import numpy as np
+
+# Example: inferring parameters of a damped oscillator
+# from noisy trajectory observations
+
+def simulator(theta):
+    """
+    Forward simulator: damped oscillator.
+    theta = [amplitude, damping, frequency]
+    Returns a noisy trajectory (100 time points).
+    """
+    A, gamma, omega = theta
+    t = np.linspace(0, 10, 100)
+    x = A * np.exp(-gamma * t) * np.cos(omega * t)
+    # Add observation noise
+    x += 0.05 * np.random.randn(len(t))
+    return x
+
+def generate_training_data(n_simulations=10000):
+    """Generate parameter-observation pairs for SBI training."""
+    prior_low = np.array([0.5, 0.1, 1.0])
+    prior_high = np.array([3.0, 1.0, 8.0])
+
+    thetas = np.random.uniform(prior_low, prior_high,
+                                size=(n_simulations, 3))
+    observations = np.array([simulator(theta) for theta in thetas])
+
+    return (
+        torch.tensor(thetas, dtype=torch.float32),
+        torch.tensor(observations, dtype=torch.float32),
+    )
+
+# Using the sbi library for Neural Posterior Estimation
+from sbi.inference import SNPE
+from sbi.utils import BoxUniform
+
+# Define prior
+prior = BoxUniform(
+    low=torch.tensor([0.5, 0.1, 1.0]),
+    high=torch.tensor([3.0, 1.0, 8.0]),
+)
+
+# Generate training simulations
+thetas, observations = generate_training_data(10000)
+
+# Train the neural posterior estimator
+inference = SNPE(prior=prior)
+inference.append_simulations(thetas, observations)
+density_estimator = inference.train()
+
+# Build the posterior
+posterior = inference.build_posterior(density_estimator)
+
+# Given a real observation, sample from the posterior
+x_observed = torch.tensor(simulator([2.0, 0.3, 4.0]),
+                           dtype=torch.float32)
+samples = posterior.sample((5000,), x=x_observed)
+
+print(f"Posterior mean: {samples.mean(dim=0).numpy()}")
+print(f"Posterior std:  {samples.std(dim=0).numpy()}")
+print(f"True values:    [2.0, 0.3, 4.0]")
+</code></pre>
+<div class="code-caption">Simulation-based inference with Neural Posterior Estimation: training a normalizing flow to learn the posterior over oscillator parameters from simulated trajectories.</div>
+
+<p>
+The SBI approach is particularly powerful for physics problems where the forward
+model is expensive (each simulation takes minutes to hours) but we need to perform
+inference for many different observations. Once the density estimator is trained,
+posterior evaluation is instantaneous, amortizing the cost of the training simulations
+across all future inferences.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Gravitational Wave Parameter Estimation</div>
+<p>
+The LIGO/Virgo collaboration detects gravitational waves from merging black holes
+and neutron stars. Inferring the source parameters (masses, spins, distance,
+sky location) from the detected signal traditionally requires running Markov Chain
+Monte Carlo (MCMC) samplers for hours per event. The DINGO system (Dax et al., 2021)
+trains a normalizing flow on millions of simulated gravitational waveforms, then
+produces posterior samples for a new event in under one second. This is a 1000x
+speedup over traditional MCMC, enabling real-time alerts for electromagnetic
+follow-up observations.
+</p>
+</div>
+
+<h2>6. Failure Modes and Mitigations</h2>
+
+<p>
+PINNs are not a universal solution. Several well-documented failure modes require
+awareness and mitigation strategies.
+</p>
+
+<p>
+<strong>Spectral bias.</strong> Neural networks with smooth activation functions
+learn low-frequency components of the solution first, struggling with sharp gradients,
+shocks, and high-frequency oscillations. For the Burgers equation with viscosity
+approaching zero, standard PINNs fail catastrophically. Mitigation: use Fourier
+feature embeddings (Tancik et al., 2020) or multi-scale architectures that explicitly
+represent high-frequency content.
+</p>
+
+<p>
+<strong>Imbalanced loss terms.</strong> The data loss, PDE residual, and boundary
+losses operate on different scales. If the PDE residual dominates, the network
+satisfies the equation approximately but ignores the data. If the data loss dominates,
+the network interpolates the data but violates the physics between measurement points.
+Mitigation: use adaptive loss weighting (Wang et al., 2021) or the neural tangent
+kernel perspective to balance gradient magnitudes across loss terms.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that adding more collocation points (where the PDE residual
+is evaluated) will always improve PINN accuracy, analogous to how more training data
+helps in standard supervised learning. In practice, increasing collocation points beyond
+a moderate number often degrades performance because it amplifies the PDE residual loss
+relative to the data and boundary losses, creating a severe imbalance that causes the
+optimizer to satisfy the equation in a vacuum while ignoring the observations. The
+dominant factor for PINN accuracy is proper loss balancing across terms, not the raw
+number of collocation points.
+</p>
+</div>
+
+<p>
+<strong>Optimization landscape.</strong> The composite loss function can have many
+local minima, saddle points, and flat regions. The two-phase training strategy
+(Adam followed by L-BFGS) helps but does not guarantee convergence to the global
+minimum. Mitigation: use curriculum training (start with easier sub-problems),
+causal training (enforce temporal causality), or ensemble methods to explore the
+loss landscape more thoroughly.
+</p>
+
+<pre><code class="language-python"># Adaptive loss weighting (Learning Rate Annealing)
+# following Wang et al. (2021)
+
+def adaptive_weights(loss_data, loss_pde, loss_bc,
+                     prev_weights, eta=0.1):
+    """
+    Update loss weights based on gradient statistics.
+    Balances gradient magnitudes across loss components.
+    """
+    # Compute gradient norms for each loss term
+    grad_data = jax.grad(lambda p: loss_data(p))(params)
+    grad_pde = jax.grad(lambda p: loss_pde(p))(params)
+    grad_bc = jax.grad(lambda p: loss_bc(p))(params)
+
+    norm_data = jnp.sqrt(sum(
+        jnp.sum(g**2) for g in jax.tree_util.tree_leaves(grad_data)
+    ))
+    norm_pde = jnp.sqrt(sum(
+        jnp.sum(g**2) for g in jax.tree_util.tree_leaves(grad_pde)
+    ))
+    norm_bc = jnp.sqrt(sum(
+        jnp.sum(g**2) for g in jax.tree_util.tree_leaves(grad_bc)
+    ))
+
+    # Target: equal gradient contributions
+    max_norm = jnp.maximum(norm_data, jnp.maximum(norm_pde, norm_bc))
+    w_data = max_norm / (norm_data + 1e-8)
+    w_pde = max_norm / (norm_pde + 1e-8)
+    w_bc = max_norm / (norm_bc + 1e-8)
+
+    # Exponential moving average for stability
+    w_data = (1 - eta) * prev_weights[0] + eta * w_data
+    w_pde = (1 - eta) * prev_weights[1] + eta * w_pde
+    w_bc = (1 - eta) * prev_weights[2] + eta * w_bc
+
+    return jnp.array([w_data, w_pde, w_bc])
+</code></pre>
+<div class="code-caption">Adaptive loss weighting that balances gradient magnitudes across data, PDE, and boundary loss terms to prevent any single term from dominating PINN training.</div>
+
+<h2>7. When to Use Each Approach</h2>
+
+<p>
+The choice between PINNs, SBI, and classical inverse methods depends on the problem
+structure:
+</p>
+
+<table>
+<thead>
+<tr>
+<th>Criterion</th>
+<th>Classical (MCMC)</th>
+<th>PINN Inverse</th>
+<th>SBI</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Likelihood tractable?</td>
+<td>Required</td>
+<td>Not needed</td>
+<td>Not needed</td>
+</tr>
+<tr>
+<td>PDE known?</td>
+<td>Often yes</td>
+<td>Required</td>
+<td>Simulator only</td>
+</tr>
+<tr>
+<td>Posterior uncertainty?</td>
+<td>Yes</td>
+<td>Limited</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Amortized inference?</td>
+<td>No</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Cost per new observation</td>
+<td>High</td>
+<td>Moderate</td>
+<td>Low</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td>Well-posed, moderate-dim</td>
+<td>PDE parameter recovery</td>
+<td>Expensive simulators</td>
+</tr>
+</tbody>
+</table>
+
+<p>
+For physics discovery, PINNs and SBI are complementary rather than competing. PINNs
+excel when the governing PDE is known and the unknown is a small number of parameters.
+SBI excels when the forward model is a complex simulator and you need full posterior
+uncertainty quantification. In <a href="section-50.4.html">Section 50.4</a>, we
+combine both: PySR discovers the equation form, a PINN recovers unknown coefficients,
+and Bayesian optimization explores the design space.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+Hao et al. (2023) introduced <strong>PINNacle</strong>, a comprehensive benchmark suite
+that systematically evaluates PINNs across 20 diverse PDE problems spanning diffusion,
+reaction-diffusion, incompressible flow, compressible flow, and solid mechanics. The
+benchmark revealed that no single PINN variant dominates all problem classes, and that
+techniques such as causal training (Respecting Causality, Wang et al., 2024) and
+separable PINNs (Cho et al., 2024) can close much of the gap between PINNs and
+classical solvers on stiff, multi-scale, and chaotic systems. PINNacle also exposed
+that reported accuracies in the literature are often not reproducible under controlled
+hyperparameter budgets, motivating standardized evaluation protocols for
+physics-informed methods.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Recover a Spring Constant with a PINN</h4>
+<p>
+Build a minimal inverse PINN that recovers the spring constant $k$ of a damped
+harmonic oscillator from noisy position measurements. This project requires only
+PyTorch (or JAX) and NumPy.
+</p>
+<p>
+<strong>Step 1.</strong> Generate synthetic data: simulate
+$\ddot{x} + 0.1\dot{x} + k\,x = 0$ with $k = 4.0$, $x(0) = 1$, $\dot{x}(0) = 0$
+using <code>scipy.integrate.solve_ivp</code> to produce 200 time points over
+$t \in [0, 10]$. Add 3% Gaussian noise to the position values.
+</p>
+<p>
+<strong>Step 2.</strong> Subsample 30 noisy observations at random times to serve as
+your sparse measurement set.
+</p>
+<p>
+<strong>Step 3.</strong> Build a small feedforward network (3 hidden layers, 32 units,
+tanh activations) that takes $t$ as input and outputs predicted position $\hat{x}(t)$.
+Define <code>k</code> as a trainable scalar parameter initialized to 1.0.
+</p>
+<p>
+<strong>Step 4.</strong> Construct the PINN loss: (a) a data term matching the 30
+observations, (b) a PDE residual term evaluating
+$\ddot{\hat{x}} + 0.1\dot{\hat{x}} + k\,\hat{x}$ at 500 collocation points sampled
+uniformly in $[0, 10]$, and (c) an initial-condition term enforcing
+$\hat{x}(0) = 1$ and $\dot{\hat{x}}(0) = 0$. Use automatic differentiation for all
+derivatives.
+</p>
+<p>
+<strong>Step 5.</strong> Train with Adam (learning rate $10^{-3}$) for 5,000 steps.
+Print $k$ every 1,000 steps and verify it converges to approximately 4.0. Plot the
+predicted trajectory against the noisy data and the ground truth to visualize how the
+physics constraint fills in the gaps between sparse measurements.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+PINNs solve individual PDE instances (one set of initial/boundary conditions, one
+set of parameters). But engineering applications require solving the <em>same</em>
+PDE for thousands of different configurations: different geometries, different
+forcing functions, different material properties.
+<a href="section-50.3.html">Section 50.3</a> introduces neural operators that
+learn the solution <em>operator</em> itself, mapping from input functions to output
+functions, and enabling zero-shot generalization to new PDE configurations without
+retraining.
+</p>
+</section>
+
+</main>
+
+<footer>
+<nav class="section-nav">
+<a href="section-50.1.html">&larr; Section 50.1</a>
+<a href="section-50.3.html">Section 50.3 &rarr;</a>
+</nav>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

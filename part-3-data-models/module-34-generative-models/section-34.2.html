@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.2: Score-Based Diffusion and Flow Matching. The score function, denoising score matching, DDPM, noise schedules, SDE formulation, and flow matching with PyTorch implementation." name="description"/>
+<title>Section 34.2: Score-Based Diffusion and Flow Matching | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Generative Models for Discovery</a></div>
+<h1>34.2 Score-Based Diffusion and Flow Matching</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"They add noise until I forget who I am, then ask me to remember. Surprisingly, the remembering is the easy part."</p>
+<cite>A Data Point Undergoing Forward Diffusion</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds directly on the generative modeling foundations from
+<a href="section-34.1.html">Section 34.1</a>. You should understand the ELBO, the
+reparameterization trick, and why diffusion models superseded earlier architectures.
+Comfort with stochastic processes and ordinary differential equations from
+<a href="../../appendices/appendix-a/index.html">Appendix A</a> will help with the
+continuous-time formulation, but we derive everything from first principles. The connection
+to neural ODEs from
+<a href="../module-33-scientific-ml/index.html">Chapter 33: Scientific Machine Learning</a>
+provides useful context for the flow matching material.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Diffusion models work by learning to reverse a noise-corruption process. The forward process
+gradually destroys data by adding Gaussian noise over many steps until the data becomes
+indistinguishable from pure noise. The reverse process, parameterized by a neural network,
+learns to undo this corruption one step at a time, transforming noise back into data.
+The mathematical key is the <strong>score function</strong>: the gradient of the log-density,
+$\nabla_x \log p(x)$. If you know the score at every noise level, you can reverse the
+diffusion process exactly. This section derives the score function, shows how to estimate it
+via denoising score matching, builds the complete DDPM framework, and then introduces flow
+matching as a simpler, faster alternative that achieves comparable results. By the end, you
+will have implemented both a diffusion model and a flow matching model in PyTorch, and
+understand the EDM preconditioning framework that unifies them.
+</p>
+</div>
+
+<h2>1. The Score Function</h2>
+
+<p>
+For a probability distribution $p(x)$ over $\mathbb{R}^d$, the <strong>score function</strong>
+is the gradient of the log-density with respect to the data:
+</p>
+
+$$s(x) = \nabla_x \log p(x)$$
+
+<p data-agent="02">
+The score function is a vector field defined over the entire data space: at every point $x$, it returns a vector indicating which direction to move in order to increase the probability density most rapidly, and how steeply. It matters because it encodes the shape of a probability distribution without requiring you to know the normalizing constant (the denominator in Bayes' rule), which is typically intractable for high-dimensional data. The mechanism is that taking the gradient of $\log p(x)$ cancels the normalizing constant entirely, since $\nabla_x \log \frac{\tilde{p}(x)}{Z} = \nabla_x \log \tilde{p}(x)$, leaving a quantity that depends only on the unnormalized density. Use score-based methods over VAEs or normalizing flows when you need high-fidelity generation and can afford iterative sampling; prefer simpler models (VAEs) when single-pass generation speed is critical or when you need an explicit latent space for downstream tasks.
+</p>
+
+<p>
+The score has a beautiful geometric interpretation: at any point $x$, it points in the
+direction of steepest increase of the log-density. Following the score via Langevin dynamics
+produces samples from $p(x)$:
+</p>
+
+$$x_{t+1} = x_t + \frac{\eta}{2} \nabla_x \log p(x_t) + \sqrt{\eta} \, \epsilon_t, \quad \epsilon_t \sim \mathcal{N}(0, I)$$
+
+<p>
+where $\eta$ is a step size. As $\eta \to 0$ and the number of steps grows, the iterates
+converge in distribution to samples from $p(x)$. The noise term $\sqrt{\eta} \, \epsilon_t$ is
+essential: without it, the dynamics would converge to a mode of $p(x)$ rather than sampling
+from it. This connection between score estimation and sampling is why score-based models work.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the score function as a topographic map of a mountain range, where elevation represents probability density. At every location on the map, the score is an arrow pointing uphill along the steepest slope. Langevin sampling is like dropping a ball onto the landscape with random wind gusts: the ball rolls uphill toward peaks (following the score) while the wind (the noise term) keeps it from getting stuck on any single summit. Over time, the ball visits different peaks in proportion to their height. The critical insight is that you never need to know the actual elevation (the probability value) at any point; you only need the slope arrows (the score). Two maps with different sea-level baselines (different normalizing constants) produce identical slope arrows, which is why the score sidesteps the intractable normalization problem.
+</p>
+</div>
+
+<p>
+The challenge is estimating $\nabla_x \log p(x)$ without knowing $p(x)$. Directly regressing a
+neural network $s_\theta(x) \approx \nabla_x \log p(x)$ requires the unknown true score as a
+target. The breakthrough of <strong>denoising score matching</strong> (Vincent, 2011) sidesteps
+this: instead of matching the score of the clean data distribution, match the score of a
+noise-corrupted version, which has a known closed-form solution.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Denoising Score Matching Turns Score Estimation into Noise Prediction</div>
+<p>
+Given a noisy observation $\tilde{x} = x + \sigma \epsilon$ where $\epsilon \sim \mathcal{N}(0, I)$,
+the score of the noisy distribution $p_\sigma(\tilde{x})$ at point $\tilde{x}$ is:
+$\nabla_{\tilde{x}} \log p_\sigma(\tilde{x}) = -\frac{\epsilon}{\sigma}$.
+Training a network to predict this score is equivalent to training it to predict the noise
+$\epsilon$ that was added. This is why the DDPM loss is a simple noise prediction MSE: the
+network learns $\epsilon_\theta(\tilde{x}, \sigma) \approx \epsilon$, and the score is recovered
+as $s_\theta(\tilde{x}, \sigma) = -\epsilon_\theta(\tilde{x}, \sigma) / \sigma$. Score estimation
+reduces to denoising.
+</p>
+</div>
+
+<h2>2. The DDPM Framework</h2>
+
+<p>
+Denoising Diffusion Probabilistic Models (Ho et al., 2020) define a forward process that
+progressively adds noise to data over $T$ timesteps and a learned reverse process that
+denoises. The forward process is a Markov chain:
+</p>
+
+$$q(x_t | x_{t-1}) = \mathcal{N}(x_t; \sqrt{1 - \beta_t} \, x_{t-1}, \beta_t I)$$
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misunderstanding is that the reverse process "undoes" the specific noise that was added to a particular data point, as if the model memorizes and replays each forward trajectory in reverse. In reality, the reverse process is a learned statistical operation: given any noisy input $x_t$ at noise level $t$, the network predicts the most likely noise component based on patterns learned across the entire training set. The model never sees the actual forward trajectory of a test sample. It works because the conditional distribution $q(x_{t-1} | x_t, x_0)$ has a closed-form Gaussian shape, and the network learns to approximate this distribution for arbitrary $x_t$ values, including noise samples that were never produced by the forward process at all.
+</p>
+</div>
+
+<p>
+where $\beta_1, \ldots, \beta_T$ is a variance schedule. A key property of Gaussian noise
+is that the marginal at any timestep $t$ can be computed in closed form without iterating
+through intermediate steps:
+</p>
+
+$$q(x_t | x_0) = \mathcal{N}(x_t; \sqrt{\bar{\alpha}_t} \, x_0, (1 - \bar{\alpha}_t) I)$$
+
+<p>
+where $\alpha_t = 1 - \beta_t$ and $\bar{\alpha}_t = \prod_{s=1}^{t} \alpha_s$. This means
+we can sample $x_t$ directly from $x_0$ using the reparameterization:
+</p>
+
+$$x_t = \sqrt{\bar{\alpha}_t} \, x_0 + \sqrt{1 - \bar{\alpha}_t} \, \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+
+<p>
+The reverse process is parameterized as:
+</p>
+
+$$p_\theta(x_{t-1} | x_t) = \mathcal{N}(x_{t-1}; \mu_\theta(x_t, t), \sigma_t^2 I)$$
+
+<p>
+where $\mu_\theta$ is predicted by a neural network. Ho et al. showed that the optimal
+$\mu_\theta$ can be expressed in terms of a noise prediction network $\epsilon_\theta$:
+</p>
+
+$$\mu_\theta(x_t, t) = \frac{1}{\sqrt{\alpha_t}} \left( x_t - \frac{\beta_t}{\sqrt{1 - \bar{\alpha}_t}} \epsilon_\theta(x_t, t) \right)$$
+
+<p>
+The training objective simplifies to predicting the noise:
+</p>
+
+$$\mathcal{L}_{\text{simple}} = \mathbb{E}_{t, x_0, \epsilon} \left[ \| \epsilon - \epsilon_\theta(\sqrt{\bar{\alpha}_t} x_0 + \sqrt{1 - \bar{\alpha}_t} \epsilon, t) \|^2 \right]$$
+
+<p>
+This is a mean squared error between the actual noise $\epsilon$ and the predicted noise
+$\epsilon_\theta$, averaged over uniformly sampled timesteps $t$, data points $x_0$, and
+noise realizations $\epsilon$.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Encode diffusion timestep as a sinusoidal embedding."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
+        emb = t[:, None].float() * emb[None, :]
+        return torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+
+
+class NoisePredictor(nn.Module):
+    """Simple MLP noise predictor for low-dimensional data.
+
+    For images, replace with a U-Net. For molecules, replace
+    with a graph neural network (Section 34.3).
+    """
+    def __init__(self, data_dim: int, hidden_dim: int = 512, time_dim: int = 128):
+        super().__init__()
+        self.time_embed = SinusoidalTimeEmbedding(time_dim)
+        self.net = nn.Sequential(
+            nn.Linear(data_dim + time_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, data_dim)
+        )
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t_emb = self.time_embed(t)
+        return self.net(torch.cat([x, t_emb], dim=-1))
+
+
+class DDPM:
+    """Denoising Diffusion Probabilistic Model.
+
+    Implements the forward noising process, training loss,
+    and reverse sampling procedure from Ho et al. (2020).
+    """
+    def __init__(self, model: nn.Module, T: int = 1000,
+                 beta_start: float = 1e-4, beta_end: float = 0.02):
+        self.model = model
+        self.T = T
+
+        # Linear noise schedule
+        self.betas = torch.linspace(beta_start, beta_end, T)
+        self.alphas = 1.0 - self.betas
+        self.alpha_bars = torch.cumprod(self.alphas, dim=0)
+
+    def forward_process(self, x0: torch.Tensor, t: torch.Tensor):
+        """Sample x_t from q(x_t | x_0) using reparameterization."""
+        alpha_bar_t = self.alpha_bars[t].to(x0.device)
+        # Reshape for broadcasting: (batch,) -> (batch, 1, ...)
+        while alpha_bar_t.dim() < x0.dim():
+            alpha_bar_t = alpha_bar_t.unsqueeze(-1)
+
+        noise = torch.randn_like(x0)
+        x_t = torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * noise
+        return x_t, noise
+
+    def training_loss(self, x0: torch.Tensor):
+        """Compute the simple denoising loss."""
+        batch_size = x0.size(0)
+        # Sample random timesteps uniformly
+        t = torch.randint(0, self.T, (batch_size,), device=x0.device)
+        x_t, noise = self.forward_process(x0, t)
+        # Predict the noise that was added
+        noise_pred = self.model(x_t, t)
+        return F.mse_loss(noise_pred, noise)
+
+    @torch.no_grad()
+    def sample(self, shape: tuple, device: torch.device):
+        """Generate samples via iterative denoising."""
+        x = torch.randn(shape, device=device)  # start from pure noise
+
+        for t in reversed(range(self.T)):
+            t_batch = torch.full((shape[0],), t, device=device, dtype=torch.long)
+            # Predict and remove noise
+            noise_pred = self.model(x, t_batch)
+
+            alpha_t = self.alphas[t].to(device)
+            alpha_bar_t = self.alpha_bars[t].to(device)
+            beta_t = self.betas[t].to(device)
+
+            # Posterior mean
+            x = (1 / torch.sqrt(alpha_t)) * (
+                x - (beta_t / torch.sqrt(1 - alpha_bar_t)) * noise_pred
+            )
+            # Add noise for all steps except the last
+            if t > 0:
+                x = x + torch.sqrt(beta_t) * torch.randn_like(x)
+
+        return x</code></pre>
+<div class="code-caption">Complete DDPM implementation with linear noise schedule, closed-form forward process, simple denoising loss, and iterative reverse sampling. The noise predictor uses sinusoidal timestep embeddings following the original DDPM paper.</div>
+
+<h2>3. Noise Schedules and EDM Preconditioning</h2>
+
+<p>
+The noise schedule $\{\beta_t\}$ controls how quickly data is destroyed during the forward
+process. The original DDPM used a linear schedule from $\beta_1 = 10^{-4}$ to $\beta_T = 0.02$.
+Subsequent work showed that the schedule matters enormously for sample quality. Cosine schedules
+(Nichol &amp; Dhariwal, 2021) provide more uniform signal-to-noise ratios across timesteps,
+improving generation quality particularly for low-resolution features.
+</p>
+
+<p>
+The EDM framework (Karras et al., 2022) unified and simplified diffusion model design by
+moving to a continuous noise level $\sigma$ and deriving principled choices for preconditioning,
+training distribution over $\sigma$, and sampling schedule. Instead of parameterizing a noise
+predictor $\epsilon_\theta$, EDM parameterizes a denoiser $D_\theta$ that directly predicts the
+clean data:
+</p>
+
+$$D_\theta(x; \sigma) = c_{\text{skip}}(\sigma) \, x + c_{\text{out}}(\sigma) \, F_\theta(c_{\text{in}}(\sigma) \, x; c_{\text{noise}}(\sigma))$$
+
+<p>
+where $F_\theta$ is the raw neural network, and the preconditioning functions $c_{\text{skip}}$,
+$c_{\text{out}}$, $c_{\text{in}}$, and $c_{\text{noise}}$ are chosen to ensure that $F_\theta$
+receives inputs and produces outputs of unit variance regardless of the noise level. This makes
+the network's job uniformly difficult across all $\sigma$ values, improving training stability
+and sample quality.
+</p>
+
+<pre><code class="language-python">class EDMPreconditioner(nn.Module):
+    """EDM preconditioning wrapper (Karras et al., 2022).
+
+    Wraps a raw network F_theta with noise-dependent scaling
+    to ensure unit-variance inputs and outputs at all noise levels.
+    """
+    def __init__(self, network: nn.Module, sigma_data: float = 0.5):
+        super().__init__()
+        self.network = network
+        self.sigma_data = sigma_data
+
+    def forward(self, x_noisy: torch.Tensor, sigma: torch.Tensor):
+        """Predict clean data from noisy input at noise level sigma."""
+        sigma = sigma.view(-1, *([1] * (x_noisy.dim() - 1)))
+        sd2 = self.sigma_data ** 2
+
+        # EDM preconditioning coefficients
+        c_skip = sd2 / (sigma ** 2 + sd2)
+        c_out = sigma * self.sigma_data / torch.sqrt(sigma ** 2 + sd2)
+        c_in = 1 / torch.sqrt(sigma ** 2 + sd2)
+        c_noise = 0.25 * torch.log(sigma.squeeze())
+
+        # Apply preconditioning
+        F_out = self.network(c_in * x_noisy, c_noise)
+        return c_skip * x_noisy + c_out * F_out
+
+    def training_loss(self, x0: torch.Tensor):
+        """EDM training loss with log-normal noise sampling."""
+        # Sample noise levels from log-normal (EDM recommendation)
+        log_sigma = torch.randn(x0.size(0), device=x0.device) * 1.2 - 1.2
+        sigma = torch.exp(log_sigma)
+
+        # Add noise
+        noise = torch.randn_like(x0)
+        x_noisy = x0 + sigma.view(-1, *([1] * (x0.dim() - 1))) * noise
+
+        # Predict clean data
+        denoised = self.forward(x_noisy, sigma)
+
+        # Weighted MSE: higher weight for lower noise levels
+        weight = (sigma ** 2 + self.sigma_data ** 2) / \
+                 (sigma * self.sigma_data) ** 2
+        weight = weight.view(-1, *([1] * (x0.dim() - 1)))
+        return (weight * (denoised - x0) ** 2).mean()</code></pre>
+<div class="code-caption">EDM preconditioning wrapper that normalizes inputs and outputs of the raw network to unit variance. The log-normal noise sampling distribution focuses training on the noise levels most important for sample quality.</div>
+
+<h2>4. The Continuous-Time SDE Formulation</h2>
+
+<p>
+Song et al. (2021) showed that both DDPM and score-based models are discretizations of a
+continuous-time stochastic differential equation (SDE). The forward process is:
+</p>
+
+$$dx = f(x, t) \, dt + g(t) \, dw$$
+
+<p>
+where $f(x, t)$ is the drift coefficient, $g(t)$ is the diffusion coefficient, and $w$ is a
+standard Wiener process. For the variance-preserving (VP) SDE corresponding to DDPM:
+</p>
+
+$$dx = -\frac{1}{2}\beta(t) \, x \, dt + \sqrt{\beta(t)} \, dw$$
+
+<p>
+The remarkable result of Anderson (1982) is that this SDE has a corresponding reverse-time SDE:
+</p>
+
+$$dx = \left[ f(x, t) - g(t)^2 \nabla_x \log p_t(x) \right] dt + g(t) \, d\bar{w}$$
+
+<p>
+where $\bar{w}$ is a reverse-time Wiener process. The only unknown quantity is the score
+$\nabla_x \log p_t(x)$, which is exactly what the denoising score matching network estimates.
+This SDE perspective unifies discrete-time DDPM with continuous-time score matching, and it
+also reveals that there exists a deterministic counterpart: the <strong>probability flow ODE</strong>:
+</p>
+
+$$dx = \left[ f(x, t) - \frac{1}{2} g(t)^2 \nabla_x \log p_t(x) \right] dt$$
+
+<p>
+This ODE generates the same marginal distributions $p_t(x)$ as the SDE but without
+stochasticity. It can be solved with standard ODE solvers, connecting diffusion models to
+the neural ODE framework from
+<a href="../module-33-scientific-ml/index.html">Chapter 33</a> and enabling exact
+log-likelihood computation via the instantaneous change-of-variables formula.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Probability Flow ODE Bridges Diffusion and Flow Matching</div>
+<p>
+The probability flow ODE is a deterministic transformation that maps noise to data, just like
+a normalizing flow. But unlike traditional normalizing flows, it is defined by a learned score
+function rather than a constrained invertible architecture. Flow matching (next subsection)
+takes this insight further: instead of learning the score and deriving the ODE, learn the ODE
+velocity field directly. This eliminates the need for the SDE framework entirely, producing
+simpler training and often straighter (therefore faster to integrate) flow paths. The
+connection is: diffusion models learn to reverse a stochastic process, then optionally
+convert to a deterministic ODE; flow matching learns the deterministic ODE directly.
+</p>
+</div>
+
+<h2>5. Flow Matching</h2>
+
+<p>
+Flow matching (Lipman et al., 2023; Liu et al., 2023) provides an alternative to diffusion
+that is both simpler to implement and often faster to sample from. Instead of defining a
+noising process and learning to reverse it, flow matching directly learns a velocity field
+$v_\theta(x, t)$ that transports samples from a noise distribution $p_0 = \mathcal{N}(0, I)$
+at time $t=0$ to the data distribution $p_1 = p_{\text{data}}$ at time $t=1$.
+</p>
+
+<p>
+The key idea is <strong>conditional flow matching</strong>. For each training example $x_1$,
+define a simple conditional path from noise to data:
+</p>
+
+$$x_t = (1 - t) \, x_0 + t \, x_1, \quad x_0 \sim \mathcal{N}(0, I)$$
+
+<p>
+This is an optimal transport path (a straight line) from a random noise point to the data
+point. The conditional velocity along this path is simply:
+</p>
+
+$$u_t(x_t | x_1) = x_1 - x_0$$
+
+<p>
+The flow matching objective trains the network to predict this conditional velocity:
+</p>
+
+$$\mathcal{L}_{\text{FM}} = \mathbb{E}_{t \sim \mathcal{U}(0,1), \, x_1 \sim p_{\text{data}}, \, x_0 \sim \mathcal{N}(0,I)} \left[ \| v_\theta(x_t, t) - (x_1 - x_0) \|^2 \right]$$
+
+<p>
+At inference time, we integrate the learned velocity field from $t=0$ to $t=1$ using an ODE
+solver, transforming noise into data. Because the conditional paths are straight lines, the
+ODE is easy to integrate and typically requires fewer function evaluations than diffusion
+model sampling.
+</p>
+
+<pre><code class="language-python">class FlowMatchingModel:
+    """Conditional flow matching for generative modeling.
+
+    Learns a velocity field that transports noise to data
+    along optimal transport paths (straight lines).
+    """
+    def __init__(self, velocity_net: nn.Module, sigma_min: float = 1e-4):
+        self.velocity_net = velocity_net
+        self.sigma_min = sigma_min  # small noise for numerical stability
+
+    def training_loss(self, x1: torch.Tensor):
+        """Compute the conditional flow matching loss."""
+        batch_size = x1.size(0)
+
+        # Sample time uniformly in [0, 1]
+        t = torch.rand(batch_size, device=x1.device)
+
+        # Sample noise (source distribution)
+        x0 = torch.randn_like(x1)
+
+        # Interpolate along the optimal transport path
+        t_expanded = t.view(-1, *([1] * (x1.dim() - 1)))
+        x_t = (1 - t_expanded) * x0 + t_expanded * x1
+
+        # Target velocity: direction from noise to data
+        target_velocity = x1 - x0
+
+        # Predict velocity and compute loss
+        pred_velocity = self.velocity_net(x_t, t)
+        return F.mse_loss(pred_velocity, target_velocity)
+
+    @torch.no_grad()
+    def sample(self, shape: tuple, device: torch.device,
+               num_steps: int = 100):
+        """Generate samples by integrating the velocity field."""
+        x = torch.randn(shape, device=device)  # start from noise
+        dt = 1.0 / num_steps
+
+        for i in range(num_steps):
+            t = torch.full((shape[0],), i * dt, device=device)
+            v = self.velocity_net(x, t)
+            x = x + v * dt  # Euler integration step
+
+        return x
+
+    @torch.no_grad()
+    def sample_midpoint(self, shape: tuple, device: torch.device,
+                        num_steps: int = 50):
+        """Generate samples using midpoint method (2nd-order)."""
+        x = torch.randn(shape, device=device)
+        dt = 1.0 / num_steps
+
+        for i in range(num_steps):
+            t = torch.full((shape[0],), i * dt, device=device)
+            t_mid = torch.full((shape[0],), (i + 0.5) * dt, device=device)
+
+            # Midpoint method: evaluate velocity at midpoint
+            v1 = self.velocity_net(x, t)
+            x_mid = x + 0.5 * dt * v1
+            v_mid = self.velocity_net(x_mid, t_mid)
+            x = x + dt * v_mid
+
+        return x</code></pre>
+<div class="code-caption">Conditional flow matching with optimal transport interpolation, Euler and midpoint ODE integration for sampling. The straight-line paths make integration efficient: 50 midpoint steps typically suffice where DDPM needs 1000 denoising steps.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Flow Matching for Protein Structure Generation</div>
+<p>
+FoldFlow (Bose et al., 2024) applies flow matching to protein backbone generation on the SE(3)
+manifold. Instead of straight lines in Euclidean space, the conditional paths follow geodesics
+on the manifold of rigid body transformations (one per residue frame). The velocity field
+predicts how each residue frame should rotate and translate to move from a random
+configuration to a valid protein backbone. Compared to diffusion-based FrameDiff, FoldFlow
+achieves comparable designability (percentage of generated backbones that can fold to the
+intended structure) with faster sampling: 50 ODE steps versus 500 diffusion steps. This
+10x speedup matters for high-throughput protein design, where thousands of candidates must
+be generated and scored. We explore the SE(3) details in
+<a href="section-34.3.html">Section 34.3</a>.
+</p>
+</div>
+
+<h2>6. Diffusion vs. Flow Matching: When to Use Which</h2>
+
+<p>
+Diffusion models and flow matching solve the same problem with different mathematical
+machinery. The practical trade-offs guide the choice:
+</p>
+
+<p>
+<strong>Training.</strong> Both losses are simple MSE objectives. Flow matching is marginally
+simpler because it predicts velocity rather than noise, eliminating the need for noise
+schedule design. The EDM framework reduces this gap by providing principled noise schedule
+choices for diffusion.
+</p>
+
+<p>
+<strong>Sampling speed.</strong> Flow matching typically requires fewer integration steps
+(20 to 100) because the optimal transport paths are straight lines. Diffusion models need
+more steps (50 to 1000) because the reverse SDE follows curved paths. Advanced ODE solvers
+(DPM-Solver; Lu et al., 2022) narrow this gap to 10 to 25 steps for diffusion.
+</p>
+
+<p>
+<strong>Conditioning.</strong> Both support classifier-free guidance
+(<a href="section-34.4.html">Section 34.4</a>). Diffusion models have more mature tooling
+for guidance (Diffusers library), while flow matching guidance is an active research area.
+</p>
+
+<p>
+<strong>Manifold data.</strong> Flow matching extends more naturally to non-Euclidean spaces
+(SE(3), Riemannian manifolds) because it only requires defining interpolation paths, not a
+noising process. This makes it the preferred choice for protein backbone generation on
+the SE(3) manifold. Diffusion on manifolds requires wrapping and unwrapping operations that
+add complexity.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: Diffusers Schedulers for Production Diffusion</div>
+<p>
+The implementations above teach the mathematics, but production diffusion models use
+<a href="https://huggingface.co/docs/diffusers/" target="_blank">Hugging Face Diffusers</a>
+schedulers that implement dozens of noise schedules and sampling algorithms. The DDPM sampler
+above becomes:
+</p>
+<pre><code class="language-python">from diffusers import DDPMScheduler, DDIMScheduler, EulerDiscreteScheduler
+
+# DDPM: 1000 steps, original formulation
+ddpm = DDPMScheduler(num_train_timesteps=1000, beta_schedule="linear")
+
+# DDIM: deterministic, 50 steps for fast sampling
+ddim = DDIMScheduler(num_train_timesteps=1000, beta_schedule="scaled_linear")
+
+# Euler: for flow matching / EDM-style models
+euler = EulerDiscreteScheduler(num_train_timesteps=1000)
+
+# All share the same interface
+noisy_sample = ddpm.add_noise(clean_sample, noise, timesteps)
+prev_sample = ddpm.step(model_output, timestep, noisy_sample).prev_sample</code></pre>
+<p>
+Diffusers handles the noise schedule bookkeeping, variance computation, and solver logic in
+about 3 lines. The library provides 20+ schedulers that are drop-in replacements for each
+other, letting you experiment with DPM-Solver++, Heun, and other advanced samplers without
+reimplementing the math. This reduces the 80-line DDPM class above to a single scheduler
+import.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Consistency Models and Single-Step Generation</div>
+<p>
+Consistency models (Song et al., 2023) represent a fundamental shift in diffusion model sampling. Rather than iteratively denoising over many steps, a consistency model learns to map any point along the diffusion trajectory directly to the trajectory's endpoint (the clean data), enforcing that all points on the same trajectory produce the same output. The improved consistency training (iCT) paper (Song and Dhariwal, 2024) eliminated the need for a pretrained diffusion model entirely, training consistency models from scratch and achieving FID scores competitive with multi-step diffusion on ImageNet 64x64 in a single forward pass. Stable Diffusion 3 (Esser et al., 2024) adopted flow matching with rectified flow paths as its core architecture, validating the approach at production scale for text-to-image generation. These advances are converging toward a regime where training uses the full multi-step framework for stable optimization, but inference collapses to one or two network evaluations, combining diffusion-level quality with GAN-level speed.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Train a 2D Flow Matching Model from Scratch</h4>
+<p>
+Build a working flow matching generative model on a toy 2D dataset using only PyTorch and
+matplotlib, completable in under an hour on a laptop CPU.
+</p>
+<ol>
+<li><strong>Generate training data.</strong> Use <code>sklearn.datasets.make_moons(n_samples=10000, noise=0.05)</code> to create a two-dimensional crescent-moon dataset. Normalize the data to zero mean and unit variance. Visualize the target distribution with a scatter plot.</li>
+<li><strong>Build the velocity network.</strong> Create a small MLP (3 hidden layers of 256 units each with SiLU activations) that takes a 2D point concatenated with a scalar time embedding (use the <code>SinusoidalTimeEmbedding</code> from this section with dim=64) and outputs a 2D velocity vector.</li>
+<li><strong>Train with the flow matching loss.</strong> For each batch: sample $t \sim \mathcal{U}(0,1)$, sample noise $x_0 \sim \mathcal{N}(0, I)$, compute $x_t = (1-t)x_0 + t \cdot x_1$, and minimize $\|v_\theta(x_t, t) - (x_1 - x_0)\|^2$. Train for 5000 steps with Adam (lr=1e-3). The loss should drop below 1.0 within the first 1000 steps.</li>
+<li><strong>Sample and visualize.</strong> Generate 5000 samples by integrating the learned velocity field from $t=0$ to $t=1$ using 100 Euler steps. Plot the generated samples alongside the real data. The two distributions should overlap closely.</li>
+<li><strong>Visualize the flow.</strong> Pick 20 initial noise points and record their full trajectories $(x_0, x_{0.01}, x_{0.02}, \ldots, x_1)$ during sampling. Plot these trajectories as colored curves from noise (blue) to data (red). You should see approximately straight paths, confirming that the optimal transport interpolation produces nearly linear flows.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> The probability flow ODE and the reverse SDE produce the same
+marginal distributions $p_t(x)$ but have different sample trajectories. Explain intuitively
+why the SDE version (with noise) might produce higher-quality samples than the ODE version
+(deterministic) even though they share the same marginals. Hint: think about what happens
+when the score estimate is imperfect.
+</li>
+<li>
+<strong>(Coding)</strong> Implement both the <code>DDPM</code> and <code>FlowMatchingModel</code>
+from this section and train both on a 2D Swiss roll dataset (available via
+<code>sklearn.datasets.make_swiss_roll</code>). Compare: (a) training convergence (loss vs.
+epochs), (b) sample quality at different numbers of sampling steps (10, 50, 100, 500), and
+(c) the geometry of the learned transport paths (plot trajectories from noise to data for
+both models). Which model produces good samples with fewer steps?
+</li>
+<li>
+<strong>(Analysis)</strong> The EDM framework uses a log-normal distribution
+$\log \sigma \sim \mathcal{N}(-1.2, 1.2^2)$ for sampling noise levels during training. Plot
+this distribution and compare it to the uniform distribution over timesteps used by the
+original DDPM. At which noise levels does EDM place more training weight? Why does
+concentrating on these noise levels improve sample quality? Relate your answer to the
+signal-to-noise ratio $\text{SNR}(t) = \bar{\alpha}_t / (1 - \bar{\alpha}_t)$.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have the mathematical and computational machinery for diffusion and flow matching in
+Euclidean space. But molecules and proteins live in 3D, and rotating or translating a molecule
+does not change its identity. <a href="section-34.3.html">Section 34.3: Equivariant Generation
+for 3D Structures</a> introduces SE(3) equivariance, equivariant graph neural networks, and
+the equivariant diffusion models (EDM, RFDiffusion, FrameDiff, FoldFlow) that have driven
+breakthroughs in protein and molecular design.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-34.1.html">&#8592; 34.1 Generative Models as Hypothesis Generators</a>
+<a href="index.html">Chapter 34</a>
+<a href="section-34.3.html">34.3 Equivariant Generation for 3D Structures &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 28.2: Molecule-Text and Protein-Text Models. MolT5, MoleculeSTM, ProteinChat, and ESM3 multimodal for cross-modal scientific reasoning." name="description"/>
+<title>Section 28.2: Molecule-Text and Protein-Text Models | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 28: Multimodal Scientific AI</a></div>
+<h1>28.2 Molecule-Text and Protein-Text Models</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"Give me a SMILES string and I will give you a paragraph. Give me a paragraph and I will give you a molecule. Give me both and I will give you a drug candidate."</p>
+<cite>A Sequence-to-Sequence Model With Ambitions</cite>
+</blockquote>
+
+<main class="content" id="main-content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+In the <a href="section-28.1.html">previous section</a> you learned how InfoNCE loss
+aligns representations from two modalities into a shared embedding space. This section
+applies that machinery to specific scientific modality pairs: molecules with text and
+proteins with text. You should be comfortable with the contrastive alignment pipeline,
+projection heads, and retrieval metrics from Section 28.1. Familiarity with SMILES
+notation for molecular structures (introduced in
+<a href="../../part-1-foundations/module-03-knowledge-representation/index.html">Chapter 3</a>)
+and protein sequence representation from
+<a href="../module-27-foundation-models/index.html">Chapter 27</a> will help you follow
+the domain-specific examples.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A chemist describes a molecule in words: "a selective COX-2 inhibitor with a
+sulfonamide group and low hepatotoxicity risk." A biologist describes a protein:
+"a serine/threonine kinase that phosphorylates MAPK in response to growth factor
+signaling." These descriptions encode expert knowledge that complements structural
+representations. <strong>Molecule-text models</strong> like MolT5 and MoleculeSTM learn
+bidirectional mappings between molecular structures (SMILES, graphs) and natural
+language. <strong>Protein-text models</strong> like ProteinChat and ESM3 do the same for
+protein sequences and structures. Together, these models enable a new paradigm:
+describe what you want in words and retrieve (or generate) the molecule or protein
+that matches. This section covers the architectures, training procedures, and
+hands-on pipelines for both modality pairs.
+</p>
+</div>
+
+<h2>1. MolT5: Bidirectional Molecule-Text Translation</h2>
+
+<p>
+MolT5 (Edwards et al., 2022) treats molecule-text translation as a sequence-to-sequence
+problem. Built on the T5 (Text-to-Text Transfer Transformer) architecture, it handles
+two tasks: <strong>molecule captioning</strong> (SMILES to text) and <strong>text-conditional
+molecule generation</strong> (text to SMILES). The model is pretrained on a large corpus of
+unlabeled SMILES strings and scientific text, then fine-tuned on paired molecule-text
+data from the CheBI-20 dataset (33,010 molecule-description pairs derived from the
+Chemical Entities of Biological Interest ontology).
+</p>
+
+<p data-agent="02">
+Molecule-text translation is the task of converting between a machine-readable molecular representation (such as a SMILES string) and a human-readable natural language description of that molecule's structure, properties, or biological activity. It matters because it bridges two communities: computational chemists who work with structural formulas and bench scientists or clinicians who think in terms of drug classes, mechanisms, and side effects. The mechanism is straightforward: an encoder-decoder transformer ingests one representation as a token sequence and autoregressively generates the other. Use molecule-text translation when you need to search chemical databases with plain-language queries, generate human-interpretable explanations of computational screening hits, or produce candidate structures from verbal specifications; use direct molecular property prediction (QSAR models) instead when you need precise numeric properties like binding affinity or solubility and already have the molecular structure in hand.
+</p>
+
+<p>
+The architecture is straightforward: a T5 encoder-decoder where the input is either a
+SMILES string (for captioning) or a text description (for generation), and the output
+is the other modality. No special molecular tokenizer is required; MolT5 treats SMILES
+characters as text tokens, though specialized tokenizers (like those splitting on
+chemical bonds) can improve performance.
+</p>
+
+<pre><code class="language-python">from transformers import T5ForConditionalGeneration, T5Tokenizer
+import torch
+
+
+def load_molt5(model_name: str = "laituan245/molt5-base") -> tuple:
+    """Load MolT5 model and tokenizer from Hugging Face.
+
+    Available sizes: molt5-small (77M), molt5-base (250M),
+    molt5-large (780M).
+    """
+    tokenizer = T5Tokenizer.from_pretrained(model_name)
+    model = T5ForConditionalGeneration.from_pretrained(model_name)
+    model.eval()
+    return model, tokenizer
+
+
+def smiles_to_caption(smiles: str, model, tokenizer,
+                      max_length: int = 256) -> str:
+    """Generate a text description for a SMILES string.
+
+    MolT5 molecule captioning: SMILES in, English out.
+    """
+    input_ids = tokenizer(
+        smiles, return_tensors="pt", max_length=512,
+        truncation=True,
+    ).input_ids
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids,
+            max_length=max_length,
+            num_beams=5,          # beam search for fluency
+            early_stopping=True,
+        )
+    return tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+
+def caption_to_smiles(description: str, model, tokenizer,
+                      num_candidates: int = 10) -> list[str]:
+    """Generate SMILES candidates from a text description.
+
+    Returns multiple candidates ranked by beam score.
+    """
+    input_ids = tokenizer(
+        description, return_tensors="pt", max_length=512,
+        truncation=True,
+    ).input_ids
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids,
+            max_length=256,
+            num_beams=num_candidates,
+            num_return_sequences=num_candidates,
+            early_stopping=True,
+        )
+    candidates = [
+        tokenizer.decode(ids, skip_special_tokens=True)
+        for ids in output_ids
+    ]
+    return candidates
+
+
+# Example usage
+model, tokenizer = load_molt5("laituan245/molt5-base")
+
+# Molecule captioning
+aspirin_smiles = "CC(=O)Oc1ccccc1C(=O)O"
+caption = smiles_to_caption(aspirin_smiles, model, tokenizer)
+print(f"Caption: {caption}")
+# Output: "The molecule is a member of the class of benzoic acids
+#          that is salicylic acid in which the hydrogen of the
+#          hydroxy group has been replaced by an acetyl group."
+
+# Text-conditional generation
+target_desc = "a nonsteroidal anti-inflammatory drug with analgesic properties"
+candidates = caption_to_smiles(target_desc, model, tokenizer,
+                                num_candidates=5)
+for i, smi in enumerate(candidates):
+    print(f"  Candidate {i+1}: {smi}")
+</code></pre>
+<div class="code-caption">MolT5 molecule captioning and text-conditional generation. The captioning direction (SMILES to text) uses beam search for fluent descriptions. The generation direction (text to SMILES) returns multiple candidates that can be filtered for chemical validity using RDKit.</div>
+
+<p>
+A critical step after text-conditional generation is <strong>validity filtering</strong>. Not
+every SMILES string generated by MolT5 represents a valid molecule. RDKit provides
+the filter:
+</p>
+
+<pre><code class="language-python">from rdkit import Chem
+from rdkit.Chem import Descriptors, Draw
+
+
+def filter_valid_molecules(smiles_list: list[str]) -> list[dict]:
+    """Filter generated SMILES for chemical validity.
+
+    Returns valid molecules with basic property annotations.
+    """
+    valid = []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            valid.append({
+                "smiles": Chem.MolToSmiles(mol),  # canonicalize
+                "molecular_weight": Descriptors.MolWt(mol),
+                "logp": Descriptors.MolLogP(mol),
+                "num_h_donors": Descriptors.NumHDonors(mol),
+                "num_h_acceptors": Descriptors.NumHAcceptors(mol),
+                "valid": True,
+            })
+    return valid
+
+
+# Filter candidates from MolT5 generation
+valid_mols = filter_valid_molecules(candidates)
+print(f"Valid: {len(valid_mols)}/{len(candidates)}")
+for mol_info in valid_mols:
+    print(f"  {mol_info['smiles']}  MW={mol_info['molecular_weight']:.1f}")
+</code></pre>
+<div class="code-caption">RDKit validity filtering for MolT5-generated SMILES candidates. Canonicalization via <code>MolToSmiles</code> normalizes the SMILES representation, and Lipinski descriptors provide a quick drug-likeness check.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Drug Repurposing via Text Query</div>
+<p>
+A researcher investigating COVID-19 treatments queries MolT5 with "a protease
+inhibitor that binds to the main protease of SARS-CoV-2 with a molecular weight
+under 500 daltons." MolT5 generates 20 SMILES candidates. After RDKit filtering,
+14 are chemically valid. Cross-referencing with PubChem reveals that 3 of these
+match known protease inhibitors (nirmatrelvir analogs), while 2 represent novel
+scaffolds not in any public database. The novel scaffolds become candidates for
+molecular dynamics simulation (see <a href="../../part-5-simulation-optimization/module-43-scientific-simulation/index.html">Chapter 43</a>)
+and experimental validation.
+</p>
+</div>
+
+<h2>2. MoleculeSTM: Contrastive Molecule-Text Alignment</h2>
+
+<p>
+While MolT5 treats molecule-text translation as a sequence-to-sequence problem,
+MoleculeSTM (Liu et al., 2023) takes the contrastive alignment approach from
+Section 28.1. It trains a molecular encoder (GNN operating on 2D molecular graphs)
+and a text encoder (SciBERT) with InfoNCE loss on 280,000 molecule-description pairs
+from PubChem. The result is a shared embedding space where molecules and their
+descriptions are neighbors.
+</p>
+
+<p>
+MoleculeSTM's advantage over MolT5 is <strong>retrieval</strong>. Instead of generating a
+SMILES string from scratch (which may be invalid), MoleculeSTM retrieves the closest
+molecules from an existing database. Given a text query, it encodes the text, then
+finds the nearest molecular embeddings in the shared space. This guarantees that all
+results are real, valid molecules.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that contrastive alignment (as in MoleculeSTM) teaches the model to "understand" molecular chemistry the way a chemist does. In reality, contrastive models learn statistical co-occurrence patterns between molecular substructures and textual phrases; they match representations in embedding space without any internal model of reaction mechanisms, 3D binding geometry, or thermodynamic stability. High cosine similarity between a molecule and a text description means "these appeared together in training data," not "this molecule truly has this property," so retrieval results always require independent experimental or computational validation.
+</p>
+</div>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+import numpy as np
+
+
+class MoleculeSTMRetriever:
+    """Text-to-molecule retrieval using MoleculeSTM embeddings.
+
+    Assumes pre-computed molecular embeddings stored in a matrix.
+    Text queries are encoded on-the-fly and compared to the
+    molecular index via cosine similarity.
+    """
+
+    def __init__(self, mol_embeddings: np.ndarray,
+                 mol_smiles: list[str],
+                 text_encoder, text_tokenizer):
+        """
+        Parameters
+        ----------
+        mol_embeddings : np.ndarray
+            Pre-computed molecular embeddings, shape (N, D).
+        mol_smiles : list[str]
+            SMILES strings corresponding to each row.
+        text_encoder : nn.Module
+            Text encoder from the aligned MoleculeSTM model.
+        text_tokenizer : tokenizer
+            Tokenizer for the text encoder.
+        """
+        # Normalize for cosine similarity
+        norms = np.linalg.norm(mol_embeddings, axis=1, keepdims=True)
+        self.mol_index = mol_embeddings / norms
+        self.smiles = mol_smiles
+        self.text_encoder = text_encoder
+        self.tokenizer = text_tokenizer
+
+    def encode_query(self, text: str) -> np.ndarray:
+        """Encode a text query to the shared embedding space."""
+        inputs = self.tokenizer(
+            text, return_tensors="pt", max_length=256,
+            truncation=True, padding=True,
+        )
+        with torch.no_grad():
+            hidden = self.text_encoder(**inputs).last_hidden_state
+            pooled = hidden[:, 0, :]  # CLS token
+        z = F.normalize(pooled, dim=-1)
+        return z.cpu().numpy()
+
+    def retrieve(self, query: str, top_k: int = 10) -> list[dict]:
+        """Retrieve top-k molecules matching a text description.
+
+        Returns SMILES, similarity scores, and ranks.
+        """
+        z_query = self.encode_query(query)  # (1, D)
+        similarities = (z_query @ self.mol_index.T).squeeze()
+
+        top_indices = np.argsort(-similarities)[:top_k]
+
+        results = []
+        for rank, idx in enumerate(top_indices):
+            results.append({
+                "rank": rank + 1,
+                "smiles": self.smiles[idx],
+                "similarity": float(similarities[idx]),
+            })
+        return results
+
+
+# Example: retrieve kinase inhibitors by text query
+# retriever = MoleculeSTMRetriever(mol_embs, smiles_db,
+#                                   text_enc, text_tok)
+# hits = retriever.retrieve(
+#     "a selective EGFR kinase inhibitor with quinazoline scaffold",
+#     top_k=5,
+# )
+# for hit in hits:
+#     print(f"  #{hit['rank']} sim={hit['similarity']:.3f} {hit['smiles']}")
+</code></pre>
+<div class="code-caption">Text-to-molecule retrieval using MoleculeSTM's aligned embedding space. Pre-computed molecular embeddings serve as the search index; text queries are encoded on-the-fly. The retrieval is exact cosine similarity over the pre-normalized index.</div>
+
+<p>
+MoleculeSTM also supports <strong>text-guided molecular editing</strong>: given a starting
+molecule and a text instruction ("make it more water-soluble"), the model adjusts the
+molecular embedding in the direction indicated by the text and retrieves the nearest
+molecule to the adjusted vector. This is analogous to the arithmetic in word2vec
+(king - man + woman = queen) but operating across modalities.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of text-guided molecular editing like adjusting a recipe by describing the change you want rather than rewriting the ingredient list. Imagine you have a soup recipe (the source molecule's embedding) and you tell the chef "make it spicier" (the text instruction). The chef does not start from scratch; instead, the chef shifts the recipe in the direction of "spicy" by a controlled amount (the alpha parameter), then looks through a cookbook of known recipes (the molecular database) to find the closest match to the adjusted version. The result is always a real, tested recipe, not a random invention. The interpolation weight alpha controls how far toward "spicy" you move: too little and the soup barely changes; too much and you lose the original flavor entirely. This is precisely how MoleculeSTM's embedding arithmetic works: interpolate in vector space, then snap to the nearest known molecule.
+</p>
+</div>
+
+<pre><code class="language-python">def text_guided_edit(retriever: MoleculeSTMRetriever,
+                     source_smiles: str,
+                     edit_instruction: str,
+                     alpha: float = 0.5,
+                     top_k: int = 5) -> list[dict]:
+    """Edit a molecule by shifting its embedding toward a text direction.
+
+    Parameters
+    ----------
+    source_smiles : str
+        Starting molecule SMILES.
+    edit_instruction : str
+        Natural language edit (e.g., "increase water solubility").
+    alpha : float
+        Interpolation weight: 0 = keep original, 1 = full text direction.
+    """
+    # Encode source molecule
+    z_mol = retriever.mol_index[
+        retriever.smiles.index(source_smiles)
+    ]  # (D,)
+
+    # Encode the edit instruction
+    z_text = retriever.encode_query(edit_instruction).squeeze()  # (D,)
+
+    # Interpolate: shift molecule embedding toward text
+    z_edited = (1 - alpha) * z_mol + alpha * z_text
+    z_edited = z_edited / np.linalg.norm(z_edited)  # re-normalize
+
+    # Retrieve nearest molecules to the edited vector
+    similarities = z_edited @ retriever.mol_index.T
+    top_indices = np.argsort(-similarities)[:top_k]
+
+    results = []
+    for rank, idx in enumerate(top_indices):
+        results.append({
+            "rank": rank + 1,
+            "smiles": retriever.smiles[idx],
+            "similarity": float(similarities[idx]),
+        })
+    return results
+</code></pre>
+<div class="code-caption">Text-guided molecular editing via embedding interpolation. The source molecule's embedding is shifted toward the text instruction's embedding by a factor of alpha, then the nearest real molecules to the edited vector are retrieved. This produces chemically valid edits without generative SMILES decoding.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Retrieval vs. Generation</div>
+<p>
+MolT5 (generation) and MoleculeSTM (retrieval) represent two complementary strategies.
+Generation can produce novel molecules not in any database, but many generated SMILES
+are invalid or unsynthesizable. Retrieval always returns real molecules, but cannot
+find anything outside the database. In practice, combine both: use MoleculeSTM to find
+the closest known molecules, then use MolT5 to generate novel variants inspired by the
+retrieval results. This two-stage approach (retrieve-then-generate) mirrors how human
+chemists work: start from known scaffolds, then modify.
+</p>
+</div>
+
+<h2>3. ProteinChat: Conversational Protein Understanding</h2>
+
+<p>
+ProteinChat (Guo et al., 2023) adapts the visual instruction tuning paradigm
+(LLaVA-style) to proteins. It aligns a protein structure encoder with a large language
+model (LLM) so that a user can ask natural language questions about a protein's 3D
+structure and receive informed answers. The architecture has three components:
+</p>
+
+<p>
+<strong>Protein encoder.</strong> ESM-2 or a 3D structure encoder (e.g., GVP-GNN) produces
+per-residue embeddings from the protein's sequence or coordinates.
+</p>
+
+<p>
+<strong>Projection layer.</strong> A linear or MLP projection maps the protein embeddings into
+the LLM's input space, analogous to the visual projection in LLaVA.
+</p>
+
+<p>
+<strong>Language model.</strong> A pretrained LLM (Vicuna, LLaMA) generates answers conditioned
+on both the projected protein embeddings and the user's question text.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+
+class ProteinChatModel(nn.Module):
+    """Simplified ProteinChat architecture.
+
+    Aligns a protein encoder with an LLM via a projection layer
+    for conversational protein understanding.
+    """
+
+    def __init__(
+        self,
+        protein_encoder_name: str = "facebook/esm2_t33_650M_UR50D",
+        llm_name: str = "meta-llama/Llama-2-7b-chat-hf",
+        projection_dim: int = 4096,
+    ):
+        super().__init__()
+        self.protein_encoder = AutoModel.from_pretrained(
+            protein_encoder_name
+        )
+        self.llm = AutoModelForCausalLM.from_pretrained(llm_name)
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_name)
+
+        # Freeze both backbone models
+        for p in self.protein_encoder.parameters():
+            p.requires_grad = False
+        for p in self.llm.parameters():
+            p.requires_grad = False
+
+        # Trainable projection: protein space -> LLM input space
+        esm_dim = self.protein_encoder.config.hidden_size
+        self.protein_projection = nn.Sequential(
+            nn.Linear(esm_dim, projection_dim),
+            nn.GELU(),
+            nn.Linear(projection_dim, self.llm.config.hidden_size),
+        )
+
+    def encode_protein(self, protein_ids: torch.Tensor,
+                       attention_mask: torch.Tensor) -> torch.Tensor:
+        """Encode protein sequence and project to LLM space.
+
+        Returns per-residue embeddings in the LLM's input dimension.
+        """
+        with torch.no_grad():
+            esm_output = self.protein_encoder(
+                input_ids=protein_ids,
+                attention_mask=attention_mask,
+            )
+        # Pool: mean over residue positions
+        hidden = esm_output.last_hidden_state
+        pooled = (hidden * attention_mask.unsqueeze(-1)).sum(dim=1)
+        pooled = pooled / attention_mask.sum(dim=1, keepdim=True)
+        # Project to LLM space
+        return self.protein_projection(pooled)  # (batch, llm_dim)
+
+    def answer_question(self, protein_ids, protein_mask,
+                        question: str,
+                        max_new_tokens: int = 256) -> str:
+        """Answer a question about a protein.
+
+        The protein embedding is prepended to the question tokens
+        as a "visual prefix" in the LLM input.
+        """
+        # Encode protein
+        protein_emb = self.encode_protein(protein_ids, protein_mask)
+        # Shape: (1, llm_dim) -> (1, 1, llm_dim) as a prefix token
+        prefix = protein_emb.unsqueeze(1)
+
+        # Tokenize the question
+        q_tokens = self.llm_tokenizer(
+            question, return_tensors="pt"
+        )
+        q_embeds = self.llm.get_input_embeddings()(
+            q_tokens.input_ids
+        )
+
+        # Concatenate: [protein_prefix, question_tokens]
+        inputs_embeds = torch.cat([prefix, q_embeds], dim=1)
+
+        with torch.no_grad():
+            output = self.llm.generate(
+                inputs_embeds=inputs_embeds,
+                max_new_tokens=max_new_tokens,
+            )
+        return self.llm_tokenizer.decode(
+            output[0], skip_special_tokens=True
+        )
+</code></pre>
+<div class="code-caption">Simplified ProteinChat architecture showing the three-component design: ESM-2 protein encoder, trainable MLP projection layer, and frozen LLM decoder. The protein embedding is prepended to the question tokens as a prefix, enabling the LLM to condition its answer on structural information.</div>
+
+<h2>4. ESM3: Multimodal Protein Foundation Model</h2>
+
+<p>
+ESM3 (Hayes et al., 2025) represents the state of the art in protein multimodal AI.
+Unlike ProteinChat, which bolts a protein encoder onto an existing LLM, ESM3 is natively
+multimodal: it jointly processes three tracks of protein information (sequence, structure,
+and function) within a single transformer architecture. Each track has its own tokenizer
+and embedding layer, but the transformer layers attend across all three tracks
+simultaneously.
+</p>
+
+<p>
+The training data is extraordinary: 2.78 billion protein sequences from UniRef, 236
+million protein structures (predicted by ESMFold), and functional annotations from
+InterPro. ESM3 was trained with a masked language modeling objective that randomly masks
+tokens from any combination of tracks. At inference time, you can provide any subset
+(sequence only, structure only, sequence plus partial function) and generate the missing
+tracks. This makes ESM3 a unified interface for protein understanding, design, and
+function prediction.
+</p>
+
+<pre><code class="language-python"># ESM3 usage via the esm Python package (EvolutionaryScale)
+# pip install esm
+
+from esm.models.esm3 import ESM3
+from esm.sdk.api import (
+    ESMProtein, GenerationConfig, SamplingConfig
+)
+
+
+def protein_from_sequence(sequence: str) -> dict:
+    """Use ESM3 to predict structure and function from sequence.
+
+    Returns structure tokens and function annotations
+    for a given amino acid sequence.
+    """
+    # Load the open-weight ESM3 model
+    model = ESM3.from_pretrained("esm3_sm_open_v1")
+
+    # Create a protein object with sequence only
+    protein = ESMProtein(sequence=sequence)
+
+    # Generate structure (predict folding from sequence)
+    structure_config = GenerationConfig(
+        track="structure",
+        num_steps=8,           # iterative refinement steps
+        temperature=0.7,
+    )
+    protein_with_structure = model.generate(
+        protein, structure_config
+    )
+
+    # Generate function annotations
+    function_config = GenerationConfig(
+        track="function",
+        num_steps=8,
+        temperature=0.5,
+    )
+    protein_full = model.generate(
+        protein_with_structure, function_config
+    )
+
+    return {
+        "sequence": protein_full.sequence,
+        "structure_tokens": protein_full.coordinates,
+        "function_annotations": protein_full.function_annotations,
+    }
+
+
+def design_protein_for_function(function_description: str,
+                                 length: int = 100) -> dict:
+    """Design a protein sequence for a target function.
+
+    Inverse folding: specify function, generate sequence
+    and structure simultaneously.
+    """
+    model = ESM3.from_pretrained("esm3_sm_open_v1")
+
+    # Create protein with only function specified
+    protein = ESMProtein(
+        function_annotations=[function_description],
+    )
+
+    # Generate sequence conditioned on function
+    seq_config = GenerationConfig(
+        track="sequence",
+        num_steps=16,
+        temperature=0.8,
+    )
+    designed = model.generate(protein, seq_config)
+
+    return {
+        "designed_sequence": designed.sequence,
+        "confidence": designed.confidence_scores,
+    }
+</code></pre>
+<div class="code-caption">ESM3 multimodal protein operations: predicting structure and function from sequence, and inverse design (generating sequence from function specification). The iterative generation with configurable temperature allows trading off diversity against confidence.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+Chai-1 (Chai Discovery, 2024) extends multimodal protein modeling to the prediction of molecular interactions, including protein-protein, protein-ligand, protein-nucleic acid, and protein-small molecule complexes within a single unified architecture. Unlike ESM3, which focuses on single-chain sequence-structure-function generation, Chai-1 treats the full biomolecular assembly as input and predicts 3D complex structures with accuracy competitive with AlphaFold-Multimer. The model was released with open weights and a permissive license for drug discovery applications. This direction points toward foundation models that reason jointly about molecules and their binding partners, closing the gap between the molecule-text and protein-text paradigms discussed in this section and enabling end-to-end virtual screening pipelines that predict not just "what molecule fits this description" but "how tightly does this molecule bind this protein target."
+</p>
+</div>
+
+<h2>5. Cross-Referencing Molecular and Protein Embeddings</h2>
+
+<p>
+Molecules interact with proteins: drugs bind to target proteins, metabolites serve as
+enzyme substrates, and signaling molecules activate receptors. If you have aligned
+molecule-text embeddings (from MoleculeSTM) and aligned protein-text embeddings (from
+ProteinChat or ESM3 plus a text projection), you can cross-reference through the shared
+text modality. A molecule's text description and a protein's function annotation, when
+both are nearby in text embedding space, suggest a potential interaction.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class CrossModalMatcher:
+    """Match molecules to proteins via shared text embeddings.
+
+    Uses the text modality as a bridge: molecules aligned to text
+    via MoleculeSTM, proteins aligned to text via ProteinChat.
+    The overlapping text space enables cross-modal matching.
+    """
+    mol_text_embeddings: np.ndarray   # (N_mol, D)
+    protein_text_embeddings: np.ndarray  # (N_prot, D)
+    mol_smiles: list[str]
+    protein_ids: list[str]
+
+    def __post_init__(self):
+        # Normalize for cosine similarity
+        self.mol_normed = self.mol_text_embeddings / np.linalg.norm(
+            self.mol_text_embeddings, axis=1, keepdims=True
+        )
+        self.prot_normed = self.protein_text_embeddings / np.linalg.norm(
+            self.protein_text_embeddings, axis=1, keepdims=True
+        )
+
+    def find_targets(self, smiles: str,
+                     top_k: int = 5) -> list[dict]:
+        """Find proteins likely to interact with a molecule.
+
+        Uses text-space similarity as a proxy for binding affinity.
+        """
+        mol_idx = self.mol_smiles.index(smiles)
+        z_mol = self.mol_normed[mol_idx]  # (D,)
+
+        # Cross-modal similarity
+        scores = z_mol @ self.prot_normed.T
+        top_indices = np.argsort(-scores)[:top_k]
+
+        return [
+            {
+                "protein_id": self.protein_ids[idx],
+                "similarity": float(scores[idx]),
+                "rank": rank + 1,
+            }
+            for rank, idx in enumerate(top_indices)
+        ]
+
+    def find_ligands(self, protein_id: str,
+                     top_k: int = 5) -> list[dict]:
+        """Find molecules likely to bind a protein target."""
+        prot_idx = self.protein_ids.index(protein_id)
+        z_prot = self.prot_normed[prot_idx]
+
+        scores = z_prot @ self.mol_normed.T
+        top_indices = np.argsort(-scores)[:top_k]
+
+        return [
+            {
+                "smiles": self.mol_smiles[idx],
+                "similarity": float(scores[idx]),
+                "rank": rank + 1,
+            }
+            for rank, idx in enumerate(top_indices)
+        ]
+</code></pre>
+<div class="code-caption">Cross-modal molecule-protein matching via shared text embeddings. The text modality serves as a bridge: molecule-text alignment (MoleculeSTM) and protein-text alignment (ProteinChat) produce overlapping text representations that enable cross-modal retrieval without direct molecule-protein training data.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Text as a Universal Bridge</div>
+<p>
+The cross-referencing strategy above exploits a fundamental property of text: it can
+describe anything. By aligning each scientific modality to text independently, you get
+emergent cross-modal connections for free. A molecule described as "inhibits EGFR
+tyrosine kinase activity" and a protein annotated as "epidermal growth factor receptor,
+tyrosine kinase domain" will have similar text embeddings even if no molecule-protein
+pairs appeared in the training data. This is the scientific analog of ImageBind's
+insight that binding all modalities to one anchor creates emergent zero-shot alignment
+between non-anchor pairs. Text is the natural anchor for scientific AI because
+scientists describe everything in text.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Hugging Face for Pretrained Multimodal Models</div>
+<p>
+The from-scratch implementations above total approximately 200 lines. Using Hugging
+Face's ecosystem, loading and running inference with these models compresses to about
+10 lines per model:
+</p>
+<pre><code class="language-python"># MolT5: 3 lines to load, 2 to run inference
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+tok = AutoTokenizer.from_pretrained("laituan245/molt5-base")
+model = AutoModelForSeq2SeqLM.from_pretrained("laituan245/molt5-base")
+out = model.generate(tok("CC(=O)Oc1ccccc1C(=O)O", return_tensors="pt").input_ids)
+print(tok.decode(out[0], skip_special_tokens=True))
+
+# ESM-2 protein embeddings: 3 lines
+from transformers import EsmModel, EsmTokenizer
+esm_tok = EsmTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
+esm_model = EsmModel.from_pretrained("facebook/esm2_t33_650M_UR50D")
+# Then: esm_model(**esm_tok(sequence, return_tensors="pt"))
+</code></pre>
+<p>
+The Hugging Face Hub hosts pretrained weights for MolT5 (all sizes), ESM-2, ChemBERTa,
+SciBERT, and dozens of other scientific models. Line count reduction: 20x compared to
+training from scratch. Use the from-scratch code for custom architectures or research
+extensions; use Hugging Face for production inference pipelines.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Molecule That Described Itself</div>
+<p>
+MolT5's training set includes molecules from the CheBI ontology, where descriptions
+are written by human curators. When you feed MolT5 a molecule and ask it to generate a
+description, then feed that description back and ask for a molecule, you sometimes get
+a different molecule. This "round-trip" inconsistency is not a bug; it reflects the
+many-to-many nature of the molecule-text relationship. Multiple molecules match the
+description "a benzodiazepine derivative with anxiolytic properties," and multiple
+descriptions apply to any given benzodiazepine. Perfect round-trip consistency would
+require a one-to-one mapping that does not exist in chemistry.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Round-Trip Molecule-Text Consistency Check</h4>
+<p>
+Test how well MolT5 preserves molecular identity through a caption-then-generate round trip, using only a laptop with Python and free libraries.
+</p>
+<p>
+<strong>Step 1.</strong> Install dependencies: <code>pip install transformers torch rdkit-pypi</code>. No GPU is required; the molt5-small model (77M parameters) runs on CPU in under 10 seconds per inference.
+</p>
+<p>
+<strong>Step 2.</strong> Pick five well-known drug molecules and collect their canonical SMILES from PubChem (e.g., aspirin: <code>CC(=O)Oc1ccccc1C(=O)O</code>, ibuprofen: <code>CC(C)Cc1ccc(cc1)C(C)C(=O)O</code>, caffeine: <code>Cn1c(=O)c2c(ncn2C)n(C)c1=O</code>).
+</p>
+<p>
+<strong>Step 3.</strong> For each molecule, run the forward pass (SMILES to caption) using <code>smiles_to_caption</code> from the code above, then run the reverse pass (caption to SMILES) using <code>caption_to_smiles</code> with <code>num_candidates=5</code>.
+</p>
+<p>
+<strong>Step 4.</strong> For each round-trip candidate, compute the Tanimoto similarity to the original molecule using RDKit Morgan fingerprints: <code>DataStructs.TanimotoSimilarity(AllChem.GetMorganFingerprintAsBitVect(mol_original, 2, 2048), AllChem.GetMorganFingerprintAsBitVect(mol_candidate, 2, 2048))</code>.
+</p>
+<p>
+<strong>Step 5.</strong> Tabulate results: for each input molecule, record the generated caption, the top candidate SMILES, its Tanimoto similarity, and whether the candidate is the same molecule (Tanimoto = 1.0). You should observe that simple molecules (aspirin) round-trip more reliably than complex ones, and that the generated captions capture functional group information even when the exact structure drifts.
+</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual.</strong> MolT5 is a generative model (encoder-decoder) while MoleculeSTM is
+a contrastive model (dual encoder). Explain under what discovery scenarios each
+architecture is preferable. Consider: (a) searching an existing molecular database for
+leads, (b) designing entirely novel molecules, (c) explaining a molecule's properties to
+a non-expert.</li>
+
+<li><strong>Coding.</strong> Using MolT5 from Hugging Face, implement a round-trip consistency test:
+generate a caption from a SMILES string, then generate SMILES from that caption. Measure
+the Tanimoto similarity (using RDKit Morgan fingerprints) between the original and
+round-trip molecules across 100 molecules from the CheBI-20 test set. What is the
+average Tanimoto similarity? How does it vary with molecule complexity (molecular weight)?</li>
+
+<li><strong>Analysis.</strong> The cross-referencing strategy in Listing 28.7 uses text as a bridge
+between molecules and proteins. Identify three failure cases where this bridge would
+produce false positives (high similarity but no real interaction). For each case, propose
+a filter or additional data source that could eliminate the false positive.</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-28.1.html">&larr; 28.1 Modality Alignment for Discovery</a>
+<span class="nav-separator">|</span>
+<a href="index.html">Chapter 28</a>
+<span class="nav-separator">|</span>
+<a href="section-28.3.html">28.3 Scientific Document AI &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,1181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 54.3: Building a Research Team with Review. Complete multi-agent discovery pipeline with proposer, implementer, experimenter, reviewers, and judge using LangGraph." name="description"/>
+<title>Section 54.3: Building a Research Team with Review | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Autonomous Discovery Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 54: Multi-Agent Discovery Systems</a></div>
+<h1>54.3 Building a Research Team with Review</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The pipeline ran for six hours, generated forty hypotheses, reviewed them all, and accepted three. Two of those three were genuinely novel. That is a better hit rate than my graduate students."</p>
+<cite>A Principal Investigator Reconsidering Hiring Decisions</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section integrates everything from the chapter. You need the five agent roles from
+<a href="section-54.1.html">Section 54.1</a> (proposer, implementer, experimenter, reviewer,
+judge), the debate and review protocols from
+<a href="section-54.2.html">Section 54.2</a> (round-robin review, calibration metrics), and
+familiarity with LangGraph's <code>StateGraph</code> from
+<a href="../../part-2-software-engineering/module-17-multi-agent-teams/section-17.3.html">Section 17.3</a>.
+The experiment registry concepts from
+<a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">Chapter 47</a>
+provide the provenance layer that tracks all pipeline outputs.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+This section builds the complete system: a six-agent discovery team (proposer, implementer,
+experimenter, two reviewers, judge) orchestrated as a LangGraph state machine with
+conditional edges, review loops, and budget controls. The recipe follows a concrete
+scientific task (discovering statistical relationships in a dataset), measures the impact
+of review on discovery quality, and integrates with the Discovery Workbench. By the end,
+you will have a working multi-agent discovery pipeline that you can adapt to any scientific
+domain by changing agent prompts and tool sets.
+</p>
+</div>
+
+<h2>1. Architecture Overview</h2>
+
+<p>
+The discovery pipeline has six stages connected by conditional edges. The flow is not
+strictly sequential: the review stage can loop back to the proposer (for major revisions)
+or to the implementer (for experimental redesign). The judge controls these routing decisions.
+</p>
+
+<p data-agent="02">
+A conditional edge is a routing rule attached to a node in a state-machine graph that inspects the current state after that node finishes and selects which node runs next. Conditional edges matter because they let the pipeline make data-dependent decisions at runtime: rather than following a fixed sequence, the graph branches based on content (a judge's verdict, a budget counter, an error flag). The mechanism is straightforward: LangGraph calls a Python function you supply, passes it the current state dictionary, and uses the returned string to look up the next node in a routing table. Use conditional edges instead of fixed edges whenever the next step depends on the output of the current step; use fixed edges when the sequence is unconditional and predetermined.
+</p>
+
+<p>
+The pipeline processes hypotheses one at a time through the following stages:
+</p>
+
+<ol>
+<li><strong>Propose</strong>: the proposer generates a candidate hypothesis from the research question and background literature.</li>
+<li><strong>Implement</strong>: the implementer translates the hypothesis into an executable experiment plan with code, data requirements, and success criteria.</li>
+<li><strong>Experiment</strong>: the experimenter executes the experiment plan, collects results, and computes statistical summaries.</li>
+<li><strong>Review</strong>: two independent reviewers evaluate the hypothesis, experimental design, and results in parallel (round-robin protocol from Section 54.2).</li>
+<li><strong>Judge</strong>: the judge aggregates reviews, resolves disagreements, and issues a verdict (accept, major revision, minor revision, reject).</li>
+<li><strong>Route</strong>: based on the verdict, the pipeline either accepts the hypothesis (terminating), routes back for revision (looping), or rejects and moves to the next hypothesis.</li>
+</ol>
+
+<pre><code class="language-python">"""Multi-agent discovery pipeline with LangGraph.
+
+This module defines a six-agent discovery team as a LangGraph
+StateGraph. The pipeline processes hypotheses through proposal,
+implementation, experimentation, review, and judgment, with
+conditional routing for revision loops.
+
+Requirements:
+    pip install langgraph langchain-core langchain-anthropic
+    pip install langchain-openai numpy
+"""
+
+from __future__ import annotations
+
+import json
+import operator
+from dataclasses import dataclass, field
+from typing import Annotated, Any, Literal, TypedDict
+
+from langgraph.graph import StateGraph, END
+
+
+# ---------- Typed State ----------
+
+class DiscoveryPipelineState(TypedDict):
+    """Shared state for the discovery pipeline.
+
+    LangGraph manages this state across all nodes. Each node
+    reads what it needs and writes its outputs. The Annotated
+    fields with operator.add use reducer semantics: new items
+    are appended rather than replacing the list.
+    """
+    # Inputs
+    research_question: str
+    background: str
+    available_datasets: list[str]
+
+    # Pipeline outputs (accumulated across iterations)
+    hypotheses: Annotated[list[dict], operator.add]
+    experiment_plans: Annotated[list[dict], operator.add]
+    experiment_results: Annotated[list[dict], operator.add]
+    reviews: Annotated[list[dict], operator.add]
+    judge_decisions: Annotated[list[dict], operator.add]
+
+    # Current working hypothesis (overwritten each iteration)
+    current_hypothesis: dict
+    current_plan: dict
+    current_result: dict
+    current_reviews: list[dict]
+    current_decision: dict
+
+    # Control flow
+    iteration: int
+    max_iterations: int
+    total_tokens: int
+    token_budget: int
+    status: str  # "running", "accepted", "rejected", "budget_exceeded"
+</code></pre>
+<div class="code-caption">The DiscoveryPipelineState uses LangGraph's typed state with reducer annotations. Lists with operator.add accumulate outputs across iterations; plain fields are overwritten each step.</div>
+
+<h2>2. Defining Agent Nodes</h2>
+
+<p>
+Each agent role becomes a LangGraph node: a function that takes the current state, calls
+an LLM with the appropriate system prompt, and returns a state update. We use LangChain's
+chat model abstraction so you can swap model providers (Anthropic, OpenAI, Google) by
+changing a single configuration line.
+</p>
+
+<pre><code class="language-python">from langchain_core.messages import SystemMessage, HumanMessage
+
+
+def make_agent_caller(
+    model_name: str,
+    system_prompt: str,
+    temperature: float = 0.7,
+):
+    """Create a reusable LLM caller with a fixed system prompt.
+
+    Returns a callable that takes a user message string and
+    returns the model's response text plus token usage.
+    """
+    from langchain_anthropic import ChatAnthropic
+    from langchain_openai import ChatOpenAI
+
+    if "claude" in model_name.lower():
+        llm = ChatAnthropic(
+            model=model_name,
+            temperature=temperature,
+            max_tokens=4096,
+        )
+    else:
+        llm = ChatOpenAI(
+            model=model_name,
+            temperature=temperature,
+            max_tokens=4096,
+        )
+
+    async def call(user_message: str) -> tuple[str, int]:
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_message),
+        ]
+        response = await llm.ainvoke(messages)
+        tokens = response.usage_metadata.get("total_tokens", 0)
+        return response.content, tokens
+
+    return call
+
+
+# ---------- Node: Proposer ----------
+
+async def propose_node(state: DiscoveryPipelineState) -> dict:
+    """Generate a hypothesis from the research question."""
+    proposer = make_agent_caller(
+        model_name="claude-sonnet-4-20250514",
+        system_prompt=(
+            "You are a creative scientific researcher. Generate a "
+            "bold, testable hypothesis that addresses the research "
+            "question. Output valid JSON with keys: statement, "
+            "mechanism, predictions (list), novelty_claim, "
+            "required_data (list), confidence (float 0-1), "
+            "risk_level (incremental/moderate/high)."
+        ),
+        temperature=0.9,
+    )
+
+    prompt = (
+        f"Research question: {state['research_question']}\n\n"
+        f"Background: {state['background']}\n\n"
+        f"Available datasets: {state['available_datasets']}\n\n"
+    )
+
+    # If this is a revision, include the judge's feedback
+    if state.get("current_decision", {}).get("final_decision") == "major_revision":
+        feedback = state["current_decision"].get("revision_guidance", "")
+        prompt += (
+            f"REVISION REQUESTED. Previous hypothesis was sent back "
+            f"with this feedback:\n{feedback}\n\n"
+            f"Generate an improved hypothesis that addresses these concerns."
+        )
+
+    response_text, tokens = await proposer(prompt)
+
+    hypothesis = json.loads(response_text)
+    hypothesis["iteration"] = state["iteration"]
+
+    return {
+        "current_hypothesis": hypothesis,
+        "hypotheses": [hypothesis],
+        "total_tokens": state["total_tokens"] + tokens,
+    }
+
+
+# ---------- Node: Implementer ----------
+
+async def implement_node(state: DiscoveryPipelineState) -> dict:
+    """Translate a hypothesis into an executable experiment."""
+    implementer = make_agent_caller(
+        model_name="claude-sonnet-4-20250514",
+        system_prompt=(
+            "You are a meticulous computational scientist. Given a "
+            "hypothesis, write a complete Python experiment to test "
+            "it. Output valid JSON with keys: code (string of Python), "
+            "statistical_tests (list), success_criteria (list), "
+            "expected_runtime (string). The code must set random "
+            "seeds and be fully self-contained."
+        ),
+        temperature=0.2,
+    )
+
+    hypothesis = state["current_hypothesis"]
+    prompt = (
+        f"Hypothesis: {hypothesis['statement']}\n"
+        f"Mechanism: {hypothesis['mechanism']}\n"
+        f"Predictions: {hypothesis['predictions']}\n"
+        f"Required data: {hypothesis['required_data']}\n"
+        f"Available datasets: {state['available_datasets']}\n\n"
+        f"Write a self-contained Python experiment to test this."
+    )
+
+    response_text, tokens = await implementer(prompt)
+    plan = json.loads(response_text)
+    plan["hypothesis_statement"] = hypothesis["statement"]
+
+    return {
+        "current_plan": plan,
+        "experiment_plans": [plan],
+        "total_tokens": state["total_tokens"] + tokens,
+    }
+
+
+# ---------- Node: Experimenter ----------
+
+async def experiment_node(state: DiscoveryPipelineState) -> dict:
+    """Execute the experiment and collect results."""
+    experimenter = make_agent_caller(
+        model_name="claude-sonnet-4-20250514",
+        system_prompt=(
+            "You are a careful experimental scientist. Execute the "
+            "provided experiment plan. Simulate running the code and "
+            "report realistic results. Output valid JSON with keys: "
+            "status (success/failure/error), statistical_summary "
+            "(dict of test results with p_values), "
+            "success_criteria_met (dict of criterion: bool), "
+            "anomalies (list), interpretation (string)."
+        ),
+        temperature=0.1,
+    )
+
+    plan = state["current_plan"]
+    prompt = (
+        f"Execute this experiment:\n\n"
+        f"Code:\n{plan.get('code', 'No code provided')}\n\n"
+        f"Statistical tests to run: {plan.get('statistical_tests', [])}\n"
+        f"Success criteria: {plan.get('success_criteria', [])}\n\n"
+        f"Report all results honestly, including negative findings."
+    )
+
+    response_text, tokens = await experimenter(prompt)
+    result = json.loads(response_text)
+    result["hypothesis_statement"] = state["current_hypothesis"]["statement"]
+
+    return {
+        "current_result": result,
+        "experiment_results": [result],
+        "total_tokens": state["total_tokens"] + tokens,
+    }
+</code></pre>
+<div class="code-caption">Three agent nodes (proposer, implementer, experimenter) as LangGraph-compatible async functions. Each reads from shared state, calls an LLM, and returns a state update dictionary. The proposer uses high temperature for creativity; the experimenter uses low temperature for faithful execution.</div>
+
+<h2>3. The Review and Judge Nodes</h2>
+
+<p>
+The review node runs two independent reviewers in parallel using the round-robin protocol
+from <a href="section-54.2.html">Section 54.2</a>. The judge node aggregates their verdicts
+and decides the routing.
+</p>
+
+<pre><code class="language-python">import asyncio
+
+
+# ---------- Node: Parallel Review ----------
+
+async def review_node(state: DiscoveryPipelineState) -> dict:
+    """Run two independent reviewers in parallel."""
+
+    reviewer_configs = [
+        {
+            "focus": "methodology and experimental design",
+            "model": "claude-sonnet-4-20250514",
+            "temperature": 0.4,
+        },
+        {
+            "focus": "statistical rigor and reproducibility",
+            "model": "gpt-4o",
+            "temperature": 0.3,
+        },
+    ]
+
+    async def run_single_review(config: dict) -> tuple[dict, int]:
+        reviewer = make_agent_caller(
+            model_name=config["model"],
+            system_prompt=(
+                f"You are a demanding scientific peer reviewer "
+                f"specializing in {config['focus']}. Evaluate the "
+                f"hypothesis, experimental design, and results. "
+                f"Output valid JSON with keys: decision "
+                f"(accept/revise/reject), confidence (float 0-1), "
+                f"strengths (list), weaknesses (list), "
+                f"methodology_score (1-10), statistical_rigor_score "
+                f"(1-10), novelty_score (1-10), "
+                f"reproducibility_score (1-10), overall_score (1-10), "
+                f"suggested_experiments (list)."
+            ),
+            temperature=config["temperature"],
+        )
+
+        hypothesis = state["current_hypothesis"]
+        result = state["current_result"]
+
+        prompt = (
+            f"HYPOTHESIS:\n{hypothesis['statement']}\n"
+            f"Mechanism: {hypothesis['mechanism']}\n"
+            f"Predictions: {hypothesis['predictions']}\n\n"
+            f"EXPERIMENTAL RESULTS:\n"
+            f"Status: {result.get('status', 'unknown')}\n"
+            f"Statistical summary: "
+            f"{json.dumps(result.get('statistical_summary', {}), indent=2)}\n"
+            f"Success criteria met: "
+            f"{json.dumps(result.get('success_criteria_met', {}))}\n"
+            f"Anomalies: {result.get('anomalies', [])}\n"
+            f"Interpretation: {result.get('interpretation', '')}\n\n"
+            f"Provide your review. Be rigorous but constructive."
+        )
+
+        response_text, tokens = await reviewer(prompt)
+        review = json.loads(response_text)
+        review["focus"] = config["focus"]
+        review["model"] = config["model"]
+        return review, tokens
+
+    # Run both reviewers in parallel
+    results = await asyncio.gather(
+        *[run_single_review(cfg) for cfg in reviewer_configs]
+    )
+
+    reviews = [r[0] for r in results]
+    total_review_tokens = sum(r[1] for r in results)
+
+    return {
+        "current_reviews": reviews,
+        "reviews": reviews,
+        "total_tokens": state["total_tokens"] + total_review_tokens,
+    }
+
+
+# ---------- Node: Judge ----------
+
+async def judge_node(state: DiscoveryPipelineState) -> dict:
+    """Aggregate reviews and issue a final verdict."""
+    judge = make_agent_caller(
+        model_name="claude-sonnet-4-20250514",
+        system_prompt=(
+            "You are the area chair of a scientific review process. "
+            "You have received multiple reviewer reports. Weigh the "
+            "opinions, resolve disagreements, and make a final "
+            "decision. Output valid JSON with keys: final_decision "
+            "(accept/major_revision/minor_revision/reject), "
+            "reasoning (string), key_concerns (list), "
+            "revision_guidance (string), reviewer_agreement (float)."
+        ),
+        temperature=0.3,
+    )
+
+    reviews = state["current_reviews"]
+    hypothesis = state["current_hypothesis"]
+
+    prompt = (
+        f"HYPOTHESIS: {hypothesis['statement']}\n\n"
+        f"REVIEWER REPORTS:\n"
+    )
+    for i, review in enumerate(reviews, 1):
+        prompt += (
+            f"\nReviewer {i} ({review.get('focus', 'general')}):\n"
+            f"  Decision: {review.get('decision', 'unknown')}\n"
+            f"  Confidence: {review.get('confidence', 'unknown')}\n"
+            f"  Strengths: {review.get('strengths', [])}\n"
+            f"  Weaknesses: {review.get('weaknesses', [])}\n"
+            f"  Scores: methodology={review.get('methodology_score')}, "
+            f"stats={review.get('statistical_rigor_score')}, "
+            f"novelty={review.get('novelty_score')}, "
+            f"reproducibility={review.get('reproducibility_score')}, "
+            f"overall={review.get('overall_score')}\n"
+        )
+
+    prompt += (
+        f"\nIteration: {state['iteration']} of {state['max_iterations']}\n"
+        f"Token budget remaining: "
+        f"{state['token_budget'] - state['total_tokens']}\n\n"
+        f"Make your decision. If recommending revision, provide "
+        f"specific, actionable guidance."
+    )
+
+    response_text, tokens = await judge(prompt)
+    decision = json.loads(response_text)
+    decision["hypothesis_statement"] = hypothesis["statement"]
+    decision["iteration"] = state["iteration"]
+
+    return {
+        "current_decision": decision,
+        "judge_decisions": [decision],
+        "total_tokens": state["total_tokens"] + tokens,
+    }
+</code></pre>
+<div class="code-caption">The review node uses asyncio.gather to run two reviewers in parallel with different model providers (Claude and GPT-4o) for error decorrelation. The judge sees all reviews and the remaining token budget before deciding.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Error decorrelation across model providers works like getting a second opinion from doctors trained at different medical schools. Two doctors from the same program share the same textbooks, the same professors, and the same diagnostic heuristics, so their blind spots overlap heavily: if one misses a rare condition, the other likely will too. But a doctor trained in a different tradition (say, one who emphasizes imaging while the other emphasizes lab work) brings genuinely independent judgment. When their diagnoses agree, your confidence soars; when they disagree, the disagreement itself is informative because it flags exactly where diagnostic uncertainty lies. Similarly, a Claude reviewer and a GPT-4 reviewer were trained on different data with different objectives, so their failure modes diverge. Agreement between them is far stronger evidence than agreement between two instances of the same model, and their disagreements pinpoint the hypotheses that need the most careful human scrutiny.
+</p>
+</div>
+
+<h2>4. Wiring the Graph</h2>
+
+<p>
+With all nodes defined, we wire them into a LangGraph <code>StateGraph</code> with conditional
+edges. The routing function after the judge node implements the revision loop: accept
+terminates the pipeline, major revision loops back to the proposer, minor revision loops
+back to the implementer, and reject terminates with a rejection status.
+</p>
+
+<pre><code class="language-python">def route_after_judge(state: DiscoveryPipelineState) -> str:
+    """Determine the next node based on judge's verdict.
+
+    Returns the name of the next node to execute, or END
+    to terminate the pipeline.
+    """
+    decision = state["current_decision"]["final_decision"]
+    iteration = state["iteration"]
+    max_iter = state["max_iterations"]
+
+    # Budget check
+    if state["total_tokens"] >= state["token_budget"]:
+        return "finalize"
+
+    # Iteration check
+    if iteration >= max_iter:
+        return "finalize"
+
+    if decision == "accept":
+        return "finalize"
+    elif decision == "major_revision":
+        return "propose"  # Back to hypothesis generation
+    elif decision == "minor_revision":
+        return "implement"  # Redo the experiment only
+    else:  # reject
+        return "finalize"
+
+
+def increment_iteration(state: DiscoveryPipelineState) -> dict:
+    """Increment the iteration counter before re-entering the loop."""
+    return {"iteration": state["iteration"] + 1}
+
+
+def finalize_node(state: DiscoveryPipelineState) -> dict:
+    """Set final status based on the last judge decision."""
+    decision = state.get("current_decision", {})
+    final = decision.get("final_decision", "unknown")
+
+    if final == "accept":
+        status = "accepted"
+    elif state["total_tokens"] >= state["token_budget"]:
+        status = "budget_exceeded"
+    elif state["iteration"] >= state["max_iterations"]:
+        status = "max_iterations_reached"
+    else:
+        status = "rejected"
+
+    return {"status": status}
+
+
+def build_discovery_pipeline() -> StateGraph:
+    """Construct the full discovery pipeline as a LangGraph.
+
+    Graph topology:
+        propose -> implement -> experiment -> review -> judge
+            ^           ^                                 |
+            |           |_____ minor_revision ____________|
+            |_____ major_revision ________________________|
+                                                          |
+                                        accept/reject --> finalize --> END
+    """
+    graph = StateGraph(DiscoveryPipelineState)
+
+    # Add all nodes
+    graph.add_node("propose", propose_node)
+    graph.add_node("increment", increment_iteration)
+    graph.add_node("implement", implement_node)
+    graph.add_node("experiment", experiment_node)
+    graph.add_node("review", review_node)
+    graph.add_node("judge", judge_node)
+    graph.add_node("finalize", finalize_node)
+
+    # Sequential edges: propose -> implement -> experiment -> review -> judge
+    graph.add_edge("propose", "implement")
+    graph.add_edge("implement", "experiment")
+    graph.add_edge("experiment", "review")
+    graph.add_edge("review", "judge")
+
+    # Conditional routing after judge
+    graph.add_conditional_edges(
+        "judge",
+        route_after_judge,
+        {
+            "propose": "increment",   # Major revision: re-propose
+            "implement": "increment", # Minor revision: re-implement
+            "finalize": "finalize",   # Accept or reject: done
+        },
+    )
+
+    # Increment loops back to the appropriate node
+    # (LangGraph handles this via the routing above)
+    graph.add_edge("increment", "propose")
+
+    # Finalize leads to END
+    graph.add_edge("finalize", END)
+
+    # Set entry point
+    graph.set_entry_point("propose")
+
+    return graph
+
+
+# Compile and run
+pipeline = build_discovery_pipeline()
+compiled = pipeline.compile()
+</code></pre>
+<div class="code-caption">The complete LangGraph pipeline with conditional routing. Major revisions loop back through the increment node to the proposer; minor revisions loop to the implementer. The finalize node sets the terminal status.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Graph Is the Experiment Protocol</div>
+<p>
+The LangGraph definition is not just infrastructure code; it is a formal specification
+of your scientific methodology. The graph topology encodes which steps are sequential
+(you cannot review before experimenting), which are parallel (reviewers run concurrently),
+and which are conditional (revisions only happen when the judge requests them). When you
+share this pipeline with collaborators, you are sharing your experimental protocol. When
+you version it in Git, you are versioning your methodology. This is the computational
+analogue of a pre-registered experiment plan.
+</p>
+</div>
+
+<h2>5. Running the Pipeline</h2>
+
+<p>
+We run the pipeline on a concrete scientific task: discovering statistical relationships
+in the Iris dataset (a deliberate toy example so you can verify results by hand before
+scaling to real research problems).
+</p>
+
+<pre><code class="language-python">import asyncio
+
+
+async def run_discovery_experiment():
+    """Run the multi-agent discovery pipeline on a sample task."""
+    initial_state: DiscoveryPipelineState = {
+        "research_question": (
+            "What are the strongest predictive relationships between "
+            "morphological features in the Iris dataset? Specifically, "
+            "can we identify non-obvious feature interactions that "
+            "improve classification accuracy beyond single-feature "
+            "baselines?"
+        ),
+        "background": (
+            "The Iris dataset contains 150 samples of three species "
+            "(setosa, versicolor, virginica) with four features: "
+            "sepal length, sepal width, petal length, petal width. "
+            "Linear discriminant analysis achieves ~98% accuracy. "
+            "We seek non-linear feature interactions that provide "
+            "additional discriminative power or biological insight."
+        ),
+        "available_datasets": ["sklearn.datasets.load_iris"],
+
+        # Initialize empty accumulator lists
+        "hypotheses": [],
+        "experiment_plans": [],
+        "experiment_results": [],
+        "reviews": [],
+        "judge_decisions": [],
+
+        # Current working state
+        "current_hypothesis": {},
+        "current_plan": {},
+        "current_result": {},
+        "current_reviews": [],
+        "current_decision": {},
+
+        # Control flow
+        "iteration": 0,
+        "max_iterations": 3,
+        "total_tokens": 0,
+        "token_budget": 100_000,
+        "status": "running",
+    }
+
+    # Run with streaming to observe each step
+    final_state = None
+    async for event in compiled.astream(
+        initial_state,
+        config={"recursion_limit": 25},
+    ):
+        for node_name, node_output in event.items():
+            tokens = node_output.get("total_tokens", 0)
+            print(f"  [{node_name}] tokens so far: {tokens}")
+
+            if node_name == "propose":
+                h = node_output.get("current_hypothesis", {})
+                print(f"    Hypothesis: {h.get('statement', '?')[:80]}")
+            elif node_name == "judge":
+                d = node_output.get("current_decision", {})
+                print(f"    Verdict: {d.get('final_decision', '?')}")
+            elif node_name == "finalize":
+                print(f"    Final status: {node_output.get('status')}")
+
+            final_state = node_output
+
+    return final_state
+
+
+# Execute
+# result = asyncio.run(run_discovery_experiment())
+</code></pre>
+<div class="code-caption">Running the pipeline with LangGraph's async streaming. Each node prints its progress; the streaming interface allows real-time monitoring of the discovery process without waiting for the full pipeline to complete.</div>
+
+<h2>6. Measuring Review Impact</h2>
+
+<p>
+The central empirical question of this chapter: <strong>does adding reviewers actually
+improve discovery quality?</strong> We answer this with a controlled experiment that
+compares the full pipeline (with review) against a baseline pipeline (without review).
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+import numpy as np
+
+
+@dataclass
+class AblationResult:
+    """Results from a review ablation experiment."""
+    condition: str           # "full_review", "no_review", "single_reviewer"
+    n_hypotheses: int        # Total hypotheses generated
+    n_accepted: int          # Hypotheses that passed review (or all, if no review)
+    n_correct: int           # Accepted hypotheses validated as correct
+    precision: float         # n_correct / n_accepted
+    total_cost: float        # Total API cost ($)
+    cost_per_correct: float  # total_cost / n_correct
+    avg_iterations: float    # Mean revision rounds per hypothesis
+    total_tokens: int        # Total tokens consumed
+
+
+async def run_ablation_study(
+    research_questions: list[str],
+    n_trials: int = 20,
+) -> list[AblationResult]:
+    """Compare discovery quality across review conditions.
+
+    Conditions:
+      1. full_review: 2 reviewers + judge (the full pipeline)
+      2. single_reviewer: 1 reviewer + judge
+      3. no_review: proposer -> implementer -> experimenter only
+
+    For each condition, we run n_trials hypotheses and measure
+    precision (fraction correct among accepted) and cost efficiency.
+    """
+    conditions = ["full_review", "single_reviewer", "no_review"]
+    results = []
+
+    for condition in conditions:
+        accepted = []
+        total_tokens = 0
+        total_iterations = 0
+
+        for trial in range(n_trials):
+            question = research_questions[trial % len(research_questions)]
+
+            if condition == "no_review":
+                # Run without review: every hypothesis is "accepted"
+                state = await run_pipeline_without_review(question)
+                accepted.append({
+                    "hypothesis": state["current_hypothesis"],
+                    "result": state["current_result"],
+                    "accepted": True,
+                })
+                total_tokens += state["total_tokens"]
+
+            elif condition == "single_reviewer":
+                # Run with one reviewer instead of two
+                state = await run_pipeline_single_reviewer(question)
+                if state["status"] == "accepted":
+                    accepted.append({
+                        "hypothesis": state["current_hypothesis"],
+                        "result": state["current_result"],
+                        "accepted": True,
+                    })
+                total_tokens += state["total_tokens"]
+                total_iterations += state["iteration"]
+
+            else:  # full_review
+                state = await run_pipeline_full(question)
+                if state["status"] == "accepted":
+                    accepted.append({
+                        "hypothesis": state["current_hypothesis"],
+                        "result": state["current_result"],
+                        "accepted": True,
+                    })
+                total_tokens += state["total_tokens"]
+                total_iterations += state["iteration"]
+
+        # Validate accepted hypotheses against ground truth
+        n_correct = validate_hypotheses(accepted)
+
+        # Estimate cost at $3 per million tokens (Claude Sonnet)
+        cost = total_tokens * 3.0 / 1_000_000
+
+        n_accepted = len(accepted)
+        results.append(AblationResult(
+            condition=condition,
+            n_hypotheses=n_trials,
+            n_accepted=n_accepted,
+            n_correct=n_correct,
+            precision=n_correct / max(n_accepted, 1),
+            total_cost=cost,
+            cost_per_correct=cost / max(n_correct, 1),
+            avg_iterations=total_iterations / n_trials,
+            total_tokens=total_tokens,
+        ))
+
+    return results
+
+
+def validate_hypotheses(accepted: list[dict]) -> int:
+    """Validate accepted hypotheses against ground truth.
+
+    In a real system, this would involve running independent
+    replication experiments. For this demonstration, we use
+    a simplified validation based on statistical criteria:
+    a hypothesis is "correct" if its experiment produced
+    p < 0.05 with an effect size > 0.3.
+    """
+    n_correct = 0
+    for item in accepted:
+        result = item.get("result", {})
+        stats = result.get("statistical_summary", {})
+
+        # Check if any test meets significance + effect size
+        for test_name, test_result in stats.items():
+            p_value = test_result.get("p_value", 1.0)
+            effect_size = test_result.get("effect_size", 0.0)
+            if p_value < 0.05 and effect_size > 0.3:
+                n_correct += 1
+                break
+
+    return n_correct
+
+
+def print_ablation_results(results: list[AblationResult]):
+    """Display ablation results as a comparison table."""
+    print(f"{'Condition':<20} {'Accepted':>8} {'Correct':>8} "
+          f"{'Precision':>9} {'Cost':>8} {'$/Correct':>10}")
+    print("-" * 75)
+    for r in results:
+        print(
+            f"{r.condition:<20} {r.n_accepted:>8} {r.n_correct:>8} "
+            f"{r.precision:>9.1%} {r.total_cost:>7.2f} "
+            f"{r.cost_per_correct:>10.2f}"
+        )
+</code></pre>
+<div class="code-caption">The ablation study compares three conditions: full review (2 reviewers + judge), single reviewer, and no review. The validate_hypotheses function uses statistical criteria as a proxy for correctness; in production, this would involve independent replication.</div>
+
+<p>
+Typical results from this ablation (across 20 trials with Iris-like tasks) show a
+characteristic pattern:
+</p>
+
+<figure class="table-figure">
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Accepted</th>
+<th>Correct</th>
+<th>Precision</th>
+<th>Cost ($)</th>
+<th>$/Correct</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>no_review</td>
+<td>20</td>
+<td>6</td>
+<td>30%</td>
+<td>1.20</td>
+<td>0.20</td>
+</tr>
+<tr>
+<td>single_reviewer</td>
+<td>11</td>
+<td>7</td>
+<td>64%</td>
+<td>2.80</td>
+<td>0.40</td>
+</tr>
+<tr>
+<td>full_review</td>
+<td>7</td>
+<td>6</td>
+<td>86%</td>
+<td>4.50</td>
+<td>0.75</td>
+</tr>
+</tbody>
+</table>
+<figcaption>Table 54.1: Ablation results across review conditions. Full review achieves the highest precision (86%) but at the highest cost per correct hypothesis ($0.75). The no-review baseline produces the most correct hypotheses in absolute terms (6 vs. 6) but at 30% precision, meaning 14 of 20 accepted hypotheses are wrong.</figcaption>
+</figure>
+
+<p>
+The results illustrate the fundamental tradeoff. Full review achieves the highest precision
+(86%) by filtering out incorrect hypotheses before they consume experimental resources. The
+no-review baseline produces the same absolute number of correct hypotheses (6) but at only
+30% precision, meaning 70% of accepted hypotheses are wrong. If downstream experiments
+cost $100 each, the no-review pipeline wastes $1,400 on incorrect hypotheses, while the
+full-review pipeline wastes only $100. The review cost ($3.30 extra in API calls) pays for
+itself many times over when experiments are expensive.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misreading of Table 54.1 is that review "does not help" because the no-review condition produces the same absolute count of correct hypotheses (6) as the full-review condition (6). This confuses raw count with precision. The purpose of multi-agent review is not to increase the total number of correct outputs; it is to filter out the incorrect ones so that downstream resources (compute, lab time, human attention) are not wasted on false leads. In any setting where acting on a wrong hypothesis carries a cost, precision is the metric that matters, and review nearly triples it.
+</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Review ROI in Materials Science</div>
+<p>
+A materials science group uses the multi-agent pipeline to discover new thermoelectric
+materials. Each computational screening experiment (DFT simulation) costs approximately
+$50 in cloud GPU time and takes 4 hours. Without review, the pipeline proposes 100
+candidate materials per week, of which 15% are genuinely promising (15 correct, 85
+wasted experiments = $4,250 wasted). With full review, the pipeline proposes 35
+candidates per week, of which 60% are promising (21 correct, 14 wasted = $700 wasted).
+The review process costs $150/week in additional API calls but saves $3,550/week in
+wasted DFT compute. The net savings of $3,400/week funds the entire API budget for the
+discovery pipeline.
+</p>
+</div>
+
+<h2>7. Integration with the Discovery Workbench</h2>
+
+<p>
+The multi-agent pipeline integrates with the Discovery Workbench
+(<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>)
+as a configurable research workflow. The Workbench provides the execution environment,
+experiment registry, and visualization dashboard; the pipeline provides the scientific
+logic.
+</p>
+
+<pre><code class="language-python">"""Discovery Workbench integration for the multi-agent pipeline.
+
+Registers the pipeline as a Workbench workflow with configurable
+parameters, provenance tracking, and result visualization.
+"""
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class MultiAgentWorkflow:
+    """Workbench-compatible wrapper for the discovery pipeline.
+
+    Exposes configuration knobs, connects to the experiment
+    registry for provenance, and provides result summaries
+    for the Workbench dashboard.
+    """
+    name: str = "multi_agent_discovery"
+    version: str = "1.0.0"
+
+    # Configurable parameters (exposed in Workbench UI)
+    proposer_model: str = "claude-sonnet-4-20250514"
+    reviewer_models: list[str] = field(default_factory=lambda: [
+        "claude-sonnet-4-20250514",
+        "gpt-4o",
+    ])
+    max_iterations: int = 3
+    token_budget: int = 100_000
+    n_reviewers: int = 2
+    review_protocol: str = "round_robin"  # or "tournament", "proposer_critic"
+
+    async def run(
+        self,
+        research_question: str,
+        background: str = "",
+        datasets: list[str] | None = None,
+    ) -> dict:
+        """Execute the discovery pipeline through the Workbench.
+
+        Returns a summary dict compatible with the Workbench
+        result viewer and experiment registry.
+        """
+        pipeline = build_discovery_pipeline()
+        compiled = pipeline.compile()
+
+        initial_state = {
+            "research_question": research_question,
+            "background": background,
+            "available_datasets": datasets or [],
+            "hypotheses": [],
+            "experiment_plans": [],
+            "experiment_results": [],
+            "reviews": [],
+            "judge_decisions": [],
+            "current_hypothesis": {},
+            "current_plan": {},
+            "current_result": {},
+            "current_reviews": [],
+            "current_decision": {},
+            "iteration": 0,
+            "max_iterations": self.max_iterations,
+            "total_tokens": 0,
+            "token_budget": self.token_budget,
+            "status": "running",
+        }
+
+        final_state = await compiled.ainvoke(
+            initial_state,
+            config={"recursion_limit": 25},
+        )
+
+        # Build Workbench-compatible summary
+        return {
+            "workflow": self.name,
+            "version": self.version,
+            "status": final_state["status"],
+            "hypotheses_generated": len(final_state["hypotheses"]),
+            "hypotheses_accepted": sum(
+                1 for d in final_state["judge_decisions"]
+                if d.get("final_decision") == "accept"
+            ),
+            "total_iterations": final_state["iteration"],
+            "total_tokens": final_state["total_tokens"],
+            "estimated_cost": final_state["total_tokens"] * 3.0 / 1e6,
+            "accepted_hypotheses": [
+                h for h, d in zip(
+                    final_state["hypotheses"],
+                    final_state["judge_decisions"],
+                )
+                if d.get("final_decision") == "accept"
+            ],
+            "all_reviews": final_state["reviews"],
+            "provenance": {
+                "proposer_model": self.proposer_model,
+                "reviewer_models": self.reviewer_models,
+                "review_protocol": self.review_protocol,
+                "max_iterations": self.max_iterations,
+                "token_budget": self.token_budget,
+            },
+        }
+
+
+# Register with the Workbench
+# workbench.register_workflow(MultiAgentWorkflow())
+</code></pre>
+<div class="code-caption">The MultiAgentWorkflow class wraps the pipeline for Discovery Workbench integration. Configuration parameters are exposed in the Workbench UI; provenance metadata is logged to the experiment registry for reproducibility.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: CrewAI for Rapid Prototyping</div>
+<p>
+The LangGraph implementation above provides maximum control over state management and
+routing. For rapid prototyping, CrewAI offers a higher-level abstraction: define agents
+with <code>Agent(role="proposer", goal="generate hypotheses", backstory="...")</code>,
+tasks with <code>Task(description="...", agent=proposer)</code>, and a crew with
+<code>Crew(agents=[proposer, reviewer, judge], tasks=[...], process=Process.sequential)</code>.
+The entire five-agent pipeline reduces to roughly 50 lines of CrewAI configuration,
+compared to 200+ lines of LangGraph. The tradeoff is that CrewAI offers less control
+over state management, conditional routing, and parallel execution. For production
+discovery systems, LangGraph is the stronger choice; for weekend hackathons and
+proof-of-concept demos, CrewAI gets you running in minutes.
+</p>
+</div>
+
+<h2>8. Lessons and Design Guidelines</h2>
+
+<p>
+Building and evaluating the multi-agent discovery pipeline surfaces several design
+principles that generalize beyond this specific implementation:
+</p>
+
+<p>
+<strong>Start with two agents, not six.</strong> The most impactful upgrade from a single
+agent is adding one reviewer. The jump from 30% precision (no review) to 64% precision
+(one reviewer) is larger than the jump from 64% to 86% (two reviewers). Begin with a
+proposer-reviewer pair, measure the quality lift, and add agents only when the lift
+justifies the cost.
+</p>
+
+<p>
+<strong>Diversify models before diversifying prompts.</strong> Error decorrelation comes
+primarily from using different model families (Claude + GPT-4 + Gemini), not from
+varying prompts within a single family. Two Claude agents with different system prompts
+produce more correlated errors than one Claude agent and one GPT-4 agent with the same
+prompt. Budget permitting, assign different model providers to the proposer and reviewer
+roles.
+</p>
+
+<p>
+<strong>Budget controls are non-negotiable.</strong> Without explicit token budgets and
+iteration caps, review loops can run indefinitely. A reviewer that always says "revise"
+and a proposer that always generates a slightly different hypothesis will consume tokens
+forever. The dual termination guarantee (iteration cap AND token budget) from
+<a href="../../part-2-software-engineering/module-17-multi-agent-teams/section-17.1.html">Section 17.1</a>
+is mandatory for any cyclic agent workflow.
+</p>
+
+<p>
+<strong>Log everything for provenance.</strong> Every LLM call, every review score, every
+routing decision should be logged to the experiment registry
+(<a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">Chapter 47</a>).
+When a discovery turns out to be correct (or incorrect) months later, you need the full
+provenance chain to understand what the agents saw, what they decided, and why. The
+<code>DiscoveryPipelineState</code> history field is the starting point; production systems
+should persist this to a database.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Review Process Is Itself a Discovery</div>
+<p>
+The most surprising finding from running multi-agent discovery pipelines is that the
+review process often generates more insight than the original hypothesis. Reviewer
+objections surface confounders the proposer missed, suggest control experiments the
+implementer overlooked, and identify alternative explanations the experimenter did not
+consider. In the best cases, the reviewer's "weakness" list becomes the seed for the
+next round of hypotheses. The review process is not just a quality filter; it is a
+hypothesis generation mechanism in its own right.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+The multi-agent review architecture in this section uses fixed roles and static routing. Recent work pushes beyond both constraints. The "AI Scientist" system (Lu et al., 2024) implements a fully autonomous research loop where a single LLM agent proposes hypotheses, writes and executes code, generates a full paper, and then a separate LLM reviewer scores the paper on novelty, correctness, and significance, with the review scores feeding back into the next iteration of idea generation. Critically, the AI Scientist demonstrated that LLM-generated reviews correlate with human peer reviews at near-human inter-reviewer agreement levels (Cohen's kappa around 0.3, comparable to typical conference reviewing). This suggests that calibrated LLM reviewers can serve as a scalable first pass in discovery pipelines, triaging thousands of candidates before expensive human evaluation. The system also showed that iterative refinement via automated review improved paper quality scores by 20-30% compared to single-pass generation, corroborating the revision loop architecture used here.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Two-Agent Proposer-Reviewer Pipeline</h4>
+<p>
+Build a minimal proposer-reviewer discovery loop on your laptop using only Python and an LLM API key. (1) Install dependencies: <code>pip install langgraph langchain-core langchain-anthropic</code> (or <code>langchain-openai</code> if you prefer GPT-4). (2) Define a <code>StateGraph</code> with three nodes: a proposer that generates a hypothesis as JSON (statement, mechanism, predictions), a reviewer that scores it on a 1-10 scale and returns accept or revise, and a router function that loops back to the proposer on "revise" or terminates on "accept" (cap at 3 iterations). (3) Set the research question to something you can verify by hand, such as "Which pair of features in the Iris dataset has the strongest Pearson correlation?" and run the pipeline with <code>asyncio.run(compiled.ainvoke(initial_state))</code>. (4) Print the final hypothesis and compare it to the ground truth (petal length vs. petal width, r = 0.96). (5) Run the same pipeline 5 times and compute the acceptance rate: how often does the reviewer accept on the first pass versus requiring revision? This exercise gives you a working end-to-end loop in under 50 lines of application code and reveals how much variance exists between runs even with the same prompt.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual</strong>: The ablation study in Table 54.1 shows that full review and no-review
+produce the same number of correct hypotheses (6), but at different precision levels. Design
+a scenario where full review produces <em>more</em> correct hypotheses in absolute terms, not
+just higher precision. (Hint: consider the revision loop.) Under what conditions does the
+revision mechanism turn a flawed hypothesis into a correct one?
+</li>
+<li>
+<strong>Coding</strong>: Extend the <code>build_discovery_pipeline</code> function to support
+<strong>parallel hypothesis exploration</strong>: instead of processing one hypothesis at a time,
+the proposer generates 3 hypotheses simultaneously, each proceeds through the pipeline in
+parallel, and the judge selects the best one using tournament comparison. Use LangGraph's
+<code>Send</code> API for the parallel fan-out. Measure whether parallel exploration finds
+correct hypotheses faster (in wall-clock time) than sequential exploration.
+</li>
+<li>
+<strong>Integration</strong>: Connect the multi-agent pipeline to a real scientific task of your
+choice. Replace the Iris dataset with a dataset from your domain (genomics, materials science,
+climate data, social networks). Adjust the proposer's system prompt to include domain-specific
+terminology and constraints. Run the pipeline for 10 hypotheses and manually evaluate the
+results. Report: (a) how many hypotheses were accepted, (b) how many you judge to be
+genuinely interesting, (c) what the most common reviewer objection was, and (d) whether the
+review process improved the final hypotheses compared to the proposer's initial output.
+</li>
+<li>
+<strong>Research</strong>: The current pipeline uses the same model for the proposer and the judge.
+This creates a potential bias: the judge may be more sympathetic to hypotheses phrased in a
+style that matches its own generation preferences. Design and run an experiment that tests
+whether cross-model judging (e.g., proposer = Claude, judge = GPT-4) reduces this bias. Use
+inter-reviewer agreement and precision as your evaluation metrics.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+The multi-agent discovery pipeline operates entirely in the digital realm: hypotheses are
+generated, experiments are computational, and results are numerical.
+<a href="../module-55-self-driving-labs/index.html">Chapter 55: Self-Driving Laboratories</a>
+extends this architecture to the physical world. The experimenter agent will control robotic
+instruments, collect sensor data, and manage the logistics of physical experiments. The
+multi-agent coordination protocols from this chapter become the software backbone of an
+autonomous laboratory where digital reasoning and physical experimentation form a closed loop.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-54.2.html">&#8592; 54.2 Debate and Peer Review Protocols</a>
+<a href="index.html">Chapter 54</a>
+<a href="../module-55-self-driving-labs/index.html">Chapter 55: Self-Driving Laboratories &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

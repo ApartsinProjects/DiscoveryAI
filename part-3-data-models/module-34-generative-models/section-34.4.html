@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 34.4: Conditional Generation and Evaluation. Classifier-free guidance, inpainting, REINFORCE for non-differentiable rewards, and evaluation metrics for molecular generators." name="description"/>
+<title>Section 34.4: Conditional Generation and Evaluation | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 34: Generative Models for Discovery</a></div>
+<h1>34.4 Conditional Generation and Evaluation</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"They gave me a reward function and told me to optimize. Three hours later I had discovered a molecule with perfect scores and zero synthetic accessibility. Goodhart sends his regards."</p>
+<cite>A REINFORCE Agent That Overfitted the Proxy</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the diffusion and flow matching foundations from
+<a href="section-34.2.html">Section 34.2</a> and the equivariant architectures from
+<a href="section-34.3.html">Section 34.3</a>. You should understand the denoising process
+and how equivariant networks generate 3D structures. Familiarity with policy gradient methods
+from reinforcement learning is helpful for the REINFORCE material but not required; we derive
+everything from the log-derivative trick. The optimization concepts connect to
+<a href="../../part-5-simulation-optimization/module-45-optimization/index.html">Chapter 45:
+Optimization for Discovery</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Unconditional generation is rarely useful for discovery. You do not want a random molecule;
+you want a molecule that binds a specific target, crosses the blood-brain barrier, and can be
+synthesized in three steps. <strong>Conditional generation</strong> steers the generative model
+toward samples with desired properties. Two mechanisms dominate: <strong>classifier-free
+guidance</strong>, which biases the diffusion process toward high-property regions during
+sampling, and <strong>REINFORCE</strong>, which fine-tunes the generator to maximize a reward
+function. Both require careful evaluation: did we actually generate good molecules, or did we
+exploit artifacts in the property predictor? This section covers conditioning, optimization,
+and the metrics that distinguish genuine discovery from Goodhart's law in action.
+</p>
+</div>
+
+<h2>1. Classifier-Free Guidance</h2>
+
+<p>
+Classifier-free guidance (Ho &amp; Salimans, 2022) is the standard method for conditioning
+diffusion models on target properties without a separate classifier. The idea: train a single
+model that can operate both conditionally (given a property label $c$) and unconditionally
+(without any label). At sampling time, extrapolate away from the unconditional prediction
+toward the conditional prediction:
+</p>
+
+$$\hat{\epsilon}_\theta(x_t, t, c) = \epsilon_\theta(x_t, t, \varnothing) + w \cdot [\epsilon_\theta(x_t, t, c) - \epsilon_\theta(x_t, t, \varnothing)]$$
+
+<p>
+where $w > 1$ is the guidance scale and $\varnothing$ denotes the null condition (the
+unconditional model). When $w = 1$, this reduces to standard conditional generation. When
+$w > 1$, the model is pushed further in the direction that the conditioning signal indicates,
+producing samples that more strongly match the condition at the cost of reduced diversity.
+</p>
+
+<p data-agent="02">
+Classifier-free guidance matters because it eliminates the need to train a separate classifier or property predictor on noisy intermediate states, which is brittle and computationally expensive. The mechanism works by jointly training conditional and unconditional pathways in a single network (randomly dropping the condition label during training), then at inference amplifying the difference between the two predictions to steer generation. Use classifier-free guidance when your target property can be represented as a label or embedding available at training time; for properties that require external black-box evaluation (docking scores, lab assays), REINFORCE (covered below) is the appropriate alternative.
+</p>
+
+<p>
+During training, the condition $c$ is randomly dropped (replaced with $\varnothing$) with
+some probability $p_{\text{uncond}}$ (typically 10 to 20%). This trains both the conditional
+and unconditional models simultaneously in a single network.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of classifier-free guidance like adjusting the seasoning in a recipe. The unconditional model is the plain, unseasoned base dish. The conditional model adds the seasoning (your target property). The guidance scale $w$ controls how aggressively you season: at $w = 1$ you follow the recipe as written, at $w = 3$ you triple the spice. Moderate seasoning enhances the dish (stronger property targeting while keeping chemical validity), but cranking the dial to $w = 20$ overwhelms everything else, producing something technically "spicy" but inedible (molecules that score well on the target metric but violate basic chemistry). The key insight the analogy captures: you are amplifying a direction, not adding something new, so over-amplification distorts rather than improves.
+</p>
+</div>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class GuidedDiffusionModel(nn.Module):
+    """Diffusion model with classifier-free guidance for molecular generation.
+
+    Trains a single noise predictor that handles both conditional and
+    unconditional generation. At inference, extrapolates toward the condition.
+    """
+    def __init__(self, denoiser: nn.Module, num_properties: int,
+                 cond_embed_dim: int = 128, p_uncond: float = 0.1):
+        super().__init__()
+        self.denoiser = denoiser
+        self.p_uncond = p_uncond
+
+        # Property conditioning embedding
+        self.cond_embed = nn.Sequential(
+            nn.Linear(num_properties, cond_embed_dim),
+            nn.SiLU(),
+            nn.Linear(cond_embed_dim, cond_embed_dim)
+        )
+        # Null embedding for unconditional generation
+        self.null_embed = nn.Parameter(torch.randn(cond_embed_dim))
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor,
+                condition: torch.Tensor = None, force_uncond: bool = False):
+        """Predict noise, optionally conditioned on target properties."""
+        batch_size = x_t.size(0)
+
+        if condition is not None and not force_uncond:
+            # During training: randomly drop condition
+            if self.training:
+                mask = torch.rand(batch_size, device=x_t.device) < self.p_uncond
+                cond_emb = self.cond_embed(condition)
+                null_emb = self.null_embed.unsqueeze(0).expand(batch_size, -1)
+                # Replace some conditions with null embedding
+                cond_emb = torch.where(mask.unsqueeze(-1), null_emb, cond_emb)
+            else:
+                cond_emb = self.cond_embed(condition)
+        else:
+            cond_emb = self.null_embed.unsqueeze(0).expand(batch_size, -1)
+
+        return self.denoiser(x_t, t, cond_emb)
+
+    @torch.no_grad()
+    def guided_sample(self, x_t: torch.Tensor, t: torch.Tensor,
+                      condition: torch.Tensor, guidance_scale: float = 3.0):
+        """Apply classifier-free guidance during sampling."""
+        # Conditional prediction
+        noise_cond = self.forward(x_t, t, condition)
+        # Unconditional prediction
+        noise_uncond = self.forward(x_t, t, force_uncond=True)
+
+        # Extrapolate: move further in the conditional direction
+        noise_guided = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+        return noise_guided</code></pre>
+<div class="code-caption">Classifier-free guidance implementation. During training, conditions are randomly dropped to train both conditional and unconditional pathways. During sampling, the guidance scale $w$ controls the strength of conditioning: higher values produce stronger property targeting at the cost of diversity.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Guidance Scale Controls the Exploration-Exploitation Trade-off</div>
+<p>
+The guidance scale $w$ maps directly to the exploration-exploitation trade-off from
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>.
+Low guidance ($w \approx 1$) produces diverse samples that broadly match the condition
+(exploration). High guidance ($w \gg 1$) produces samples that strongly match the condition
+but cluster around a few high-scoring modes (exploitation). For drug discovery, you typically
+want moderate guidance ($w = 2$ to $5$) in early lead identification (diverse candidates) and
+higher guidance ($w = 5$ to $10$) in lead optimization (focused refinement). Setting $w$ too
+high causes the model to generate out-of-distribution samples that score well on the condition
+but violate other constraints (validity, synthesizability), a manifestation of Goodhart's law
+applied to generative modeling.
+</p>
+</div>
+
+<h2>2. Inpainting and Motif Scaffolding</h2>
+
+<p>
+A particularly powerful form of conditional generation is <strong>inpainting</strong>:
+generating part of a structure while keeping another part fixed. For protein design, this
+enables <strong>motif scaffolding</strong>: given a functional motif (a binding site, a
+catalytic triad, an epitope), generate a complete protein backbone that positions the motif
+correctly and provides structural stability.
+</p>
+
+<p>
+The mechanism is elegant. During the reverse diffusion process, at each denoising step,
+replace the noisy values at the fixed positions with the correct noisy version of the ground
+truth motif at that noise level. This constrains the generation to be consistent with the
+motif while allowing the scaffold regions to be freely generated.
+</p>
+
+<pre><code class="language-python">@torch.no_grad()
+def inpainting_sample(model, motif_positions: torch.Tensor,
+                      motif_mask: torch.Tensor, shape: tuple,
+                      T: int, alpha_bars: torch.Tensor,
+                      alphas: torch.Tensor, betas: torch.Tensor,
+                      device: torch.device):
+    """Generate structures with fixed motif regions via inpainting.
+
+    Args:
+        model: trained noise predictor
+        motif_positions: ground truth positions for motif residues (N, 3)
+        motif_mask: boolean mask, True for motif residues (N,)
+        shape: output shape (N, 3)
+        T: number of diffusion steps
+    """
+    # Start from noise
+    x = torch.randn(shape, device=device)
+
+    for t_val in reversed(range(T)):
+        t = torch.full((1,), t_val, device=device, dtype=torch.long)
+        alpha_bar_t = alpha_bars[t_val]
+
+        # Standard reverse step for scaffold regions
+        noise_pred = model(x, t)
+        alpha_t = alphas[t_val]
+        beta_t = betas[t_val]
+
+        x_denoised = (1 / torch.sqrt(alpha_t)) * (
+            x - (beta_t / torch.sqrt(1 - alpha_bar_t)) * noise_pred
+        )
+
+        if t_val > 0:
+            noise = torch.randn_like(x)
+            x_denoised = x_denoised + torch.sqrt(beta_t) * noise
+
+        # Inpainting: replace motif positions with correctly noised ground truth
+        if t_val > 0:
+            motif_noise = torch.randn_like(motif_positions)
+            alpha_bar_prev = alpha_bars[t_val - 1]
+            motif_noisy = (torch.sqrt(alpha_bar_prev) * motif_positions +
+                          torch.sqrt(1 - alpha_bar_prev) * motif_noise)
+        else:
+            motif_noisy = motif_positions  # final step: use clean motif
+
+        # Blend: motif positions from ground truth, scaffold from generation
+        mask = motif_mask.unsqueeze(-1).expand_as(x)
+        x = torch.where(mask, motif_noisy, x_denoised)
+
+    return x</code></pre>
+<div class="code-caption">Diffusion inpainting for motif scaffolding. At each reverse step, motif positions are replaced with correctly-noised ground truth values, constraining the generated scaffold to be structurally compatible with the fixed functional motif.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Scaffolding a Catalytic Triad</div>
+<p>
+Consider designing a novel enzyme that positions a serine-histidine-aspartate catalytic triad
+(the active site geometry found in serine proteases) within a structurally stable protein.
+Using RFDiffusion's motif scaffolding mode, you specify the 3D coordinates of the three
+catalytic residues as fixed constraints. The model generates thousands of diverse backbone
+scaffolds, each positioning the triad with sub-angstrom accuracy relative to the target
+geometry. ProteinMPNN then designs amino acid sequences for each scaffold, and AlphaFold2
+filters for designs whose predicted structures match the generated backbone. This pipeline
+has produced experimentally validated enzymes with catalytic activity, demonstrating that
+equivariant diffusion can design functional proteins from scratch. The catalytic triad
+specification requires just 12 numbers (4 atoms times 3 coordinates per catalytic residue);
+the model fills in the remaining 200+ residues.
+</p>
+</div>
+
+<h2>3. REINFORCE for Non-Differentiable Rewards</h2>
+
+<p>
+Classifier-free guidance works when the target property can be encoded as a conditioning
+signal during training. But many discovery-relevant properties cannot: docking scores require
+running a physics-based simulation, synthetic accessibility scores involve graph-based
+heuristics, and experimental binding affinity is only available after wet-lab testing.
+For these <strong>non-differentiable reward functions</strong>, we turn to policy gradient
+methods from reinforcement learning.
+</p>
+
+<p>
+The REINFORCE algorithm (Williams, 1992) treats the generative model as a policy
+$\pi_\theta(x)$ that produces molecular samples $x$, and the property evaluator as a reward
+function $R(x)$. The objective is to maximize the expected reward:
+</p>
+
+$$J(\theta) = \mathbb{E}_{x \sim \pi_\theta}[R(x)]$$
+
+<p>
+The gradient of this objective is given by the log-derivative trick:
+</p>
+
+$$\nabla_\theta J(\theta) = \mathbb{E}_{x \sim \pi_\theta}[R(x) \cdot \nabla_\theta \log \pi_\theta(x)]$$
+
+<p>
+This gradient does not require differentiating through the reward function $R(x)$; it only
+requires evaluating $R(x)$ and computing the log-probability $\log \pi_\theta(x)$ of the
+generated sample. For autoregressive molecular generators, $\log \pi_\theta(x)$ is the sum
+of log-probabilities at each generation step. For diffusion models, it can be approximated
+via the probability flow ODE (Section 34.2).
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often assume that REINFORCE trains the generator to produce only high-reward molecules, replacing the original chemical knowledge with reward-chasing behavior. This is incorrect: REINFORCE adjusts the sampling probabilities so that high-reward regions are visited more frequently, but the pretrained model's chemical grammar remains the foundation. Without safeguards (KL penalty, entropy bonus), the distribution can collapse to a narrow mode, but the mechanism is probability reweighting, not replacement of learned chemistry. The generator never "forgets" how to make valid molecules; it shifts which valid molecules it prefers.
+</p>
+</div>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+from typing import Callable, List
+from dataclasses import dataclass
+
+
+@dataclass
+class RewardConfig:
+    """Configuration for multi-property reward function."""
+    weights: dict          # property_name -> weight
+    thresholds: dict       # property_name -> minimum acceptable value
+    baseline_ema: float    # exponential moving average decay for baseline
+
+
+class REINFORCETrainer:
+    """REINFORCE optimizer for molecular generators with non-differentiable rewards.
+
+    Fine-tunes a pretrained autoregressive molecular generator
+    to maximize a multi-property reward function.
+    """
+    def __init__(self, generator: torch.nn.Module,
+                 reward_fns: dict,  # name -> callable(smiles) -> float
+                 config: RewardConfig,
+                 lr: float = 1e-5):
+        self.generator = generator
+        self.reward_fns = reward_fns
+        self.config = config
+        self.optimizer = torch.optim.Adam(generator.parameters(), lr=lr)
+        self.baseline = 0.0  # running baseline for variance reduction
+
+    def compute_reward(self, smiles_list: List[str]) -> torch.Tensor:
+        """Compute multi-property reward for a batch of molecules."""
+        rewards = torch.zeros(len(smiles_list))
+        property_values = {}
+
+        for name, fn in self.reward_fns.items():
+            values = torch.tensor([fn(s) for s in smiles_list])
+            property_values[name] = values
+
+            # Apply threshold: zero reward if below minimum
+            threshold = self.config.thresholds.get(name, float('-inf'))
+            mask = values >= threshold
+
+            # Weighted contribution
+            weight = self.config.weights.get(name, 1.0)
+            rewards += weight * values * mask.float()
+
+        return rewards, property_values
+
+    def train_step(self, batch_size: int = 64) -> dict:
+        """One REINFORCE training step."""
+        self.generator.train()
+
+        # Generate molecules and collect log-probabilities
+        samples, log_probs = self.generator.sample_with_log_prob(batch_size)
+
+        # Decode to SMILES (generator-specific)
+        smiles_list = self.generator.decode_to_smiles(samples)
+
+        # Compute rewards (non-differentiable)
+        rewards, properties = self.compute_reward(smiles_list)
+        rewards = rewards.to(log_probs.device)
+
+        # Update baseline (variance reduction)
+        self.baseline = (self.config.baseline_ema * self.baseline +
+                        (1 - self.config.baseline_ema) * rewards.mean().item())
+
+        # REINFORCE gradient: (R - baseline) * grad log pi
+        advantage = rewards - self.baseline
+        loss = -(advantage * log_probs).mean()
+
+        # Optional: add entropy bonus to prevent mode collapse
+        entropy = -(torch.exp(log_probs) * log_probs).mean()
+        loss = loss - 0.01 * entropy
+
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
+        self.optimizer.step()
+
+        return {
+            'loss': loss.item(),
+            'mean_reward': rewards.mean().item(),
+            'baseline': self.baseline,
+            'entropy': entropy.item(),
+            'valid_frac': sum(1 for s in smiles_list if s is not None) / len(smiles_list),
+            'properties': {k: v.mean().item() for k, v in properties.items()}
+        }</code></pre>
+<div class="code-caption">REINFORCE trainer for molecular generation with multi-property rewards, baseline variance reduction, and entropy regularization. The reward function is called as a black box; no gradients flow through the property evaluators.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Reward Hacking Problem in Molecular Generation</div>
+<p>
+REINFORCE optimizes whatever reward function you give it, including the artifacts and biases
+of that function. If your docking score predictor has systematic errors for certain
+scaffolds, REINFORCE will find and exploit them. This is Goodhart's law applied to molecular
+design: "when a measure becomes a target, it ceases to be a good measure." Three defenses help.
+First, use multiple orthogonal reward components (docking score AND synthetic accessibility
+AND drug-likeness) so exploiting one requires satisfying the others. Second, include a
+KL penalty against the pretrained model to prevent the fine-tuned model from drifting too far
+from the space of valid molecules. Third, validate top candidates with independent tools: if
+your reward uses a fast docking proxy, re-score the top 100 molecules with a more expensive
+physics-based method. We implement all three safeguards in the recipe of
+<a href="section-34.5.html">Section 34.5</a>.
+</p>
+</div>
+
+<h2>4. Evaluation Metrics for Molecular Generators</h2>
+
+<p>
+How do you know if your molecular generator is any good? The evaluation landscape for
+generative models in chemistry and biology has matured into a set of standard metrics,
+organized into four categories.
+</p>
+
+<p>
+<strong>Validity</strong> measures whether generated molecules satisfy basic chemical
+rules: correct valences, no impossible bonds, parseable SMILES strings. For SMILES-based
+generators, validity rates range from 30% (early VAEs) to 99%+ (graph-based generators
+with action masking). For 3D structure generators, validity includes bond length and angle
+distributions matching reference data.
+</p>
+
+<p>
+<strong>Uniqueness</strong> measures the fraction of non-duplicate molecules among valid
+outputs. A generator that produces the same molecule 1000 times has 100% validity but 0.1%
+uniqueness. Mode collapse in GANs manifests as low uniqueness.
+</p>
+
+<p>
+<strong>Novelty</strong> measures the fraction of generated molecules not present in the
+training set. A generator that memorizes and replays training data has 100% validity and
+uniqueness but 0% novelty. High novelty is essential for discovery.
+</p>
+
+<p>
+<strong>Distribution similarity</strong> measures how closely the generated distribution
+matches a reference distribution. The Frechet ChemNet Distance (FCD; Preuer et al., 2018)
+computes the Frechet distance between the activations of a pretrained ChemNet model on
+generated and reference molecules, analogous to the FID score for images. Lower FCD indicates
+more similar distributions.
+</p>
+
+<pre><code class="language-python">from rdkit import Chem
+from rdkit.Chem import Descriptors, QED, AllChem
+from collections import Counter
+import numpy as np
+from typing import List, Dict
+
+
+class MolecularGeneratorEvaluator:
+    """Evaluate molecular generators on standard metrics.
+
+    Computes validity, uniqueness, novelty, property distributions,
+    and internal diversity for a set of generated SMILES strings.
+    """
+    def __init__(self, training_smiles: set):
+        self.training_smiles = training_smiles
+
+    def evaluate(self, generated_smiles: List[str]) -> Dict[str, float]:
+        """Compute all standard evaluation metrics."""
+        n_total = len(generated_smiles)
+
+        # Parse molecules, filtering invalid SMILES
+        valid_mols = []
+        valid_smiles = []
+        for smi in generated_smiles:
+            mol = Chem.MolFromSmiles(smi)
+            if mol is not None:
+                # Canonicalize for uniqueness checking
+                canon = Chem.MolToSmiles(mol)
+                valid_mols.append(mol)
+                valid_smiles.append(canon)
+
+        n_valid = len(valid_mols)
+        validity = n_valid / n_total if n_total > 0 else 0.0
+
+        # Uniqueness: fraction of distinct valid molecules
+        unique_smiles = set(valid_smiles)
+        uniqueness = len(unique_smiles) / n_valid if n_valid > 0 else 0.0
+
+        # Novelty: fraction not in training set
+        novel = unique_smiles - self.training_smiles
+        novelty = len(novel) / len(unique_smiles) if unique_smiles else 0.0
+
+        # Property distributions for valid molecules
+        properties = self._compute_properties(valid_mols)
+
+        # Internal diversity: average pairwise Tanimoto distance
+        diversity = self._internal_diversity(valid_mols[:1000])  # cap for speed
+
+        return {
+            'validity': validity,
+            'uniqueness': uniqueness,
+            'novelty': novelty,
+            'diversity': diversity,
+            'n_valid': n_valid,
+            'n_unique': len(unique_smiles),
+            'n_novel': len(novel),
+            **{f'mean_{k}': v for k, v in properties.items()}
+        }
+
+    def _compute_properties(self, mols: list) -> dict:
+        """Compute molecular property statistics."""
+        qed_scores = [QED.qed(m) for m in mols]
+        mw = [Descriptors.MolWt(m) for m in mols]
+        logp = [Descriptors.MolLogP(m) for m in mols]
+
+        return {
+            'QED': np.mean(qed_scores) if qed_scores else 0.0,
+            'MW': np.mean(mw) if mw else 0.0,
+            'LogP': np.mean(logp) if logp else 0.0,
+        }
+
+    def _internal_diversity(self, mols: list) -> float:
+        """Average pairwise Tanimoto distance (higher = more diverse)."""
+        if len(mols) < 2:
+            return 0.0
+        fps = [AllChem.GetMorganFingerprintAsBitVect(m, 2, 2048) for m in mols]
+        from rdkit.DataStructs import BulkTanimotoSimilarity
+        total_dist = 0.0
+        n_pairs = 0
+        for i in range(min(len(fps), 500)):  # cap pairwise comparisons
+            sims = BulkTanimotoSimilarity(fps[i], fps[i+1:])
+            total_dist += sum(1.0 - s for s in sims)
+            n_pairs += len(sims)
+        return total_dist / n_pairs if n_pairs > 0 else 0.0
+
+
+# Usage example
+evaluator = MolecularGeneratorEvaluator(training_smiles=set())
+# results = evaluator.evaluate(generated_smiles_list)
+# print(f"Validity: {results['validity']:.1%}")
+# print(f"Uniqueness: {results['uniqueness']:.1%}")
+# print(f"Novelty: {results['novelty']:.1%}")
+# print(f"Diversity: {results['diversity']:.3f}")</code></pre>
+<div class="code-caption">Molecular generator evaluator computing validity, uniqueness, novelty, internal diversity, and property distributions. Uses RDKit for SMILES parsing, property calculation, and Tanimoto fingerprint similarity.</div>
+
+<h2>5. Benchmarks: MOSES, GuacaMol, and TDC</h2>
+
+<p>
+Standardized benchmarks enable fair comparison of molecular generators. Three dominate the
+field:
+</p>
+
+<p>
+<strong>MOSES</strong> (Polykovskiy et al., 2020) provides a curated subset of ZINC with
+standardized train/test splits and a comprehensive metric suite (validity, uniqueness, novelty,
+FCD, fragment similarity, scaffold similarity). It is the most widely used benchmark for
+unconditional molecular generation.
+</p>
+
+<p>
+<strong>GuacaMol</strong> (Brown et al., 2019) focuses on goal-directed generation: given a
+target molecular property profile (e.g., high QED, LogP in range, specific scaffold), how
+well can the generator produce molecules matching the specification? This is more relevant for
+discovery than unconditional generation.
+</p>
+
+<p>
+<strong>Therapeutic Data Commons (TDC)</strong> (Huang et al., 2021) provides real-world
+drug discovery tasks including ADMET prediction, drug-target interaction, and molecular
+generation benchmarks with clinically relevant endpoints. TDC is the closest to real
+discovery workflows and connects to the domain-specific applications in
+<a href="../../part-6-scientific-domains/module-49-chemistry-materials/index.html">Chapter 49</a>.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: TDC for Standardized Molecular Generation Benchmarks</div>
+<p>
+The evaluation code above implements metrics from scratch. The
+<a href="https://tdcommons.ai/" target="_blank">Therapeutic Data Commons</a> provides
+standardized benchmark evaluation with a single function call:
+</p>
+<pre><code class="language-python">from tdc import Evaluator
+
+# Load the standard molecular generation evaluator
+evaluator = Evaluator(name='Diversity')
+diversity = evaluator(generated_smiles)
+
+evaluator = Evaluator(name='Validity')
+validity = evaluator(generated_smiles)
+
+evaluator = Evaluator(name='FCD')
+fcd_score = evaluator(generated_smiles, reference_smiles)
+
+# Or run the full MOSES benchmark suite
+from tdc import BenchmarkGroup
+group = BenchmarkGroup(name='MolGen')
+results = group.evaluate(generated_smiles)</code></pre>
+<p>
+TDC handles all the canonical SMILES normalization, train/test split management, and metric
+computation that the from-scratch implementation requires, reducing the 80-line evaluator
+above to 5 lines. It also provides leaderboards for comparing against published methods.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Beyond Proxy Metrics</div>
+<p>
+The standard metrics (validity, uniqueness, novelty, FCD) evaluate the generator in isolation.
+But the real question for discovery is: do the generated molecules succeed in downstream
+experiments? The Practical Molecular Optimization (PMO) benchmark (Gao et al., 2022) took an
+early step by evaluating generators on their ability to optimize oracle functions within a
+budget of calls. More recently, DrugAgent (Li et al., 2024) introduces an LLM-powered
+multi-agent framework that integrates molecular generation with automated literature retrieval,
+ADMET filtering, and synthesis planning into a single closed-loop system, achieving
+state-of-the-art hit rates on multi-parameter optimization tasks from TDC. SynFlowNet
+(Cretu et al., 2024) constrains the generative process itself to only propose molecules
+constructible from purchasable building blocks via known reactions, so that every generated
+candidate is synthesizable by construction rather than by post-hoc filtering. The frontier
+is converging on evaluation protocols where computational generation feeds directly into
+robotic synthesis and assay, connecting to the self-driving laboratory paradigm of
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">Chapter 55</a>.
+</p>
+</div>
+
+<h2>6. Putting It Together: The Conditional Generation Pipeline</h2>
+
+<p>
+A complete conditional generation pipeline for molecular discovery combines the components
+from this section into a coherent workflow:
+</p>
+
+<p>
+<strong>Stage 1: Pretrain.</strong> Train an unconditional or weakly conditional generative
+model on a large molecular dataset (ZINC, ChEMBL, PubChem). This gives the model broad
+chemical knowledge: valid bond patterns, common functional groups, realistic size distributions.
+</p>
+
+<p>
+<strong>Stage 2: Condition.</strong> Add conditioning signals via classifier-free guidance
+(differentiable properties) or prepare for REINFORCE fine-tuning (non-differentiable
+properties). For structure-based design, condition on the target protein pocket geometry.
+</p>
+
+<p>
+<strong>Stage 3: Generate and filter.</strong> Generate a large pool of candidates (10,000+),
+filter by validity and basic property thresholds, and deduplicate.
+</p>
+
+<p>
+<strong>Stage 4: Evaluate.</strong> Score filtered candidates with the full property prediction
+pipeline (docking, ADMET, synthesizability). Compute the standard metrics to verify the
+generator is working correctly.
+</p>
+
+<p>
+<strong>Stage 5: Iterate.</strong> Feed top-scoring candidates back as conditioning signals
+or training data for the next round. This iterative refinement converges toward the target
+property region while maintaining diversity.
+</p>
+
+<p>
+We implement this complete pipeline in the next section.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Evaluate a SMILES Generator from Scratch</h4>
+<p>
+Build a minimal molecular generation evaluation pipeline using only RDKit and NumPy.
+(1) Install RDKit: <code>pip install rdkit-pypi numpy</code>.
+(2) Create a baseline "generator" by randomly sampling 1,000 SMILES from the ZINC250K
+dataset CSV (available from the MOSES GitHub repository); treat these as your "generated"
+molecules and hold out 500 as a reference training set.
+(3) Implement the four core metrics from this section: parse each SMILES with
+<code>Chem.MolFromSmiles()</code> to compute validity, canonicalize with
+<code>Chem.MolToSmiles()</code> and count unique strings for uniqueness, subtract the
+training set for novelty, and compute pairwise Tanimoto distances on Morgan fingerprints
+for internal diversity.
+(4) Deliberately degrade your "generator" to observe metric trade-offs: duplicate each
+molecule 5 times (watch uniqueness drop), restrict to training-set molecules only (watch
+novelty drop), and insert random character strings (watch validity drop).
+(5) Plot all four metrics across these degradation modes as a grouped bar chart with
+matplotlib, reproducing the type of evaluation table found in MOSES benchmark papers.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Explain why the guidance scale $w$ in classifier-free guidance
+can be interpreted as controlling a temperature parameter on the conditional distribution.
+What happens to the entropy of the generated distribution as $w \to \infty$? How does this
+relate to the exploitation side of the exploration-exploitation trade-off from
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>?
+</li>
+<li>
+<strong>(Coding)</strong> Implement the <code>MolecularGeneratorEvaluator</code> from this
+section and evaluate two molecular generation strategies: (a) random sampling from a
+pretrained SMILES VAE, and (b) latent space optimization of the same VAE using a QED
+predictor as the objective. Compare validity, uniqueness, novelty, and mean QED for 1000
+molecules from each strategy. Does the optimized generator sacrifice any metric to improve QED?
+</li>
+<li>
+<strong>(Analysis)</strong> The REINFORCE estimator has notoriously high variance. Implement
+REINFORCE with and without the baseline variance reduction technique from this section.
+Generate 100 batches of 64 molecules each and plot the gradient variance (estimated as the
+variance of the per-sample gradient contributions) across batches. How much does the baseline
+reduce variance? Experiment with the baseline EMA decay parameter: what value gives the best
+variance-reward trade-off?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We have all the pieces: diffusion models for generation (Section 34.2), equivariant
+architectures for 3D structures (Section 34.3), and conditioning and evaluation mechanisms
+(this section). <a href="section-34.5.html">Section 34.5: Building a Molecular Generator</a>
+assembles these into a complete, working pipeline: structure-based drug design with
+DiffSBDD-style diffusion, multi-property scoring with QED, synthetic accessibility, and a
+docking proxy, REINFORCE fine-tuning for target optimization, and integration with the
+Discovery Workbench.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-34.3.html">&#8592; 34.3 Equivariant Generation for 3D Structures</a>
+<a href="index.html">Chapter 34</a>
+<a href="section-34.5.html">34.5 Building a Molecular Generator &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

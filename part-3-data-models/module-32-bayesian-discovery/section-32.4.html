@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 32.4: Building a Bayesian Discovery Model. Complete recipe: two competing hypotheses, PyMC inference, LOO-CV comparison, expected information gain, and Discovery Workbench integration." name="description"/>
+<title>Section 32.4: Building a Bayesian Discovery Model | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 32: Bayesian Discovery and Uncertainty</a></div>
+<h1>32.4 Building a Bayesian Discovery Model</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I have two hypotheses, three priors, four diagnostics, and one dataset. Let the posterior decide."</p>
+<cite>A Model Comparison Framework With No Favorites</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section integrates everything from the chapter: the Bayesian workflow
+(<a href="section-32.1.html">Section 32.1</a>), inference methods
+(<a href="section-32.2.html">Section 32.2</a>), and model comparison tools
+(<a href="section-32.3.html">Section 32.3</a>). You should be comfortable specifying
+PyMC models, interpreting NUTS convergence diagnostics, and reading LOO-CV comparison
+tables. The scientific scenario connects to the <a href="../module-31-causal-discovery/index.html">causal
+reasoning</a> of Chapter 31 and foreshadows the
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">experiment
+design</a> methods of Chapter 46.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+This section assembles the complete Bayesian discovery pipeline. We take a realistic
+scientific scenario (competing hypotheses about enzyme kinetics), encode each hypothesis
+as a generative model, perform full posterior inference, compare the models using LOO-CV,
+compute expected information gain to guide the next experiment, and integrate the pipeline
+with the Discovery Workbench. By the end, you will have a reusable template for
+Bayesian hypothesis testing in any scientific domain.
+</p>
+</div>
+
+<h2>1. The Scientific Scenario: Enzyme Kinetics</h2>
+
+<p>
+A biochemistry lab is studying how an enzyme's reaction rate $v$ depends on substrate
+concentration $[S]$. Two competing hypotheses are on the table:
+</p>
+
+<p>
+<strong>Hypothesis 1: Michaelis-Menten kinetics.</strong> The enzyme follows the classic
+single-substrate model:
+</p>
+
+$$v = \frac{V_{\max} [S]}{K_m + [S]}$$
+
+<p>
+where $V_{\max}$ is the maximum rate and $K_m$ is the Michaelis constant (the substrate
+concentration at half-maximal rate). This model assumes a single binding site with no
+cooperativity.
+</p>
+
+<p>
+<strong>Hypothesis 2: Hill kinetics.</strong> The enzyme exhibits cooperative binding,
+described by the Hill equation:
+</p>
+
+$$v = \frac{V_{\max} [S]^n}{K_{0.5}^n + [S]^n}$$
+
+<p>
+where $n$ is the Hill coefficient. When $n > 1$, the enzyme shows positive cooperativity
+(binding of one substrate molecule makes subsequent binding easier); when $n < 1$,
+negative cooperativity; when $n = 1$, the Hill equation reduces to Michaelis-Menten.
+Note that the Michaelis-Menten model is nested within the Hill model as a special case.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is assuming that because the Hill model <em>contains</em>
+Michaelis-Menten as a special case ($n = 1$), the more complex model will always fit
+at least as well and therefore always "win" the comparison. This confuses in-sample fit
+with predictive accuracy: LOO-CV and related criteria penalize models that waste
+flexibility on noise, so a Hill model whose extra parameter $n$ merely chases measurement
+error will score <em>worse</em> than Michaelis-Menten, not better. Complexity is only
+rewarded when it captures genuine structure in the data.
+</p>
+</div>
+
+<p>
+The lab has collected 15 measurements at different substrate concentrations. The question:
+does the data support cooperativity, or is the simpler Michaelis-Menten model sufficient?
+</p>
+
+<pre><code class="language-python">import numpy as np
+import pymc as pm
+import arviz as az
+
+# Experimental data: substrate concentrations and observed rates
+# (realistic enzyme kinetics with mild positive cooperativity)
+rng = np.random.default_rng(42)
+substrate_conc = np.array([
+    0.1, 0.2, 0.5, 1.0, 2.0, 3.0, 5.0, 7.0,
+    10.0, 15.0, 20.0, 30.0, 50.0, 75.0, 100.0
+])
+
+# True parameters: Hill kinetics with n=1.4 (mild cooperativity)
+true_vmax = 120.0   # nmol/min
+true_k05 = 8.0      # uM
+true_n = 1.4         # Hill coefficient
+true_sigma = 5.0     # measurement noise (nmol/min)
+
+# Generate observed rates
+true_rate = true_vmax * substrate_conc**true_n / (true_k05**true_n + substrate_conc**true_n)
+observed_rate = true_rate + rng.normal(0, true_sigma, len(substrate_conc))
+observed_rate = np.maximum(observed_rate, 0.1)  # rates must be positive
+</code></pre>
+<div class="code-caption">Listing 32.18: Simulated enzyme kinetics data with mild positive cooperativity (Hill coefficient n=1.4). The 15 measurements span three orders of magnitude in substrate concentration, a realistic experimental design for kinetic characterization.</div>
+
+<h2>2. Encoding Hypotheses as PyMC Models</h2>
+
+<p>
+Each hypothesis becomes a complete generative model with explicit priors informed by
+biochemical domain knowledge. The priors encode what a biochemist knows before looking
+at this particular dataset: $V_{\max}$ is positive and typically in the range
+1-1000 nmol/min for enzymes of this class; $K_m$ and $K_{0.5}$ are positive and typically
+0.1-100 $\mu$M; the Hill coefficient is positive and rarely exceeds 4 in naturally
+occurring enzymes.
+</p>
+
+<pre><code class="language-python">def build_michaelis_menten(substrate, rates):
+    """Hypothesis 1: Standard Michaelis-Menten kinetics.
+
+    v = V_max * [S] / (K_m + [S])
+    """
+    with pm.Model() as mm_model:
+        # Priors informed by biochemical domain knowledge
+        log_vmax = pm.Normal("log_vmax", mu=np.log(100), sigma=1.5)
+        log_km = pm.Normal("log_km", mu=np.log(10), sigma=1.5)
+        sigma = pm.HalfNormal("sigma", sigma=20)
+
+        # Transform to natural scale
+        vmax = pm.math.exp(log_vmax)
+        km = pm.math.exp(log_km)
+
+        # Michaelis-Menten rate equation
+        mu = vmax * substrate / (km + substrate)
+
+        # Likelihood: normal measurement noise
+        pm.Normal("obs", mu=mu, sigma=sigma, observed=rates)
+
+    return mm_model
+
+def build_hill(substrate, rates):
+    """Hypothesis 2: Hill kinetics with cooperativity.
+
+    v = V_max * [S]^n / (K_0.5^n + [S]^n)
+    """
+    with pm.Model() as hill_model:
+        # Same Vmax and K priors as Michaelis-Menten
+        log_vmax = pm.Normal("log_vmax", mu=np.log(100), sigma=1.5)
+        log_k05 = pm.Normal("log_k05", mu=np.log(10), sigma=1.5)
+
+        # Hill coefficient prior: centered on 1 (no cooperativity),
+        # weakly allowing values from ~0.3 to ~4
+        n_hill = pm.TruncatedNormal("n_hill", mu=1.0, sigma=0.8, lower=0.1, upper=5.0)
+
+        sigma = pm.HalfNormal("sigma", sigma=20)
+
+        # Transform to natural scale
+        vmax = pm.math.exp(log_vmax)
+        k05 = pm.math.exp(log_k05)
+
+        # Hill rate equation
+        mu = vmax * substrate**n_hill / (k05**n_hill + substrate**n_hill)
+
+        # Likelihood
+        pm.Normal("obs", mu=mu, sigma=sigma, observed=rates)
+
+    return hill_model
+
+mm_model = build_michaelis_menten(substrate_conc, observed_rate)
+hill_model = build_hill(substrate_conc, observed_rate)
+</code></pre>
+<div class="code-caption">Listing 32.19: Two competing enzyme kinetics models encoded as PyMC generative models. Log-transformed priors on rate constants ensure positivity while allowing exploration across orders of magnitude. The Hill coefficient prior is centered on 1 (the Michaelis-Menten special case), providing a fair comparison.</div>
+
+<h2>3. Prior Predictive Checks</h2>
+
+<p>
+Before fitting either model, we verify that the priors generate scientifically plausible
+reaction rates. This catches prior miscalibration before it contaminates the posterior.
+</p>
+
+<p data-agent="02">
+A prior predictive check works by sampling parameter values from your chosen priors and
+then pushing those samples forward through the model's likelihood to generate simulated
+data, all <em>without</em> conditioning on any observations. It matters because priors
+that look reasonable in parameter space can produce absurd predictions in data space (for
+example, reaction rates of a million nmol/min from a seemingly mild log-normal prior on
+$V_{\max}$). The mechanism is straightforward: draw $\theta \sim p(\theta)$, compute
+$y_{\text{sim}} \sim p(y \mid \theta)$, and check whether the distribution of
+$y_{\text{sim}}$ covers the range of values you would consider physically possible. Use
+prior predictive checks whenever you specify a new model; switch to sensitivity analysis
+or prior elicitation from domain experts when the prior predictive distribution is too
+wide or too narrow despite reasonable-looking parameter priors.
+</p>
+
+<pre><code class="language-python"># Prior predictive checks for both models
+with mm_model:
+    mm_prior = pm.sample_prior_predictive(samples=500, random_seed=42)
+
+with hill_model:
+    hill_prior = pm.sample_prior_predictive(samples=500, random_seed=42)
+
+# Check: do the prior predictive samples span a reasonable range?
+mm_prior_obs = mm_prior.prior_predictive["obs"].values.flatten()
+hill_prior_obs = hill_prior.prior_predictive["obs"].values.flatten()
+
+print("Michaelis-Menten prior predictive range:")
+print(f"  2.5th percentile: {np.percentile(mm_prior_obs, 2.5):.1f}")
+print(f"  97.5th percentile: {np.percentile(mm_prior_obs, 97.5):.1f}")
+print(f"  Fraction negative: {(mm_prior_obs < 0).mean():.3f}")
+
+print("\nHill prior predictive range:")
+print(f"  2.5th percentile: {np.percentile(hill_prior_obs, 2.5):.1f}")
+print(f"  97.5th percentile: {np.percentile(hill_prior_obs, 97.5):.1f}")
+print(f"  Fraction negative: {(hill_prior_obs < 0).mean():.3f}")
+</code></pre>
+<div class="code-caption">Listing 32.20: Prior predictive checks for both enzyme kinetics models. If the prior predictive range includes reaction rates of millions of nmol/min or large fractions of negative rates, the priors need tightening before fitting.</div>
+
+<h2>4. Posterior Inference With Full Diagnostics</h2>
+
+<p>
+We fit both models with NUTS and run the complete convergence diagnostic suite from
+<a href="section-32.2.html">Section 32.2</a>. For a model comparison to be trustworthy,
+<em>both</em> models must have converged; comparing a well-fit model to a poorly-fit one
+is meaningless.
+</p>
+
+<pre><code class="language-python">def fit_and_diagnose(model, model_name, draws=3000, tune=1500):
+    """Fit a model with NUTS and return trace with full diagnostics."""
+    with model:
+        trace = pm.sample(
+            draws=draws, tune=tune, chains=4,
+            target_accept=0.95,
+            random_seed=42,
+        )
+        # Posterior predictive for model comparison
+        pm.sample_posterior_predictive(trace, extend_inferencedata=True)
+
+    # Convergence diagnostics
+    rhat_max = max(
+        float(az.rhat(trace)[v].max()) for v in az.rhat(trace).data_vars
+    )
+    ess_min = min(
+        float(az.ess(trace, method="bulk")[v].min())
+        for v in az.ess(trace, method="bulk").data_vars
+    )
+    divs = int(trace.sample_stats["diverging"].sum().values)
+
+    print(f"\n{'='*50}")
+    print(f"Model: {model_name}")
+    print(f"  R-hat max: {rhat_max:.4f} {'PASS' if rhat_max < 1.01 else 'FAIL'}")
+    print(f"  ESS bulk min: {ess_min:.0f} {'PASS' if ess_min > 400 else 'FAIL'}")
+    print(f"  Divergences: {divs} {'PASS' if divs == 0 else 'FAIL'}")
+    print(f"{'='*50}")
+
+    return trace
+
+mm_trace = fit_and_diagnose(mm_model, "Michaelis-Menten")
+hill_trace = fit_and_diagnose(hill_model, "Hill Kinetics")
+
+# Posterior summaries
+print("\nMichaelis-Menten posterior:")
+print(az.summary(mm_trace, var_names=["log_vmax", "log_km", "sigma"], hdi_prob=0.94))
+
+print("\nHill posterior:")
+print(az.summary(hill_trace, var_names=["log_vmax", "log_k05", "n_hill", "sigma"],
+                 hdi_prob=0.94))
+</code></pre>
+<div class="code-caption">Listing 32.21: Fitting both models with full convergence diagnostics. The fit_and_diagnose function ensures that R-hat, ESS, and divergence checks all pass before proceeding to model comparison. Both models must pass for the comparison to be valid.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Hill Coefficient Posterior Is the Scientific Answer</div>
+<p>
+The posterior distribution of <code>n_hill</code> directly answers the scientific question.
+If the 94% HDI for $n$ excludes 1.0, there is strong evidence for cooperativity. If it
+includes 1.0, the data is compatible with simple Michaelis-Menten kinetics. Unlike a
+frequentist test that produces a binary "significant/not significant" verdict, the
+posterior tells you the full range of plausible Hill coefficients and their relative
+probabilities. A posterior centered at $n = 1.3$ with HDI $[0.9, 1.7]$ says something
+very different from a posterior centered at $n = 2.5$ with HDI $[2.0, 3.1]$, even if
+both "reject" $n = 1$.
+</p>
+</div>
+
+<h2>5. Model Comparison With LOO-CV</h2>
+
+<p>
+With both posteriors in hand and convergence verified, we compare the models' predictive
+accuracy using LOO-CV. The comparison answers: which model better predicts held-out
+enzyme kinetics measurements?
+</p>
+
+<pre><code class="language-python"># LOO-CV model comparison
+comparison = az.compare(
+    {"Michaelis-Menten": mm_trace, "Hill": hill_trace},
+    ic="loo",
+)
+print("\nLOO-CV Model Comparison:")
+print(comparison)
+
+# Detailed pointwise diagnostics
+loo_mm = az.loo(mm_trace, pointwise=True)
+loo_hill = az.loo(hill_trace, pointwise=True)
+
+print(f"\nMichaelis-Menten: {(loo_mm.pareto_k > 0.7).sum()} problematic observations")
+print(f"Hill: {(loo_hill.pareto_k > 0.7).sum()} problematic observations")
+
+# Pointwise elpd difference: where does Hill predict better?
+elpd_diff = loo_hill.loo_i.values - loo_mm.loo_i.values
+print(f"\nPointwise elpd difference (Hill - MM):")
+print(f"  Mean: {elpd_diff.mean():.3f}")
+print(f"  Observations where Hill is better: {(elpd_diff > 0).sum()}/{len(elpd_diff)}")
+
+# Which substrate concentrations favor Hill?
+better_at = substrate_conc[elpd_diff > 0]
+print(f"  Substrate concentrations where Hill wins: {better_at}")
+</code></pre>
+<div class="code-caption">Listing 32.22: LOO-CV model comparison with pointwise diagnostics. The pointwise elpd difference reveals which observations drive the preference for one model over the other, providing scientific insight about where cooperativity matters.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Interpreting the Comparison Table</div>
+<p>
+The <code>az.compare</code> output includes several columns that require careful
+interpretation. The <code>elpd_loo</code> column gives each model's estimated predictive
+accuracy (higher is better). The <code>d_loo</code> column gives the difference from the
+best model. The <code>se</code> column gives the standard error of the elpd estimate, and
+<code>dse</code> gives the standard error of the difference. A rule of thumb: if
+<code>|d_loo| < 2 * dse</code>, the models are indistinguishable by predictive accuracy.
+The <code>weight</code> column gives pseudo-BMA or stacking weights for model averaging.
+In our enzyme kinetics example, if the Hill model wins with <code>d_loo = 5.2</code> and
+<code>dse = 2.1</code> (ratio of 2.5), the evidence for cooperativity is moderate but not
+overwhelming; collecting a few more data points near $K_{0.5}$ would sharpen the
+distinction.
+</p>
+</div>
+
+<h2>6. Expected Information Gain for the Next Experiment</h2>
+
+<p>
+The comparison reveals which model currently predicts better, but the lab wants to know:
+<em>where should we measure next</em> to most efficiently distinguish between the two
+hypotheses? Expected Information Gain (EIG) quantifies how much a new measurement at
+substrate concentration $s^*$ would reduce our uncertainty about which model is correct.
+</p>
+
+<p>
+The EIG at a candidate design point $s^*$ is the expected KL divergence between the
+updated and current model posteriors:
+</p>
+
+$$\text{EIG}(s^*) = \mathbb{E}_{y^* \mid s^*} \left[ \text{KL}\left( p(\mathcal{M} \mid \mathcal{D}, y^*, s^*) \| p(\mathcal{M} \mid \mathcal{D}) \right) \right]$$
+
+<p>
+We approximate this by forward-simulating measurements from both models and computing how
+each simulated outcome would shift the model comparison:
+</p>
+
+<pre><code class="language-python">def expected_information_gain(
+    mm_trace, hill_trace, candidate_concentrations, n_simulations=200
+):
+    """Compute expected information gain for each candidate concentration.
+
+    Simulates new observations from each model's posterior predictive
+    and measures how much the LOO-CV ranking would shift.
+
+    Parameters
+    ----------
+    mm_trace, hill_trace : az.InferenceData
+        Fitted traces for both models.
+    candidate_concentrations : np.ndarray
+        Substrate concentrations to evaluate.
+    n_simulations : int
+        Number of forward simulations per candidate.
+
+    Returns
+    -------
+    eig : np.ndarray
+        Expected information gain at each candidate concentration.
+    """
+    # Current model weights from LOO-CV
+    current_comparison = az.compare(
+        {"MM": mm_trace, "Hill": hill_trace}, ic="loo"
+    )
+    current_weights = current_comparison["weight"].values
+
+    # Extract posterior samples for forward simulation
+    mm_vmax = np.exp(mm_trace.posterior["log_vmax"].values.flatten())
+    mm_km = np.exp(mm_trace.posterior["log_km"].values.flatten())
+    mm_sigma = mm_trace.posterior["sigma"].values.flatten()
+
+    hill_vmax = np.exp(hill_trace.posterior["log_vmax"].values.flatten())
+    hill_k05 = np.exp(hill_trace.posterior["log_k05"].values.flatten())
+    hill_n = hill_trace.posterior["n_hill"].values.flatten()
+    hill_sigma = hill_trace.posterior["sigma"].values.flatten()
+
+    rng = np.random.default_rng(42)
+    eig = np.zeros(len(candidate_concentrations))
+
+    for i, s_star in enumerate(candidate_concentrations):
+        kl_divergences = []
+
+        for _ in range(n_simulations):
+            # Draw parameters from each posterior
+            idx = rng.integers(len(mm_vmax))
+
+            # Simulate observation under MM
+            mm_pred = mm_vmax[idx] * s_star / (mm_km[idx] + s_star)
+            y_mm = mm_pred + rng.normal(0, mm_sigma[idx])
+
+            # Simulate observation under Hill
+            hill_pred = (hill_vmax[idx] * s_star**hill_n[idx]
+                        / (hill_k05[idx]**hill_n[idx] + s_star**hill_n[idx]))
+            y_hill = hill_pred + rng.normal(0, hill_sigma[idx])
+
+            # Compute log-likelihood ratio at the simulated points
+            ll_mm_under_mm = -0.5 * ((y_mm - mm_pred) / mm_sigma[idx])**2
+            ll_hill_under_mm = -0.5 * ((y_mm - hill_pred) / hill_sigma[idx])**2
+
+            # Information gain approximation: absolute difference in log-likelihoods
+            kl_divergences.append(abs(ll_mm_under_mm - ll_hill_under_mm))
+
+        eig[i] = np.mean(kl_divergences)
+
+    return eig
+
+# Evaluate EIG across the concentration range
+candidates = np.logspace(-1, 2, 50)  # 0.1 to 100 uM
+eig = expected_information_gain(mm_trace, hill_trace, candidates)
+
+# Find the optimal next experiment
+best_idx = np.argmax(eig)
+print(f"\nOptimal next measurement: [S] = {candidates[best_idx]:.2f} uM")
+print(f"Expected information gain: {eig[best_idx]:.4f}")
+print(f"This is where MM and Hill predictions diverge most.")
+</code></pre>
+<div class="code-caption">Listing 32.23: Expected information gain computation for optimal experiment design. The EIG peaks at substrate concentrations where the Michaelis-Menten and Hill models make the most different predictions, typically near the inflection point of the Hill curve where cooperativity has its strongest signature.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of Expected Information Gain like choosing where to shine a flashlight in a dark
+room to tell apart two suspects. If both suspects are standing in the same corner, shining
+the light there tells you nothing new: you see a figure either way. If they are both near
+the far wall, same problem. The flashlight is most useful aimed at the one spot where the
+suspects would be standing in <em>different</em> places, because only there does the beam
+distinguish one from the other. In enzyme kinetics, "shining the flashlight" means
+measuring at a substrate concentration, and the two suspects are the Michaelis-Menten and
+Hill models. EIG peaks at concentrations where the two models' predicted rates diverge
+most, just as the flashlight is most informative where the suspects' positions differ.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Information Gain Concentrates Near the Inflection</div>
+<p>
+The EIG is highest at substrate concentrations near $K_{0.5}$, the half-maximal point.
+This makes scientific sense: at very low concentrations, both models predict nearly linear
+kinetics; at very high concentrations, both models predict saturation at $V_{\max}$. The
+models disagree most strongly in the transition region, where the Hill equation's
+sigmoidal character (controlled by $n$) departs most from the Michaelis-Menten hyperbola.
+A Bayesian experimentalist would concentrate measurements near this point, rather than
+spacing them uniformly across the concentration range. This connects directly to the
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Bayesian
+optimal design</a> methods of Chapter 46.
+</p>
+</div>
+
+<h2>7. The Complete Discovery Pipeline</h2>
+
+<p>
+The following function integrates all components into a single reusable pipeline that takes
+competing hypotheses, data, and candidate experiments and returns the full Bayesian analysis:
+</p>
+
+<pre><code class="language-python">class BayesianDiscoveryPipeline:
+    """End-to-end Bayesian hypothesis comparison and experiment design.
+
+    Integrates the Bayesian workflow (Section 32.1), NUTS inference
+    (Section 32.2), LOO-CV comparison (Section 32.3), and EIG-based
+    experiment design into a single reusable component.
+    """
+
+    def __init__(self, model_builders, model_names, data):
+        """
+        Parameters
+        ----------
+        model_builders : list of callable
+            Functions that build PyMC models given data.
+        model_names : list of str
+            Human-readable names for each model.
+        data : dict
+            Data to pass to each model builder.
+        """
+        self.model_builders = model_builders
+        self.model_names = model_names
+        self.data = data
+        self.models = {}
+        self.traces = {}
+        self.comparison = None
+
+    def fit_all(self, draws=3000, tune=1500, target_accept=0.95):
+        """Fit all models with NUTS and verify convergence."""
+        for name, builder in zip(self.model_names, self.model_builders):
+            model = builder(**self.data)
+            with model:
+                trace = pm.sample(
+                    draws=draws, tune=tune, chains=4,
+                    target_accept=target_accept, random_seed=42,
+                )
+                pm.sample_posterior_predictive(trace, extend_inferencedata=True)
+
+            self.models[name] = model
+            self.traces[name] = trace
+
+            # Verify convergence
+            rhat_max = max(
+                float(az.rhat(trace)[v].max())
+                for v in az.rhat(trace).data_vars
+            )
+            if rhat_max > 1.01:
+                print(f"WARNING: {name} has R-hat = {rhat_max:.4f}. "
+                      f"Do not trust this posterior.")
+
+        return self
+
+    def compare(self, ic="loo"):
+        """Compare all fitted models using LOO-CV or WAIC."""
+        self.comparison = az.compare(self.traces, ic=ic)
+        return self.comparison
+
+    def report(self):
+        """Generate a human-readable discovery report."""
+        if self.comparison is None:
+            self.compare()
+
+        best_model = self.comparison.index[0]
+        elpd_diff = self.comparison["d_loo"].values[1]
+        dse = self.comparison["dse"].values[1]
+        ratio = abs(elpd_diff / dse) if dse > 0 else float("inf")
+
+        report_lines = [
+            "=" * 60,
+            "BAYESIAN DISCOVERY REPORT",
+            "=" * 60,
+            f"Models compared: {', '.join(self.model_names)}",
+            f"Best model: {best_model}",
+            f"elpd difference: {elpd_diff:.2f} (SE: {dse:.2f})",
+            f"Strength of evidence: {ratio:.1f} SE",
+        ]
+
+        if ratio < 2:
+            report_lines.append("Verdict: Models are INDISTINGUISHABLE. "
+                              "Collect more data or accept the simpler model.")
+        elif ratio < 5:
+            report_lines.append("Verdict: MODERATE evidence for the preferred model. "
+                              "Consider targeted experiments.")
+        else:
+            report_lines.append("Verdict: STRONG evidence for the preferred model.")
+
+        report_lines.append("=" * 60)
+        return "\n".join(report_lines)
+
+# Usage: the enzyme kinetics discovery pipeline
+pipeline = BayesianDiscoveryPipeline(
+    model_builders=[
+        lambda substrate, rates: build_michaelis_menten(substrate, rates),
+        lambda substrate, rates: build_hill(substrate, rates),
+    ],
+    model_names=["Michaelis-Menten", "Hill"],
+    data={"substrate": substrate_conc, "rates": observed_rate},
+)
+pipeline.fit_all()
+print(pipeline.report())
+</code></pre>
+<div class="code-caption">Listing 32.24: The complete BayesianDiscoveryPipeline class. Encapsulates model specification, inference, convergence checking, model comparison, and report generation into a reusable component suitable for integration with the Discovery Workbench.</div>
+
+<h2>8. Integration With the Discovery Workbench</h2>
+
+<p>
+The <code>BayesianDiscoveryPipeline</code> class is designed for direct integration with
+the Discovery Workbench introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.
+The pipeline's <code>fit_all()</code>, <code>compare()</code>, and <code>report()</code>
+methods map to the Workbench's experiment-run-analyze cycle. The EIG computation from
+Listing 32.23 plugs into the Workbench's experiment design module, enabling a fully
+automated discovery loop:
+</p>
+
+<ol>
+<li><strong>Specify</strong>: define competing hypotheses as model builders.</li>
+<li><strong>Fit</strong>: run posterior inference on available data.</li>
+<li><strong>Compare</strong>: rank models by predictive accuracy.</li>
+<li><strong>Design</strong>: compute EIG to select the next experiment.</li>
+<li><strong>Acquire</strong>: collect new data at the optimal design point.</li>
+<li><strong>Repeat</strong>: return to step 2 with the expanded dataset.</li>
+</ol>
+
+<p>
+This iterative loop is the Bayesian embodiment of the discovery cycle described in
+<a href="../../part-1-foundations/module-02-scientific-discovery/index.html">Chapter 2</a>.
+Each iteration either increases confidence in the leading hypothesis or reveals that the
+current models are inadequate, triggering model revision (a new model builder added to
+the pipeline). The loop terminates when the EVPI drops below the cost of the next experiment
+(<a href="section-32.3.html">Section 32.3</a>), indicating that additional data would
+not change the scientific conclusion.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Simulation-Based Inference Meets Experiment Design (2024)</div>
+<p>
+Computing EIG exactly requires nested Monte Carlo estimation, which scales poorly to
+high-dimensional design spaces. Ivanova et al. (2024, "Data-Efficient Autoregressive
+Bandits for Sequential Experimental Design," <em>ICML 2024</em>) introduced
+DAD-AR, an autoregressive policy that selects entire batches of experiments in a single
+forward pass, cutting the computational cost of sequential Bayesian design by orders of
+magnitude compared to per-point amortization. Their method trains a transformer-based
+policy on simulated experimental rollouts, producing near-optimal designs without
+rerunning MCMC at each candidate. The approach integrates naturally with simulation-based
+inference frameworks such as <code>sbi</code> and <code>pyro.contrib.oed</code>,
+enabling real-time optimal design even for scientific models whose likelihoods are
+intractable. Combined with the
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">self-driving
+laboratory</a> architectures of Chapter 55, these methods bring fully autonomous
+Bayesian experimentation closer to routine practice.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+The enzyme kinetics scenario in this section is not hypothetical. The debate between
+Michaelis-Menten and cooperative binding has consumed biochemists for over a century.
+Leonor Michaelis and Maud Menten published their kinetic model in 1913, and Archibald
+Hill had proposed his equation for oxygen binding to hemoglobin just three years earlier
+in 1910. Over a hundred years later, distinguishing between these models from noisy data
+remains a genuine challenge, and Bayesian methods provide the most principled approach to
+resolving it. The posterior does not care about the age of the hypotheses; it cares about
+the data.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Bambi for Formula-Based Bayesian Models</div>
+<p>
+For models that can be expressed as regression formulas (which covers many scientific
+applications), the <a href="https://bambinos.github.io/bambi/">Bambi</a> library provides
+an R-style formula interface on top of PyMC. A hierarchical regression that takes 30
+lines of PyMC code reduces to <code>bmb.Model("y ~ 1 + x + (1|group)", data)</code> in
+Bambi, with automatic prior selection, NUTS sampling, and ArviZ integration. Bambi does
+not support custom nonlinear models like Hill kinetics, so PyMC remains necessary for
+mechanistic models. For standard regression, ANOVA, and generalized linear models,
+Bambi reduces the code from 30+ lines to 3, with sensible defaults for priors.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Compare Two Dose-Response Models on Your Own Data</h4>
+<p>
+Apply the Bayesian discovery pipeline from this section to a simple dose-response
+comparison using only NumPy, PyMC, and ArviZ.
+</p>
+<ol>
+<li>Generate a synthetic dataset of 20 observations: pick 20 evenly log-spaced
+"dose" values from 0.01 to 100, then simulate responses using a four-parameter
+log-logistic model ($y = d + (a - d) / (1 + (x / c)^b)$) with parameters of your
+choice, adding Gaussian noise with $\sigma = 0.5$.</li>
+<li>Build two competing PyMC models: (A) a two-parameter sigmoid
+($y = 1 / (1 + e^{-k(x - x_0)})$) and (B) the full four-parameter log-logistic.
+Use weakly informative priors (e.g., <code>pm.Normal(mu=0, sigma=5)</code> for
+location parameters, <code>pm.HalfNormal(sigma=5)</code> for scale).</li>
+<li>Run prior predictive checks for both models. Verify that the 95% prior predictive
+interval covers the range of your simulated data without spanning absurd values
+(responses above 1000 or below -1000 signal a prior problem).</li>
+<li>Sample both posteriors with <code>pm.sample(draws=2000, tune=1000, chains=4)</code>.
+Confirm convergence: all R-hat values below 1.01, bulk ESS above 400, zero
+divergences.</li>
+<li>Run <code>az.compare({"Sigmoid": trace_a, "LogLogistic": trace_b}, ic="loo")</code>
+and interpret the output. Record which model wins, the <code>d_loo</code> and
+<code>dse</code> values, and whether the ratio exceeds 2. Try regenerating your
+data with different noise levels ($\sigma = 0.1$ and $\sigma = 2.0$) and observe
+how the comparison changes.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>Conceptual:</strong> The Hill model contains Michaelis-Menten as a special case ($n = 1$). Why is LOO-CV preferred over Bayes factors for comparing nested models? What happens to the Bayes factor when the prior on $n$ is diffuse?</li>
+<li><strong>Coding:</strong> Extend the <code>BayesianDiscoveryPipeline</code> to support a third hypothesis: substrate inhibition kinetics ($v = V_{\max} [S] / (K_m + [S] + [S]^2 / K_i)$). Fit all three models and run the LOO-CV comparison. Does adding the substrate inhibition model change the ranking between Michaelis-Menten and Hill?</li>
+<li><strong>Analysis:</strong> Run the EIG computation from Listing 32.23 and select the top-3 optimal concentrations for the next batch of experiments. Simulate collecting 3 new data points at those concentrations (using the true Hill parameters), add them to the dataset, refit both models, and recompute the LOO-CV comparison. How much does the evidence for the Hill model change? Repeat for 3 data points at random concentrations and compare the efficiency.</li>
+</ol>
+</section>
+
+<section class="bibliography">
+<h2>Section Bibliography</h2>
+<div class="bib-category">
+<div class="bib-card">
+<a href="https://doi.org/10.1021/bi00731a028" target="_blank">Michaelis, L. &amp; Menten, M. L. (1913). Die Kinetik der Invertinwirkung. <em>Biochemische Zeitschrift</em>, 49, 333-369.</a>
+<p>The original paper establishing Michaelis-Menten kinetics, one of the most cited equations in biochemistry.</p>
+</div>
+<div class="bib-card">
+<a href="https://doi.org/10.1113/jphysiol.1910.sp001386" target="_blank">Hill, A. V. (1910). The possible effects of the aggregation of the molecules of haemoglobin on its dissociation curves. <em>Journal of Physiology</em>, 40, iv-vii.</a>
+<p>The Hill equation for cooperative binding, originally developed for hemoglobin-oxygen interactions.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2103.02438" target="_blank">Foster, A., et al. (2021). Deep Adaptive Design: Amortizing sequential Bayesian experimental design. <em>ICML 2021</em>.</a>
+<p>Neural network-based amortization of Bayesian optimal experimental design for real-time experiment selection.</p>
+</div>
+<div class="bib-card">
+<a href="https://bambinos.github.io/bambi/" target="_blank">Capretto, T., et al. (2022). Bambi: A simple interface for fitting Bayesian linear models in Python. <em>JOSS</em>, 7(72), 3630.</a>
+<p>Formula-based Bayesian modeling interface built on PyMC, simplifying common regression analyses.</p>
+</div>
+</div>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-32.3.html">&#8592; 32.3 Model Comparison and Decision Making</a>
+<a href="index.html">Chapter 32</a>
+<a href="../module-33-scientific-ml/index.html">Chapter 33: Scientific Machine Learning &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

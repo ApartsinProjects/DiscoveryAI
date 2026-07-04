@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.2: Property-Based Testing and Mutation. Hypothesis strategies, mutation testing with mutmut, and the oracle problem." name="description"/>
+<title>Section 18.2: Property-Based Testing and Mutation | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: AI-Assisted Testing and QA</a></div>
+<h1>18.2 Property-Based Testing and Mutation</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"You gave me one example and called it a test. I gave you ten thousand examples and called it a proof sketch. Neither of us was entirely wrong."</p>
+<cite>A Hypothesis Strategy With Statistical Ambitions</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the test generation strategies from
+<a href="section-18.1.html">Section 18.1</a>, particularly the distinction between
+specification-based and code-based testing. You should also be familiar with the
+property-based testing concepts introduced in
+<a href="../module-09-vibe-coding/section-9.3.html">Section 9.3: Verification and Repair</a>,
+where we first used Hypothesis to verify AI-generated code. Here we go deeper: building
+custom strategies, composing properties, and measuring test strength with mutation analysis.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Example-based tests verify specific input-output pairs: "given [3, 1, 2], sorting
+produces [1, 2, 3]." Property-based tests verify universal claims: "for all lists,
+sorting produces a permutation that is non-decreasing." The shift from examples to
+properties is the shift from checking to proving, from individual data points to
+universal laws. This is precisely the same intellectual move that
+<a href="../../part-1-foundations/module-02-scientific-discovery/index.html">Chapter 2</a>
+identifies as the core of scientific discovery: moving from observations to general
+theories. Property-based testing turns your test suite into a miniature scientific
+enterprise, and mutation testing is its peer review.
+</p>
+</div>
+
+<h2>1. The Oracle Problem</h2>
+
+<p>
+The fundamental challenge of automated testing is the <strong>oracle problem</strong>: given
+a random input to a function, how do you know what the correct output should be? For a
+sorting function, you can check that the output is sorted and is a permutation of the
+input without knowing the exact output sequence. For a machine learning model's
+prediction, there is no simple oracle. The oracle problem explains why most automated
+test generators produce tests with weak assertions ("does not crash") rather than strong
+ones ("produces the correct output").
+</p>
+
+<p>
+Properties are the solution to the oracle problem. Instead of specifying the exact output
+for each input, you specify <em>relationships</em> that must hold between the input and
+output, or between multiple calls to the function. These relationships are called
+<strong>behavioral invariants</strong>, and they fall into several families.
+</p>
+
+<p data-agent="02">
+A <strong>behavioral invariant</strong> is a predicate over a function's inputs and outputs that must evaluate to true for every valid input, not just for a handful of chosen examples. Invariants matter because they transform testing from a sampling exercise (checking a few points) into a specification exercise (asserting universal laws the implementation must obey). The mechanism is straightforward: a property-based testing framework like Hypothesis draws hundreds or thousands of random inputs from a defined domain, runs each through the function, and checks whether the invariant holds; if it ever fails, the framework shrinks the input to the smallest counterexample that still triggers the violation. Use behavioral invariants when you cannot write a complete oracle for every input (the common case in scientific and ML code); fall back to example-based tests only when the expected output is both known and meaningful to assert directly, such as regression snapshots or golden-file comparisons.
+</p>
+
+<pre><code class="language-python">"""
+The five families of behavioral invariants.
+Each family provides a different angle on correctness
+without requiring a complete oracle.
+"""
+from hypothesis import given, settings, assume
+from hypothesis import strategies as st
+import math
+
+
+# Family 1: ROUNDTRIP (encode then decode returns the original)
+# If f and g are inverses, then g(f(x)) == x for all valid x.
+
+@given(st.floats(min_value=0.01, max_value=1e6, allow_nan=False))
+def test_log_exp_roundtrip(x):
+    """exp(log(x)) should return x for positive values."""
+    assert math.isclose(math.exp(math.log(x)), x, rel_tol=1e-9)
+
+
+# Family 2: IDEMPOTENCE (applying twice equals applying once)
+# f(f(x)) == f(x)
+
+@given(st.lists(st.integers(), min_size=1))
+def test_sort_idempotent(xs):
+    """Sorting an already-sorted list should produce the same list."""
+    once = sorted(xs)
+    twice = sorted(once)
+    assert once == twice
+
+
+# Family 3: INVARIANT PRESERVATION (some property holds before and after)
+# P(x) implies P(f(x))
+
+@given(st.lists(st.integers()))
+def test_sort_preserves_length(xs):
+    """Sorting should not change the number of elements."""
+    assert len(sorted(xs)) == len(xs)
+
+
+@given(st.lists(st.integers()))
+def test_sort_preserves_elements(xs):
+    """Sorting should not add or remove elements."""
+    assert sorted(sorted(xs)) == sorted(xs)  # multiset equality
+
+
+# Family 4: METAMORPHIC (relating outputs of related inputs)
+# If input x becomes x', then output f(x) relates to f(x') in a known way.
+
+@given(
+    st.lists(st.integers(), min_size=1),
+    st.integers()
+)
+def test_sort_metamorphic_append(xs, new_element):
+    """Adding an element and re-sorting should insert it in order."""
+    sorted_original = sorted(xs)
+    sorted_with_new = sorted(xs + [new_element])
+    # The new sorted list should contain all original elements plus the new one
+    assert len(sorted_with_new) == len(sorted_original) + 1
+
+
+# Family 5: ORACLE COMPARISON (comparing against a reference implementation)
+# f_optimized(x) == f_reference(x) for all x
+
+def naive_normalize(values):
+    """Reference implementation: simple but obviously correct."""
+    min_v, max_v = min(values), max(values)
+    if max_v == min_v:
+        return [0.5] * len(values)
+    return [(v - min_v) / (max_v - min_v) for v in values]
+
+def fast_normalize(values):
+    """Optimized implementation under test."""
+    import numpy as np
+    arr = np.array(values, dtype=np.float64)
+    mn, mx = arr.min(), arr.max()
+    if mx == mn:
+        return [0.5] * len(values)
+    return ((arr - mn) / (mx - mn)).tolist()
+
+@given(st.lists(
+    st.floats(min_value=-1e6, max_value=1e6, allow_nan=False, allow_infinity=False),
+    min_size=2
+))
+def test_normalize_oracle_comparison(values):
+    """Optimized normalization matches naive reference."""
+    naive = naive_normalize(values)
+    fast = fast_normalize(values)
+    for n, f in zip(naive, fast):
+        assert math.isclose(n, f, rel_tol=1e-9, abs_tol=1e-12)
+</code></pre>
+<div class="code-caption">The five families of behavioral invariants: roundtrip, idempotence, invariant preservation, metamorphic relations, and oracle comparison. Each property verifies correctness without requiring exact expected outputs.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Properties Are Partial Specifications That Scale</div>
+<p>
+A single property like "sorting preserves length" does not fully specify sorting. But
+the <em>conjunction</em> of several properties (preserves length, preserves elements,
+produces non-decreasing output, is idempotent) progressively constrains the function
+until very few implementations can satisfy all of them. Each property you add eliminates
+a class of incorrect implementations. This is exactly the specification-gap closing
+strategy from <a href="../module-09-vibe-coding/section-9.1.html">Section 9.1</a>,
+but automated and exhaustive.
+</p>
+</div>
+
+<h2>2. Building Hypothesis Strategies for Scientific Data</h2>
+
+<p>
+Hypothesis generates test inputs from <strong>strategies</strong>: composable descriptions
+of the input space. Built-in strategies cover primitives (integers, floats, strings,
+booleans), containers (lists, dicts, tuples), and compositions (mapped, filtered, one-of).
+For scientific applications, you typically need custom strategies that generate
+domain-specific data: valid chemical formulas, well-formed molecular graphs, plausible
+time series, or physically meaningful parameter combinations.
+</p>
+
+<pre><code class="language-python">"""
+Custom Hypothesis strategies for scientific data types.
+"""
+from hypothesis import strategies as st
+from hypothesis.strategies import composite
+from dataclasses import dataclass
+
+
+@dataclass
+class Spectrum:
+    """A spectral measurement with wavelengths and intensities."""
+    wavelengths: list[float]  # nm, sorted ascending
+    intensities: list[float]  # arbitrary units, same length
+
+
+@composite
+def spectra(draw, min_points=2, max_points=200):
+    """Generate valid Spectrum objects with sorted wavelengths."""
+    n = draw(st.integers(min_value=min_points, max_value=max_points))
+
+    # Wavelengths: sorted, positive, in visible/near-IR range
+    wavelengths = sorted(draw(st.lists(
+        st.floats(min_value=200.0, max_value=2500.0,
+                  allow_nan=False, allow_infinity=False),
+        min_size=n, max_size=n
+    )))
+
+    # Intensities: non-negative (photon counts)
+    intensities = draw(st.lists(
+        st.floats(min_value=0.0, max_value=1e6,
+                  allow_nan=False, allow_infinity=False),
+        min_size=n, max_size=n
+    ))
+
+    return Spectrum(wavelengths=wavelengths, intensities=intensities)
+
+
+@composite
+def experiment_configs(draw):
+    """Generate plausible experiment configuration dicts."""
+    return {
+        "temperature": draw(st.floats(
+            min_value=4.0, max_value=1500.0  # Kelvin
+        )),
+        "pressure": draw(st.floats(
+            min_value=0.001, max_value=100.0  # atmospheres
+        )),
+        "concentration": draw(st.floats(
+            min_value=1e-9, max_value=1.0  # molar
+        )),
+        "duration": draw(st.floats(
+            min_value=0.1, max_value=86400.0  # seconds (up to 1 day)
+        )),
+        "replicates": draw(st.integers(
+            min_value=1, max_value=96  # standard microplate
+        )),
+    }
+
+
+# Using the custom strategies in property tests
+@given(spectrum=spectra())
+def test_spectrum_wavelengths_sorted(spectrum):
+    """Generated spectra should always have sorted wavelengths."""
+    for i in range(1, len(spectrum.wavelengths)):
+        assert spectrum.wavelengths[i] >= spectrum.wavelengths[i - 1]
+
+
+@given(spectrum=spectra(), config=experiment_configs())
+def test_normalize_preserves_spectrum_length(spectrum, config):
+    """Normalization should not change the number of data points."""
+    # Assume non-trivial spectrum (not all zeros)
+    assume(max(spectrum.intensities) > 0)
+    normalized = naive_normalize(spectrum.intensities)
+    assert len(normalized) == len(spectrum.intensities)
+</code></pre>
+<div class="code-caption">Custom Hypothesis strategies for scientific data: spectra with sorted wavelengths and experiment configurations with physically plausible parameter ranges.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Finding a Floating-Point Bug in Peak Detection</div>
+<p>
+A bioinformatics team used the <code>spectra()</code> strategy above to test their peak
+detection algorithm. Within 50 iterations, Hypothesis found a spectrum where two adjacent
+wavelength values were equal (e.g., 532.0 and 532.0), causing the derivative calculation
+to divide by zero. The team had tested with hundreds of real spectra and never seen
+duplicate wavelengths because their instrument produced distinct values at each pixel.
+Hypothesis found the edge case by generating from the full float space, not just the
+observed data space. The fix took one line (<code>assume(len(set(spectrum.wavelengths)) == len(spectrum.wavelengths))</code>
+in the strategy, plus a guard clause in the function), but without property-based
+testing, this bug would have surfaced only when a user fed in interpolated data with
+repeated grid points.
+</p>
+</div>
+
+<h2>3. Mutation Testing: Measuring Test Strength</h2>
+
+<p>
+Coverage tells you which code your tests execute. Mutation testing tells you whether
+your tests would <em>notice</em> if that code were wrong. The idea is simple: make a small
+change (a <strong>mutant</strong>) to the source code, then run your test suite. If at
+least one test fails, the mutant is <strong>killed</strong> (your tests detected the
+fault). If all tests pass, the mutant <strong>survived</strong> (your tests are blind to
+that class of fault).
+</p>
+
+<p>
+The <strong>mutation score</strong> is the fraction of mutants killed:
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that "if all my tests pass, the code is correct." Passing tests only confirm that the code behaves as expected for the specific assertions you wrote; mutation testing reveals that a test suite can execute every line of code and still fail to detect real faults because the assertions are too weak or too generic. A surviving mutant is proof that a specific class of bug could hide in your code unnoticed by the entire test suite, so passing tests are a necessary but not sufficient condition for correctness.
+</p>
+</div>
+
+$$M = \frac{|\{\text{killed mutants}\}|}{|\{\text{total mutants}\} - \{\text{equivalent mutants}\}|}$$
+
+<p>
+An <strong>equivalent mutant</strong> is one that changes the source code without
+changing the program's behavior (for example, replacing <code>x + 0</code> with
+<code>x</code>). Equivalent mutants are the bane of mutation testing because they
+inflate the denominator without representing real faults. In practice, most mutation
+testing tools accept a small rate of equivalent mutants as noise.
+</p>
+
+<h3>3.1 Mutation Operators</h3>
+
+<p>
+A mutation operator defines a class of source-code transformations. Common operators include:
+</p>
+
+<ul>
+<li><strong>Arithmetic operator replacement</strong>: <code>+</code> becomes <code>-</code>, <code>*</code> becomes <code>/</code></li>
+<li><strong>Comparison operator replacement</strong>: <code>&lt;</code> becomes <code>&lt;=</code>, <code>==</code> becomes <code>!=</code></li>
+<li><strong>Boolean operator replacement</strong>: <code>and</code> becomes <code>or</code></li>
+<li><strong>Constant replacement</strong>: <code>0</code> becomes <code>1</code>, <code>True</code> becomes <code>False</code></li>
+<li><strong>Statement deletion</strong>: removing a line entirely</li>
+<li><strong>Return value mutation</strong>: replacing <code>return x</code> with <code>return None</code></li>
+</ul>
+
+<p>
+The theoretical foundation is the <strong>competent programmer hypothesis</strong>: real
+bugs are small deviations from the correct program, so if your tests catch all small
+deviations (mutants), they will also catch most real bugs. This connects to the
+<strong>coupling effect</strong>: tests that detect simple faults also tend to detect
+complex faults that are "coupled" to them. These hypotheses, established by DeMillo,
+Lipton, and Sayward (1978) and validated empirically by Jia and Harman (2011), justify
+mutation testing as a proxy for real-world fault detection.
+</p>
+
+<pre><code class="language-python">"""
+Running mutation testing with mutmut on a Python module.
+"""
+# First, install mutmut: pip install mutmut
+
+# The function under test (spectrum.py):
+def find_peaks(
+    wavelengths: list[float],
+    intensities: list[float],
+    threshold: float = 0.1,
+    min_distance: int = 5
+) -> list[int]:
+    """Find peaks in a spectrum above a relative threshold.
+
+    Args:
+        wavelengths: Wavelength values (sorted ascending).
+        intensities: Intensity values.
+        threshold: Minimum relative height (0 to 1) above baseline.
+        min_distance: Minimum number of points between peaks.
+
+    Returns:
+        Indices of detected peaks.
+    """
+    if len(intensities) < 3:
+        return []
+
+    baseline = min(intensities)
+    max_intensity = max(intensities)
+    abs_threshold = baseline + threshold * (max_intensity - baseline)
+
+    peaks = []
+    for i in range(1, len(intensities) - 1):
+        # A peak is a local maximum above the threshold
+        if (intensities[i] > intensities[i - 1] and
+                intensities[i] > intensities[i + 1] and
+                intensities[i] >= abs_threshold):
+            # Enforce minimum distance from the last peak
+            if not peaks or (i - peaks[-1]) >= min_distance:
+                peaks.append(i)
+
+    return peaks
+</code></pre>
+<div class="code-caption">A peak detection function with multiple decision points: length guard, threshold comparison, local maximum check, and minimum distance enforcement. Each decision is a target for mutation operators.</div>
+
+<pre><code class="language-bash"># Run mutmut on the spectrum module
+mutmut run --paths-to-mutate=spectrum.py --tests-dir=tests/
+
+# View results summary
+mutmut results
+
+# Example output:
+# Legend for output:
+# -Ass = survived (test suite did not catch the mutant)
+# - Killed = killed (test suite caught the mutant)
+# - Timeout = timeout (mutant caused an infinite loop)
+#
+# Survived:   3
+# Killed:    24
+# Timeout:    1
+# Total:     28
+#
+# Mutation score: 24/27 = 88.9% (excluding timeouts)
+
+# Inspect surviving mutants
+mutmut show 5
+# --- spectrum.py
+# +++ spectrum.py (mutant 5)
+# @@ -15,7 +15,7 @@
+# -        if (intensities[i] > intensities[i - 1] and
+# +        if (intensities[i] >= intensities[i - 1] and
+#
+# This mutant changed > to >= in the local maximum check.
+# It survives because no test has a plateau (equal adjacent values)
+# where the distinction between > and >= matters.
+</code></pre>
+<div class="code-caption">Running mutmut and inspecting surviving mutants. Mutant 5 reveals that no test exercises the case where adjacent values are equal, exposing a gap in the test suite.</div>
+
+<p>
+Each surviving mutant points to a gap in the test suite. The mutant above (changing
+<code>&gt;</code> to <code>&gt;=</code> in the local maximum check) survives because no
+test includes a spectrum with a plateau. This is precisely the kind of edge case that
+property-based testing excels at finding: flat regions, equal adjacent values, monotonic
+sequences.
+</p>
+
+<h3>3.2 Killing Surviving Mutants with Property Tests</h3>
+
+<p>
+The combination of mutation testing and property-based testing is particularly powerful.
+Mutation testing identifies <em>where</em> the test suite is weak. Property-based testing
+generates inputs that exercise those weak spots. The workflow is: run mutmut, examine
+surviving mutants, write property tests targeting the uncovered behavior, and re-run
+mutmut to verify the mutants are now killed.
+</p>
+
+<pre><code class="language-python">"""
+Killing surviving mutants with targeted property tests.
+"""
+from hypothesis import given, assume
+from hypothesis import strategies as st
+
+
+# Mutant 5 survived: > changed to >= in local max check.
+# This means no test has equal adjacent values where a "peak"
+# would be incorrectly detected. Write a property test for plateaus.
+
+@given(st.lists(
+    st.floats(min_value=0.0, max_value=100.0,
+              allow_nan=False, allow_infinity=False),
+    min_size=5, max_size=50
+))
+def test_plateau_not_detected_as_peak(intensities):
+    """A flat region (constant value) should never contain a peak.
+
+    A peak requires being strictly greater than both neighbors.
+    If we make a subarray constant, no index in that subarray
+    should appear in the peak list.
+    """
+    # Create a spectrum with a flat plateau in the middle
+    n = len(intensities)
+    mid = n // 2
+    plateau_value = intensities[mid]
+    plateau_start = max(1, mid - 2)
+    plateau_end = min(n - 1, mid + 3)
+
+    # Set plateau region to a constant value
+    for i in range(plateau_start, plateau_end):
+        intensities[i] = plateau_value
+
+    wavelengths = list(range(n))  # dummy wavelengths
+    peaks = find_peaks(wavelengths, intensities, threshold=0.0)
+
+    # No peak should be in the plateau interior
+    for p in peaks:
+        if plateau_start < p < plateau_end - 1:
+            # This is interior: neighbors on both sides have the same value
+            assert intensities[p] > intensities[p - 1] or \
+                   intensities[p] > intensities[p + 1], \
+                f"Peak at index {p} is on a plateau (value={intensities[p]})"
+
+
+# Mutant 12 survived: min_distance changed from >= to >
+# This means no test has peaks exactly min_distance apart.
+
+@given(
+    st.integers(min_value=3, max_value=10),
+    st.floats(min_value=1.0, max_value=100.0,
+              allow_nan=False, allow_infinity=False)
+)
+def test_peaks_at_exact_min_distance(min_dist, peak_height):
+    """Two peaks exactly min_distance apart should both be detected."""
+    # Construct a spectrum with two peaks at exactly min_distance spacing
+    n = min_dist * 3 + 2
+    intensities = [0.0] * n
+    peak1_idx = min_dist
+    peak2_idx = peak1_idx + min_dist  # exactly min_distance apart
+
+    intensities[peak1_idx] = peak_height
+    intensities[peak2_idx] = peak_height
+
+    wavelengths = list(range(n))
+    peaks = find_peaks(
+        wavelengths, intensities,
+        threshold=0.0, min_distance=min_dist
+    )
+
+    assert peak1_idx in peaks, f"First peak at {peak1_idx} not detected"
+    assert peak2_idx in peaks, f"Second peak at {peak2_idx} not detected"
+</code></pre>
+<div class="code-caption">Targeted property tests that kill surviving mutants. Each test is designed to distinguish the correct operator from the mutated one by exercising the exact boundary condition.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Mutation Score Measures Assertion Strength, Not Coverage</div>
+<p>
+A test suite can have 100% branch coverage and a 60% mutation score. That means 40%
+of the injected faults go undetected: the tests reach the right code but do not check
+the right properties. Mutation score is a strictly stronger quality metric than coverage
+because it requires not just execution but <em>detection</em>. For scientific software
+where an undetected arithmetic error could invalidate published results, mutation score
+is the metric that matters. Aim for at least 80% mutation score on critical modules;
+scores below 70% indicate that the test suite is fundamentally incomplete.
+</p>
+</div>
+
+<h2>4. Combining Property Tests and Mutation Testing in CI</h2>
+
+<p>
+In a continuous integration pipeline, property tests and mutation tests serve
+complementary roles. Property tests run on every commit (they are fast, typically under
+a minute for 100 properties with 100 examples each). Mutation tests run nightly or on
+pull requests (they are slow, requiring one full test suite run per mutant). The
+combination provides both rapid feedback (property tests catch regressions immediately)
+and deep analysis (mutation tests verify that the test suite itself remains strong).
+</p>
+
+<pre><code class="language-python">"""
+CI configuration for combined property and mutation testing.
+This pytest conftest.py configures Hypothesis for CI environments.
+"""
+from hypothesis import settings, Phase, HealthCheck
+
+# CI profile: more examples, deterministic, no shrinking timeout
+settings.register_profile(
+    "ci",
+    max_examples=500,          # more thorough than dev (default 100)
+    derandomize=True,          # reproducible failures
+    suppress_health_check=[
+        HealthCheck.too_slow,  # allow slow strategies in CI
+    ],
+    phases=[
+        Phase.explicit,        # run explicit examples first
+        Phase.reuse,           # replay previously failing examples
+        Phase.generate,        # generate new examples
+        Phase.shrink,          # shrink failing examples to minimal form
+    ],
+    deadline=None,             # no per-example time limit
+)
+
+# Dev profile: fast feedback
+settings.register_profile(
+    "dev",
+    max_examples=20,           # fast iteration
+    derandomize=False,         # explore new inputs each run
+    deadline=2000,             # 2-second timeout per example
+)
+
+# Load profile from environment variable:
+#   HYPOTHESIS_PROFILE=ci pytest tests/
+settings.load_profile("dev")  # default to dev
+</code></pre>
+<div class="code-caption">Hypothesis profiles for development (fast, exploratory) and CI (thorough, deterministic). The CI profile runs 5x more examples and disables per-example timeouts.</div>
+
+<pre><code class="language-yaml"># .github/workflows/test.yml (excerpt)
+# Property tests on every push; mutation tests on PRs only.
+
+jobs:
+  property-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-test.txt
+      - run: HYPOTHESIS_PROFILE=ci pytest tests/ -x --tb=short
+
+  mutation-tests:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-test.txt mutmut
+      - run: |
+          mutmut run \
+            --paths-to-mutate=src/ \
+            --tests-dir=tests/ \
+            --runner="pytest tests/ -x --tb=no -q"
+      - run: |
+          # Fail the PR if mutation score drops below 80%
+          python -c "
+          import json
+          with open('.mutmut-cache/results.json') as f:
+              r = json.load(f)
+          killed = r.get('killed', 0)
+          total = r.get('total', 1) - r.get('equivalent', 0)
+          score = killed / total * 100 if total > 0 else 100
+          print(f'Mutation score: {score:.1f}%')
+          assert score >= 80, f'Mutation score {score:.1f}% below 80% threshold'
+          "
+</code></pre>
+<div class="code-caption">GitHub Actions workflow running property tests on every push and mutation tests on pull requests, with an 80% mutation score gate.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: mutmut in Three Commands</div>
+<p>
+The entire mutation testing workflow reduces to three commands:
+<code>pip install mutmut</code> (install),
+<code>mutmut run --paths-to-mutate=src/</code> (analyze), and
+<code>mutmut results</code> (report). For a 500-line module with 50 tests, mutmut
+generates approximately 150 mutants and completes in under 5 minutes on a modern laptop.
+Compare this to building a mutation testing framework from scratch (which would require
+AST manipulation, process isolation, result aggregation, and caching), roughly 2,000
+lines of code. mutmut handles all of this, plus incremental caching: re-running after
+adding one test only re-tests the surviving mutants.
+</p>
+</div>
+
+<h2>5. The Metamorphic Testing Pattern for ML Systems</h2>
+
+<p>
+Machine learning models present a particularly severe oracle problem: for a given input,
+no formula can tell you the "correct" prediction. Metamorphic testing sidesteps this
+by testing <em>relationships between predictions</em> rather than individual predictions.
+If rotating an image by 5 degrees changes a classifier's prediction from "cat" to "dog,"
+that is almost certainly a bug, even though we do not know the correct label. This
+pattern is critical for the ML-intensive systems we build in
+<a href="../../part-3-data-models/module-27-foundation-models/index.html">Part III</a> and
+the evaluation frameworks in
+<a href="../../part-7-autonomous-discovery/module-56-evaluating-discovery/index.html">Chapter 56</a>.
+</p>
+
+<pre><code class="language-python">"""
+Metamorphic testing for a scientific classifier.
+Tests relationships between predictions, not individual predictions.
+"""
+from hypothesis import given, assume
+from hypothesis import strategies as st
+import numpy as np
+
+
+def classify_material(spectrum: np.ndarray) -> str:
+    """Classify a material from its IR absorption spectrum.
+    (Placeholder for an actual ML model.)
+    """
+    # In production, this calls model.predict()
+    peak_position = np.argmax(spectrum)
+    if peak_position < len(spectrum) * 0.3:
+        return "polymer"
+    elif peak_position < len(spectrum) * 0.7:
+        return "ceramic"
+    else:
+        return "metal"
+
+
+# Metamorphic relation 1: Scaling invariance
+# Multiplying all intensities by a positive constant should not
+# change the classification (the material is the same, just measured
+# with a different detector gain).
+
+@given(
+    st.lists(
+        st.floats(min_value=0.1, max_value=1000.0,
+                  allow_nan=False, allow_infinity=False),
+        min_size=20, max_size=200
+    ),
+    st.floats(min_value=0.01, max_value=100.0,
+              allow_nan=False, allow_infinity=False)
+)
+def test_classification_scale_invariant(intensities, scale_factor):
+    """Scaling intensities should not change the classification."""
+    original = np.array(intensities)
+    scaled = original * scale_factor
+
+    assert classify_material(original) == classify_material(scaled), \
+        f"Classification changed when scaling by {scale_factor}"
+
+
+# Metamorphic relation 2: Noise robustness
+# Adding small Gaussian noise should not change the classification
+# (real measurements always have some noise).
+
+@given(
+    st.lists(
+        st.floats(min_value=1.0, max_value=1000.0,
+                  allow_nan=False, allow_infinity=False),
+        min_size=20, max_size=200
+    ),
+    st.integers(min_value=0, max_value=2**31 - 1)  # random seed
+)
+def test_classification_noise_robust(intensities, seed):
+    """Small noise should not change the classification."""
+    rng = np.random.default_rng(seed)
+    original = np.array(intensities)
+    snr = 100.0  # signal-to-noise ratio
+    noise = rng.normal(0, original.max() / snr, size=len(original))
+    noisy = original + noise
+
+    assert classify_material(original) == classify_material(noisy), \
+        f"Classification changed with SNR={snr}"
+</code></pre>
+<div class="code-caption">Metamorphic testing for an ML classifier: verifying that scaling invariance and noise robustness hold without knowing the correct label for any individual input.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of metamorphic testing like checking a kitchen scale by comparison rather than by knowing the true weight. You do not need a calibrated reference weight (an oracle). Instead, you place a bag of flour on the scale, read the number, then place a second identical bag on top. If the reading does not double, the scale is broken. You discovered the fault by reasoning about the <em>relationship</em> between two measurements (doubling the load should double the reading), not by knowing the exact weight of the flour. Each metamorphic relation is a different "double the bag" trick: scaling, rotation, adding noise, reversing order. If the system's output violates the expected relationship, you have found a bug, even though you never knew the "correct" answer for any single input.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: LLM-Generated Metamorphic Relations</div>
+<p>
+Deng et al. (2023) demonstrated that LLMs can generate effective fuzz tests for complex
+APIs by reasoning about input constraints and expected behaviors. Building on this,
+Rao et al. (2024, "MorphAgent: Automated Metamorphic Relation Generation via LLM Agents,"
+ASE 2024) introduced an agentic pipeline that takes a function signature and its
+docstring, uses chain-of-thought reasoning to hypothesize candidate metamorphic
+relations, then validates each candidate by running it against the implementation and
+filtering out relations that produce false positives. On a benchmark of 15 numerical
+and ML libraries, MorphAgent generated metamorphic relations that killed 23% more
+mutants than human-written relations, with a false-positive rate under 4%.
+For example, given a protein function predictor, the agent inferred that reordering
+atoms within each residue should not change the prediction (the chemistry is identical)
+but reversing the full sequence should (the protein is structurally different). This
+automation of metamorphic relation discovery feeds directly into the invariant discovery
+system we build in Section 18.3.
+</p>
+</div>
+
+<h2>6. From Test Metrics to Test Confidence</h2>
+
+<p>
+We now have three complementary metrics for test quality: coverage (what code executes),
+mutation score (what faults are detected), and property count (how many invariants are
+verified). None alone is sufficient. A useful composite metric is the
+<strong>mutation-adjusted confidence score</strong>:
+</p>
+
+$$\text{Confidence} = C_{\text{branch}} \times M \times \min\left(1,\; \frac{P}{P_{\text{target}}}\right)$$
+
+<p>
+where $C_{\text{branch}}$ is branch coverage (0 to 1), $M$ is mutation score (0 to 1),
+and $P / P_{\text{target}}$ is the ratio of property tests to a target count (capped at 1).
+A module with 95% branch coverage, 90% mutation score, and 8 out of 10 target properties
+gets a confidence of $0.95 \times 0.90 \times 0.80 = 0.684$. This composite score makes
+the tradeoffs visible: high coverage with low mutation score (weak assertions) pulls the
+score down just as much as low coverage with strong assertions.
+</p>
+
+<p>
+Section 18.3 builds this metric into an automated invariant discovery system that
+targets all three components simultaneously.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Property-Test and Mutate a Statistics Module</h4>
+<p>
+Build a small statistics module, write property tests for it, then use mutation testing to find gaps in your test suite. You need only Python, Hypothesis, and mutmut (all installable via pip).
+</p>
+<p>
+1. Create a file <code>stats.py</code> containing three functions: <code>mean(xs)</code>, <code>median(xs)</code>, and <code>stdev(xs)</code>, each operating on a non-empty list of floats. Implement them without using any library (pure arithmetic).
+</p>
+<p>
+2. Install Hypothesis and write at least four property tests in <code>test_stats.py</code>: (a) the mean of a list where every element is the same constant <em>c</em> equals <em>c</em> (idempotence family), (b) adding a constant <em>k</em> to every element shifts the mean by exactly <em>k</em> (metamorphic family), (c) <code>stdev</code> of a constant list is zero, and (d) <code>median</code> always returns a value between <code>min(xs)</code> and <code>max(xs)</code> (invariant preservation family). Run <code>pytest test_stats.py</code> and confirm all tests pass.
+</p>
+<p>
+3. Install mutmut (<code>pip install mutmut</code>) and run <code>mutmut run --paths-to-mutate=stats.py --tests-dir=.</code>. Record the mutation score.
+</p>
+<p>
+4. Run <code>mutmut results</code> and pick two surviving mutants. For each, use <code>mutmut show &lt;id&gt;</code> to see the diff, then write a new property test that distinguishes the correct operator from the mutated one.
+</p>
+<p>
+5. Re-run mutmut and verify that your new tests kill the previously surviving mutants. Aim for a mutation score above 85%.
+</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise">
+<p><strong>Exercise 18.2.1 (Conceptual):</strong>
+Explain the difference between a killed mutant, a surviving mutant, and an equivalent
+mutant. Give an example of each for a function that computes the arithmetic mean of a
+list of numbers. Why do equivalent mutants make mutation scores misleading if not
+accounted for?
+</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 18.2.2 (Coding):</strong>
+Write a Hypothesis strategy that generates valid molecular formulas as strings (e.g.,
+"C6H12O6", "NaCl", "H2SO4"). Use <code>@composite</code> to ensure the formula follows
+standard chemical notation (element symbol followed by optional count). Then write three
+property tests for a molecular weight calculator using your strategy.
+</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 18.2.3 (Analysis):</strong>
+Run mutmut on a Python module of your choice (at least 100 lines of code). Report the
+total mutants, killed, survived, and timeout counts. For each surviving mutant, classify
+it as either (a) a genuine test gap, (b) an equivalent mutant, or (c) a mutant in
+unreachable code. Write tests to kill the mutants in category (a) and re-run to verify
+the mutation score improves.
+</p>
+</div>
+
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-18.1.html">&larr; 18.1 Test Generation Strategies</a>
+<span class="nav-separator">|</span>
+<a href="index.html">Chapter 18 Index</a>
+<span class="nav-separator">|</span>
+<a href="section-18.3.html">18.3 Building an Invariant Discovery System &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

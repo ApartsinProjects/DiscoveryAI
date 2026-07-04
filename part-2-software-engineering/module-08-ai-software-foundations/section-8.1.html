@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.1: Code Foundation Models. Pre-training on code corpora, tokenization, fill-in-the-middle objectives, instruction tuning, and in-context learning for programming." name="description"/>
+<title>Section 8.1: Code Foundation Models | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Foundations of AI Assisted Software Engineering</a></div>
+<h1>8.1 Code Foundation Models</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I memorized every Stack Overflow answer ever posted. The hard part was learning which ones were wrong."</p>
+<cite>A Language Model Graduating from Pre-training</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section opens Chapter 8. We assume you have read
+<a href="../module-07-software-discovery/index.html">Chapter 7</a> on software as a
+discovery process and have a conceptual understanding of transformer architectures
+(attention, positional encoding, autoregressive generation). If the term "next-token
+prediction" is unfamiliar, review
+<a href="../../part-1-foundations/module-04-reasoning-for-discovery/index.html">Chapter 4</a>
+on reasoning foundations before proceeding.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Code foundation models are transformer-based language models trained on massive
+corpora of source code and natural language. They learn statistical patterns over
+token sequences that capture syntax, semantics, idioms, API usage, and even
+aspects of program behavior. Three training phases determine what a code model
+can do: <strong>pre-training</strong> builds broad competence over code and language,
+<strong>fine-tuning</strong> specializes the model for specific tasks (instruction following,
+code repair, test generation), and <strong>in-context learning</strong> adapts behavior at
+inference time through prompts and examples. Understanding these three phases is
+essential for knowing what coding AI tools can and cannot do, and for using them
+effectively in your own work.
+</p>
+</div>
+
+<h2>1. Code as a Sequence Modeling Problem</h2>
+
+<p>
+At its core, a code LLM treats source code the same way a language model treats
+English prose: as a sequence of tokens to predict. Given a prefix of tokens
+$x_1, x_2, \ldots, x_{t-1}$, the model estimates a probability distribution over
+the next token:
+</p>
+
+$$P(x_t \mid x_1, x_2, \ldots, x_{t-1}; \theta)$$
+
+<p>
+where $\theta$ denotes the model's parameters. Training maximizes the log-likelihood
+over a corpus $\mathcal{D}$ of code files:
+</p>
+
+$$\mathcal{L}(\theta) = \sum_{x \in \mathcal{D}} \sum_{t=1}^{|x|} \log P(x_t \mid x_{<t}; \theta)$$
+
+<p>
+This objective, called <strong>causal language modeling</strong> (CLM), is the same one
+used for GPT-style text models. What makes code models distinctive is not the
+objective but the training data, the tokenizer, and the additional training
+objectives layered on top.
+</p>
+
+<p>
+Code differs from natural language in ways that matter for modeling. Programs have
+strict syntax enforced by parsers and compilers; a single misplaced bracket makes a
+program fail. Identifiers carry semantic weight (a variable named <code>user_count</code>
+conveys intent that <code>x</code> does not). Indentation is syntactically significant in
+Python and semantically significant everywhere. Files within a repository depend on
+each other through imports, inheritance, and API contracts. These structural
+properties mean that a code model must learn far more rigid constraints than a
+prose model, but they also provide richer signal during training.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that code foundation models "understand" code the way a compiler or interpreter does, by parsing syntax trees and applying formal rules. In reality, these models learn statistical correlations over token sequences: they predict what token is likely to come next based on patterns seen during training, not by executing or formally verifying the code. This distinction matters because it explains why a model can produce code that looks plausible and follows common patterns yet contains subtle logical errors that a compiler or type checker would catch immediately.
+</p>
+</div>
+
+<h2>2. Tokenization for Programming Languages</h2>
+
+<p>
+Tokenization, the process of splitting raw text into the discrete units the model
+processes, presents unique challenges for code. Natural-language tokenizers like
+byte-pair encoding (BPE) are trained primarily on prose and may fragment code tokens
+in unhelpful ways. Consider the Python identifier <code>get_user_by_email</code>: a
+prose-trained BPE tokenizer might split it into <code>["get", "_user", "_by", "_email"]</code>,
+while a code-aware tokenizer preserves it as fewer, more meaningful tokens.
+</p>
+
+<p data-agent="02">
+Tokenization is the mandatory first step in any neural language model pipeline: it converts raw characters into integer IDs from a fixed vocabulary, which are then mapped to embedding vectors that the transformer processes. It matters because the choice of tokenizer directly controls how much source code fits within the model's finite context window, how much each API call costs (providers charge per token), and whether the model can treat meaningful code constructs as atomic units rather than arbitrary character fragments. Byte-pair encoding (BPE), the most common tokenization algorithm, works by starting with individual bytes or characters and iteratively merging the most frequently co-occurring pair into a new vocabulary entry, repeating until the vocabulary reaches a target size. Use a code-specialized tokenizer (such as those shipped with StarCoder or DeepSeek-Coder) whenever your workload is predominantly code; fall back to a general-purpose tokenizer (like GPT-4's cl100k_base) only when the input mixes prose and code roughly equally.
+</p>
+
+<p>
+Whitespace and indentation are critical in Python but are often collapsed by
+prose tokenizers. Code-specialized tokenizers preserve indentation tokens explicitly,
+sometimes encoding indentation depth as a single token (e.g., <code>&lt;INDENT_4&gt;</code>).
+This reduces sequence length (important because transformer cost scales quadratically
+with context in standard attention) while preserving syntactic structure.
+</p>
+
+<p>
+Let us examine how tokenization affects a simple Python function:
+</p>
+
+<pre><code class="language-python">import tiktoken
+
+# Compare tokenization of the same code snippet
+code = """def fibonacci(n: int) -> list[int]:
+    sequence = [0, 1]
+    for i in range(2, n):
+        sequence.append(sequence[-1] + sequence[-2])
+    return sequence
+"""
+
+# GPT-4 tokenizer (cl100k_base)
+enc_gpt4 = tiktoken.get_encoding("cl100k_base")
+tokens_gpt4 = enc_gpt4.encode(code)
+print(f"cl100k_base tokens: {len(tokens_gpt4)}")
+
+# Inspect individual tokens to see split points
+for tok in tokens_gpt4[:15]:
+    print(f"  {tok:6d} -> {repr(enc_gpt4.decode([tok]))}")
+</code></pre>
+<div class="code-caption">Listing 8.1: Comparing tokenization of Python code with a general-purpose BPE tokenizer, showing how identifiers and operators are split into subword units.</div>
+
+<p>
+The token count directly impacts both inference cost and the amount of code that
+fits within the model's context window. A tokenizer that uses 40 tokens for a
+function signature leaves less room in the context for surrounding code. This is
+why models designed for code (StarCoder, Code Llama, DeepSeek-Coder) train their
+tokenizers on code-heavy corpora, yielding vocabularies where common programming
+constructs (<code>def</code>, <code>return</code>, <code>import</code>, <code>self.</code>)
+are single tokens.
+</p>
+
+<h2>3. Pre-training: Learning the Language of Code</h2>
+
+<p>
+Pre-training is the phase where the model absorbs the statistical structure of code
+from a large corpus. The scale of these corpora is staggering: The Stack v2, used
+to train StarCoder2, contains over 900 billion tokens across 600+ programming
+languages. Codex was trained on 159 GB of Python code from GitHub. These datasets
+include not just code but also comments, docstrings, README files, commit messages,
+and issue discussions, providing the model with natural-language context that bridges
+intent and implementation.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Code Models Learn More Than Syntax</div>
+<p>
+Pre-training on code teaches models far more than syntax completion. By predicting
+the next token across millions of repositories, the model implicitly learns API
+usage patterns (which functions are called together), common bug patterns (what
+code typically follows a resource allocation), testing conventions (what assertions
+follow what operations), and even aspects of program semantics (variables named
+<code>total</code> tend to be sums of previously defined quantities). This emergent
+knowledge is what makes code LLMs useful for tasks far beyond autocomplete: code
+review, bug detection, refactoring, and documentation generation.
+</p>
+</div>
+
+<p>
+The standard causal language modeling objective trains the model to predict code
+left-to-right. But real programming rarely proceeds linearly. A developer might
+write a function signature, skip to the return statement, then fill in the body.
+The <strong>fill-in-the-middle</strong> (FIM) objective addresses this by training the
+model to predict a missing span given surrounding context:
+</p>
+
+$$\text{Input: } \texttt{<PRE>} \; x_{1..a} \; \texttt{<SUF>} \; x_{b..|x|} \; \texttt{<MID>}$$
+$$\text{Target: } x_{a+1..b-1}$$
+
+<p>
+The training data is transformed by selecting a random span within each file,
+moving it to the end, and training the model to reconstruct it. This costs
+essentially nothing in additional compute (the same tokens are predicted, just
+reordered) but enables the model to perform <strong>infilling</strong>: generating code
+that fits between a prefix and a suffix. Infilling is the backbone of IDE
+integration, where the model must generate code that is consistent with both
+what comes before the cursor and what comes after.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of fill-in-the-middle training like a jigsaw puzzle exercise for the model. In normal left-to-right training, the model is like a bricklayer building a wall from bottom to top, placing each brick based only on the ones below it. FIM training, by contrast, is like handing the model a wall with a gap in the middle and asking it to cut bricks that fit the opening exactly: the new pieces must match the courses below (the prefix) and also lock flush against the courses above (the suffix). This is why FIM-trained models excel at IDE autocomplete, where the cursor sits in the middle of an existing file and the generated code must be consistent with both the code above and the code below.
+</p>
+</div>
+
+<p>
+We can simulate the FIM transformation to see how training data is restructured:
+</p>
+
+<pre><code class="language-python">import random
+
+def create_fim_example(code: str,
+                       fim_rate: float = 0.5) -> dict:
+    """Transform a code string into a fill-in-the-middle training example.
+
+    With probability fim_rate, create a FIM example;
+    otherwise return a standard causal example.
+    """
+    if random.random() > fim_rate:
+        return {"type": "causal", "text": code}
+
+    # Select a random span to mask
+    lines = code.split("\n")
+    if len(lines) < 3:
+        return {"type": "causal", "text": code}
+
+    # Choose span boundaries (at line granularity)
+    start = random.randint(1, len(lines) - 2)
+    end = random.randint(start + 1, min(start + 5, len(lines) - 1))
+
+    prefix = "\n".join(lines[:start])
+    middle = "\n".join(lines[start:end])  # this is what the model predicts
+    suffix = "\n".join(lines[end:])
+
+    # PSM format: prefix, suffix, middle
+    fim_text = f"<PRE>{prefix}<SUF>{suffix}<MID>{middle}"
+    return {"type": "fim", "text": fim_text,
+            "prefix": prefix, "middle": middle, "suffix": suffix}
+
+
+# Demonstrate on a sample function
+sample = """def quicksort(arr):
+    if len(arr) <= 1:
+        return arr
+    pivot = arr[len(arr) // 2]
+    left = [x for x in arr if x < pivot]
+    middle = [x for x in arr if x == pivot]
+    right = [x for x in arr if x > pivot]
+    return quicksort(left) + middle + quicksort(right)"""
+
+random.seed(42)
+example = create_fim_example(sample, fim_rate=1.0)
+print(f"Prefix:  {example['prefix'][:60]}...")
+print(f"Middle:  {example['middle'][:60]}...")
+print(f"Suffix:  {example['suffix'][:60]}...")
+</code></pre>
+<div class="code-caption">Listing 8.2: Creating fill-in-the-middle (FIM) training examples by extracting a random span and restructuring the code into prefix-suffix-middle format.</div>
+
+<h2>4. Fine-tuning: From Completion to Conversation</h2>
+
+<p>
+A pre-trained code model is a powerful completion engine, but it has no concept of
+following instructions. If you type "write a function that sorts a list," the model
+might complete your sentence with more English prose rather than producing code. Fine-tuning
+bridges this gap by training on curated datasets of (instruction, response) pairs.
+</p>
+
+<p>
+Three fine-tuning approaches dominate code model development:
+</p>
+
+<p>
+<strong>Supervised fine-tuning (SFT)</strong> trains on human-written or human-verified
+instruction-response pairs. The dataset might contain entries like ("Write a Python
+function that computes the nth Fibonacci number using memoization", followed by a
+correct implementation). SFT teaches the model to map natural-language specifications
+to code.
+</p>
+
+<p>
+<strong>Reinforcement learning from human feedback (RLHF)</strong> goes further by training
+a reward model on human preferences between pairs of outputs, then optimizing the
+code model to produce outputs that the reward model scores highly. For code, the
+reward signal can incorporate not just human preference but also execution results:
+does the code compile? Does it pass the test suite? This combination of human
+judgment and automated verification is particularly powerful for code because
+correctness is partially verifiable.
+</p>
+
+<p>
+<strong>Direct preference optimization (DPO)</strong> simplifies RLHF by skipping the
+separate reward model. Instead, it directly optimizes the policy (the code model)
+using pairs of preferred and rejected outputs. DPO has gained traction for code
+models because it is simpler to implement while achieving comparable results.
+</p>
+
+<p>
+The loss function for SFT is straightforward: given an instruction $I$ and a
+target response $R = (r_1, r_2, \ldots, r_m)$, we minimize:
+</p>
+
+$$\mathcal{L}_{\text{SFT}}(\theta) = -\sum_{t=1}^{m} \log P(r_t \mid I, r_1, \ldots, r_{t-1}; \theta)$$
+
+<p>
+Note that the loss is computed only over the response tokens $r_t$, not the
+instruction tokens. The instruction provides context but the model is not
+penalized for its representation of the instruction.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Fine-tuning Data for Code Repair</div>
+<p>
+Consider building a fine-tuning dataset for automated bug fixing. Each example
+pairs a buggy function (instruction) with a corrected version (response):
+</p>
+<pre><code class="language-python"># Fine-tuning example for code repair
+training_example = {
+    "instruction": """Fix the bug in this function:
+```python
+def binary_search(arr, target):
+    low, high = 0, len(arr)
+    while low < high:
+        mid = (low + high) // 2
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            low = mid  # Bug: should be mid + 1
+        else:
+            high = mid
+    return -1
+```""",
+    "response": """The bug is on the line `low = mid`. When `arr[mid] < target`,
+we know `mid` is not the answer, so we should set `low = mid + 1` to avoid
+an infinite loop when `mid == low`.
+
+```python
+def binary_search(arr, target):
+    low, high = 0, len(arr)
+    while low < high:
+        mid = (low + high) // 2
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            low = mid + 1  # Fixed: advance past mid
+        else:
+            high = mid
+    return -1
+```"""
+}
+</code></pre>
+<p>
+Real fine-tuning datasets for code repair contain thousands of such pairs,
+often mined from version control history: the buggy version comes from one
+commit and the fix from the next. The model learns not just to produce correct
+code but to explain the reasoning behind the fix, which is crucial for
+developer trust.
+</p>
+</div>
+
+<h2>5. In-Context Learning: Adaptation at Inference Time</h2>
+
+<p>
+In-context learning (ICL) is the remarkable ability of large language models to
+adapt their behavior based on examples provided in the prompt, without updating
+any model parameters. For code models, ICL means you can teach the model a new
+API, a coding convention, or a transformation pattern simply by including examples
+in the context window.
+</p>
+
+<p>
+ICL operates through what researchers call <strong>task vectors</strong> in the model's
+activation space. When the model sees a pattern of (input, output) pairs in its
+context, its internal representations shift to implement the implied function.
+The number of examples needed depends on the complexity of the pattern: a simple
+name-refactoring rule might need one example, while a complex data transformation
+might need five or more.
+</p>
+
+<pre><code class="language-python">def build_icl_prompt(examples: list[tuple[str, str]],
+                     query: str) -> str:
+    """Build an in-context learning prompt for code transformation.
+
+    Args:
+        examples: List of (input_code, output_code) pairs
+            demonstrating the desired transformation
+        query: The new code to transform
+
+    Returns:
+        A formatted prompt with examples and the query
+    """
+    prompt_parts = [
+        "Transform the following code according to the pattern "
+        "shown in the examples.\n"
+    ]
+
+    for i, (inp, out) in enumerate(examples, 1):
+        prompt_parts.append(f"Example {i}:")
+        prompt_parts.append(f"Input:\n```python\n{inp}\n```")
+        prompt_parts.append(f"Output:\n```python\n{out}\n```\n")
+
+    prompt_parts.append(f"Now transform this code:")
+    prompt_parts.append(f"Input:\n```python\n{query}\n```")
+    prompt_parts.append(f"Output:")
+
+    return "\n".join(prompt_parts)
+
+
+# Example: teach the model to add type hints
+examples = [
+    ("def add(a, b):\n    return a + b",
+     "def add(a: float, b: float) -> float:\n    return a + b"),
+    ("def greet(name):\n    return f'Hello, {name}!'",
+     "def greet(name: str) -> str:\n    return f'Hello, {name}!'"),
+]
+
+query = "def multiply(x, y):\n    return x * y"
+prompt = build_icl_prompt(examples, query)
+print(prompt)
+# A code LLM would produce:
+# def multiply(x: float, y: float) -> float:
+#     return x * y
+</code></pre>
+<div class="code-caption">Listing 8.3: Constructing an in-context learning prompt that teaches a code model to add type hints by providing input-output examples, with no parameter updates required.</div>
+
+<p>
+ICL is the mechanism behind many practical code AI workflows. When you paste
+existing code into a chat with Claude or Cursor and ask for modifications, you are
+providing in-context examples. When a coding agent reads your repository's existing
+files before generating new code, it is using ICL to match your project's style and
+conventions. The quality of the context you provide directly determines the quality
+of the output, a principle we explore in depth in
+<a href="../module-11-context-engineering/index.html">Chapter 11: Context Engineering</a>.
+</p>
+
+<h2>6. Program Synthesis: From Specification to Code</h2>
+
+<p>
+Program synthesis, the automatic generation of programs from specifications, predates
+LLMs by decades. Classical approaches used deductive synthesis (deriving programs from
+logical specifications), inductive synthesis (generalizing from input-output examples),
+or constraint-based synthesis (encoding the specification as a satisfiability problem).
+LLM-based code generation represents a new paradigm: <strong>neural program synthesis</strong>,
+where the "specification" is a natural-language description and the "search" is
+implicit in the model's learned distribution over programs.
+</p>
+
+<p>
+The connection to <a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>
+is direct: program synthesis is search over the space of programs. The search space $S$
+is the set of all syntactically valid programs; the objective $f$ is correctness with
+respect to the specification; and the model's learned distribution serves as a
+heuristic that guides search toward promising regions of program space. Temperature
+sampling, beam search, and nucleus sampling are all strategies for navigating this
+space, each with different exploration-exploitation trade-offs (recall
+<a href="../../part-1-foundations/module-01-discovery-as-search/section-1.2.html">Section 1.2</a>).
+</p>
+
+<p>
+The <strong>pass@k</strong> metric quantifies how effectively a model searches program space.
+Given a problem, we sample $n$ candidate programs and check how many of the first $k$
+pass all test cases. The unbiased estimator for pass@k, given $n$ total samples and
+$c$ correct ones, is:
+</p>
+
+$$\text{pass@k} = 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}}$$
+
+<p>
+This metric reveals a key insight: generating multiple candidates and selecting
+among them is far more effective than generating a single "best" candidate. A
+model with 30% pass@1 might achieve 70% pass@10, because different samples
+explore different regions of program space. This motivates the generate-and-test
+approach that underlies most coding agents.
+</p>
+
+<pre><code class="language-python">from math import comb
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Compute the unbiased pass@k estimator.
+
+    Args:
+        n: Total number of samples generated
+        c: Number of correct samples (passing all tests)
+        k: The k in pass@k (number of attempts allowed)
+
+    Returns:
+        Probability that at least one of k samples is correct
+    """
+    if n - c < k:
+        return 1.0  # more correct than k, guaranteed pass
+    return 1.0 - comb(n - c, k) / comb(n, k)
+
+
+# Demonstrate the power of multiple samples
+print("pass@k for a model with 30% base accuracy (n=100, c=30):")
+for k in [1, 5, 10, 25, 50]:
+    score = pass_at_k(n=100, c=30, k=k)
+    print(f"  pass@{k:2d} = {score:.3f}")
+
+# Output:
+# pass@k for a model with 30% base accuracy (n=100, c=30):
+#   pass@ 1 = 0.300
+#   pass@ 5 = 0.836
+#   pass@10 = 0.976
+#   pass@25 = 1.000
+#   pass@50 = 1.000
+</code></pre>
+<div class="code-caption">Listing 8.4: Computing the pass@k metric, showing how generating multiple candidate programs dramatically increases the probability of finding a correct solution.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: HumanEval with the Evaluate Library</div>
+<p>
+The manual pass@k computation above illustrates the mathematics, but in practice you
+would use Hugging Face's <code>evaluate</code> library, which bundles the HumanEval
+metric and handles sampling, execution sandboxing, and the unbiased estimator in two
+lines:
+</p>
+<pre><code class="language-python">import evaluate
+
+code_eval = evaluate.load("code_eval")
+results = code_eval.compute(
+    references=["assert add(2,3)==5"],       # test cases
+    predictions=[["def add(a,b): return a+b",  # candidate 1
+                  "def add(a,b): return a*b"]], # candidate 2
+    k=[1, 2]
+)
+# results["pass@1"], results["pass@2"]
+</code></pre>
+<p>
+This reduces roughly 30 lines of sampling, sandboxed execution, and metric
+computation to 5 lines, while handling edge cases like infinite loops via timeouts.
+</p>
+</div>
+
+<h2>7. The Landscape of Code Foundation Models</h2>
+
+<p>
+The field has produced a rich ecosystem of code models, each with different trade-offs
+in size, training data, licensing, and capabilities. Understanding this landscape
+helps you choose the right model for your task.
+</p>
+
+<p>
+<strong>Closed-source frontier models</strong> like Claude (Anthropic), GPT-4 (OpenAI), and
+Gemini (Google) are trained on diverse mixtures of code and text. They excel at
+complex multi-step reasoning, long-context understanding, and instruction following.
+Their code capabilities emerge from general intelligence rather than code-specific
+training alone, which makes them strong at tasks requiring both code and natural-language
+understanding: explaining code, translating between languages, and reasoning about
+software architecture.
+</p>
+
+<p>
+<strong>Open-weight code-specialized models</strong> like StarCoder2, DeepSeek-Coder, and
+Code Llama are trained on code-heavy corpora with code-specific tokenizers and
+objectives. They are often smaller (1B to 33B parameters compared to frontier
+models at 100B+) but can match or exceed larger general models on pure coding
+benchmarks, particularly for languages well-represented in their training data.
+Their open weights enable fine-tuning for specific codebases or tasks, a capability
+we leverage in
+<a href="../module-16-ai-implementation/index.html">Chapter 16</a> on repository-scale
+implementation.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Verified Code Generation with Execution Feedback</div>
+<p>
+A major frontier in code foundation models is closing the loop between generation and verification. CodeChain (Le et al., 2023) introduced a technique where the model iteratively revises its own code by examining execution outputs from failed test cases, chaining together self-revision steps that progressively fix errors. Building on this direction, systems like SWE-agent (Yang et al., 2024) and OpenHands (Wang et al., 2024) embed code models inside agent loops that can browse repository files, run tests, and interpret stack traces before submitting a patch. These execution-grounded approaches represent a shift from single-shot generation toward iterative refinement with real-world feedback, achieving substantially higher solve rates on benchmarks like SWE-bench than purely prompt-based methods. Meanwhile, test-time compute scaling (extended "thinking" in models like Claude and OpenAI's o-series) applies complementary reasoning depth at inference, breaking complex problems into sub-problems and evaluating edge cases before generating code. We revisit this topic in <a href="../../part-3-data-models/module-29-reasoning-models/index.html">Chapter 29: Reasoning Models for Discovery</a>.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Compare Tokenizers on Your Own Code</h4>
+<p>
+This mini-project lets you measure how different tokenizers handle real code from your own projects, giving you intuition for context-window budgets and inference costs.
+</p>
+<p>
+<strong>1.</strong> Install the tokenizer library: <code>pip install tiktoken</code>. This provides the tokenizers used by GPT-4 and GPT-4o.
+</p>
+<p>
+<strong>2.</strong> Pick a Python file from one of your projects (ideally 50+ lines). Load it and tokenize with two encodings:
+</p>
+<pre><code class="language-python">import tiktoken, pathlib
+
+code = pathlib.Path("your_file.py").read_text()
+enc_100k = tiktoken.get_encoding("cl100k_base")   # GPT-4
+enc_200k = tiktoken.get_encoding("o200k_base")     # GPT-4o
+print(f"cl100k: {len(enc_100k.encode(code))} tokens")
+print(f"o200k:  {len(enc_200k.encode(code))} tokens")
+</code></pre>
+<p>
+<strong>3.</strong> Compute the compression ratio (characters per token) for each encoding. A higher ratio means more code fits in the context window.
+</p>
+<p>
+<strong>4.</strong> Inspect the first 20 tokens from each encoding by decoding them individually (<code>enc.decode([tok])</code>). Note where they split identifiers, operators, and whitespace differently.
+</p>
+<p>
+<strong>5.</strong> Repeat with a file in a second language (JavaScript, Rust, or SQL) and compare. Code-aware tokenizers typically show larger efficiency gains on languages with verbose syntax (Java, TypeScript) than on terse ones (Python, Ruby).
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> A code model trained only on Python is asked to generate Rust code.
+Explain why it might still produce partially correct Rust, and identify two specific
+failure modes you would expect compared to a model trained on both languages.
+</li>
+<li>
+<strong>(Coding)</strong> Using the <code>tiktoken</code> library, compare the token count for
+the same 50-line Python function using the <code>cl100k_base</code> (GPT-4) and
+<code>o200k_base</code> (GPT-4o) tokenizers. Compute the percentage difference and
+explain which tokenizer is more efficient for code and why.
+</li>
+<li>
+<strong>(Analysis)</strong> A model achieves pass@1 = 0.15 on HumanEval. You have a budget
+of 20 API calls per problem. Compute pass@20 using the formula from this section.
+Then argue whether it is more cost-effective to spend 20 calls on one model with
+15% pass@1, or 10 calls each on two different models with 10% and 20% pass@1
+respectively (assume independence).
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+Code foundation models process individual files as token sequences. But real software
+lives in repositories: interconnected webs of files, functions, classes, and dependencies.
+In <a href="section-8.2.html">Section 8.2: Repository-Level Reasoning</a>, we build the
+graph structures that let AI reason about code at the scale of an entire codebase,
+enabling tasks like cross-file refactoring, issue-to-patch search, and test-guided
+program repair.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 8 Index</a>
+<a href="index.html">Chapter 8</a>
+<a href="section-8.2.html">8.2 Repository-Level Reasoning &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

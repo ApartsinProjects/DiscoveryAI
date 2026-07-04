@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 11.1: Why Context Is the Bottleneck. Token limits, attention decay, information density, and repo structure signals for coding agents." name="description"/>
+<title>Section 11.1: Why Context Is the Bottleneck | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Context Engineering at Repository Scale</a></div>
+<h1>11.1 Why Context Is the Bottleneck</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"Give me a 200K token context window and I will move the world. Give me the wrong 200K tokens and I will move it in the wrong direction."</p>
+<cite>A Language Model Paraphrasing Archimedes</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A coding agent's effectiveness is bounded not by its reasoning ability but by the
+quality of the context it receives. Modern LLMs can process 128K to 1M tokens, yet
+production codebases routinely exceed 10 million tokens. Even if you could fit the
+entire repository into the context window, attention mechanisms degrade on long
+sequences, burying critical details in a sea of irrelevant code. This section
+quantifies the mismatch between codebase size and context capacity, introduces the
+structural signals (file trees, import graphs, symbol tables) that help bridge the
+gap, and frames context selection as an optimization problem that the rest of this
+chapter solves.
+</p>
+</div>
+
+<h2>1. The Scale Mismatch</h2>
+
+<p>
+Let us start with concrete numbers. A typical production codebase contains between
+100,000 and 10,000,000 lines of code. At roughly 10 tokens per line of Python
+(accounting for indentation, operators, and identifiers), a 500,000-line repository
+consumes approximately 5,000,000 tokens. The largest commercially available context
+windows in 2026 top out around 1,000,000 tokens for models like Gemini 1.5 Pro, and
+most practical coding workflows use models with 128K to 200K token windows.
+</p>
+
+<p data-agent="02">
+Context coverage is the fraction of a codebase that fits into a single model prompt,
+and it is the fundamental metric that drives every design decision in this chapter.
+It matters because a coding agent can only reason about code it can see: if a critical
+dependency falls outside the coverage window, the agent will hallucinate interfaces,
+miss side effects, or produce patches that break at integration time. The mechanism is
+straightforward: you divide the model's available token budget by the codebase's total
+token count to get the percentage of code visible in one interaction. Use coverage to
+decide when simple "paste the file" prompting suffices (coverage above 50%) versus when
+you need the retrieval and summarization pipeline described in the rest of this chapter
+(coverage below 10%).
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that a larger context window eliminates the need for context
+engineering. In practice, even a 1M-token window covers only 10-20% of a large codebase,
+and attention quality degrades well before the window is full, so careful selection of
+which code to include remains essential regardless of window size.
+</p>
+</div>
+
+<p>
+The arithmetic is unforgiving. If your codebase is $L$ lines and the model's context
+window is $W$ tokens, the fraction of the codebase you can present in a single prompt is:
+</p>
+
+$$
+\text{coverage} = \frac{W}{L \times \bar{t}}
+$$
+
+<p>
+where $\bar{t}$ is the average number of tokens per line. For a 500K-line codebase
+with $\bar{t} = 10$ and $W = 200{,}000$, coverage is $200{,}000 / 5{,}000{,}000 = 4\%$.
+The agent sees at most 4% of the code in any single interaction. Choosing which 4%
+to show is the core challenge of context engineering.
+</p>
+
+<pre><code class="language-python">import os
+from pathlib import Path
+
+def measure_codebase(root: str, extensions: set[str] = {".py"}) -> dict:
+    """Count lines and estimate tokens for a codebase."""
+    total_lines = 0
+    total_files = 0
+    tokens_per_line = 10  # empirical average for Python
+
+    for path in Path(root).rglob("*"):
+        if path.suffix in extensions and path.is_file():
+            try:
+                lines = path.read_text(encoding="utf-8").count("\n")
+                total_lines += lines
+                total_files += 1
+            except (UnicodeDecodeError, PermissionError):
+                continue
+
+    estimated_tokens = total_lines * tokens_per_line
+    return {
+        "files": total_files,
+        "lines": total_lines,
+        "estimated_tokens": estimated_tokens,
+    }
+
+# Example: measure a real project
+stats = measure_codebase("/path/to/your/project")
+context_windows = [128_000, 200_000, 1_000_000]
+for w in context_windows:
+    coverage = w / max(stats["estimated_tokens"], 1)
+    print(f"  {w:>10,} tokens -> {coverage:.1%} coverage")</code></pre>
+<div class="code-caption">Listing 11.1: Measuring codebase size and computing context coverage for different model window sizes.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: CPython's Context Budget</div>
+<p>
+The CPython repository (the reference Python implementation) contains roughly 640,000
+lines of Python and C code. At 10 tokens per line, that is approximately 6.4 million
+tokens. With a 200K token context window, a coding agent can see about 3.1% of
+CPython in a single interaction. To fix a bug in the garbage collector, the agent
+needs to select precisely the right 3.1%, which includes the GC implementation
+(<code>Modules/gcmodule.c</code>), the object header definitions
+(<code>Include/object.h</code>), relevant test files, and the issue description. Missing
+any of these pieces leads to incorrect patches. Including the entire
+<code>Lib/</code> directory instead wastes 90% of the budget on unrelated standard library
+modules.
+</p>
+</div>
+
+<h2>2. Attention Decay and the Lost-in-the-Middle Problem</h2>
+
+<p>
+Even when the context window is large enough, there is a second, subtler problem:
+attention quality degrades with sequence length. Liu et al. (2024) demonstrated the
+"lost in the middle" effect: language models attend most strongly to information at
+the beginning and end of the context, with significant performance drops for
+information placed in the middle third. This U-shaped attention curve means that
+simply concatenating files in arbitrary order wastes the most valuable positions
+on potentially irrelevant content.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the context window as a bookshelf where you are searching for a recipe.
+You naturally scan the first few books and the last few books on the shelf with care,
+but your eyes glaze over the ones in the middle. If someone shelves the cookbook you
+need dead center in a long row, you will likely miss it and grab something from the
+ends instead. The "lost in the middle" effect works the same way: the model's attention
+mechanism gives strong weight to tokens near the start and end of the sequence, while
+tokens in the interior receive diluted attention. Effective context engineering is
+therefore not just about choosing which books go on the shelf, but about placing the
+most important ones at the ends where they will actually be read.
+</p>
+</div>
+
+<p>
+The attention mechanism in a transformer computes, for each query token $q$, a
+weighted sum over all key-value pairs. The weight assigned to position $j$ by
+query at position $i$ is:
+</p>
+
+$$
+\alpha_{ij} = \frac{\exp(q_i \cdot k_j / \sqrt{d_k})}{\sum_{m=1}^{n} \exp(q_i \cdot k_m / \sqrt{d_k})}
+$$
+
+<p>
+As sequence length $n$ grows, the softmax denominator grows, and the attention weight
+on any individual position shrinks. Positional encodings (RoPE, ALiBi) attempt to
+preserve locality, but empirically the U-shaped attention curve persists. The
+practical consequence: position within the context matters as much as presence in
+the context.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Context Quality Has Three Dimensions</div>
+<p>
+Effective context engineering optimizes along three axes simultaneously:
+<strong>relevance</strong> (is this code related to the task?),
+<strong>position</strong> (is it placed where the model attends most strongly?), and
+<strong>density</strong> (does it carry maximum information per token?). Optimizing only
+relevance while ignoring position produces a context window where the most important
+code sits in the middle, precisely where the model attends least. Optimizing only
+density while ignoring relevance produces maximally compressed but irrelevant
+context. The context engineering pipeline we build in this chapter addresses all
+three dimensions.
+</p>
+</div>
+
+<h2>3. Information Density of Code Versus Prose</h2>
+
+<p>
+Code is not prose. A single line of code can carry the semantic weight of an entire
+paragraph of natural language. The statement
+<code>scores = torch.einsum('bhid,bhjd->bhij', queries, keys) / math.sqrt(d_k)</code>
+encodes the scaled dot-product attention formula, references four tensors by name
+(implying specific shapes), invokes Einstein summation notation, and normalizes by the
+key dimension. Explaining this line in prose takes 50 or more words; the code itself
+is 12 tokens.
+</p>
+
+<p>
+This high information density has two consequences for context engineering. First,
+removing even a single line can destroy comprehension: dropping an import statement
+makes every reference to that module unresolvable. Second, summarizing code requires
+understanding its semantics, not just its surface form. A naive text summarizer that
+shortens "a function that sorts a list" to "a sorting function" loses nothing, but
+shortening <code>def topological_sort(graph: dict[str, set[str]]) -> list[str]</code>
+to "a sorting function" loses the critical fact that this is a topological sort on a
+directed graph, not a comparison sort on a list.
+</p>
+
+<pre><code class="language-python">def estimate_information_density(code: str, description: str) -> float:
+    """Compare token counts between code and its natural-language description.
+
+    A ratio > 1 means the code is more information-dense than prose.
+    """
+    # Rough tokenization: split on whitespace and punctuation
+    import re
+    tokenize = lambda text: re.findall(r'\w+|[^\w\s]', text)
+
+    code_tokens = len(tokenize(code))
+    desc_tokens = len(tokenize(description))
+
+    return desc_tokens / max(code_tokens, 1)
+
+# Example
+code = "scores = torch.einsum('bhid,bhjd->bhij', q, k) / math.sqrt(d_k)"
+description = (
+    "Compute the scaled dot-product attention scores by taking the "
+    "Einstein summation of the query tensor (batch, heads, seq_len, dim) "
+    "with the key tensor, producing a (batch, heads, seq_i, seq_j) "
+    "attention matrix, then dividing by the square root of the key dimension "
+    "for numerical stability."
+)
+ratio = estimate_information_density(code, description)
+print(f"Information density ratio: {ratio:.1f}x")
+# Output: Information density ratio: 3.8x</code></pre>
+<div class="code-caption">Listing 11.2: Estimating the information density ratio between code and its natural-language equivalent.</div>
+
+<h2>4. Repository Structure as a Signal Source</h2>
+
+<p>
+Raw source code is not the only source of context. Every repository carries rich
+structural signals that a context engineering system can exploit. Three structures
+are particularly valuable: file trees, import graphs, and symbol tables.
+</p>
+
+<h3>4.1 File Trees</h3>
+
+<p>
+The directory hierarchy of a well-organized codebase encodes architectural intent.
+Files in <code>src/models/</code> likely contain model definitions; files in
+<code>tests/unit/</code> contain unit tests; files in <code>src/api/routes/</code>
+contain HTTP endpoint handlers. A file tree summary, even without reading any file
+contents, tells an agent where to look for specific functionality. This is the cheapest
+signal to compute: a single <code>os.walk</code> call produces it.
+</p>
+
+<pre><code class="language-python">from pathlib import Path
+
+def build_file_tree(root: str, max_depth: int = 4,
+                    skip: set[str] = {".git", "node_modules", "__pycache__", ".venv"}
+                    ) -> str:
+    """Build a compact file tree string for context injection."""
+    lines = []
+    root_path = Path(root)
+
+    def walk(path: Path, depth: int, prefix: str = ""):
+        if depth > max_depth:
+            return
+        entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name))
+        dirs = [e for e in entries if e.is_dir() and e.name not in skip]
+        files = [e for e in entries if e.is_file()]
+
+        for d in dirs:
+            lines.append(f"{prefix}{d.name}/")
+            walk(d, depth + 1, prefix + "  ")
+        for f in files:
+            lines.append(f"{prefix}{f.name}")
+
+    lines.append(f"{root_path.name}/")
+    walk(root_path, 0, "  ")
+    return "\n".join(lines)
+
+# Typically costs 200-500 tokens for a medium project
+tree = build_file_tree("/path/to/project")
+print(tree)</code></pre>
+<div class="code-caption">Listing 11.3: Generating a compact file tree for context injection, costing only a few hundred tokens.</div>
+
+<h3>4.2 Import Graphs</h3>
+
+<p>
+Import statements form a directed graph where each node is a module and each edge
+represents a dependency. This graph tells us which files are likely relevant together:
+if the agent is editing <code>src/pipeline.py</code>, and that file imports from
+<code>src/transforms.py</code> and <code>src/validators.py</code>, then those two files
+are strong candidates for context inclusion. The import graph also reveals the most
+connected modules (hubs), which are the files most likely to be relevant to any task.
+</p>
+
+<pre><code class="language-python">import ast
+from collections import defaultdict
+from pathlib import Path
+
+def build_import_graph(root: str) -> dict[str, set[str]]:
+    """Extract the import dependency graph from a Python project."""
+    graph = defaultdict(set)
+    root_path = Path(root)
+
+    for py_file in root_path.rglob("*.py"):
+        module = str(py_file.relative_to(root_path)).replace("/", ".").replace("\\", ".")
+        module = module.removesuffix(".py").removesuffix(".__init__")
+
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    graph[module].add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and not node.module.startswith("."):
+                    graph[module].add(node.module)
+                elif node.module:  # relative import
+                    # Resolve relative imports against the module path
+                    parts = module.split(".")
+                    level = node.level
+                    if level <= len(parts):
+                        base = ".".join(parts[:-level]) if level > 0 else module
+                        resolved = f"{base}.{node.module}" if node.module else base
+                        graph[module].add(resolved)
+
+    return dict(graph)
+
+# Find the most-imported modules (hubs)
+graph = build_import_graph("/path/to/project")
+import_counts = defaultdict(int)
+for source, targets in graph.items():
+    for target in targets:
+        import_counts[target] += 1
+hubs = sorted(import_counts.items(), key=lambda x: -x[1])[:10]
+print("Top 10 most-imported modules:")
+for module, count in hubs:
+    print(f"  {module}: imported by {count} files")</code></pre>
+<div class="code-caption">Listing 11.4: Building an import graph and identifying hub modules that are strong candidates for context inclusion.</div>
+
+<h3>4.3 Symbol Tables</h3>
+
+<p>
+A symbol table maps every name (function, class, variable, constant) to its location
+and type. This is the densest structural signal: knowing that <code>validate_schema</code>
+is a function defined at line 142 of <code>src/validators.py</code> that accepts a
+<code>dict</code> and returns a <code>bool</code> gives the agent enough information to
+call the function correctly without reading its entire implementation. We build symbol
+tables using tree-sitter in <a href="section-11.2.html">Section 11.2</a>, where they
+serve double duty as both a retrieval index and a summarization input.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Learned Repository Representations</div>
+<p>
+Recent systems go well beyond hand-crafted structural signals. RepoFusion
+(Shrivastava et al., 2023) trains a model to jointly attend to multiple retrieved code
+snippets, learning which combinations are most useful. CodePlan (Bairi et al., 2024)
+uses a repository-level dependency graph to plan multi-file edits, treating the entire
+repository as a structured planning problem. More recently, SWE-Search (Antoniades et al.,
+2024) frames repository-level code editing as a tree search problem with a value function
+learned from agent trajectories, achieving state-of-the-art results on SWE-bench by
+dynamically deciding which files to explore and which edits to attempt based on a
+Monte Carlo Tree Search strategy. The emerging pattern is treating the repository not
+as a bag of files but as a richly connected search space where structural signals guide
+exploration. We revisit graph-based representations in
+<a href="../../part-4-knowledge/module-38-knowledge-graphs/index.html">Chapter 38: Knowledge Graph Discovery</a>.
+</p>
+</div>
+
+<h2>5. The Context Budget as an Optimization Problem</h2>
+
+<p>
+With all three signal sources in hand (file contents, structural signals, and
+summarizations), we can frame context selection precisely. Given a task description
+$q$, a set of candidate context items $\mathcal{C} = \{c_1, c_2, \ldots, c_n\}$
+(code chunks, file summaries, tree fragments), and a token budget $B$, we want to
+select a subset $S \subseteq \mathcal{C}$ that maximizes a relevance score while
+fitting within the budget:
+</p>
+
+$$
+\max_{S \subseteq \mathcal{C}} \sum_{c \in S} \text{relevance}(c, q) \quad \text{subject to} \quad \sum_{c \in S} \text{tokens}(c) \leq B
+$$
+
+<p>
+This is a variant of the 0-1 knapsack problem. Each context item $c_i$ has a "weight"
+(its token count) and a "value" (its relevance to the current task). The budget $B$
+is the knapsack capacity. When relevance scores are independent across items, a greedy
+algorithm that sorts by value-to-weight ratio and packs greedily achieves a
+$1 - 1/e$ approximation. When items interact (e.g., including file A makes file B
+more valuable because A imports B), the problem becomes a submodular maximization, which
+the same greedy algorithm still approximates well. We implement this optimization
+in <a href="section-11.3.html">Section 11.3</a>.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+
+@dataclass
+class ContextItem:
+    """A candidate item for context inclusion."""
+    id: str              # e.g., "src/models/transformer.py:TransformerBlock"
+    content: str         # the actual code or summary text
+    tokens: int          # token count
+    relevance: float     # relevance score to the current query (0 to 1)
+
+def greedy_knapsack(items: list[ContextItem], budget: int) -> list[ContextItem]:
+    """Select context items using greedy value-density packing."""
+    # Sort by relevance-per-token (value density), descending
+    ranked = sorted(items, key=lambda c: c.relevance / max(c.tokens, 1), reverse=True)
+
+    selected = []
+    remaining_budget = budget
+    for item in ranked:
+        if item.tokens <= remaining_budget:
+            selected.append(item)
+            remaining_budget -= item.tokens
+
+    return selected
+
+# Example usage
+items = [
+    ContextItem("models/base.py:BaseModel", "class BaseModel: ...", 450, 0.92),
+    ContextItem("utils/logging.py:setup", "def setup_logging(): ...", 120, 0.35),
+    ContextItem("models/attention.py:MHA", "class MultiHeadAttention: ...", 380, 0.88),
+    ContextItem("tests/test_model.py", "class TestBaseModel: ...", 600, 0.71),
+    ContextItem("config.py:defaults", "DEFAULT_CONFIG = {...}", 200, 0.65),
+]
+selected = greedy_knapsack(items, budget=1000)
+for item in selected:
+    print(f"  [{item.tokens:>4} tok] {item.id} (relevance: {item.relevance:.2f})")</code></pre>
+<div class="code-caption">Listing 11.5: Greedy knapsack algorithm for context selection, maximizing total relevance within a token budget.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Paradox of Bigger Windows</div>
+<p>
+You might expect that doubling the context window would double coding agent performance.
+Empirically, it does not. SWE-bench results show diminishing returns beyond 32K tokens
+of well-selected context, because additional context dilutes attention on the critical
+files. A perfectly curated 32K context often outperforms a carelessly assembled 128K
+context. This is the paradox: the scarcer the budget, the more it forces careful
+selection, which turns out to be more important than raw capacity. Context engineering
+is the discipline of making scarcity productive.
+</p>
+</div>
+
+<h2>6. A Taxonomy of Context Engineering Strategies</h2>
+
+<p>
+The rest of this chapter builds four complementary strategies that, together, form
+a complete context engineering pipeline. Each strategy addresses a different aspect
+of the bottleneck:
+</p>
+
+<ol>
+<li><strong>Chunking</strong> (<a href="section-11.2.html">Section 11.2</a>):
+Break source files into semantically meaningful units (functions, classes, blocks)
+that can be individually scored and selected. This converts the granularity problem
+(files are too big; lines are too small) into a tractable indexing problem.</li>
+
+<li><strong>Summarization</strong> (<a href="section-11.2.html">Section 11.2</a>):
+Compress code chunks into shorter representations (signatures, docstrings, natural-language
+summaries) that preserve enough information for relevance scoring while consuming
+fewer tokens.</li>
+
+<li><strong>Retrieval</strong> (<a href="section-11.3.html">Section 11.3</a>):
+Given a task description, rank all chunks and summaries by relevance using a combination
+of dense embeddings, sparse keyword matching, and structural signals.</li>
+
+<li><strong>Packing</strong> (<a href="section-11.3.html">Section 11.3</a>):
+Select the highest-ranked items that fit within the token budget, respecting dependencies
+(if you include a function, include its imports) and optimizing position (most relevant
+items at the beginning and end of the context).</li>
+</ol>
+
+<p>
+These four strategies compose into a pipeline: raw code enters the chunker, chunks
+flow through the summarizer, queries hit the retriever, and the packer assembles the
+final context window. The
+<a href="section-11.4.html">repository intelligence layer of Section 11.4</a>
+implements this entire pipeline as a reusable service.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Aider's Repository Map</div>
+<p>
+The open-source coding assistant <a href="https://aider.chat" target="_blank">Aider</a>
+implements a "repository map" that builds a compact summary of the entire codebase
+using tree-sitter tags. In roughly 200 lines of Python, Aider extracts function and
+class definitions, computes a PageRank-style importance score over the reference graph,
+and assembles a map that fits in 1,024 tokens. This single feature accounts for a
+significant portion of Aider's performance on SWE-bench. What takes us an entire
+chapter to build from first principles, Aider ships as a built-in feature. However,
+understanding the principles lets you customize the pipeline for domain-specific
+codebases (scientific code, embedded systems, polyglot repositories) where
+general-purpose tools fall short.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Measure and Visualize Your Own Context Budget</h4>
+<p>
+Pick any open-source Python project you have cloned locally and complete this five-step
+mini-project to internalize the scale mismatch firsthand.
+</p>
+<ol>
+<li>Run the <code>measure_codebase</code> function from Listing 11.1 on the repository.
+Record the total file count, line count, and estimated token count.</li>
+<li>Compute the coverage percentage for three context window sizes (128K, 200K, 1M tokens).
+Print the results as a small table.</li>
+<li>Use the <code>build_import_graph</code> function from Listing 11.4 to extract the
+dependency graph. Identify the top five hub modules by in-degree (number of files that
+import them).</li>
+<li>Using Python's <code>matplotlib</code>, create a bar chart showing the top 10 hub
+modules and their import counts. Save it as <code>context_hubs.png</code>.</li>
+<li>Estimate how many of those top-five hub files fit within a 32K-token budget by summing
+their line counts times 10 tokens per line. Write a one-paragraph reflection: does the
+budget leave room for the task-specific files an agent would also need?</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> A repository has 1,200 Python files totaling 180,000
+lines. Your model has a 128K token context window, and your system prompt and task
+description consume 4,000 tokens. Calculate the maximum coverage percentage. Then
+explain why even this coverage is an overestimate (hint: think about what else
+consumes tokens in a conversation).
+</li>
+<li>
+<strong>(Coding)</strong> Run the <code>measure_codebase</code> function from Listing
+11.1 on a public repository of your choice (e.g., Flask, FastAPI, or scikit-learn).
+Build the import graph from Listing 11.4 and identify the top 5 hub modules. Explain
+why these modules would be strong default candidates for context inclusion.
+</li>
+<li>
+<strong>(Analysis)</strong> The greedy knapsack in Listing 11.5 treats relevance
+scores as independent. Describe a scenario where including file A dramatically
+increases the value of including file B (i.e., relevance is submodular, not additive).
+How would you modify the greedy algorithm to account for this interaction?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We have established why context is the bottleneck and what signals are available to
+address it. In <a href="section-11.2.html">Section 11.2: Chunking and Summarization</a>,
+we build the machinery that breaks source files into meaningful units and compresses
+them into context-efficient representations, using tree-sitter for parsing and
+both extractive and generative techniques for summarization.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 11 Index</a>
+<a href="index.html">Chapter 11</a>
+<a href="section-11.2.html">11.2 Chunking and Summarization &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

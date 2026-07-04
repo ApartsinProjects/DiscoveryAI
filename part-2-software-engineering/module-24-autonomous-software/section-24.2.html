@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 24.2: Autonomous Factory Architecture. The five-stage pipeline for autonomous software development: sense, triage, plan, execute, verify. Reward signals, feedback loops, and self-improving triage." name="description"/>
+<title>Section 24.2: Autonomous Factory Architecture | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 24: Autonomous Software Organizations</a></div>
+<h1>24.2 Autonomous Factory Architecture</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I designed a five-stage pipeline for autonomous software development. Then I realized stages two through four kept delegating to each other in a cycle. I had invented bureaucracy."</p>
+<cite>A Software Architect Who Automated Too Much</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds directly on <a href="section-24.1.html">Section 24.1</a>, where you
+learned what SWE agents can do and how the autonomy ladder classifies systems by their
+level of human involvement. The workflow graph patterns from
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17</a> provide the structural
+foundation: the autonomous factory is, at its core, a multi-agent workflow with
+feedback loops. The observability infrastructure from
+<a href="../module-22-mlops-llmops/index.html">Chapter 22</a> provides the monitoring
+layer that makes autonomous operation safe.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+An autonomous software factory is a persistent system that continuously monitors a
+repository for work, decides what to do, does it, checks the result, and learns from
+the outcome. Unlike the one-shot agent invocations in <a href="section-24.1.html">Section 24.1</a>,
+the factory runs indefinitely as a background process. Its architecture has five stages
+arranged in a loop: <strong>sense</strong> (detect new issues and events),
+<strong>triage</strong> (classify by risk and route to human or agent),
+<strong>plan</strong> (decompose the task), <strong>execute</strong> (dispatch SWE agents),
+and <strong>verify</strong> (run tests, static analysis, and review). The verify stage
+feeds reward signals back to the triage stage, making the system self-improving.
+This section designs each stage, defines the reward signals, and formalizes the
+feedback loop as an online learning problem.
+</p>
+</div>
+
+<h2>1. The Five-Stage Pipeline</h2>
+
+<p>
+The autonomous factory pipeline processes repository events through five sequential
+stages. Each stage has a well-defined input, output, and failure mode. The pipeline
+is not a one-way conveyor belt; the verify stage can route work back to earlier
+stages for retry, and the triage stage evolves its routing policy over time based
+on outcomes.
+</p>
+
+<p data-agent="02">
+A pipeline in this context is a directed graph of processing stages that transforms a raw
+event (such as a new GitHub issue) into a verified, mergeable code change, with each stage
+acting as both a filter and an enrichment step. It matters because without this structure,
+autonomous agents would operate as isolated, stateless tools with no mechanism for
+self-correction or incremental trust expansion. The mechanism is straightforward: each
+stage reads a typed input record, performs its function (classification, decomposition,
+code generation, or verification), attaches its output to that record, and forwards it to
+the next stage, while failure at any point triggers either a retry loop or an escalation
+to a human. Use a staged pipeline when you need auditable, bounded autonomy with
+feedback; use a simpler one-shot agent when tasks are low-risk and self-contained, or a
+fully manual workflow when every change requires human judgment.
+</p>
+
+<p>
+We model the pipeline as a state machine $M = (Q, \Sigma, \delta, q_0, F)$ where
+$Q = \{\text{sense}, \text{triage}, \text{plan}, \text{execute}, \text{verify},
+\text{merge}, \text{escalate}, \text{retry}\}$ is the state set, $\Sigma$ is the
+set of events (new issue, test result, review decision), $\delta$ is the transition
+function, $q_0 = \text{sense}$ is the start state, and
+$F = \{\text{merge}, \text{escalate}\}$ are terminal states.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Optional, Any
+import datetime
+
+class PipelineStage(Enum):
+    SENSE = auto()      # detect new issues, events, signals
+    TRIAGE = auto()     # classify risk, route to agent or human
+    PLAN = auto()       # decompose task into sub-steps
+    EXECUTE = auto()    # dispatch SWE agents
+    VERIFY = auto()     # run tests, static analysis, review
+    MERGE = auto()      # auto-merge (terminal, success)
+    ESCALATE = auto()   # route to human (terminal, needs help)
+    RETRY = auto()      # loop back to plan or execute
+
+@dataclass
+class PipelineEvent:
+    """An event flowing through the autonomous pipeline."""
+    issue_id: str
+    stage: PipelineStage
+    timestamp: datetime.datetime = field(
+        default_factory=datetime.datetime.now
+    )
+    payload: dict = field(default_factory=dict)
+    attempt: int = 1
+    max_attempts: int = 3
+
+@dataclass
+class PipelineState:
+    """Full state of a task as it moves through the pipeline."""
+    event: PipelineEvent
+    triage_result: Optional["TriageDecision"] = None
+    plan: Optional["TaskPlan"] = None
+    execution_result: Optional["SWEAgentResult"] = None
+    verification: Optional["VerificationReport"] = None
+    reward_signals: dict = field(default_factory=dict)
+
+    @property
+    def should_retry(self) -> bool:
+        """Retry if verification failed and attempts remain."""
+        if self.verification is None:
+            return False
+        return (
+            not self.verification.passed
+            and self.event.attempt < self.event.max_attempts
+        )
+
+    @property
+    def should_escalate(self) -> bool:
+        """Escalate to human if retries exhausted or risk is high."""
+        if self.triage_result and self.triage_result.route == "human":
+            return True
+        if self.verification and not self.verification.passed:
+            return self.event.attempt >= self.event.max_attempts
+        return False
+</code></pre>
+<div class="code-caption">The pipeline state machine as Python data classes. Each task enters at SENSE and exits at either MERGE (autonomous success) or ESCALATE (routed to a human). The <code>should_retry</code> property implements bounded retry logic, preventing infinite loops.</div>
+
+<h3>1.1 Stage 1: Sense</h3>
+
+<p>
+The sense stage monitors the repository for actionable events. The most common
+event sources are:
+</p>
+
+<ul>
+<li><strong>New issues.</strong> A user or automated system opens a GitHub issue describing a
+bug, feature request, or improvement.</li>
+<li><strong>Failing CI.</strong> A scheduled test run or a dependency update breaks the build.
+The factory detects the failure and creates an internal task to investigate.</li>
+<li><strong>Dependency updates.</strong> A new version of a dependency is released. The factory
+can create update PRs, run tests, and merge if everything passes.</li>
+<li><strong>Performance regressions.</strong> A monitoring system detects that response times have
+increased. The factory investigates recent changes to identify the cause.</li>
+<li><strong>Code quality alerts.</strong> A linter or static analysis tool flags new issues
+(unused imports, type errors, security vulnerabilities).</li>
+</ul>
+
+<pre><code class="language-python">import aiohttp
+import asyncio
+from dataclasses import dataclass
+from typing import AsyncIterator
+
+@dataclass
+class GitHubEventSource:
+    """
+    Polls GitHub for new issues and events.
+
+    Uses the GitHub REST API with conditional requests
+    (If-None-Match) to avoid redundant data transfer.
+    """
+    owner: str
+    repo: str
+    token: str
+    poll_interval: int = 60  # seconds
+
+    async def poll(self) -> AsyncIterator[PipelineEvent]:
+        """Yield new events as they appear."""
+        seen_issues: set[int] = set()
+        etag: str | None = None
+        url = (
+            f"https://api.github.com/repos/{self.owner}/{self.repo}"
+            f"/issues?state=open&sort=created&direction=desc"
+        )
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            while True:
+                req_headers = {**headers}
+                if etag:
+                    req_headers["If-None-Match"] = etag
+
+                async with session.get(url, headers=req_headers) as resp:
+                    if resp.status == 304:
+                        # No new data since last poll
+                        await asyncio.sleep(self.poll_interval)
+                        continue
+
+                    etag = resp.headers.get("ETag")
+                    issues = await resp.json()
+
+                    for issue in issues:
+                        if issue["number"] not in seen_issues:
+                            seen_issues.add(issue["number"])
+                            yield PipelineEvent(
+                                issue_id=str(issue["number"]),
+                                stage=PipelineStage.SENSE,
+                                payload={
+                                    "title": issue["title"],
+                                    "body": issue.get("body", ""),
+                                    "labels": [
+                                        l["name"]
+                                        for l in issue.get("labels", [])
+                                    ],
+                                    "author": issue["user"]["login"],
+                                },
+                            )
+
+                await asyncio.sleep(self.poll_interval)
+</code></pre>
+<div class="code-caption">An async GitHub event source that polls for new issues using conditional requests (ETags) to minimize API usage. Each new issue becomes a <code>PipelineEvent</code> that enters the triage stage. Production deployments should use webhooks instead of polling for lower latency.</div>
+
+<h3>1.2 Stage 2: Triage</h3>
+
+<p>
+The triage stage is the most critical decision point in the pipeline. It classifies
+each incoming event by risk level and routes it to either autonomous execution or
+human review. A wrong decision here has asymmetric consequences: routing a safe task
+to a human wastes human time (low cost); routing a dangerous task to autonomous
+execution can cause production incidents (high cost). The triage policy should
+therefore be <strong>conservative by default</strong>, erring toward human review and
+expanding autonomous scope only as evidence accumulates.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that "autonomous" means "no human involvement at all."
+In practice, most tasks in a well-designed autonomous factory still flow through the
+SUPERVISED route, where an agent does the work but a human reviews before merge.
+Full autonomy (the AUTONOMOUS route) is reserved for narrow, well-understood task
+categories that have accumulated a strong track record of success; it is the
+exception, not the default, and the system is specifically designed to keep humans
+in the loop for anything uncertain.
+</p>
+</div>
+
+<p>
+The triage decision combines two assessments: the <strong>delegability score</strong> from
+<a href="section-24.1.html">Section 24.1</a> (can the agent handle this task?) and a
+<strong>blast radius estimate</strong> (how bad is it if the agent gets it wrong?). We
+implement triage as a classifier that takes issue metadata and repository context
+as input and produces a routing decision.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+from enum import Enum
+
+class TriageRoute(str, Enum):
+    AUTONOMOUS = "autonomous"   # agent executes, auto-merge if verified
+    SUPERVISED = "supervised"   # agent executes, human reviews before merge
+    HUMAN = "human"             # route directly to human developer
+
+@dataclass
+class TriageDecision:
+    """Output of the triage classifier."""
+    route: TriageRoute
+    confidence: float             # classifier confidence (0-1)
+    risk_category: str            # "low", "medium", "high", "critical"
+    estimated_complexity: float   # from TaskAssessment
+    reasoning: str                # explanation for audit trail
+
+class TriageClassifier:
+    """
+    Classifies issues for routing in the autonomous pipeline.
+
+    Uses a combination of rule-based heuristics (for safety-
+    critical patterns) and LLM-based classification (for
+    nuanced judgment). The rule layer runs first and can
+    short-circuit to human review; the LLM layer handles
+    everything else.
+    """
+
+    # Patterns that always route to human review
+    CRITICAL_PATTERNS = [
+        "security", "vulnerability", "CVE", "authentication",
+        "authorization", "payment", "billing", "PII",
+        "password", "encryption", "database migration",
+        "breaking change", "API deprecation",
+    ]
+
+    # Labels that indicate low-risk tasks
+    LOW_RISK_LABELS = [
+        "documentation", "typo", "chore", "dependencies",
+        "good first issue", "help wanted", "enhancement",
+    ]
+
+    def classify(self, event: PipelineEvent) -> TriageDecision:
+        """Classify an issue and decide routing."""
+        title = event.payload.get("title", "").lower()
+        body = event.payload.get("body", "").lower()
+        labels = event.payload.get("labels", [])
+        combined_text = f"{title} {body}"
+
+        # Rule layer: critical patterns always go to human
+        for pattern in self.CRITICAL_PATTERNS:
+            if pattern in combined_text:
+                return TriageDecision(
+                    route=TriageRoute.HUMAN,
+                    confidence=0.95,
+                    risk_category="critical",
+                    estimated_complexity=0.8,
+                    reasoning=(
+                        f"Critical pattern '{pattern}' detected. "
+                        f"Routing to human review."
+                    ),
+                )
+
+        # Rule layer: known low-risk labels
+        low_risk_labels = [
+            l for l in labels if l.lower() in self.LOW_RISK_LABELS
+        ]
+        if low_risk_labels:
+            return TriageDecision(
+                route=TriageRoute.AUTONOMOUS,
+                confidence=0.85,
+                risk_category="low",
+                estimated_complexity=0.2,
+                reasoning=(
+                    f"Low-risk labels detected: {low_risk_labels}. "
+                    f"Routing to autonomous execution."
+                ),
+            )
+
+        # Default: supervised (agent works, human reviews)
+        return TriageDecision(
+            route=TriageRoute.SUPERVISED,
+            confidence=0.6,
+            risk_category="medium",
+            estimated_complexity=0.5,
+            reasoning=(
+                "No strong signal for autonomous or human routing. "
+                "Defaulting to supervised mode."
+            ),
+        )
+</code></pre>
+<div class="code-caption">A two-layer triage classifier combining rule-based pattern matching (for safety-critical keywords) with label-based heuristics (for known low-risk categories). The default route is SUPERVISED, ensuring no task reaches production without at least one verification step. An LLM-based classifier can replace the default case for more nuanced routing.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Asymmetric Error Costs Shape Triage Policy</div>
+<p>
+The optimal triage policy is not the one that maximizes autonomous throughput. It is
+the one that minimizes <strong>expected regret</strong>, accounting for the asymmetric costs
+of false positives (routing a safe task to humans, wasting time) versus false negatives
+(routing a dangerous task to autonomous execution, risking incidents). If we denote
+the cost of unnecessary human review as $c_{\text{fp}}$ and the cost of an
+autonomous failure as $c_{\text{fn}}$, the optimal threshold $\theta^*$ satisfies:
+$$\theta^* = \frac{c_{\text{fp}}}{c_{\text{fp}} + c_{\text{fn}}}$$
+Since $c_{\text{fn}} \gg c_{\text{fp}}$ in most production settings (an incident
+costs far more than a wasted code review), the threshold is low, meaning the system
+should be biased toward human involvement. Only as $c_{\text{fn}}$ decreases
+(through better verification, sandboxing, and rollback mechanisms) should the
+threshold rise.
+</p>
+</div>
+
+<h3>1.3 Stage 3: Plan</h3>
+
+<p>
+Tasks that pass triage enter the planning stage, where a planning agent decomposes
+the issue into concrete sub-tasks. The planner reads the issue description, examines
+the relevant code, and produces a <strong>task plan</strong>: an ordered list of steps the
+execution agent should follow. Good plans are specific enough to guide the agent
+but flexible enough to allow adaptation when the agent discovers something unexpected
+during execution.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+
+@dataclass
+class TaskStep:
+    """A single step in a task plan."""
+    description: str
+    target_files: list[str]      # files this step will likely modify
+    verification: str            # how to check this step succeeded
+    estimated_complexity: float  # 0-1 scale
+
+@dataclass
+class TaskPlan:
+    """A decomposed plan for resolving an issue."""
+    issue_id: str
+    summary: str                    # one-sentence summary of the approach
+    steps: list[TaskStep]
+    estimated_files_changed: int
+    estimated_lines_changed: int
+    test_strategy: str              # how to verify the full solution
+    rollback_strategy: str          # how to undo if something goes wrong
+    compute_budget: float = 2.0     # max USD to spend on this task
+
+    @property
+    def total_complexity(self) -> float:
+        if not self.steps:
+            return 0.0
+        return sum(s.estimated_complexity for s in self.steps) / len(self.steps)
+
+def create_plan_prompt(issue_title: str, issue_body: str, repo_summary: str) -> str:
+    """
+    Build the prompt for the planning agent.
+
+    The planner receives the issue description and a summary
+    of the repository structure (file tree, key modules, test
+    locations) and produces a structured TaskPlan.
+    """
+    return f"""You are a software planning agent. Analyze this issue and
+produce a step-by-step plan for resolving it.
+
+ISSUE: {issue_title}
+{issue_body}
+
+REPOSITORY STRUCTURE:
+{repo_summary}
+
+OUTPUT FORMAT (JSON):
+{{
+  "summary": "One-sentence approach description",
+  "steps": [
+    {{
+      "description": "What to do",
+      "target_files": ["path/to/file.py"],
+      "verification": "How to check it worked",
+      "estimated_complexity": 0.3
+    }}
+  ],
+  "estimated_files_changed": 3,
+  "estimated_lines_changed": 50,
+  "test_strategy": "Run pytest tests/test_module.py",
+  "rollback_strategy": "git checkout -- src/module.py"
+}}
+
+PLANNING RULES:
+1. Read the relevant code BEFORE planning.
+2. Each step should be independently verifiable.
+3. Order steps so later steps build on earlier ones.
+4. Include a test step that verifies the complete fix.
+5. Keep the plan minimal: prefer fewer, well-targeted changes."""
+</code></pre>
+<div class="code-caption">A task plan structure and prompt template for the planning agent. Each step specifies target files, a verification method, and an estimated complexity. The plan includes a compute budget, test strategy, and rollback strategy to support safe autonomous execution.</div>
+
+<h3>1.4 Stage 4: Execute</h3>
+
+<p>
+The execution stage dispatches one or more SWE agents to carry out the plan. This
+stage uses the <code>ClaudeCodeSWEAgent</code> from
+<a href="section-24.1.html">Section 24.1</a>, passing it the plan steps as context.
+The key architectural decision is whether to dispatch a single agent that follows
+the entire plan or multiple specialized agents (one per step) coordinated by the
+orchestrator. Single-agent execution is simpler and maintains full context across
+steps; multi-agent execution enables parallelism and specialization but introduces
+coordination overhead.
+</p>
+
+<p>
+For most tasks, single-agent execution is sufficient and preferred. The agent receives
+the plan as part of its system prompt, executes each step in order, and can adapt if
+a step reveals unexpected complexities. Multi-agent execution becomes valuable when
+the plan involves independent sub-tasks (such as fixing a bug in one module while
+updating documentation in another) that can proceed in parallel.
+</p>
+
+<h3>1.5 Stage 5: Verify</h3>
+
+<p>
+Verification is the stage that makes autonomous operation safe. It runs after
+execution and determines whether the agent's changes are correct, complete, and
+safe to merge. Verification combines multiple signals into a single pass/fail
+decision, with each signal contributing to a confidence score.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+import subprocess
+from pathlib import Path
+
+@dataclass
+class VerificationReport:
+    """Comprehensive verification of an agent's changes."""
+    passed: bool
+    test_results: dict            # {"passed": int, "failed": int, "error": int}
+    lint_score: float             # 0-1, from static analysis
+    type_check_passed: bool
+    security_scan_clean: bool
+    diff_size: dict               # {"files": int, "additions": int, "deletions": int}
+    review_comments: list[str]    # from automated code review
+    confidence: float             # overall confidence (0-1)
+    blocking_issues: list[str]    # issues that prevent merge
+
+class VerificationPipeline:
+    """
+    Multi-signal verification for autonomous changes.
+
+    Runs tests, linting, type checking, and security scanning
+    in sequence. Any blocking failure stops the pipeline.
+    """
+
+    def __init__(self, repo_path: Path):
+        self.repo_path = repo_path
+
+    def verify(self) -> VerificationReport:
+        """Run all verification checks and produce a report."""
+        blocking = []
+
+        # 1. Run the test suite
+        test_results = self._run_tests()
+        if test_results["failed"] > 0 or test_results["error"] > 0:
+            blocking.append(
+                f"{test_results['failed']} tests failed, "
+                f"{test_results['error']} errors"
+            )
+
+        # 2. Run linting (ruff)
+        lint_score = self._run_linter()
+
+        # 3. Run type checking (mypy/pyright)
+        type_ok = self._run_type_check()
+        if not type_ok:
+            blocking.append("Type checking failed")
+
+        # 4. Run security scan (bandit)
+        security_ok = self._run_security_scan()
+        if not security_ok:
+            blocking.append("Security scan found issues")
+
+        # 5. Measure diff size
+        diff = self._measure_diff()
+
+        # 6. Compute confidence from signals
+        confidence = self._compute_confidence(
+            test_results, lint_score, type_ok, security_ok, diff
+        )
+
+        return VerificationReport(
+            passed=len(blocking) == 0,
+            test_results=test_results,
+            lint_score=lint_score,
+            type_check_passed=type_ok,
+            security_scan_clean=security_ok,
+            diff_size=diff,
+            review_comments=[],
+            confidence=confidence,
+            blocking_issues=blocking,
+        )
+
+    def _run_tests(self) -> dict:
+        """Run pytest and parse results."""
+        result = subprocess.run(
+            ["python", "-m", "pytest", "--tb=short", "-q"],
+            capture_output=True, text=True,
+            cwd=str(self.repo_path),
+            timeout=300,
+        )
+        # Parse pytest output for pass/fail counts
+        output = result.stdout
+        passed = failed = errors = 0
+        for line in output.split("\n"):
+            if "passed" in line:
+                import re
+                m = re.search(r"(\d+) passed", line)
+                if m:
+                    passed = int(m.group(1))
+            if "failed" in line:
+                import re
+                m = re.search(r"(\d+) failed", line)
+                if m:
+                    failed = int(m.group(1))
+            if "error" in line:
+                import re
+                m = re.search(r"(\d+) error", line)
+                if m:
+                    errors = int(m.group(1))
+        return {"passed": passed, "failed": failed, "error": errors}
+
+    def _run_linter(self) -> float:
+        """Run ruff and return a 0-1 quality score."""
+        result = subprocess.run(
+            ["ruff", "check", "--statistics", "."],
+            capture_output=True, text=True,
+            cwd=str(self.repo_path),
+        )
+        # Score: 1.0 if no issues, decreasing with issue count
+        issue_count = len(result.stdout.strip().split("\n"))
+        if not result.stdout.strip():
+            issue_count = 0
+        return max(0.0, 1.0 - issue_count * 0.05)
+
+    def _run_type_check(self) -> bool:
+        """Run pyright and return pass/fail."""
+        result = subprocess.run(
+            ["pyright", "--outputjson"],
+            capture_output=True, text=True,
+            cwd=str(self.repo_path),
+        )
+        return result.returncode == 0
+
+    def _run_security_scan(self) -> bool:
+        """Run bandit and return pass/fail."""
+        result = subprocess.run(
+            ["bandit", "-r", "src/", "-f", "json", "-q"],
+            capture_output=True, text=True,
+            cwd=str(self.repo_path),
+        )
+        return result.returncode == 0
+
+    def _measure_diff(self) -> dict:
+        """Measure the size of the agent's changes."""
+        result = subprocess.run(
+            ["git", "diff", "--stat", "--numstat", "HEAD~1"],
+            capture_output=True, text=True,
+            cwd=str(self.repo_path),
+        )
+        files, additions, deletions = 0, 0, 0
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split("\t")
+            if len(parts) == 3:
+                try:
+                    additions += int(parts[0])
+                    deletions += int(parts[1])
+                    files += 1
+                except ValueError:
+                    pass
+        return {
+            "files": files,
+            "additions": additions,
+            "deletions": deletions,
+        }
+
+    def _compute_confidence(
+        self, tests, lint, type_ok, security_ok, diff
+    ) -> float:
+        """
+        Weighted confidence from verification signals.
+
+        Tests are the strongest signal (weight 0.4).
+        Smaller diffs get a bonus (less risk).
+        """
+        score = 0.0
+        total_tests = tests["passed"] + tests["failed"] + tests["error"]
+        if total_tests > 0:
+            score += 0.4 * (tests["passed"] / total_tests)
+        score += 0.2 * lint
+        score += 0.15 * (1.0 if type_ok else 0.0)
+        score += 0.15 * (1.0 if security_ok else 0.0)
+        # Diff size penalty: larger changes are riskier
+        total_lines = diff["additions"] + diff["deletions"]
+        size_bonus = max(0.0, 0.1 * (1.0 - total_lines / 500))
+        score += size_bonus
+        return min(1.0, score)
+</code></pre>
+<div class="code-caption">A multi-signal verification pipeline that runs tests, linting (ruff), type checking (pyright), and security scanning (bandit) on the agent's changes. The confidence score weights test results most heavily (0.4) and gives a bonus for smaller, more focused diffs. Any blocking failure prevents autonomous merge.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Why Multi-Signal Verification Matters</div>
+<p>
+Consider an agent that fixes a "TypeError on line 42" issue by changing
+<code>x.strip()</code> to <code>str(x).strip()</code>. The test suite passes because the
+existing test only checks the happy path where <code>x</code> is already a string. But
+the linter flags a broader type inconsistency: the function is annotated as accepting
+<code>str</code> but is called with <code>Optional[str]</code>. The type checker
+confirms this, revealing that the agent's fix is a band-aid over a deeper design
+issue. Without multi-signal verification, this patch would reach production and
+eventually cause a <code>None.strip()</code> crash on a code path the tests do not
+cover. The verification pipeline catches it, routes the issue to SUPERVISED mode,
+and a human reviewer identifies the correct fix: adding a <code>None</code> check at
+the function boundary.
+</p>
+</div>
+
+<h2>2. Reward Signals for Self-Improvement</h2>
+
+<p>
+The factory becomes self-improving when the verify stage feeds signals back to the
+triage stage. Over time, the triage classifier learns which types of issues the
+agent resolves successfully and which types it consistently fails on. This feedback
+loop is the key difference between a static L3 system and a progressing L4/L5 system.
+</p>
+
+<p>
+We define four categories of reward signals, ordered by availability (how quickly
+you get the signal) and reliability (how accurately it predicts real-world success):
+</p>
+
+<p>
+<strong>Immediate signals (seconds).</strong> Test pass rate, lint score, type check result,
+diff size. Available immediately after execution. Reliable for catching obvious
+failures but blind to subtle correctness issues.
+</p>
+
+<p>
+<strong>CI signals (minutes).</strong> Full CI pipeline results, integration test outcomes,
+build artifacts. Available after CI completes. More comprehensive than immediate
+signals because CI typically runs a broader test matrix (multiple Python versions,
+operating systems, dependency configurations).
+</p>
+
+<p>
+<strong>Review signals (hours to days).</strong> Human reviewer comments, requested changes,
+approval/rejection. Available only for SUPERVISED tasks where a human reviews the
+PR. The richest signal because it captures correctness judgments that automated
+checks miss, but the slowest and most expensive to collect.
+</p>
+
+<p>
+<strong>Production signals (days to weeks).</strong> User-reported bugs against the change,
+rollback events, performance metrics after deployment. The ground truth signal:
+did the change actually work in production? The most reliable but also the most
+delayed, making it suitable only for long-term calibration, not real-time routing
+decisions.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+import datetime
+
+@dataclass
+class RewardSignal:
+    """A single reward signal from the verification/monitoring pipeline."""
+    source: str          # "tests", "ci", "review", "production"
+    value: float         # normalized to [0, 1]
+    confidence: float    # how reliable this signal is
+    timestamp: datetime.datetime = field(
+        default_factory=datetime.datetime.now
+    )
+    metadata: dict = field(default_factory=dict)
+
+@dataclass
+class OutcomeRecord:
+    """
+    Complete outcome record for a resolved issue.
+
+    Stored in the feedback database and used to train
+    the triage classifier over time.
+    """
+    issue_id: str
+    triage_decision: TriageDecision
+    plan_complexity: float
+    execution_cost_usd: float
+    execution_time_seconds: float
+    signals: list[RewardSignal] = field(default_factory=list)
+
+    @property
+    def composite_reward(self) -> float:
+        """
+        Weighted average of all reward signals.
+
+        Later signals (review, production) are weighted higher
+        because they are more reliable, but earlier signals
+        dominate until later ones arrive.
+        """
+        if not self.signals:
+            return 0.0
+        weights = {
+            "tests": 0.2,
+            "ci": 0.25,
+            "review": 0.3,
+            "production": 0.25,
+        }
+        weighted_sum = sum(
+            s.value * weights.get(s.source, 0.1) * s.confidence
+            for s in self.signals
+        )
+        weight_total = sum(
+            weights.get(s.source, 0.1) * s.confidence
+            for s in self.signals
+        )
+        return weighted_sum / weight_total if weight_total > 0 else 0.0
+
+    @property
+    def was_successful(self) -> bool:
+        """Binary success: composite reward above threshold."""
+        return self.composite_reward >= 0.7
+</code></pre>
+<div class="code-caption">Reward signals and outcome records for the feedback loop. Each resolved issue accumulates signals from tests, CI, review, and production over time. The composite reward weights later signals (review, production) more heavily because they are more reliable, creating a multi-timescale learning signal.</div>
+
+<h2>3. The Feedback Loop as Online Learning</h2>
+
+<p>
+The triage classifier improves over time by learning from outcome records. This is
+an <strong>online learning</strong> problem: the classifier makes a routing decision (autonomous
+vs. supervised vs. human), observes the outcome, and updates its parameters. The
+challenge is that the feedback is <strong>delayed</strong> (production signals arrive days
+later) and <strong>partial</strong> (tasks routed to humans never generate autonomous outcome
+data, so we never learn whether the agent could have handled them).
+</p>
+
+<p>
+We formalize this as a contextual bandit problem. At each time step $t$, the triage
+classifier observes a context $x_t$ (issue features: title, body, labels, repository
+statistics), selects an action $a_t \in \{\text{autonomous}, \text{supervised},
+\text{human}\}$, and receives a reward $r_t$ (the composite reward from the outcome
+record). The goal is to learn a policy $\pi(a | x)$ that maximizes cumulative reward
+while maintaining a safety constraint:
+</p>
+
+$$\max_\pi \sum_{t=1}^{T} \mathbb{E}_{a_t \sim \pi(\cdot | x_t)}[r_t] \quad \text{subject to} \quad P(\text{incident} | a_t = \text{autonomous}) \leq \epsilon$$
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the contextual bandit triage system like a hospital emergency department's
+intake nurse. Each patient (issue) arrives with visible symptoms (labels, title,
+description). The nurse must decide: send the patient home with over-the-counter
+advice (autonomous), schedule them for a doctor visit with follow-up (supervised), or
+admit them immediately to specialist care (human). The nurse does not know for certain
+which decision is correct at intake time, but after each case resolves, she learns
+whether the patient recovered, needed escalation, or had complications. Over hundreds
+of cases, she builds a mental model of which symptom patterns predict which outcomes,
+and her routing accuracy improves. The key parallel is that this learning only works
+because she tracks outcomes by category: "chest pain in patients under 30" might be
+safe for the doctor-visit track, while "chest pain in patients over 60" always goes
+to the specialist. The triage learner in our pipeline does exactly this, maintaining
+per-category success statistics and graduating categories to autonomous routing only
+when the evidence is strong enough.
+</p>
+</div>
+
+<p>
+The safety constraint $\epsilon$ bounds the probability of an autonomous merge
+causing a production incident. In practice, $\epsilon$ is set conservatively
+(e.g., 0.01) and relaxed as the system accumulates a track record.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+import math
+
+@dataclass
+class TriageLearner:
+    """
+    Online learner for triage routing decisions.
+
+    Uses an epsilon-greedy strategy with Thompson sampling
+    to balance exploration (trying autonomous on new task
+    types) with exploitation (using the best known route).
+    """
+    # Per-category success/failure counts (Beta distribution params)
+    category_stats: dict[str, dict[str, list[float]]] = field(
+        default_factory=lambda: {}
+    )
+    # Minimum observations before allowing autonomous routing
+    min_observations: int = 10
+    # Maximum autonomous failure rate
+    max_failure_rate: float = 0.05
+
+    def update(self, category: str, route: str, success: bool) -> None:
+        """Update beliefs after observing an outcome."""
+        if category not in self.category_stats:
+            self.category_stats[category] = {}
+        if route not in self.category_stats[category]:
+            # Beta(1, 1) = uniform prior
+            self.category_stats[category][route] = [1.0, 1.0]
+
+        alpha_beta = self.category_stats[category][route]
+        if success:
+            alpha_beta[0] += 1  # increment successes
+        else:
+            alpha_beta[1] += 1  # increment failures
+
+    def should_allow_autonomous(self, category: str) -> bool:
+        """
+        Decide if a task category has enough evidence
+        for autonomous routing.
+
+        Requires: (1) enough observations, (2) failure rate
+        below threshold, (3) lower bound of Beta CI above
+        the safety threshold.
+        """
+        stats = self.category_stats.get(category, {})
+        auto_stats = stats.get("autonomous", [1.0, 1.0])
+        alpha, beta = auto_stats
+
+        total_observations = alpha + beta - 2  # subtract prior
+        if total_observations < self.min_observations:
+            return False
+
+        # Point estimate of success rate
+        success_rate = alpha / (alpha + beta)
+        failure_rate = 1.0 - success_rate
+
+        if failure_rate > self.max_failure_rate:
+            return False
+
+        # 95% lower bound of Beta distribution
+        # Approximation using normal approximation to Beta
+        std = math.sqrt(
+            alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1))
+        )
+        lower_bound = success_rate - 1.96 * std
+
+        return lower_bound >= (1.0 - self.max_failure_rate)
+</code></pre>
+<div class="code-caption">An online triage learner using Beta-distributed success/failure counts per task category. A category graduates to autonomous routing only when it has enough observations and the 95% lower bound of the success rate exceeds the safety threshold. This implements the conservative expansion principle: start supervised, graduate to autonomous with evidence.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+SWE-bench Verified (Chowdhury et al., 2024) established the first rigorous benchmark
+for autonomous software engineering by curating 500 real GitHub issues from popular
+Python repositories, each with validated test patches that confirm whether an agent's
+fix is correct. As of early 2026, leading systems such as Amazon Q Developer Agent
+and open-source frameworks like SWE-agent and Moatless Tools resolve 40-55% of these
+tasks autonomously. More recent work pushes beyond single-issue resolution:
+SWE-bench Multimodal (2024) adds issues that require interpreting screenshots and
+UI mockups, while RepoBench (2024) evaluates cross-file reasoning over entire
+repository contexts. The core open problem is closing the gap between benchmark
+performance and production reliability, because benchmark tasks have clean
+reproduction steps and isolated scope, whereas real repositories present ambiguous
+requirements, flaky tests, and undocumented side effects that current triage and
+verification pipelines struggle to handle.
+</p>
+</div>
+
+<h2>4. Guardrails and Safety Architecture</h2>
+
+<p>
+Autonomous operation requires guardrails at every stage. The guardrail architecture
+implements a <strong>defense in depth</strong> strategy: each stage has its own safety checks,
+and a failure at any stage halts progression and escalates to a human.
+</p>
+
+<p>
+<strong>Repository isolation.</strong> Agents never operate on the production repository
+directly. Every task gets a fresh clone (or a git worktree) on a feature branch.
+The agent cannot access the main branch, the production database, or any external
+service beyond the repository and its test infrastructure.
+</p>
+
+<p>
+<strong>File-level permissions.</strong> The autonomy configuration from
+<a href="section-24.1.html">Section 24.1</a> restricts which files the agent may edit.
+Configuration files, secrets, CI pipelines, database migrations, and infrastructure
+definitions are off-limits. These restrictions are enforced at the tool level (the
+edit tool checks the path against the allowlist before writing) rather than relying
+on the agent to self-police.
+</p>
+
+<p>
+<strong>Diff size limits.</strong> An upper bound on the number of files changed and lines
+modified prevents runaway agents that rewrite large portions of the codebase. If the
+agent exceeds the limit, the execution stage halts and the task is escalated.
+</p>
+
+<p>
+<strong>Cost caps.</strong> Each task has a compute budget (in USD) that limits how many LLM
+tokens the agent can consume. This prevents infinite retry loops where the agent
+keeps trying different approaches, burning through budget without making progress.
+The cost cap connects to the AgentOps infrastructure from
+<a href="../module-22-mlops-llmops/index.html">Chapter 22</a>.
+</p>
+
+<p>
+<strong>Incident response.</strong> When an autonomously merged change causes a production
+issue (detected through monitoring), the system automatically reverts the PR,
+creates a post-mortem issue, and downgrades the task category from "autonomous" to
+"supervised" in the triage learner. This negative feedback ensures the system
+contracts its autonomous scope in response to failures.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Infinite Refactor</div>
+<p>
+A common failure mode in early autonomous systems was the "infinite refactor": the
+agent would be asked to fix a bug, notice that the surrounding code was poorly
+structured, refactor it, discover new issues in the refactored code, refactor those,
+and continue until it had rewritten half the repository. The fix was simple: count
+the number of files changed, and if it exceeds the limit, stop the agent and show
+the human what happened. Most "one-line bug fixes" do not require touching 47 files.
+</p>
+</div>
+
+<h2>5. Integration with the Discovery Workbench</h2>
+
+<p>
+The autonomous factory extends the Discovery Workbench
+(introduced in <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>)
+with a <strong>continuous development module</strong>. This module connects the factory's
+pipeline stages to the Workbench's existing components:
+</p>
+
+<ul>
+<li>The <strong>sense stage</strong> integrates with the Workbench's data ingestion layer, treating
+repository events as a data source alongside experimental results and literature
+updates.</li>
+<li>The <strong>triage stage</strong> uses the Workbench's knowledge graph
+(from <a href="../../part-4-knowledge/module-38-knowledge-graphs/index.html">Chapter 38</a>)
+to understand dependencies between modules and assess blast radius.</li>
+<li>The <strong>verify stage</strong> publishes results to the Workbench's experiment registry
+(from <a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">Chapter 47</a>),
+creating provenance records that trace every autonomous change back to its trigger,
+plan, and verification results.</li>
+<li>The <strong>feedback loop</strong> contributes to the Workbench's model of research team
+productivity, enabling the autonomous discovery systems in
+<a href="../../part-7-autonomous-discovery/module-53-ai-scientists/index.html">Chapter 53</a>
+to treat code changes as part of the scientific workflow.</li>
+</ul>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Triage-and-Verify Pipeline</h4>
+<p>
+Build a working autonomous triage and verification pipeline on your laptop using
+only Python standard libraries and pytest.
+<strong>Step 1:</strong> Create a small Python project with three files: <code>src/math_utils.py</code>
+(a module with two functions, one containing an intentional bug), <code>tests/test_math.py</code>
+(pytest tests covering the correct function but not the buggy one), and <code>issues.json</code>
+(a list of three mock issues, each with a title, body, and labels array).
+<strong>Step 2:</strong> Implement the <code>TriageClassifier</code> from this section and run it against your
+three mock issues. Print the routing decision for each and verify that an issue mentioning
+"security" routes to HUMAN while one labeled "typo" routes to AUTONOMOUS.
+<strong>Step 3:</strong> Implement a simplified <code>VerificationPipeline</code> that runs <code>pytest</code>
+and counts pass/fail results. Run it against your project and confirm it detects the untested
+buggy function by adding a test that exercises the bug.
+<strong>Step 4:</strong> Wire the two together: read an issue from <code>issues.json</code>, triage it,
+and if the route is AUTONOMOUS, run the verification pipeline. Print a final report showing
+the triage decision, test results, and whether the pipeline would merge or escalate.
+<strong>Step 5:</strong> Add a <code>TriageLearner</code> that records outcomes from step 4 into a JSON
+file. Run the pipeline on all three issues, then reload the learner and print which categories
+(based on the first label of each issue) have enough data to qualify for autonomous routing.
+Observe that with only one observation per category, none qualify (the minimum is 10).
+</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual.</strong> The triage classifier uses keyword matching for critical patterns
+(e.g., "security", "payment"). Describe two scenarios where this approach produces
+false positives (routing safe tasks to humans unnecessarily) and two where it produces
+false negatives (missing genuinely dangerous tasks). Propose an improvement that
+addresses each failure mode.</li>
+
+<li><strong>Coding.</strong> Implement a <code>VerificationPipeline</code> that runs three
+checks (pytest, ruff, and a custom "no print statements in production code" check)
+and produces a <code>VerificationReport</code>. Test it against a small repository
+with intentional failures in each category.</li>
+
+<li><strong>Analysis.</strong> The composite reward formula weights review signals at 0.3 and
+production signals at 0.25. Argue for or against reversing these weights. Under what
+circumstances would production signals deserve higher weight? Consider the trade-off
+between signal reliability and signal latency.</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-24.1.html">&larr; 24.1 SWE Agents and Capabilities</a>
+<span class="nav-separator">|</span>
+<a href="index.html">Chapter 24</a>
+<span class="nav-separator">|</span>
+<a href="section-24.3.html">24.3 Building a Supervised Autonomous Loop &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

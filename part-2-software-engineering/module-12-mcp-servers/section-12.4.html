@@ -1,0 +1,1012 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.4: Building a Scientific MCP Server. Recipe: a complete MCP server combining PubChem, OpenAlex, and vector database tools into a unified scientific discovery interface." name="description"/>
+<title>Section 12.4: Building a Scientific MCP Server | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Building MCP Servers for Scientific Workflows</a></div>
+<h1>12.4 Building a Scientific MCP Server</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I unified three databases, two computation engines, and a vector store behind a single protocol. The agent's first request was 'list your tools,' and its second was 'never mind, I'll use Google.'"</p>
+<cite>An Integration Layer Seeking Appreciation</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section brings together everything from the chapter. You need the MCP architecture
+concepts from <a href="section-12.1.html">Section 12.1</a>, the tool implementations
+from <a href="section-12.2.html">Section 12.2</a>, and the testing and packaging
+patterns from <a href="section-12.3.html">Section 12.3</a>. You should have
+<code>chromadb</code> installed (<code>pip install chromadb</code>) for the vector
+database component. Familiarity with the Discovery Workbench concept from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>
+will help you see how this server fits into the larger platform.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The previous sections taught individual patterns: database lookups, literature search,
+local computation, testing, and packaging. This section assembles them into a single,
+production-quality MCP server called <code>science-mcp</code>. The server combines
+PubChem compound tools, OpenAlex literature tools, and a Chroma vector database for
+semantic search over a local scientific corpus. It exposes resources for configuration
+and corpus metadata, and provides prompt templates for common scientific workflows.
+By the end of this section, you will have a complete, tested, deployable server that
+plugs directly into the Discovery Workbench and serves as the tool backbone for
+the research agents we build in
+<a href="../../part-4-knowledge/module-40-research-agents/index.html">Chapter 40</a>.
+</p>
+</div>
+
+<h2>1. Project Structure</h2>
+
+<p>
+A well-organized MCP server separates concerns into distinct modules. The entry point
+handles transport setup; each tool domain lives in its own file; shared infrastructure
+(rate limiting, HTTP clients, error handling) is factored into utilities.
+</p>
+
+<pre><code class="language-text">science-mcp/
+├── pyproject.toml
+├── README.md
+├── src/
+│   └── science_mcp/
+│       ├── __init__.py
+│       ├── server.py            # Entry point: creates Server, registers all tools
+│       ├── config.py            # Configuration from environment variables
+│       ├── utils/
+│       │   ├── __init__.py
+│       │   ├── rate_limiter.py  # Token-bucket rate limiter
+│       │   ├── http_client.py   # Shared async HTTP client
+│       │   └── errors.py        # Structured error responses
+│       ├── tools/
+│       │   ├── __init__.py
+│       │   ├── pubchem.py       # PubChem compound search and lookup
+│       │   ├── literature.py    # OpenAlex literature search
+│       │   ├── chemistry.py     # RDKit molecular computation
+│       │   └── vector_db.py     # Chroma vector database search
+│       ├── resources/
+│       │   ├── __init__.py
+│       │   └── corpus.py        # Corpus metadata and configuration resources
+│       └── prompts/
+│           ├── __init__.py
+│           └── workflows.py     # Scientific workflow prompt templates
+├── tests/
+│   ├── conftest.py
+│   ├── test_pubchem.py
+│   ├── test_literature.py
+│   ├── test_chemistry.py
+│   ├── test_vector_db.py
+│   └── test_protocol.py
+└── Dockerfile
+</code></pre>
+<div class="code-caption">Project structure for the <code>science-mcp</code> server. Each tool domain has its own module; shared utilities are factored out; tests mirror the source structure.</div>
+
+<h2>2. Configuration Management</h2>
+
+<p>
+Scientific MCP servers need configuration for API endpoints, authentication tokens,
+database paths, and rate limits. Environment variables are the standard mechanism
+(as established in <a href="section-12.3.html">Section 12.3</a>), but a configuration
+module provides validation, defaults, and documentation.
+</p>
+
+<pre><code class="language-python">"""Configuration for the science-mcp server."""
+import os
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class Config:
+    """Server configuration loaded from environment variables.
+
+    All settings have sensible defaults for local development.
+    Production deployments should set API keys and adjust rate limits.
+    """
+    # OpenAlex settings
+    openalex_email: str = field(
+        default_factory=lambda: os.environ.get("OPENALEX_EMAIL", "user@example.com")
+    )
+    openalex_rate_limit: float = field(
+        default_factory=lambda: float(os.environ.get("OPENALEX_RATE_LIMIT", "10.0"))
+    )
+
+    # PubChem settings
+    pubchem_rate_limit: float = field(
+        default_factory=lambda: float(os.environ.get("PUBCHEM_RATE_LIMIT", "5.0"))
+    )
+
+    # Vector database settings
+    chroma_persist_dir: str = field(
+        default_factory=lambda: os.environ.get("CHROMA_PERSIST_DIR", "./chroma_data")
+    )
+    chroma_collection: str = field(
+        default_factory=lambda: os.environ.get("CHROMA_COLLECTION", "scientific_papers")
+    )
+    embedding_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "EMBEDDING_MODEL", "all-MiniLM-L6-v2"
+        )
+    )
+
+    # Server settings
+    server_name: str = "science-mcp"
+    server_version: str = "1.0.0"
+    max_concurrent_requests: int = field(
+        default_factory=lambda: int(os.environ.get("MAX_CONCURRENT", "10"))
+    )
+
+
+def load_config() -> Config:
+    """Load and validate server configuration."""
+    config = Config()
+    # Warn about defaults in production
+    if config.openalex_email == "user@example.com":
+        import warnings
+        warnings.warn(
+            "OPENALEX_EMAIL not set. Using default. "
+            "Set it to join the OpenAlex polite pool for higher rate limits.",
+            stacklevel=2,
+        )
+    return config
+</code></pre>
+<div class="code-caption">Configuration management with validation and defaults. The frozen dataclass prevents accidental mutation. Warnings guide users toward proper production configuration.</div>
+
+<h2>3. The Vector Database Tool</h2>
+
+<p>
+The third pillar of our server is a <strong>vector database</strong> for semantic search over
+a local corpus of scientific documents. While PubChem and OpenAlex search public
+databases, the vector database searches <em>your</em> collection: papers your lab has
+read, internal reports, experiment notes, and proprietary datasets. This is where
+the <a href="../../part-4-knowledge/module-37-rag-discovery/index.html">Retrieval Augmented
+Discovery</a> patterns from Chapter 37 begin.
+</p>
+
+<p data-agent="02">
+A vector database is a storage system purpose-built for high-dimensional numerical vectors, where each vector represents the meaning of a piece of text (or an image, or any data that an embedding model can encode). It matters because traditional keyword search fails when the user's query and the relevant document use different words for the same concept: a search for "heart attack treatment" would miss a paper titled "myocardial infarction therapy" unless you search by meaning rather than by exact words. The mechanism is straightforward: an embedding model converts both documents and queries into fixed-length vectors in the same high-dimensional space, and the database uses approximate nearest-neighbor algorithms (such as HNSW graphs) to find the stored vectors closest to the query vector, typically in milliseconds even over millions of documents. Use a vector database when your search needs are semantic (meaning-based) rather than exact-match; for structured lookups by known identifiers or precise field values, a traditional relational or document database remains the better choice.
+</p>
+
+<p>
+We use Chroma, an open-source embedding database that stores documents as vectors and
+retrieves them by semantic similarity. When a user queries "CRISPR delivery mechanisms
+in neurons," Chroma encodes the query into a vector using the same embedding model that
+encoded the documents, then returns the documents whose vectors are closest in cosine
+distance.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of semantic search like a spice rack organized by flavor profile rather than by alphabetical name. In a traditional (keyword) spice rack, you would need to know the exact name "smoked paprika" to find it. In a flavor-organized rack, all the smoky spices sit near each other: smoked paprika, chipotle powder, and lapsang souchong tea share a shelf because they taste similar, even though their names have nothing in common. The embedding model is the expert chef who decided which flavors belong together; the vector database is the rack that keeps similar items physically close so you can grab the right neighborhood instantly. Just as you would reach for the "smoky" shelf and browse what is there, a vector query lands in the right region of meaning-space and returns the nearest neighbors, regardless of the specific words each document uses.
+</p>
+</div>
+
+<p>
+The cosine similarity between two embedding vectors $\mathbf{a}$ and $\mathbf{b}$ is:
+</p>
+
+$$\text{cos}(\mathbf{a}, \mathbf{b}) = \frac{\mathbf{a} \cdot \mathbf{b}}{||\mathbf{a}|| \cdot ||\mathbf{b}||}$$
+
+<p>
+Values range from $-1$ (opposite) to $1$ (identical). For normalized embeddings
+(which most sentence transformers produce), this simplifies to a dot product.
+Chroma handles the indexing, storage, and nearest-neighbor search; we only need to
+wrap it as an MCP tool.
+</p>
+
+<pre><code class="language-python">"""Vector database tools using Chroma for semantic search."""
+import json
+from mcp.server import Server
+import chromadb
+from chromadb.config import Settings
+
+server = Server("vector-db-tools")
+
+# Initialize Chroma client (persistent storage)
+_chroma_client: chromadb.ClientAPI | None = None
+_collection: chromadb.Collection | None = None
+
+
+def get_collection(persist_dir: str, collection_name: str) -> chromadb.Collection:
+    """Lazy-initialize the Chroma collection."""
+    global _chroma_client, _collection
+    if _collection is None:
+        _chroma_client = chromadb.PersistentClient(
+            path=persist_dir,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        _collection = _chroma_client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+    return _collection
+
+
+@server.tool()
+async def search_corpus(
+    query: str,
+    max_results: int = 5,
+    min_relevance: float = 0.3,
+    metadata_filter: dict | None = None,
+) -> str:
+    """Search the local scientific corpus by semantic similarity.
+
+    Finds documents in the local vector database whose content is
+    semantically similar to the query. Useful for finding relevant
+    papers, notes, or reports in the lab's private collection.
+
+    Args:
+        query: Natural language search query.
+               Example: 'mechanisms of drug resistance in cancer cells'.
+        max_results: Maximum documents to return (1-20, default 5).
+        min_relevance: Minimum cosine similarity score (0.0 to 1.0).
+                       Documents below this threshold are excluded.
+        metadata_filter: Optional filter on document metadata.
+                         Example: {"year": {"$gte": 2023}, "type": "paper"}.
+
+    Returns:
+        JSON with matching documents sorted by relevance. Each document
+        includes: id, text (excerpt), metadata, and relevance_score.
+    """
+    collection = get_collection("./chroma_data", "scientific_papers")
+
+    query_params = {
+        "query_texts": [query],
+        "n_results": min(max_results, 20),
+    }
+    if metadata_filter:
+        query_params["where"] = metadata_filter
+
+    results = collection.query(**query_params)
+
+    documents = []
+    for i in range(len(results["ids"][0])):
+        # Chroma returns distances; convert to similarity for cosine
+        distance = results["distances"][0][i] if results["distances"] else 0
+        similarity = 1 - distance  # cosine distance to similarity
+
+        if similarity < min_relevance:
+            continue
+
+        documents.append({
+            "id": results["ids"][0][i],
+            "text": results["documents"][0][i][:1000],  # Truncate for context window
+            "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
+            "relevance_score": round(similarity, 4),
+        })
+
+    return json.dumps({
+        "documents": documents,
+        "count": len(documents),
+        "query": query,
+        "source": "local_corpus",
+    }, indent=2)
+
+
+@server.tool()
+async def add_to_corpus(
+    text: str,
+    doc_id: str,
+    metadata: dict | None = None,
+) -> str:
+    """Add a document to the local scientific corpus.
+
+    Indexes a document for future semantic search. Use this to build
+    a searchable collection of papers, notes, and experimental results.
+
+    Args:
+        text: The document text to index. Can be an abstract, full paper,
+              or experiment note. Long documents should be chunked first.
+        doc_id: Unique identifier for the document (e.g., 'doi:10.1234/example').
+        metadata: Optional metadata dict. Recommended keys:
+                  'title', 'authors', 'year', 'type' (paper/note/report),
+                  'source' (pubmed/arxiv/internal).
+
+    Returns:
+        Confirmation with the document ID and metadata.
+    """
+    collection = get_collection("./chroma_data", "scientific_papers")
+
+    collection.upsert(
+        ids=[doc_id],
+        documents=[text],
+        metadatas=[metadata or {}],
+    )
+
+    return json.dumps({
+        "status": "indexed",
+        "doc_id": doc_id,
+        "metadata": metadata or {},
+        "text_length": len(text),
+        "collection_size": collection.count(),
+    }, indent=2)
+</code></pre>
+<div class="code-caption">Vector database tools for semantic search over a local scientific corpus. The <code>search_corpus</code> tool retrieves semantically similar documents; <code>add_to_corpus</code> indexes new documents. Together they form the local knowledge layer of the Discovery Workbench.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Local Corpus Complements Public APIs</div>
+<p>
+PubChem and OpenAlex search the world's public knowledge. The vector database
+searches <em>your</em> knowledge: lab notebooks, internal reports, annotated papers,
+failed experiment records. An agent that can search both has a significant advantage.
+When investigating a new drug target, it can find the published literature
+(OpenAlex), check molecular properties (PubChem), <em>and</em> discover that your lab
+already tested a related compound three years ago (vector database). This combination
+of public and private knowledge is the foundation of
+<a href="../../part-4-knowledge/module-37-rag-discovery/index.html">Retrieval Augmented Discovery</a>
+and becomes central to the
+<a href="../../part-7-autonomous-discovery/module-53-ai-scientists/index.html">AI Scientist</a>
+architecture.
+</p>
+</div>
+
+<h2>4. Resources: Server Metadata and Corpus Statistics</h2>
+
+<p>
+Beyond tools, our server exposes resources that provide context without requiring
+computation. Resources are ideal for metadata that the agent (or the human) might
+need to understand the server's capabilities and the state of the local corpus.
+</p>
+
+<pre><code class="language-python">"""MCP resources for server metadata and corpus statistics."""
+import json
+from mcp.server import Server
+
+server = Server("science-mcp")
+
+@server.resource("science://config")
+async def get_server_config() -> str:
+    """Current server configuration and capability summary.
+
+    Returns which APIs are configured, rate limits, and vector database status.
+    Useful for the agent to understand what tools are available and any
+    constraints on their use.
+    """
+    config = load_config()
+    collection = get_collection(config.chroma_persist_dir, config.chroma_collection)
+
+    return json.dumps({
+        "server": {
+            "name": config.server_name,
+            "version": config.server_version,
+        },
+        "apis": {
+            "pubchem": {
+                "enabled": True,
+                "rate_limit_per_second": config.pubchem_rate_limit,
+            },
+            "openalex": {
+                "enabled": True,
+                "rate_limit_per_second": config.openalex_rate_limit,
+                "polite_pool": config.openalex_email != "user@example.com",
+            },
+        },
+        "vector_database": {
+            "backend": "chroma",
+            "collection": config.chroma_collection,
+            "document_count": collection.count(),
+            "embedding_model": config.embedding_model,
+        },
+    }, indent=2)
+
+
+@server.resource("science://corpus/stats")
+async def get_corpus_stats() -> str:
+    """Statistics about the local scientific corpus.
+
+    Returns document count, metadata distribution, and storage usage.
+    Helps the agent decide whether to search the local corpus or
+    external databases for a given query.
+    """
+    config = load_config()
+    collection = get_collection(config.chroma_persist_dir, config.chroma_collection)
+
+    # Get metadata distribution
+    all_metadata = collection.get(include=["metadatas"])
+    total = len(all_metadata["ids"])
+
+    type_counts = {}
+    year_counts = {}
+    for meta in (all_metadata["metadatas"] or []):
+        doc_type = meta.get("type", "unknown")
+        type_counts[doc_type] = type_counts.get(doc_type, 0) + 1
+        year = meta.get("year")
+        if year:
+            year_counts[str(year)] = year_counts.get(str(year), 0) + 1
+
+    return json.dumps({
+        "total_documents": total,
+        "by_type": type_counts,
+        "by_year": dict(sorted(year_counts.items())),
+        "collection_name": config.chroma_collection,
+    }, indent=2)
+</code></pre>
+<div class="code-caption">MCP resources exposing server configuration and corpus statistics. The agent can read <code>science://config</code> to understand available APIs and rate limits, and <code>science://corpus/stats</code> to decide whether the local corpus is worth searching for a given query.</div>
+
+<h2>5. Prompt Templates for Scientific Workflows</h2>
+
+<p>
+Prompt templates encode common scientific workflows as reusable, parameterized
+instructions. They guide the agent through multi-step processes that combine several
+tools in a specific order. Think of them as recipes: the agent supplies the
+ingredients (a compound name, a research question), and the prompt template supplies
+the procedure.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is assuming that MCP prompt templates execute their steps automatically, like a script or a macro. They do not. A prompt template is a structured message that the server returns to the host, which then passes it to the language model as part of the conversation. The model reads the steps and decides, one tool call at a time, how to carry them out. The agent can skip steps, reorder them, or ask for clarification, just as a human chef can deviate from a recipe. If you need guaranteed sequential execution with no model discretion, you want a deterministic workflow engine, not a prompt template.
+</p>
+</div>
+
+<pre><code class="language-python">"""Scientific workflow prompt templates."""
+from mcp.server import Server
+from mcp.types import PromptMessage, TextContent
+
+server = Server("science-mcp")
+
+@server.prompt()
+async def literature_review(
+    topic: str,
+    year_from: int = 2020,
+    max_papers: int = 10,
+) -> list[PromptMessage]:
+    """Generate a structured literature review workflow.
+
+    Args:
+        topic: Research topic to review (e.g., 'AlphaFold protein structure prediction').
+        year_from: Earliest publication year to include.
+        max_papers: Maximum papers to retrieve.
+    """
+    return [
+        PromptMessage(
+            role="user",
+            content=TextContent(
+                type="text",
+                text=(
+                    f"Conduct a structured literature review on: {topic}\n\n"
+                    f"Follow these steps:\n\n"
+                    f"1. Use search_literature to find the {max_papers} most-cited "
+                    f"papers on '{topic}' published since {year_from}.\n\n"
+                    f"2. Use search_corpus to check if our local collection has "
+                    f"related papers or notes on this topic.\n\n"
+                    f"3. For each paper found, extract:\n"
+                    f"   - Key contribution (one sentence)\n"
+                    f"   - Methodology\n"
+                    f"   - Main findings\n"
+                    f"   - Limitations noted by the authors\n\n"
+                    f"4. Identify research gaps: what questions remain open?\n\n"
+                    f"5. Synthesize findings into a structured summary with sections:\n"
+                    f"   - Background and motivation\n"
+                    f"   - Methods landscape\n"
+                    f"   - Key results across studies\n"
+                    f"   - Open questions and future directions\n\n"
+                    f"6. Use add_to_corpus to save the review summary for future reference."
+                ),
+            ),
+        )
+    ]
+
+
+@server.prompt()
+async def compound_investigation(smiles: str) -> list[PromptMessage]:
+    """Generate a comprehensive compound investigation workflow.
+
+    Args:
+        smiles: SMILES notation of the compound to investigate.
+    """
+    return [
+        PromptMessage(
+            role="user",
+            content=TextContent(
+                type="text",
+                text=(
+                    f"Investigate the compound: {smiles}\n\n"
+                    f"Follow these steps:\n\n"
+                    f"1. Use compute_descriptors to calculate physicochemical "
+                    f"properties and drug-likeness.\n\n"
+                    f"2. Use search_pubchem with the SMILES to find the compound "
+                    f"in PubChem and get its CID, name, and known activities.\n\n"
+                    f"3. Use find_similar_compounds to identify structural analogs.\n\n"
+                    f"4. Use search_literature with the compound name to find "
+                    f"published studies.\n\n"
+                    f"5. Use search_corpus to check for internal data on this "
+                    f"compound or its analogs.\n\n"
+                    f"6. Synthesize all findings into a compound profile:\n"
+                    f"   - Identity (name, formula, structure)\n"
+                    f"   - Physicochemical properties and drug-likeness\n"
+                    f"   - Known biological activities\n"
+                    f"   - Structural analogs and their activities\n"
+                    f"   - Literature context\n"
+                    f"   - Internal lab data (if any)\n"
+                    f"   - Recommendation: pursue, deprioritize, or investigate further"
+                ),
+            ),
+        )
+    ]
+</code></pre>
+<div class="code-caption">Prompt templates for scientific workflows. The <code>literature_review</code> template guides a six-step review process; <code>compound_investigation</code> orchestrates a comprehensive compound profile. Both reference specific MCP tools by name so the agent knows which tools to call at each step.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: From Prompt Template to Agent Behavior</div>
+<p>
+When a researcher selects the <code>compound_investigation</code> prompt in Claude
+Desktop and enters a SMILES string, the following sequence unfolds. The host sends
+<code>prompts/get</code> to the server, which returns the structured workflow. Claude
+reads the workflow and begins executing: it calls <code>compute_descriptors</code>,
+parses the JSON response, calls <code>search_pubchem</code>, extracts the compound
+name, uses that name to call <code>search_literature</code>, and so on. Each tool call
+is a separate JSON-RPC request. The researcher watches the agent work through the
+steps, intervenes if needed (perhaps redirecting the literature search to a specific
+journal), and receives a comprehensive compound profile. The entire interaction is
+mediated by the MCP server we built, the same server that will power the autonomous
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">self-driving lab</a> in Chapter 55.
+</p>
+</div>
+
+<h2>6. The Complete Server Entry Point</h2>
+
+<p>
+The entry point ties everything together: it loads configuration, initializes shared
+infrastructure, registers all tools, resources, and prompts, and starts the
+transport loop.
+</p>
+
+<pre><code class="language-python">"""science-mcp: A unified MCP server for scientific discovery.
+
+Combines PubChem compound search, OpenAlex literature search,
+RDKit molecular computation, and Chroma vector database into
+a single MCP server for scientific discovery workflows.
+"""
+import asyncio
+import logging
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+
+from science_mcp.config import load_config
+from science_mcp.utils.http_client import SharedHTTPClient
+from science_mcp.utils.rate_limiter import RateLimiter
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("science-mcp")
+
+
+def create_server() -> Server:
+    """Create and configure the MCP server with all tools and resources."""
+    config = load_config()
+    server = Server(config.server_name)
+
+    # Shared infrastructure
+    http_client = SharedHTTPClient()
+    pubchem_limiter = RateLimiter(rate=config.pubchem_rate_limit, burst=5)
+    openalex_limiter = RateLimiter(rate=config.openalex_rate_limit, burst=10)
+
+    # --- PubChem Tools ---
+    @server.tool()
+    async def search_pubchem(
+        query: str, search_type: str = "name", max_results: int = 5
+    ) -> str:
+        """Search PubChem for chemical compounds by name, formula, or SMILES.
+
+        Args:
+            query: Search term (compound name, formula, or SMILES string).
+            search_type: One of 'name', 'formula', or 'smiles'.
+            max_results: Number of results (1-25, default 5).
+
+        Returns:
+            JSON with compounds array (cid, name, formula, weight, smiles).
+        """
+        await pubchem_limiter.acquire()
+        client = await http_client.get()
+        # ... full implementation from Section 12.2 ...
+
+    @server.tool()
+    async def get_compound_properties(cid: int) -> str:
+        """Get detailed properties for a PubChem compound by CID.
+
+        Args:
+            cid: PubChem Compound ID (positive integer, e.g., 2244 for aspirin).
+
+        Returns:
+            JSON with compound properties including name, formula, weight,
+            SMILES, InChI, and computed descriptors.
+        """
+        await pubchem_limiter.acquire()
+        client = await http_client.get()
+        # ... implementation ...
+
+    # --- OpenAlex Tools ---
+    @server.tool()
+    async def search_literature(
+        query: str,
+        max_results: int = 10,
+        sort_by: str = "relevance",
+        year_from: int | None = None,
+        year_to: int | None = None,
+        open_access_only: bool = False,
+    ) -> str:
+        """Search scholarly literature using OpenAlex.
+
+        Args:
+            query: Search terms. Supports boolean operators ('AND', 'OR').
+            max_results: Number of papers (1-50, default 10).
+            sort_by: One of 'relevance', 'cited_by_count', 'publication_date'.
+            year_from: Earliest publication year.
+            year_to: Latest publication year.
+            open_access_only: Return only open-access papers.
+
+        Returns:
+            JSON with papers array (title, authors, year, doi, abstract,
+            cited_by_count, open_access_url) and total_count.
+        """
+        await openalex_limiter.acquire()
+        client = await http_client.get()
+        # ... full implementation from Section 12.2 ...
+
+    # --- Chemistry Computation Tools ---
+    @server.tool()
+    async def compute_descriptors(smiles: str) -> str:
+        """Compute physicochemical descriptors and drug-likeness for a molecule.
+
+        Args:
+            smiles: Molecule in SMILES notation (e.g., 'CCO' for ethanol).
+
+        Returns:
+            JSON with molecular descriptors (MW, LogP, HBD, HBA, TPSA,
+            rotatable bonds) and Lipinski Rule of Five assessment.
+        """
+        # ... full implementation from Section 12.2 ...
+
+    @server.tool()
+    async def find_similar_compounds(
+        smiles: str, threshold: float = 0.7, fingerprint: str = "morgan"
+    ) -> str:
+        """Find structurally similar compounds using molecular fingerprints.
+
+        Args:
+            smiles: Query molecule in SMILES notation.
+            threshold: Minimum Tanimoto similarity (0.0-1.0, default 0.7).
+            fingerprint: Algorithm ('morgan' or 'rdkit', default 'morgan').
+
+        Returns:
+            JSON with similar compounds sorted by decreasing similarity.
+        """
+        # ... full implementation from Section 12.2 ...
+
+    # --- Vector Database Tools ---
+    @server.tool()
+    async def search_corpus(
+        query: str, max_results: int = 5, min_relevance: float = 0.3
+    ) -> str:
+        """Search the local scientific corpus by semantic similarity.
+
+        Args:
+            query: Natural language query (e.g., 'CRISPR delivery in neurons').
+            max_results: Maximum documents (1-20, default 5).
+            min_relevance: Minimum cosine similarity (0.0-1.0, default 0.3).
+
+        Returns:
+            JSON with matching documents (id, text excerpt, metadata, score).
+        """
+        # ... full implementation from above ...
+
+    @server.tool()
+    async def add_to_corpus(
+        text: str, doc_id: str, metadata: dict | None = None
+    ) -> str:
+        """Add a document to the local scientific corpus for future search.
+
+        Args:
+            text: Document text to index (abstract, paper, or note).
+            doc_id: Unique identifier (e.g., 'doi:10.1234/example').
+            metadata: Optional dict with 'title', 'authors', 'year', 'type'.
+
+        Returns:
+            Confirmation with document ID and updated corpus size.
+        """
+        # ... full implementation from above ...
+
+    # --- Resources ---
+    @server.resource("science://config")
+    async def get_server_config() -> str:
+        """Server configuration, API status, and rate limits."""
+        # ... implementation from above ...
+
+    @server.resource("science://corpus/stats")
+    async def get_corpus_stats() -> str:
+        """Corpus statistics: document count, type distribution, year range."""
+        # ... implementation from above ...
+
+    # --- Prompts ---
+    @server.prompt()
+    async def literature_review(
+        topic: str, year_from: int = 2020, max_papers: int = 10
+    ) -> list:
+        """Structured literature review workflow."""
+        # ... implementation from above ...
+
+    @server.prompt()
+    async def compound_investigation(smiles: str) -> list:
+        """Comprehensive compound investigation workflow."""
+        # ... implementation from above ...
+
+    logger.info(
+        "science-mcp server initialized: %d tools, %d resources, %d prompts",
+        len(server._tool_handlers),
+        len(server._resource_handlers),
+        len(server._prompt_handlers),
+    )
+    return server
+
+
+async def main():
+    """Run the server on stdio transport."""
+    server = create_server()
+    async with stdio_server() as (read, write):
+        logger.info("science-mcp server running on stdio")
+        await server.run(read, write, server.create_initialization_options())
+
+
+def main_sync():
+    """Synchronous entry point for console scripts."""
+    asyncio.run(main())
+
+
+if __name__ == "__main__":
+    main_sync()
+</code></pre>
+<div class="code-caption">The complete server entry point. The <code>create_server</code> factory function registers all tools, resources, and prompts. The <code>main_sync</code> function serves as the console script entry point for <code>pip install</code>ed packages.</div>
+
+<h2>7. Integration with the Discovery Workbench</h2>
+
+<p>
+The Discovery Workbench, introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>,
+is the platform that grows throughout this book. Our <code>science-mcp</code> server
+plugs into the workbench as a tool provider. The workbench's agent orchestration
+layer (covered in <a href="../module-17-multi-agent-teams/index.html">Chapter 17</a>)
+routes tool calls to the appropriate MCP server based on the task at hand.
+</p>
+
+<p>
+From the workbench's perspective, the MCP server is a capability module. When a user
+asks the workbench to "investigate compound X," the orchestrator reads the available
+MCP servers, finds <code>science-mcp</code> with its <code>compound_investigation</code>
+prompt, and delegates the workflow. The orchestrator does not need to know how PubChem
+works or what a SMILES string is; the MCP server's tool descriptions carry all the
+domain knowledge.
+</p>
+
+<p>
+This separation of concerns has a concrete benefit: you can swap the chemistry backend
+(from PubChem to a proprietary database) without changing the workbench code. You can
+add new tools (a protein structure prediction tool, a synthetic route planner) without
+modifying existing ones. The MCP protocol's capability negotiation ensures that the
+workbench discovers new tools automatically. This is the
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">modular architecture</a>
+principle from Chapter 6, realized through a concrete protocol.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Autonomous Tool Composition and Discovery</div>
+<p>
+The server we built combines three data sources and one computation engine. Real
+scientific workflows may require dozens of tools: protein structure prediction
+(AlphaFold, ESMFold), pathway analysis (KEGG, Reactome), genomic databases
+(NCBI, Ensembl), materials databases (Materials Project, AFLOW), climate data
+(ERA5, CMIP6), and instrument control systems. The emerging research question is
+how agents <strong>compose</strong> tools from different servers into novel workflows
+that no human explicitly programmed. The ChemCrow system (Bran et al., 2024,
+<em>Nature Machine Intelligence</em>) demonstrated an LLM agent using 18
+chemistry tools to plan syntheses and predict reactions. More recently, the
+SciAgents framework (Ghafarollahi and Buehler, 2024) introduced a multi-agent
+system where agents autonomously discover and chain scientific tools across
+disciplines, generating novel research hypotheses by combining knowledge graph
+traversal with on-demand tool invocation. Their approach shows that agents can
+not only use pre-defined tool sequences but also invent new tool compositions
+that researchers had not anticipated, a preview of the
+<a href="../../part-6-scientific-domains/module-49-chemistry-materials/index.html">chemistry discovery</a>
+systems in Chapter 49.
+</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: FastMCP</div>
+<p>
+The MCP Python SDK's <code>FastMCP</code> class provides an even more concise API for
+building servers. Where the standard <code>Server</code> class requires you to manually
+handle transport setup and initialization, <code>FastMCP</code> reduces the entire
+entry point to three lines: create the server, decorate your tools, and call
+<code>mcp.run()</code>. A 7-tool server that takes 80 lines with the standard API takes
+about 50 lines with <code>FastMCP</code>. The trade-off is less control over transport
+configuration and middleware. For prototyping and small servers, <code>FastMCP</code>
+is the right choice; for production servers with custom authentication and connection
+management, the standard <code>Server</code> class gives you the control you need.
+</p>
+</div>
+
+<h2>8. Running and Verifying the Server</h2>
+
+<p>
+With the server complete, verify it end-to-end using the MCP inspector and then
+configure it for use with Claude Desktop:
+</p>
+
+<pre><code class="language-bash"># Install the server in development mode
+pip install -e ".[all]"
+
+# Run the test suite
+pytest -m "not integration" -v
+
+# Launch the MCP inspector for interactive testing
+npx @modelcontextprotocol/inspector python -m science_mcp.server
+
+# The inspector opens a browser UI where you can:
+# 1. Browse all tools, resources, and prompts
+# 2. Call tools with test inputs
+# 3. Inspect JSON-RPC message traces
+# 4. Verify schema validation
+</code></pre>
+<div class="code-caption">Commands for testing and verifying the complete MCP server. The MCP inspector provides a browser-based UI for interactive tool testing and protocol inspection.</div>
+
+<pre><code class="language-json">// Claude Desktop configuration (~/.claude/claude_desktop_config.json)
+{
+  "mcpServers": {
+    "science-mcp": {
+      "command": "python",
+      "args": ["-m", "science_mcp.server"],
+      "env": {
+        "OPENALEX_EMAIL": "researcher@university.edu",
+        "CHROMA_PERSIST_DIR": "/path/to/lab/corpus",
+        "CHROMA_COLLECTION": "lab_papers"
+      }
+    }
+  }
+}
+</code></pre>
+<div class="code-caption">Claude Desktop configuration for the science-mcp server. The server starts via stdio when Claude Desktop launches, with environment variables pointing to the lab's local corpus.</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Minimal Literature Search MCP Server</h4>
+<p>
+You can build a working MCP server with semantic search in under an hour using only
+Python standard libraries plus <code>chromadb</code> and the <code>mcp</code> SDK.
+Follow these steps:
+</p>
+<p>
+1. Create a new directory <code>mini-science-mcp/</code> and install the dependencies:
+<code>pip install mcp chromadb</code>. Create a single file, <code>server.py</code>.
+</p>
+<p>
+2. In <code>server.py</code>, initialize a Chroma persistent client and create a
+collection called <code>"papers"</code>. Write an <code>add_paper</code> tool that
+accepts a title, abstract, and year, then upserts them into the collection using the
+title as the document ID.
+</p>
+<p>
+3. Write a <code>search_papers</code> tool that accepts a natural-language query and
+returns the top 3 matching documents with their similarity scores. Convert Chroma's
+cosine distance to similarity by computing <code>1 - distance</code>.
+</p>
+<p>
+4. Add the stdio transport entry point (<code>async with stdio_server() as (read, write):
+await server.run(read, write, ...)</code>) and test your server using the MCP inspector:
+<code>npx @modelcontextprotocol/inspector python server.py</code>. Use the inspector
+to add three paper abstracts from different fields (for example, one on CRISPR, one on
+climate modeling, one on graph neural networks), then search for a cross-cutting query
+like "biological sequence prediction" and verify that the results are ranked by
+semantic relevance rather than keyword overlap.
+</p>
+<p>
+5. Add a <code>corpus_stats</code> resource that returns the total document count and
+the distribution of years in your collection. Reload the inspector and confirm the
+resource appears alongside your tools.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+The first version of this server had a bug where the rate limiter's token bucket
+refilled at the wrong rate, sending 50 requests per second to PubChem instead of 5.
+PubChem's response was polite but firm: a 429 status code with the message "Please
+do not make more than 5 requests per second." The bug took 10 minutes to fix. The
+email from PubChem's abuse team took 3 days to arrive. Test your rate limiters.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual</strong>: The <code>science-mcp</code> server combines three external
+data sources (PubChem, OpenAlex, Chroma) behind a single MCP interface. What are the
+advantages and disadvantages of this "unified server" approach compared to running
+three separate MCP servers (one per data source)? Consider failure isolation,
+deployment flexibility, and configuration complexity. How does this relate to the
+monolith vs. microservices discussion in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>?
+</li>
+<li>
+<strong>Coding</strong>: Add a new tool called <code>cross_reference</code> that takes a
+compound SMILES and returns both the PubChem properties and all papers in the local
+corpus that mention the compound (by name or CID). This requires calling
+<code>search_pubchem</code> to get the compound name, then calling
+<code>search_corpus</code> with that name. Implement it as a single MCP tool that
+orchestrates both lookups internally, and write unit tests with mocked responses.
+</li>
+<li>
+<strong>Analysis</strong>: Profile the server's memory usage as the Chroma corpus grows
+from 100 to 100,000 documents. At what corpus size does the server exceed the 1 GB
+Docker memory limit from <a href="section-12.3.html">Section 12.3</a>? How does the
+choice of embedding model (<code>all-MiniLM-L6-v2</code> at 384 dimensions vs.
+<code>all-mpnet-base-v2</code> at 768 dimensions) affect this threshold? Use Chroma's
+persistent storage mode and measure with <code>psutil</code>.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+You now have a complete, tested, deployable MCP server that gives AI agents structured
+access to chemical databases, scholarly literature, and a local knowledge base. In
+<a href="../module-13-requirements-discovery/index.html">Chapter 13: Discovery of
+Requirements</a>, we shift from building the tools agents use to discovering what
+software should do. The MCP servers from this chapter become the hands through which
+requirements-discovery agents explore problem domains, querying databases, reading
+documentation, and probing existing systems to understand stakeholder needs.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-12.3.html">&#8592; 12.3 Testing and Publishing</a>
+<a href="index.html">Chapter 12</a>
+<a href="../module-13-requirements-discovery/index.html">Chapter 13: Discovery of Requirements &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 31.2: Causal Discovery Algorithms. Learning causal structure from data with PC, FCI, GES, and LiNGAM algorithms using causal-learn." name="description"/>
+<title>Section 31.2: Causal Discovery Algorithms | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 31: Causal Discovery and Causal Inference</a></div>
+<h1>31.2 Causal Discovery Algorithms</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I tested 10,000 conditional independence relations and recovered a skeleton. Then I spent a week arguing with my collaborator about three edge orientations."</p>
+<cite>A PC Algorithm Running Low on Patience</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+In <a href="section-31.1.html">Section 31.1</a>, we learned how structural causal models
+encode causal knowledge as directed acyclic graphs (DAGs) and how d-separation connects
+graph structure to conditional independence. Now we reverse the problem: given data, can we
+recover the causal graph? You should be comfortable with conditional independence, the causal
+Markov condition, and the faithfulness assumption from the previous section. Familiarity with
+hypothesis testing (p-values, significance levels) from
+<a href="../../appendices/appendix-a/index.html">Appendix A</a> is needed for
+constraint-based methods.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Causal discovery algorithms learn causal graph structure directly from data, moving beyond
+hand-drawn DAGs that require complete domain knowledge. Three families of algorithms approach
+this problem from different angles: <em>constraint-based</em> methods (PC, FCI) test conditional
+independencies and use d-separation rules to orient edges; <em>score-based</em> methods (GES)
+search over the space of graphs to maximize a scoring criterion; and <em>functional</em> methods
+(LiNGAM) exploit asymmetries in the data distribution (non-Gaussianity) to determine causal
+direction. Each family makes different assumptions about the data and recovers different levels
+of detail. By the end of this section, you will know which algorithm to reach for given your
+data's properties and your scientific question.
+</p>
+</div>
+
+<h2>1. Markov Equivalence Classes</h2>
+
+<p>
+Before diving into algorithms, we need to confront a fundamental limitation. Two different
+DAGs can encode exactly the same set of conditional independence relations and are therefore
+indistinguishable from observational data alone. Such DAGs form a <strong>Markov equivalence
+class</strong>. For example, $X \to Y \to Z$, $X \leftarrow Y \leftarrow Z$, and
+$X \leftarrow Y \to Z$ all imply the same independence: $X \perp\!\!\!\perp Z \mid Y$. No
+amount of observational data can distinguish these three structures.
+</p>
+
+<p data-agent="02">
+A Markov equivalence class is precisely the set of all DAGs that encode identical conditional independence relationships and therefore produce statistically indistinguishable observational distributions. This concept matters because it defines the hard ceiling on what any algorithm can learn from data without experiments: you can narrow down the causal structure to a class of candidates, but not to one unique graph. The mechanism behind it is that two DAGs sharing the same skeleton and the same v-structures will imply exactly the same set of d-separation statements, so no statistical test on passively collected data can tell them apart. Use equivalence class reasoning (and its CPDAG representation) as the default output format for observational causal discovery; switch to methods that break equivalence (such as LiNGAM or interventional experiments) only when your data satisfy their additional assumptions or when you can run controlled perturbations.
+</p>
+
+<p>
+A Markov equivalence class is represented by a <strong>completed partially directed acyclic
+graph (CPDAG)</strong>, which contains directed edges where the orientation is determined and
+undirected edges where it is ambiguous. Two DAGs belong to the same equivalence class if and
+only if they have the same <em>skeleton</em> (undirected edges) and the same
+<em>v-structures</em> (colliders $X \to Z \leftarrow Y$ where $X$ and $Y$ are not adjacent).
+V-structures are identifiable because they create a distinctive independence pattern: $X$ and
+$Y$ are marginally independent but become dependent when conditioning on $Z$.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Observational Data Identifies Equivalence Classes, Not Unique DAGs</div>
+<p>
+The best that any causal discovery algorithm can do from purely observational data (under the
+standard assumptions of causal sufficiency, the Markov condition, and faithfulness) is to
+identify the Markov equivalence class. Within that class, multiple DAGs are equally consistent
+with the data. Narrowing to a unique DAG requires either interventional data (experiments),
+additional structural assumptions (such as non-Gaussianity for LiNGAM or non-linearity for
+ANM), or domain knowledge. This is why the output of PC and GES is a CPDAG, not a DAG.
+</p>
+</div>
+
+<h2>2. The PC Algorithm (Constraint-Based)</h2>
+
+<p>
+The PC algorithm (named after its creators Peter Spirtes and Clark Glymour) is the foundational
+constraint-based causal discovery method. It works in two phases:
+</p>
+
+<p>
+<strong>Phase 1: Skeleton recovery.</strong> Start with a complete undirected graph (every pair
+of variables connected). For each pair $(X, Y)$, test whether there exists a conditioning set
+$Z \subseteq V \setminus \{X, Y\}$ such that $X \perp\!\!\!\perp Y \mid Z$. If such a $Z$
+exists, remove the edge between $X$ and $Y$. The algorithm tests conditioning sets of
+increasing size: first the empty set, then single variables, then pairs, and so on. This
+order matters for computational efficiency, as most edges are removed by small conditioning sets.
+</p>
+
+<p>
+<strong>Phase 2: Edge orientation.</strong> Apply orientation rules to direct edges where
+possible. First, orient v-structures: if $X$ and $Y$ are not adjacent but both adjacent to
+$Z$, and $Z$ was not in the separating set for $(X, Y)$, then orient $X \to Z \leftarrow Y$.
+Then propagate orientations using Meek's rules (Meek, 1995) to avoid creating new v-structures
+or cycles.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent mistake is to interpret the output of PC (or GES) as "the" unique causal graph. Because these algorithms return a CPDAG, undirected edges represent genuine ambiguity: the algorithm is not uncertain or underpowered, it is telling you that multiple causal directions are equally consistent with the data. Treating an undirected edge as if it were directed in a particular way (for instance, defaulting to alphabetical or temporal order) introduces an unjustified causal claim that the data do not support.
+</p>
+</div>
+
+<pre><code class="language-python">import numpy as np
+import pandas as pd
+from causallearn.search.ConstraintBased.PC import pc
+from causallearn.utils.cit import fisherz
+
+# Generate data from a known causal structure:
+# X1 -> X3 <- X2, X3 -> X4, X2 -> X5
+np.random.seed(42)
+n = 2000
+
+X1 = np.random.normal(0, 1, n)
+X2 = np.random.normal(0, 1, n)
+X3 = 0.8 * X1 + 0.6 * X2 + np.random.normal(0, 0.5, n)  # Collider
+X4 = 0.7 * X3 + np.random.normal(0, 0.5, n)
+X5 = 0.5 * X2 + np.random.normal(0, 0.5, n)
+
+data = np.column_stack([X1, X2, X3, X4, X5])
+labels = ["X1", "X2", "X3", "X4", "X5"]
+
+# Run the PC algorithm with Fisher's z conditional independence test
+cg = pc(data, alpha=0.05, indep_test=fisherz, node_names=labels)
+
+# Display the learned graph
+print("Learned CPDAG edges:")
+adj_matrix = cg.G.graph
+for i in range(len(labels)):
+    for j in range(i + 1, len(labels)):
+        if adj_matrix[i, j] != 0 or adj_matrix[j, i] != 0:
+            if adj_matrix[i, j] == -1 and adj_matrix[j, i] == 1:
+                print(f"  {labels[i]} -> {labels[j]}")
+            elif adj_matrix[i, j] == 1 and adj_matrix[j, i] == -1:
+                print(f"  {labels[j]} -> {labels[i]}")
+            elif adj_matrix[i, j] == -1 and adj_matrix[j, i] == -1:
+                print(f"  {labels[i]} -- {labels[j]} (undirected)")
+
+# Visualize the result
+cg.draw_pydot_graph(labels=labels)</code></pre>
+<div class="code-caption">Listing 31.6: Running the PC algorithm with causal-learn. The algorithm recovers the skeleton and orients the v-structure $X_1 \to X_3 \leftarrow X_2$. Fisher's z-test is used for conditional independence testing, appropriate for linear Gaussian relationships.</div>
+
+<p>
+The PC algorithm's computational complexity is determined by the maximum degree of the true
+graph. If the maximum in-degree is $d$, the algorithm tests conditioning sets up to size $d$,
+giving a worst-case complexity of $O(p^{d+2})$ conditional independence tests for $p$
+variables. For sparse graphs (small $d$), this is tractable even for thousands of variables;
+for dense graphs, it becomes prohibitive.
+</p>
+
+<p>
+The <strong>significance level</strong> $\alpha$ controls the skeleton density: larger $\alpha$
+removes more edges (more liberal independence testing), while smaller $\alpha$ retains more
+edges (more conservative). In practice, $\alpha = 0.01$ to $0.05$ works well for datasets
+with hundreds to thousands of samples.
+</p>
+
+<h2>3. The FCI Algorithm (Handling Latent Confounders)</h2>
+
+<p>
+The PC algorithm assumes <strong>causal sufficiency</strong>: all common causes of measured
+variables are themselves measured. When this assumption fails (latent confounders exist),
+PC can produce incorrect orientations. The <strong>FCI</strong> (Fast Causal Inference)
+algorithm drops this assumption and recovers a <strong>partial ancestral graph (PAG)</strong>,
+which uses additional edge types to represent the possible presence of latent common causes.
+</p>
+
+<p>
+A PAG uses three edge marks: arrowheads ($>$), tails ($-$), and circles ($\circ$). A circle
+indicates ambiguity: the mark could be either an arrowhead or a tail. For example:
+</p>
+
+<ul>
+<li>$X \to Y$: $X$ is a direct cause of $Y$, and there is no latent common cause.</li>
+<li>$X \leftrightarrow Y$: there is a latent common cause $L$ with $X \leftarrow L \to Y$ in the true DAG.</li>
+<li>$X \circ\!\!\to Y$: $X$ is either a direct cause of $Y$ or there is a latent common cause, but we cannot distinguish which from the data.</li>
+<li>$X \circ\!\!\!-\!\!\circ Y$: multiple causal relationships are consistent with the data.</li>
+</ul>
+
+<pre><code class="language-python">from causallearn.search.ConstraintBased.FCI import fci
+from causallearn.utils.cit import fisherz
+
+# Generate data with a latent confounder
+np.random.seed(42)
+n = 2000
+
+L = np.random.normal(0, 1, n)  # Latent (unmeasured) confounder
+X1 = 0.7 * L + np.random.normal(0, 0.5, n)
+X2 = 0.6 * L + np.random.normal(0, 0.5, n)
+X3 = 0.8 * X1 + np.random.normal(0, 0.5, n)
+
+# Only observe X1, X2, X3 (not L)
+data_observed = np.column_stack([X1, X2, X3])
+labels_obs = ["X1", "X2", "X3"]
+
+# Run FCI (handles latent confounders)
+G, edges = fci(data_observed, fisherz, alpha=0.05, node_names=labels_obs)
+
+print("FCI output (PAG edges):")
+adj = G.graph
+for i in range(len(labels_obs)):
+    for j in range(i + 1, len(labels_obs)):
+        if adj[i, j] != 0 or adj[j, i] != 0:
+            # Decode edge types
+            marks = {-1: ">", 1: "-", 2: "o"}
+            left_mark = marks.get(adj[j, i], "?")
+            right_mark = marks.get(adj[i, j], "?")
+            print(f"  {labels_obs[i]} {left_mark}--{right_mark} {labels_obs[j]}")
+
+# Expected: X1 <-> X2 (bidirected, indicating latent common cause)
+#           X1 -> X3 (direct cause)</code></pre>
+<div class="code-caption">Listing 31.7: The FCI algorithm detects latent confounders. Where PC would incorrectly orient the $X_1$-$X_2$ edge, FCI outputs a bidirected edge ($X_1 \leftrightarrow X_2$), correctly indicating the presence of an unmeasured common cause $L$.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Gene Regulatory Network Discovery</div>
+<p>
+In genomics, researchers use causal discovery to learn gene regulatory networks from expression
+data. A typical workflow: measure mRNA expression levels for 50 genes across 500 samples,
+apply FCI (because unmeasured transcription factors are almost certain), and interpret the
+resulting PAG. Bidirected edges ($X \leftrightarrow Y$) suggest co-regulation by an unmeasured
+factor. Directed edges ($X \to Y$) suggest direct regulation. Circle marks indicate
+uncertainty that could be resolved with additional perturbation experiments (gene knockouts or
+knockdowns), connecting to the <a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">experiment
+design</a> methods of Chapter 46. The DREAM (Dialogue for Reverse Engineering Assessments and
+Methods) challenges have benchmarked causal discovery algorithms on gene regulatory networks,
+finding that combining constraint-based methods with expression data from perturbation
+experiments substantially outperforms purely observational approaches.
+</p>
+</div>
+
+<h2>4. GES: Score-Based Discovery</h2>
+
+<p>
+The <strong>Greedy Equivalence Search (GES)</strong> algorithm (Chickering, 2002) takes a
+fundamentally different approach from PC and FCI. Instead of testing conditional independencies,
+GES searches directly over the space of CPDAGs (equivalence classes) by greedily optimizing a
+scoring function, typically the <strong>Bayesian Information Criterion (BIC)</strong>:
+</p>
+
+$$\text{BIC}(\mathcal{G}, \mathcal{D}) = -2 \ln L(\hat{\theta}_{\mathcal{G}}; \mathcal{D}) + k \ln n$$
+
+<p>
+where $L$ is the maximized likelihood, $k$ is the number of free parameters in the model
+implied by graph $\mathcal{G}$, and $n$ is the sample size. The BIC penalizes model
+complexity, preferring simpler graphs that explain the data well.
+</p>
+
+<p>
+GES proceeds in two phases:
+</p>
+
+<ol>
+<li><strong>Forward phase</strong>: start from the empty graph. At each step, add the single edge that most improves the BIC score. Continue until no edge addition improves the score.</li>
+<li><strong>Backward phase</strong>: starting from the forward phase result, delete edges one at a time, choosing the deletion that most improves BIC. Continue until no deletion improves the score.</li>
+</ol>
+
+<p>
+Chickering (2002) proved that GES is <em>consistent</em>: given sufficient data from a
+faithful distribution, it recovers the correct Markov equivalence class. In practice, GES
+is often faster than PC on dense graphs and more robust to individual conditional
+independence test failures, because it considers the global fit of the entire graph rather
+than relying on individual pairwise tests.
+</p>
+
+<pre><code class="language-python">from causallearn.search.ScoreBased.GES import ges
+
+# Use the same five-variable dataset from the PC example
+# X1 -> X3 <- X2, X3 -> X4, X2 -> X5
+data_five = np.column_stack([X1, X2, X3, X4, X5])
+
+# Run GES with BIC scoring
+result = ges(data_five, score_func="local_score_BIC", maxP=5)
+
+print("GES learned CPDAG:")
+adj_ges = result["G"].graph
+for i in range(len(labels)):
+    for j in range(i + 1, len(labels)):
+        if adj_ges[i, j] != 0 or adj_ges[j, i] != 0:
+            if adj_ges[i, j] == -1 and adj_ges[j, i] == 1:
+                print(f"  {labels[i]} -> {labels[j]}")
+            elif adj_ges[i, j] == 1 and adj_ges[j, i] == -1:
+                print(f"  {labels[j]} -> {labels[i]}")
+            elif adj_ges[i, j] == -1 and adj_ges[j, i] == -1:
+                print(f"  {labels[i]} -- {labels[j]} (undirected)")
+
+# Compare GES and PC results
+print("\nGES and PC should agree on the equivalence class.")</code></pre>
+<div class="code-caption">Listing 31.8: Score-based causal discovery with GES. The algorithm searches over equivalence classes by greedily optimizing BIC, adding edges in the forward phase and pruning in the backward phase. For the same data, GES and PC should recover the same CPDAG.</div>
+
+<h2>5. LiNGAM: Exploiting Non-Gaussianity</h2>
+
+<p>
+The constraint-based and score-based methods above can only recover equivalence classes, not
+unique DAGs. The <strong>LiNGAM</strong> (Linear Non-Gaussian Acyclic Model) algorithm
+(Shimizu et al., 2006) breaks this limitation by exploiting an additional assumption: the
+noise terms $U_i$ are <em>non-Gaussian</em>. Under linearity and non-Gaussianity, the causal
+direction between two variables is uniquely identifiable from observational data.
+</p>
+
+<p>
+The intuition is elegant. In a linear model $Y = \beta X + U_Y$ where $X$ and $U_Y$ are
+independent, the distribution of the residual $Y - \beta X$ is non-Gaussian (since $U_Y$
+is non-Gaussian). If we fit the model in the wrong direction, $X = \gamma Y + U_X$, the
+residual $X - \gamma Y$ will <em>not</em> be independent of $Y$ (unless the data happen to
+be Gaussian, where all linear models are equivalent). LiNGAM exploits this asymmetry using
+Independent Component Analysis (ICA) to find the unique causal ordering.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of causal direction under non-Gaussianity like identifying the original recipe from a mixed smoothie. If someone blends mango (a distinctly flavored, non-uniform ingredient) into a base, a food chemist can separate the mango contribution from the base because mango has a recognizable chemical signature. But if someone blends plain water into plain water, you cannot tell which container was poured into which. Gaussian noise is like plain water: perfectly symmetric, so the "blending direction" is unrecoverable. Non-Gaussian noise is like mango: its distinctive distributional shape (skew, heavy tails, sharp cutoffs) leaves a fingerprint that reveals which variable was the input and which was the mixture. LiNGAM uses ICA to detect that fingerprint and determine the pouring order.
+</p>
+</div>
+
+<pre><code class="language-python">from causallearn.search.FCMBased.lingam import DirectLiNGAM
+
+# Generate non-Gaussian data (uniform noise)
+np.random.seed(42)
+n = 3000
+
+# True causal order: X1 -> X2 -> X3
+e1 = np.random.uniform(-1, 1, n)  # Non-Gaussian noise
+e2 = np.random.uniform(-1, 1, n)
+e3 = np.random.uniform(-1, 1, n)
+
+X1 = e1
+X2 = 0.8 * X1 + e2
+X3 = 0.6 * X2 + 0.3 * X1 + e3
+
+data_lingam = np.column_stack([X1, X2, X3])
+labels_lingam = ["X1", "X2", "X3"]
+
+# Run DirectLiNGAM
+model = DirectLiNGAM()
+model.fit(data_lingam)
+
+# The causal order
+print(f"Discovered causal order: {[labels_lingam[i] for i in model.causal_order_]}")
+
+# The connection strength matrix (B matrix)
+print("\nConnection strength matrix B:")
+print("(B[i,j] = effect of X_j on X_i)")
+B = model.adjacency_matrix_
+for i in range(len(labels_lingam)):
+    for j in range(len(labels_lingam)):
+        if abs(B[i, j]) > 0.01:
+            print(f"  {labels_lingam[j]} -> {labels_lingam[i]}: {B[i,j]:.3f}")
+
+# Compare with true values: X1->X2 = 0.8, X2->X3 = 0.6, X1->X3 = 0.3</code></pre>
+<div class="code-caption">Listing 31.9: DirectLiNGAM recovers both the unique causal ordering and the connection strengths. Unlike PC and GES, LiNGAM identifies the full DAG (not just the equivalence class) by exploiting non-Gaussian noise distributions.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Non-Gaussianity Breaks Symmetry</div>
+<p>
+Why does non-Gaussianity matter? The Gaussian distribution is the only distribution for which
+uncorrelatedness implies independence. With Gaussian noise, the models $Y = \beta X + U_Y$ and
+$X = \gamma Y + U_X$ are statistically indistinguishable (both yield Gaussian residuals
+independent of the regressor). With non-Gaussian noise, only the correct causal direction produces
+independent residuals. This is a deep result from the theory of independent component analysis:
+the "mixing matrix" (the causal structure) is identifiable up to permutation and scaling when
+the sources are non-Gaussian. In scientific data, non-Gaussianity is the norm (skewed
+distributions, heavy tails, bounded variables), making LiNGAM widely applicable.
+</p>
+</div>
+
+<h2>6. Choosing an Algorithm</h2>
+
+<p>
+Each algorithm family has distinct strengths and limitations. The following table summarizes
+the key tradeoffs:
+</p>
+
+<table>
+<thead>
+<tr><th>Property</th><th>PC</th><th>FCI</th><th>GES</th><th>LiNGAM</th></tr>
+</thead>
+<tbody>
+<tr><td>Output</td><td>CPDAG</td><td>PAG</td><td>CPDAG</td><td>Full DAG</td></tr>
+<tr><td>Latent confounders</td><td>No</td><td>Yes</td><td>No</td><td>No (ICA-LiNGAM: partial)</td></tr>
+<tr><td>Linearity required</td><td>No*</td><td>No*</td><td>No*</td><td>Yes</td></tr>
+<tr><td>Gaussianity OK</td><td>Yes</td><td>Yes</td><td>Yes</td><td>No (requires non-Gaussian)</td></tr>
+<tr><td>Consistency</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Scalability</td><td>Sparse graphs</td><td>Sparse graphs</td><td>Dense graphs</td><td>Moderate ($p &lt; 100$)</td></tr>
+</tbody>
+</table>
+
+<p>
+*PC, FCI, and GES require appropriate conditional independence tests. Fisher's z-test assumes
+linearity and Gaussianity; the kernel-based test (KCI) handles nonlinear relationships but is
+computationally expensive ($O(n^3)$ per test). The chi-squared test handles discrete data.
+</p>
+
+<p>
+A practical decision tree for choosing an algorithm:
+</p>
+
+<ol>
+<li>If latent confounders are plausible: use <strong>FCI</strong>.</li>
+<li>If all common causes are measured and noise is non-Gaussian: use <strong>LiNGAM</strong> for a unique DAG.</li>
+<li>If the graph is dense and Gaussian: use <strong>GES</strong> (more robust to individual test errors).</li>
+<li>If the graph is sparse and you want fast results: use <strong>PC</strong>.</li>
+<li>When in doubt: run multiple algorithms and compare. Edges that appear consistently across methods are more trustworthy than those that appear in only one.</li>
+</ol>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: causal-learn's Unified Interface</div>
+<p>
+The causal-learn library provides PC, FCI, GES, LiNGAM, and a dozen other algorithms under
+a unified API. What would require separate implementations of conditional independence
+testing, graph data structures, orientation rules, and score functions reduces to a few
+import statements and function calls. The library handles the graph representation (CPDAG,
+PAG, DAG), visualization (via pydot or matplotlib), and evaluation (structural Hamming
+distance for comparing learned graphs to ground truth). For production use, gCastle
+(Huawei's library) adds GPU-accelerated variants and differentiable structure learning
+methods like NOTEARS, which we discuss in the research frontier below.
+</p>
+</div>
+
+<h2>7. Evaluating Discovered Graphs</h2>
+
+<p>
+When ground truth is available (simulation studies, benchmarks), we evaluate causal discovery
+algorithms using the <strong>Structural Hamming Distance (SHD)</strong>: the number of edge
+additions, deletions, and reversals needed to transform the learned graph into the true graph.
+An SHD of 0 means perfect recovery. Additional metrics include:
+</p>
+
+<ul>
+<li><strong>Skeleton F1</strong>: precision and recall of the undirected skeleton (ignoring orientations).</li>
+<li><strong>Arrow precision/recall</strong>: precision and recall of correctly oriented edges.</li>
+<li><strong>SID (Structural Intervention Distance)</strong>: counts the number of interventional distributions on which the learned and true graphs disagree. SID is more causally meaningful than SHD because it penalizes errors that affect causal inference.</li>
+</ul>
+
+<pre><code class="language-python">from causallearn.utils.GraphUtils import GraphUtils
+import numpy as np
+
+def structural_hamming_distance(true_adj, learned_adj):
+    """Compute SHD between two adjacency matrices.
+
+    Counts edge additions, deletions, and reversals needed
+    to transform learned_adj into true_adj.
+    """
+    p = true_adj.shape[0]
+    shd = 0
+    for i in range(p):
+        for j in range(i + 1, p):
+            true_edge = (true_adj[i, j] != 0) or (true_adj[j, i] != 0)
+            learned_edge = (learned_adj[i, j] != 0) or (learned_adj[j, i] != 0)
+
+            if true_edge and not learned_edge:
+                shd += 1  # Missing edge
+            elif not true_edge and learned_edge:
+                shd += 1  # Extra edge
+            elif true_edge and learned_edge:
+                # Check orientation
+                true_dir = (true_adj[i, j], true_adj[j, i])
+                learned_dir = (learned_adj[i, j], learned_adj[j, i])
+                if true_dir != learned_dir:
+                    shd += 1  # Wrong orientation
+    return shd
+
+# Evaluate PC result against ground truth
+true_adj = np.zeros((5, 5))
+# True edges: X1->X3, X2->X3, X3->X4, X2->X5
+true_adj[0, 2] = -1; true_adj[2, 0] = 1   # X1 -> X3
+true_adj[1, 2] = -1; true_adj[2, 1] = 1   # X2 -> X3
+true_adj[2, 3] = -1; true_adj[3, 2] = 1   # X3 -> X4
+true_adj[1, 4] = -1; true_adj[4, 1] = 1   # X2 -> X5
+
+pc_adj = cg.G.graph
+shd = structural_hamming_distance(true_adj, pc_adj)
+print(f"Structural Hamming Distance (PC): {shd}")</code></pre>
+<div class="code-caption">Listing 31.10: Computing the Structural Hamming Distance between a learned CPDAG and the true graph. SHD counts the total number of edge additions, deletions, and orientation errors.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+Classical algorithms like PC and GES search over discrete graph structures, limiting scalability.
+NOTEARS (Zheng et al., 2018) reformulated causal discovery as a continuous optimization problem
+by characterizing DAGs through a smooth acyclicity constraint:
+$h(W) = \text{tr}(e^{W \circ W}) - d = 0$, where $W$ is the weighted adjacency matrix. This
+enables gradient-based optimization over the space of DAGs, scaling to hundreds of variables.
+More recently, <strong>DiffAN</strong> (Sanchez et al., 2023) introduced a differentiable
+approach to topological ordering that avoids the problematic acyclicity constraint entirely:
+it learns a causal ordering via a differentiable sorting operator and then prunes spurious edges
+with a variable-selection step, achieving state-of-the-art performance on the BnLearn and
+SynTReN benchmarks while running an order of magnitude faster than DAGMA and NOTEARS on graphs
+with 100+ nodes. Meanwhile, <strong>CDRL</strong> (Ke et al., 2023) applies reinforcement
+learning to causal discovery, training an agent to sequentially add edges while respecting
+acyclicity, and has shown strong results on mixed continuous-discrete data where traditional
+methods struggle. These methods connect to the
+<a href="../../part-5-simulation-optimization/module-42-differentiable-programming/index.html">differentiable
+programming</a> paradigm of Chapter 42, where gradients flow through entire computational
+pipelines.
+</p>
+</div>
+
+<h2>8. Practical Considerations</h2>
+
+<p>
+Running causal discovery on real scientific data requires careful attention to several
+practical issues:
+</p>
+
+<p>
+<strong>Sample size requirements.</strong> Conditional independence tests lose power as the
+conditioning set grows. For PC with Fisher's z-test, a rough guideline is $n > 10^{d/2}$
+samples for a graph with maximum in-degree $d$. With 1,000 samples, conditioning sets beyond
+size 3 or 4 become unreliable. GES is generally more sample-efficient because it uses global
+scoring rather than individual tests.
+</p>
+
+<p>
+<strong>Mixed data types.</strong> Scientific datasets often mix continuous measurements,
+count data, and categorical variables. Fisher's z-test handles only continuous data; the
+chi-squared test handles only discrete data. For mixed data, the conditional Gaussian (CG)
+test or kernel-based independence tests (KCI) are appropriate, though KCI scales as $O(n^3)$
+per test. An alternative is to discretize continuous variables, though this loses information.
+</p>
+
+<p>
+<strong>Prior knowledge incorporation.</strong> Domain knowledge can be encoded as constraints:
+forbidden edges (variables that cannot be causally related), required edges (known causal
+relationships), and tier orderings (temporal or mechanistic ordering constraints). PC and GES
+in causal-learn accept these constraints, and incorporating them dramatically improves
+accuracy by reducing the search space.
+</p>
+
+<pre><code class="language-python"># Incorporating prior knowledge into PC
+from causallearn.search.ConstraintBased.PC import pc
+from causallearn.utils.PCUtils.BackgroundKnowledge import BackgroundKnowledge
+
+# Create background knowledge
+bk = BackgroundKnowledge()
+
+# Forbid edge: X4 cannot cause X1 (temporal ordering)
+bk.add_forbidden_by_node(
+    cg.G.nodes[3],  # X4
+    cg.G.nodes[0],  # X1
+)
+
+# Require edge: X1 must cause X3 (domain knowledge)
+bk.add_required_by_node(
+    cg.G.nodes[0],  # X1
+    cg.G.nodes[2],  # X3
+)
+
+# Re-run PC with background knowledge
+cg_constrained = pc(
+    data, alpha=0.05, indep_test=fisherz,
+    node_names=labels, background_knowledge=bk
+)
+
+print("Constrained PC result:")
+adj_c = cg_constrained.G.graph
+for i in range(len(labels)):
+    for j in range(i + 1, len(labels)):
+        if adj_c[i, j] != 0 or adj_c[j, i] != 0:
+            if adj_c[i, j] == -1 and adj_c[j, i] == 1:
+                print(f"  {labels[i]} -> {labels[j]}")
+            elif adj_c[i, j] == 1 and adj_c[j, i] == -1:
+                print(f"  {labels[j]} -> {labels[i]}")
+            else:
+                print(f"  {labels[i]} -- {labels[j]}")</code></pre>
+<div class="code-caption">Listing 31.11: Incorporating domain knowledge as constraints in the PC algorithm. Forbidden edges prevent implausible causal directions; required edges encode known mechanisms. These constraints reduce the search space and improve accuracy.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Causal Discovery Arms Race</div>
+<p>
+The CausalDiscovery.org benchmarking platform hosts a running competition where researchers
+submit causal discovery algorithms and evaluate them on synthetic and semi-synthetic datasets
+with known ground truth. The leaderboard reveals a humbling pattern: no single algorithm
+dominates across all settings. PC wins on sparse linear Gaussian data; LiNGAM wins on sparse
+non-Gaussian data; GES wins on dense Gaussian data; and nonlinear methods like CAM (Causal
+Additive Models) win on nonlinear data. The practical lesson: always run multiple algorithms
+and trust the edges that agree.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Compare Three Algorithms on Synthetic Data</h4>
+<p>
+Build a short experiment that generates causal data and compares PC, GES, and LiNGAM head to head.
+</p>
+<ol>
+<li><strong>Install dependencies.</strong> Run <code>pip install causal-learn numpy matplotlib</code>. These are the only libraries you need.</li>
+<li><strong>Generate a ground-truth DAG.</strong> Create a 6-variable linear model with non-Gaussian (uniform) noise: let $X_1$ and $X_2$ be root causes, $X_3 = 0.7 X_1 + 0.5 X_2 + U_3$, $X_4 = 0.6 X_3 + U_4$, $X_5 = 0.4 X_2 + U_5$, $X_6 = 0.8 X_4 + 0.3 X_5 + U_6$, where each $U_i \sim \text{Uniform}(-1, 1)$. Draw $n = 2000$ samples.</li>
+<li><strong>Run all three algorithms.</strong> Apply PC (with <code>fisherz</code>, $\alpha = 0.05$), GES (with <code>local_score_BIC</code>), and DirectLiNGAM to the same dataset. Store each algorithm's adjacency matrix.</li>
+<li><strong>Compute SHD for each.</strong> Write the <code>structural_hamming_distance</code> function from Listing 31.10 and score each learned graph against the true adjacency matrix. Print the three SHD values.</li>
+<li><strong>Vary sample size and plot.</strong> Repeat steps 2 through 4 for $n \in \{200, 500, 1000, 2000, 5000\}$. Plot SHD versus $n$ with one line per algorithm using matplotlib. Observe which algorithm converges fastest and which achieves SHD = 0 first on this non-Gaussian data.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Consider a dataset with five variables where the true DAG is $A \to B \to C$, $A \to D$, $D \to C$, $B \to E$. Draw the CPDAG (Markov equivalence class). Which edges are directed and which are undirected? Identify all v-structures. Now suppose the noise terms are all uniform (non-Gaussian). Does LiNGAM recover the full DAG? Why?
+</li>
+<li>
+<strong>(Coding)</strong> Generate data from a 10-variable linear Gaussian DAG (use a random sparse adjacency matrix with density 0.3). Run PC, GES, and LiNGAM on the same data and compare their SHD scores. Repeat for sample sizes $n \in \{200, 500, 1000, 5000\}$ and plot SHD versus $n$ for all three algorithms. At what sample size does each algorithm's SHD stabilize? What happens to LiNGAM on Gaussian data?
+</li>
+<li>
+<strong>(Analysis)</strong> Download the Sachs et al. (2005) protein signaling dataset (available in causal-learn's example datasets). Run FCI on this data and interpret the PAG. Which edges are bidirected (suggesting latent confounders)? Compare your result to the expert-curated network published in the original paper. Discuss: where does the algorithm agree with domain knowledge, and where does it disagree?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+Causal discovery gives us the graph; now we need to quantify the causal effects encoded in it.
+In <a href="section-31.3.html">Section 31.3: Treatment Effect Estimation</a>, we move from
+structure to strength: estimating the average treatment effect (ATE), the average treatment
+effect on the treated (ATT), and the conditional average treatment effect (CATE) using
+modern semiparametric methods. We will see how double machine learning and meta-learners
+combine the flexibility of ML models with the rigor of causal identification, and how
+sensitivity analysis with E-values quantifies robustness to unmeasured confounding.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-31.1.html">&#8592; 31.1 Structural Causal Models</a>
+<a href="index.html">Chapter 31</a>
+<a href="section-31.3.html">31.3 Treatment Effect Estimation &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

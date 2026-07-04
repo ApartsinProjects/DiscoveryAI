@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 12.1: MCP Architecture. The Model Context Protocol from first principles: hosts, clients, servers, transports, JSON-RPC messaging, and the tool/resource/prompt primitives." name="description"/>
+<title>Section 12.1: MCP Architecture | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 12: Building MCP Servers for Scientific Workflows</a></div>
+<h1>12.1 MCP Architecture</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I implemented capability negotiation for 23 scientific instruments, and the only capability any of them agreed on was 'returning errors.'"</p>
+<cite>A Protocol Handshake With Commitment Issues</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section opens the chapter. You should be comfortable with Python async
+programming and have read
+<a href="../module-10-prompting-to-programming/index.html">Chapter 10: Prompting to Programming</a>
+for the basics of tool calling. Familiarity with HTTP APIs and JSON is assumed.
+<a href="../module-11-context-engineering/index.html">Chapter 11: Context Engineering</a>
+explains why delivering structured context to an LLM matters; this section builds
+the infrastructure that makes it possible.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+An AI agent that can only read and write text is like a scientist who can think but
+has no hands, no instruments, and no access to the library. The Model Context Protocol
+(MCP) gives agents structured access to the outside world through a standardized
+interface. Just as the Language Server Protocol (LSP) let every editor talk to every
+language compiler through a single integration, MCP lets every AI host talk to every
+tool server. This section builds your mental model of the protocol from the ground up:
+the actors (hosts, clients, servers), the messages (JSON-RPC), the transports
+(stdio, HTTP), and the three primitive types (tools, resources, prompts) that a
+server can expose.
+</p>
+</div>
+
+<h2>1. Why a Protocol?</h2>
+
+<p>
+Before MCP, connecting an AI agent to an external tool required custom integration
+code for every combination of agent framework and tool. If you had $m$ agent
+frameworks and $n$ tools, you needed $O(m \times n)$ integrations. MCP reduces this
+to $O(m + n)$: each agent framework implements the MCP client once, each tool
+implements the MCP server once, and they all interoperate.
+</p>
+
+<p data-agent="02">
+A <em>protocol</em>, in this context, is a shared contract that specifies exactly how two
+pieces of software exchange messages: what format the messages use, what order they
+arrive in, and what each side must do when it receives one. Protocols matter because
+they decouple producers from consumers; the chemistry tool does not need to know
+whether the agent is Claude, GPT, or a custom research framework, only that it speaks
+MCP. The mechanism is straightforward: both sides agree on JSON-RPC 2.0 as the message
+envelope, negotiate capabilities at connection time, and then exchange typed
+request/response pairs over a transport (stdio or HTTP). Use a protocol instead of
+ad-hoc integration whenever you have more than one agent or more than one tool, or when
+the agent and tool are maintained by different teams.
+</p>
+
+<p>
+This is not a theoretical concern. A scientific discovery platform might need to
+query PubChem for molecular properties, search OpenAlex for literature, control a
+liquid handler, log results to a LIMS, and run simulations on a GPU cluster. Without
+a protocol, each integration is bespoke. With MCP, the agent discovers available
+tools at runtime, reads their schemas, and calls them through a uniform interface.
+The search space of possible integrations collapses from combinatorial to linear
+(recall the complexity analysis from
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>).
+</p>
+
+<h2>2. The Three Actors: Host, Client, Server</h2>
+
+<p>
+MCP defines three roles that participate in every interaction:
+</p>
+
+<p>
+The <strong>host</strong> is the user-facing application: Claude Desktop, a VS Code extension,
+a Jupyter notebook, or a custom research agent built with the framework from
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17</a>. The host manages the
+user session, enforces security policies, and coordinates AI/LLM interactions. A host
+may connect to multiple servers simultaneously, giving the agent access to many tools
+at once.
+</p>
+
+<p>
+The <strong>client</strong> lives inside the host and maintains a stateful, one-to-one
+connection with a single MCP server. Each client-server pair negotiates capabilities
+independently: one client might connect to a chemistry server that exposes molecular
+property tools, while another connects to a literature server exposing search
+resources. The client translates between the host's internal representation and the
+MCP wire protocol.
+</p>
+
+<p>
+The <strong>server</strong> is the process that exposes tools, resources, and prompts. It runs
+in its own process (or container, or remote machine) and communicates with exactly one
+client. A server might wrap a REST API (PubChem), a local database (SQLite, Chroma),
+a command-line tool (RDKit), or a physical instrument (a plate reader connected via
+serial port). The server is responsible for input validation, error handling, and
+rate limiting.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of MCP's host/client/server architecture like a law firm handling multiple cases.
+The <strong>host</strong> is the senior partner who coordinates everything and talks to the
+actual client (the user). Each <strong>MCP client</strong> is a junior associate assigned to
+exactly one outside expert: one associate works with the forensic accountant, another
+with the medical examiner, a third with the private investigator. Each
+<strong>server</strong> is that outside expert, accepting requests only through its assigned
+associate. The senior partner never calls the experts directly, and no expert talks to
+another expert. If the forensic accountant makes a mistake, the medical examiner's work
+is unaffected, because they operate through separate associates with separate
+communication channels. This is why MCP enforces one-to-one client-server pairs:
+isolation through dedicated intermediaries.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Client, One Server</div>
+<p>
+The one-to-one relationship between client and server is a deliberate design choice.
+It means each server connection has its own lifecycle, its own capability set, and its
+own security boundary. A host that needs five tools from five different services runs
+five clients, each in its own connection. This isolation prevents a misbehaving
+chemistry server from interfering with the literature search server. The pattern
+mirrors microservice architecture: small, focused servers composed at the host level.
+</p>
+</div>
+
+<h2>3. Transports: How Messages Move</h2>
+
+<p>
+MCP is transport-agnostic. The protocol defines the message format (JSON-RPC 2.0) but
+not how those messages reach the server. The specification defines three standard
+transports:
+</p>
+
+<p>
+<strong>stdio</strong> is the simplest transport. The host spawns the server as a child
+process and communicates over standard input/output. Each JSON-RPC message is a
+single line of JSON followed by a newline. This transport is ideal for local
+development: no network configuration, no ports to open, no TLS certificates to
+manage. Most MCP servers start here.
+</p>
+
+<p>
+<strong>Server-Sent Events (SSE)</strong> uses HTTP for client-to-server messages (POST
+requests) and SSE for server-to-client messages (a long-lived event stream). This
+transport works through firewalls and reverse proxies, making it suitable for
+remote servers.
+</p>
+
+<p>
+<strong>Streamable HTTP</strong> is the newest transport, using standard HTTP POST requests
+with optional streaming responses via SSE. It supports both stateful (session-based)
+and stateless operation, making it the most flexible option for production
+deployments. The server can optionally upgrade a response to an SSE stream when it
+needs to send multiple messages (progress updates, partial results).
+</p>
+
+<pre><code class="language-python">"""Minimal MCP server using stdio transport."""
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+
+# Create a server with a descriptive name
+server = Server("chemistry-tools")
+
+@server.tool()
+async def get_molecular_weight(smiles: str) -> str:
+    """Calculate molecular weight from a SMILES string.
+
+    Args:
+        smiles: A valid SMILES molecular notation string.
+                Example: 'CCO' for ethanol.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES string: {smiles}")
+    weight = Descriptors.MolWt(mol)
+    return f"Molecular weight of {smiles}: {weight:.2f} g/mol"
+
+async def main():
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+</code></pre>
+<div class="code-caption">A minimal MCP server exposing a single chemistry tool via stdio transport. The <code>@server.tool()</code> decorator registers the function, automatically generating a JSON Schema from the type hints and docstring.</div>
+
+<h2>4. JSON-RPC 2.0: The Message Format</h2>
+
+<p>
+Every MCP message is a JSON-RPC 2.0 object. The protocol defines three message types:
+<strong>requests</strong> (which expect a response), <strong>responses</strong> (which answer a
+request), and <strong>notifications</strong> (one-way messages that expect no reply). Each
+request carries a string <code>method</code>, a structured <code>params</code> object, and
+an integer <code>id</code> that the response echoes back.
+</p>
+
+<p>
+The connection lifecycle begins with an <code>initialize</code> request from the client
+to the server. The client declares its name, version, and supported capabilities.
+The server responds with its own capabilities: which primitives it supports (tools,
+resources, prompts), whether it supports resource subscriptions, and any protocol
+extensions. Only after both sides agree on capabilities does the client send an
+<code>initialized</code> notification, and the connection is ready for use.
+</p>
+
+<pre><code class="language-json">// Client → Server: initialize request
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2025-03-26",
+    "capabilities": {
+      "roots": { "listChanged": true }
+    },
+    "clientInfo": {
+      "name": "discovery-workbench",
+      "version": "0.1.0"
+    }
+  }
+}
+
+// Server → Client: initialize response
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocolVersion": "2025-03-26",
+    "capabilities": {
+      "tools": { "listChanged": true },
+      "resources": { "subscribe": true },
+      "prompts": { "listChanged": true }
+    },
+    "serverInfo": {
+      "name": "science-mcp",
+      "version": "1.0.0"
+    }
+  }
+}
+</code></pre>
+<div class="code-caption">The MCP initialization handshake. The client declares its capabilities (root tracking), and the server responds with its own (tools, resources, prompts). The <code>protocolVersion</code> field ensures both sides speak the same dialect.</div>
+
+<h2>5. The Three Primitives</h2>
+
+<p>
+MCP servers expose functionality through three primitive types, each designed for a
+different interaction pattern:
+</p>
+
+<h3>5.1 Tools: Functions the Agent Can Call</h3>
+
+<p>
+A <strong>tool</strong> is a function that the AI model can invoke to perform an action or
+retrieve computed results. Tools are the most common primitive. Each tool has a name,
+a human-readable description, and an <code>inputSchema</code> defined in JSON Schema
+that specifies the expected parameters. The agent reads the schema, constructs a valid
+input, and the server executes the function.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often assume that MCP tools are simply REST API endpoints with a different
+wire format. They are not. A REST endpoint is stateless and available to any client
+that knows its URL, whereas an MCP tool exists inside a <em>stateful connection</em>
+that begins with capability negotiation, enforces schema validation at the host level
+before the call reaches the server, and supports progress reporting and cancellation
+mid-execution. The lifecycle (initialize, discover, operate, shutdown) means the
+server knows its client and can maintain session state across calls, something a bare
+REST endpoint does not provide.
+</p>
+</div>
+
+<p>
+The key design principle for tool descriptions is that they serve <em>two audiences</em>:
+the LLM (which decides whether and how to call the tool) and the human developer
+(who needs to understand what the tool does). Good tool descriptions are specific
+about input formats, include examples, and state failure modes. Recall the context
+engineering principles from
+<a href="../module-11-context-engineering/index.html">Chapter 11</a>: the description is
+context for the model, and vague context produces vague behavior.
+</p>
+
+<pre><code class="language-python">from mcp.server import Server
+from mcp.types import Tool, TextContent
+import json
+
+server = Server("scientific-tools")
+
+@server.tool()
+async def search_compounds(
+    query: str,
+    max_results: int = 5,
+    property_filter: str | None = None,
+) -> str:
+    """Search PubChem for chemical compounds matching a query.
+
+    Searches by compound name, molecular formula, or SMILES pattern.
+    Returns compound IDs, names, molecular formulas, and key properties.
+
+    Args:
+        query: Search term. Can be a compound name ('aspirin'),
+               molecular formula ('C9H8O4'), or SMILES ('CC(=O)OC1=CC=CC=C1C(=O)O').
+        max_results: Maximum number of compounds to return (1-25, default 5).
+        property_filter: Optional property constraint, e.g. 'MolecularWeight<300'.
+
+    Returns:
+        JSON array of matching compounds with CID, name, formula, and properties.
+
+    Raises:
+        ValueError: If max_results is outside the allowed range.
+        ConnectionError: If the PubChem API is unreachable.
+    """
+    if not 1 <= max_results <= 25:
+        raise ValueError(f"max_results must be 1-25, got {max_results}")
+
+    import pubchempy as pcp
+    compounds = pcp.get_compounds(query, "name", listkey_count=max_results)
+    results = [
+        {
+            "cid": c.cid,
+            "name": c.iupac_name,
+            "formula": c.molecular_formula,
+            "weight": c.molecular_weight,
+            "smiles": c.canonical_smiles,
+        }
+        for c in compounds[:max_results]
+    ]
+    return json.dumps(results, indent=2)
+</code></pre>
+<div class="code-caption">A well-documented MCP tool for searching PubChem. The docstring is critical: the MCP SDK extracts it to build the tool description that the LLM reads when deciding how to call the function. Note the specific examples in each parameter description.</div>
+
+<h3>5.2 Resources: Data the Agent Can Read</h3>
+
+<p>
+A <strong>resource</strong> is a piece of data identified by a URI that the agent (or the
+user, through the host) can read. Resources are for <em>data retrieval</em> rather than
+computation. Think of them as files, database records, or live sensor readings that
+the agent can pull into its context window. Each resource has a URI, a name, a
+description, and a MIME type.
+</p>
+
+<p>
+Resources can be static (a fixed configuration file) or dynamic (the latest reading
+from a mass spectrometer). They can also use URI templates with variables, enabling
+parameterized access: <code>pubchem://compound/{cid}/properties</code> lets the agent
+request properties for any compound by CID.
+</p>
+
+<pre><code class="language-python">from mcp.server import Server
+from mcp.types import Resource, TextContent
+
+server = Server("lab-resources")
+
+@server.resource("lab://instruments/status")
+async def get_instrument_status() -> str:
+    """Current status of all connected laboratory instruments.
+
+    Returns a JSON object mapping instrument IDs to their current state
+    (idle, running, error) and last calibration timestamp.
+    """
+    # In production, this queries the instrument control system
+    status = {
+        "plate-reader-01": {"state": "idle", "last_calibration": "2026-06-30T08:00:00Z"},
+        "liquid-handler-01": {"state": "running", "protocol": "compound-screen-v3"},
+        "mass-spec-01": {"state": "idle", "last_calibration": "2026-06-29T14:30:00Z"},
+    }
+    return json.dumps(status, indent=2)
+
+@server.resource("lab://experiments/{experiment_id}/results")
+async def get_experiment_results(experiment_id: str) -> str:
+    """Retrieve results for a specific experiment by its ID.
+
+    Args:
+        experiment_id: The unique experiment identifier (e.g., 'EXP-2026-0142').
+    """
+    # Query the LIMS database for results
+    results = await query_lims(experiment_id)
+    return json.dumps(results, indent=2)
+</code></pre>
+<div class="code-caption">MCP resources for laboratory data. The first resource has a fixed URI; the second uses a URI template with a variable <code>{experiment_id}</code>, enabling the agent to retrieve results for any experiment.</div>
+
+<h3>5.3 Prompts: Reusable Prompt Templates</h3>
+
+<p>
+A <strong>prompt</strong> is a reusable template that generates structured messages for the
+LLM. Prompts are user-controlled (the human selects which prompt to use), unlike
+tools (which the model selects). They are useful for encoding domain-specific
+workflows: "analyze this compound," "summarize these papers," "design an experiment
+for this hypothesis."
+</p>
+
+<pre><code class="language-python">from mcp.server import Server
+from mcp.types import Prompt, PromptMessage, TextContent
+
+server = Server("science-prompts")
+
+@server.prompt()
+async def analyze_compound(smiles: str) -> list[PromptMessage]:
+    """Generate a structured analysis prompt for a chemical compound.
+
+    Args:
+        smiles: SMILES notation for the compound to analyze.
+    """
+    return [
+        PromptMessage(
+            role="user",
+            content=TextContent(
+                type="text",
+                text=(
+                    f"Analyze the compound with SMILES: {smiles}\n\n"
+                    "Please provide:\n"
+                    "1. Common name and IUPAC name\n"
+                    "2. Key physicochemical properties (logP, PSA, HBD/HBA)\n"
+                    "3. Known biological activities\n"
+                    "4. Drug-likeness assessment (Lipinski's Rule of Five)\n"
+                    "5. Structural alerts for toxicity\n\n"
+                    "Use the search_compounds and get_molecular_weight tools "
+                    "to retrieve data before analyzing."
+                ),
+            ),
+        )
+    ]
+</code></pre>
+<div class="code-caption">An MCP prompt template for compound analysis. The prompt guides the LLM to use specific tools (search_compounds, get_molecular_weight) as part of a structured workflow. This is prompt engineering encoded as infrastructure.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: When to Use Each Primitive</div>
+<p>
+Consider a scientific discovery platform. <strong>Tools</strong> handle actions: search PubChem,
+run a docking simulation, submit a synthesis order. <strong>Resources</strong> provide context:
+the current instrument status, a dataset of known inhibitors, today's experiment log.
+<strong>Prompts</strong> encode workflows: "given a target protein, generate a hit-finding
+campaign" or "review this batch of NMR spectra." The distinction matters because each
+primitive has different security implications. Tools execute code and should be
+sandboxed (see <a href="section-12.3.html">Section 12.3</a>). Resources are read-only
+and generally safe. Prompts shape the LLM's behavior and should be reviewed for
+injection risks (recall the prompt security discussion in
+<a href="../module-11-context-engineering/index.html">Chapter 11</a>).
+</p>
+</div>
+
+<h2>6. JSON Schema Validation</h2>
+
+<p>
+Every tool's <code>inputSchema</code> is a JSON Schema object that the host uses to
+validate the agent's tool call before sending it to the server. This is a critical
+safety layer: malformed inputs are rejected at the protocol level, before they
+reach your code. The MCP Python SDK generates JSON Schema automatically from Python
+type hints, but understanding the schema language lets you add constraints that
+type hints alone cannot express.
+</p>
+
+<p>
+JSON Schema supports constraints beyond basic types: <code>minimum</code> and
+<code>maximum</code> for numbers, <code>pattern</code> for regex validation on strings,
+<code>enum</code> for fixed sets of values, and <code>maxItems</code> for array length.
+For scientific tools, these constraints prevent the agent from submitting impossible
+queries: a molecular weight cannot be negative, a SMILES string must match a
+structural pattern, and a plate reader can only handle 96 or 384 wells.
+</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field
+
+class SimilaritySearchInput(BaseModel):
+    """Input schema for chemical similarity search."""
+    smiles: str = Field(
+        description="Query molecule in SMILES notation. Example: 'c1ccccc1' for benzene.",
+        pattern=r'^[A-Za-z0-9@+\-\[\]\(\)\\\/=#$:.%]+$',  # Basic SMILES character set
+    )
+    threshold: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Tanimoto similarity threshold (0.0 to 1.0). "
+                    "Higher values return fewer, more similar compounds.",
+    )
+    fingerprint_type: str = Field(
+        default="morgan",
+        description="Molecular fingerprint algorithm to use for comparison.",
+        json_schema_extra={"enum": ["morgan", "rdkit", "maccs", "topological"]},
+    )
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Maximum number of similar compounds to return.",
+    )
+</code></pre>
+<div class="code-caption">Using Pydantic to define a typed, validated input schema for a similarity search tool. The <code>Field</code> constraints (ge, le, pattern, enum) generate JSON Schema validation rules that the host enforces before the tool is called.</div>
+
+<p>
+The generated JSON Schema for this model looks like the following (simplified):
+</p>
+
+<pre><code class="language-json">{
+  "type": "object",
+  "properties": {
+    "smiles": {
+      "type": "string",
+      "description": "Query molecule in SMILES notation. Example: 'c1ccccc1' for benzene.",
+      "pattern": "^[A-Za-z0-9@+\\-\\[\\]\\(\\)\\\\/=#$:.%]+$"
+    },
+    "threshold": {
+      "type": "number",
+      "description": "Tanimoto similarity threshold (0.0 to 1.0).",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "default": 0.7
+    },
+    "fingerprint_type": {
+      "type": "string",
+      "enum": ["morgan", "rdkit", "maccs", "topological"],
+      "default": "morgan"
+    },
+    "max_results": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 10
+    }
+  },
+  "required": ["smiles"]
+}
+</code></pre>
+<div class="code-caption">The JSON Schema generated from the Pydantic model. The host validates incoming tool calls against this schema before forwarding them to the server, providing a first line of defense against malformed inputs.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Schema Generation</div>
+<p>
+We defined the JSON Schema explicitly above to show what the protocol uses under the
+hood. In practice, the MCP Python SDK handles this automatically. When you use
+<code>@server.tool()</code> with typed parameters, the SDK calls
+<code>pydantic.TypeAdapter</code> to generate the JSON Schema from your type hints and
+<code>Field</code> metadata. You write 15 lines of Python; the SDK generates the 30-line
+schema. For complex nested types, Pydantic's automatic schema generation saves even
+more: a <code>BaseModel</code> with five nested models that would require 200 lines of
+hand-written JSON Schema reduces to 50 lines of Python.
+</p>
+</div>
+
+<h2>7. Connection Lifecycle</h2>
+
+<p>
+An MCP connection follows a well-defined lifecycle with four phases:
+</p>
+
+<p>
+<strong>Initialization</strong>: The client sends <code>initialize</code> with its capabilities.
+The server responds with its capabilities. The client sends <code>initialized</code>
+notification. Both sides now know what the other supports.
+</p>
+
+<p>
+<strong>Discovery</strong>: The client calls <code>tools/list</code>, <code>resources/list</code>,
+and <code>prompts/list</code> to enumerate what the server offers. The server returns
+arrays of tool/resource/prompt descriptors with names, descriptions, and schemas.
+The host presents these to the LLM as available capabilities.
+</p>
+
+<p>
+<strong>Operation</strong>: The agent (through the host and client) calls tools via
+<code>tools/call</code>, reads resources via <code>resources/read</code>, and invokes
+prompts via <code>prompts/get</code>. Each call is a JSON-RPC request; each response
+carries results or errors.
+</p>
+
+<p>
+<strong>Shutdown</strong>: Either side can close the connection. The client sends a
+<code>close</code> notification, or the transport disconnects. Servers should clean up
+any open resources (database connections, file handles, instrument locks).
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+Current MCP servers declare a fixed set of tools at initialization. Active research
+explores <strong>dynamic tool composition</strong>, where servers generate new tools at
+runtime based on the agent's context. For example, a chemistry server might synthesize
+a specialized "dock_compound_to_target_X" tool after the agent specifies a protein
+target, with the docking parameters pre-filled. The MCP specification supports
+<code>listChanged</code> notifications that inform the client when tools are added or
+removed, enabling this pattern. The <strong>MCP Streamable HTTP</strong> transport,
+standardized in the March 2025 protocol revision, takes this further by allowing
+stateless servers that re-derive their tool set per request, enabling serverless
+deployments where each invocation is an independent cloud function. Meanwhile,
+Anthropic's 2025 introduction of <strong>remote MCP servers with OAuth 2.1
+authentication</strong> (documented in the MCP specification, revision 2025-03-26)
+establishes a production-grade pattern for multi-tenant tool hosting, where a single
+remote server can serve many agents with per-user authorization scopes, a prerequisite
+for shared scientific infrastructure that spans institutions.
+</p>
+</div>
+
+<h2>8. Security Model</h2>
+
+<p>
+MCP's security model follows a principle of <strong>minimal authority</strong>. Servers should
+request only the permissions they need, and hosts should grant only the permissions
+required. The specification defines several security boundaries:
+</p>
+
+<p>
+<strong>Process isolation</strong>: Each server runs in its own process. A crash or
+compromise in one server does not affect others. For scientific workflows, this means
+a buggy instrument-control server cannot corrupt the literature search server.
+</p>
+
+<p>
+<strong>Input validation</strong>: The JSON Schema layer validates all inputs before they
+reach server code. This prevents entire classes of injection attacks: if a SMILES
+parameter must match a regex, arbitrary shell commands cannot be injected through it.
+</p>
+
+<p>
+<strong>Human-in-the-loop</strong>: Hosts are expected to present tool calls to the user for
+approval before execution, especially for tools with side effects (ordering reagents,
+submitting jobs, controlling instruments). The protocol includes progress reporting
+and cancellation mechanisms so that long-running operations can be monitored and
+stopped. We revisit these patterns in the context of
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">self-driving laboratories</a>
+(Chapter 55), where the tension between autonomy and safety becomes acute.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Inspect a Two-Tool MCP Server</h4>
+<p>
+1. Install the MCP SDK and inspector: <code>pip install "mcp[cli]"</code>. This gives
+you the <code>mcp</code> library and the <code>mcp dev</code> command for interactive
+testing.<br/>
+2. Create a file <code>unit_server.py</code> with a <code>Server("unit-converter")</code>
+that registers two tools using <code>@server.tool()</code>: one that converts
+temperatures (accepting a value, a source unit from
+<code>["celsius", "fahrenheit", "kelvin"]</code>, and a target unit) and one that converts
+pressures (atmospheres, pascals, torr). Use Pydantic <code>Field</code> constraints to
+reject temperatures below absolute zero.<br/>
+3. Run <code>mcp dev unit_server.py</code> to launch the MCP inspector in your browser.
+The inspector shows the initialization handshake, the discovered tools, and their
+generated JSON Schemas.<br/>
+4. In the inspector, call the temperature tool with a valid input (e.g., 100 celsius to
+fahrenheit) and observe the JSON-RPC request/response pair. Then call it with an invalid
+input (e.g., negative 300 kelvin) and observe the validation error.<br/>
+5. Open the inspector's "Schema" tab and compare the generated JSON Schema against
+your Python type hints. Note how <code>Field(ge=...)</code> became
+<code>"minimum"</code> and how the <code>enum</code> list appeared in the schema. This
+is the contract that any MCP host will enforce before your code runs.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>Conceptual</strong>: Explain why MCP uses a one-to-one client-server relationship
+rather than allowing a single client to connect to multiple servers. What are the
+security and complexity trade-offs? How does this design choice compare to the
+microservice pattern discussed in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>?
+</li>
+<li>
+<strong>Coding</strong>: Write a minimal MCP server with two tools: one that converts
+temperature between Celsius, Fahrenheit, and Kelvin, and one that converts pressure
+between atmospheres, pascals, and torr. Use Pydantic models for input validation
+with appropriate constraints (e.g., temperature cannot be below absolute zero).
+Test it using the MCP inspector.
+</li>
+<li>
+<strong>Analysis</strong>: Compare the JSON-RPC message flow of an MCP tool call with a
+standard REST API call. Count the number of round trips needed to discover a tool,
+validate inputs, execute it, and handle errors in each approach. Under what
+conditions does the overhead of capability negotiation pay for itself?
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+With the architectural foundations in place, <a href="section-12.2.html">Section 12.2:
+Implementing Scientific Tools</a> puts the theory into practice. We will build three
+real MCP tools that wrap PubChem, OpenAlex, and a chemistry computation library,
+paying close attention to input validation, error handling, and rate limiting.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&#8592; Chapter 12 Index</a>
+<a href="index.html">Chapter 12</a>
+<a href="section-12.2.html">12.2 Implementing Scientific Tools &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

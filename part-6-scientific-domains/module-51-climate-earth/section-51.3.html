@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 51.3: Extreme Events and Attribution. Detecting extreme weather events with anomaly detection, optimal fingerprinting, and causal attribution of anthropogenic forcing." name="description"/>
+<title>Section 51.3: Extreme Events and Attribution | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Discovery in Scientific Domains</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 51: Discovery AI for Climate and Earth Science</a></div>
+<h1>51.3 Extreme Events and Attribution</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The heatwave was a one-in-a-thousand-year event. Then it happened again the next summer. I updated my priors, but my confidence intervals filed a formal complaint."</p>
+<cite>A Return Period Estimate in Need of Recalibration</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Extreme weather events cause the most damage, and their frequency and intensity are changing under anthropogenic climate forcing. Two questions drive this section. First, <em>detection</em>: how do we identify extreme events in high-dimensional, noisy climate data, distinguishing genuine anomalies from natural variability? Second, <em>attribution</em>: given that an extreme event occurred, how much of its probability is attributable to human-caused climate change versus natural variability? These questions connect directly to the anomaly detection methods of <a href="../../part-3-data-models/module-30-anomaly-novelty/index.html">Chapter 30</a> and the causal inference framework of <a href="../../part-3-data-models/module-31-causal-discovery/index.html">Chapter 31</a>, applied here to the geophysical domain.</p>
+</div>
+
+<h2>1. Extreme Value Theory</h2>
+
+<p><strong>What.</strong> Extreme value theory (EVT) provides the statistical foundation for modeling the tails of climate distributions. Rather than fitting a distribution to all observations and extrapolating to the tails, EVT fits distributions specifically designed for extreme values, providing rigorous estimates of return levels and return periods.</p>
+
+<p><strong>Why.</strong> Infrastructure, insurance, and adaptation planning need answers to questions like "what is the maximum daily rainfall with a 1% annual probability of being exceeded?" Standard Gaussian assumptions break down in the tails. EVT provides the mathematical framework for these calculations.</p>
+
+<p><strong>How.</strong> Two approaches dominate. The <strong>block maxima</strong> method takes the annual maximum of a variable (e.g., annual maximum daily temperature) and fits a Generalized Extreme Value (GEV) distribution. The <strong>peaks-over-threshold</strong> (POT) method selects all exceedances above a high threshold and fits a Generalized Pareto Distribution (GPD). POT uses more data and is generally preferred when a reliable threshold can be selected.</p>
+
+<p>The GEV distribution has three parameters: location $\mu$, scale $\sigma > 0$, and shape $\xi$:</p>
+
+$$G(x; \mu, \sigma, \xi) = \exp\left\{-\left[1 + \xi\left(\frac{x - \mu}{\sigma}\right)\right]^{-1/\xi}\right\}$$
+
+<p>The shape parameter $\xi$ determines the tail behavior. When $\xi > 0$ (Frechet type), the tail is heavy; when $\xi = 0$ (Gumbel type), the tail is exponential; when $\xi < 0$ (Weibull type), the tail has an upper bound. For temperature extremes, $\xi$ is typically near zero or slightly negative. For precipitation, $\xi$ is typically positive, reflecting the heavy-tailed nature of rainfall extremes.</p>
+
+<pre><code class="language-python">"""
+Extreme value analysis for climate data:
+GEV fitting, return levels, and non-stationary models.
+"""
+import numpy as np
+from scipy import stats
+from scipy.optimize import minimize
+from dataclasses import dataclass
+
+
+@dataclass
+class GEVFit:
+    """Result of a GEV distribution fit."""
+    location: float     # mu
+    scale: float        # sigma
+    shape: float        # xi
+    nll: float          # negative log-likelihood
+    aic: float          # Akaike Information Criterion
+
+
+def fit_gev(block_maxima: np.ndarray) -> GEVFit:
+    """Fit a Generalized Extreme Value distribution to block maxima.
+
+    Uses maximum likelihood estimation via scipy's genextreme,
+    which parameterizes the shape as c = -xi (note the sign
+    convention difference from the climate literature).
+
+    Args:
+        block_maxima: Array of annual (or seasonal) maxima
+    Returns:
+        GEVFit with estimated parameters
+    """
+    # scipy uses c = -xi convention
+    c, loc, scale = stats.genextreme.fit(block_maxima)
+    xi = -c  # Convert to climate convention
+
+    # Negative log-likelihood for model comparison
+    nll = -np.sum(stats.genextreme.logpdf(block_maxima,
+                                          c, loc=loc, scale=scale))
+    aic = 2 * 3 + 2 * nll  # 3 parameters
+
+    return GEVFit(location=loc, scale=scale, shape=xi,
+                  nll=nll, aic=aic)
+
+
+def return_level(gev: GEVFit, return_period: float) -> float:
+    """Compute the return level for a given return period.
+
+    The T-year return level is the value that is exceeded
+    once every T years on average.
+
+    Args:
+        gev: Fitted GEV parameters
+        return_period: Return period in years (e.g., 100)
+    Returns:
+        Return level value
+    """
+    p = 1 - 1.0 / return_period
+    if abs(gev.shape) < 1e-8:
+        # Gumbel case (xi -> 0)
+        return gev.location - gev.scale * np.log(-np.log(p))
+    else:
+        # General GEV case
+        yp = -np.log(p)
+        return gev.location + gev.scale / gev.shape * (
+            yp ** (-gev.shape) - 1
+        )
+
+
+def return_level_confidence(block_maxima: np.ndarray,
+                            return_period: float,
+                            n_bootstrap: int = 1000,
+                            ci: float = 0.95) -> tuple[float, float, float]:
+    """Bootstrap confidence interval for return levels.
+
+    Resamples the block maxima, refits the GEV for each
+    resample, and computes the return level distribution.
+
+    Args:
+        block_maxima: Array of annual maxima
+        return_period: Return period in years
+        n_bootstrap: Number of bootstrap resamples
+        ci: Confidence level
+    Returns:
+        (lower, median, upper) return level estimates
+    """
+    rng = np.random.default_rng(42)
+    n = len(block_maxima)
+    levels = []
+
+    for _ in range(n_bootstrap):
+        sample = rng.choice(block_maxima, size=n, replace=True)
+        try:
+            gev = fit_gev(sample)
+            rl = return_level(gev, return_period)
+            if np.isfinite(rl):
+                levels.append(rl)
+        except Exception:
+            continue
+
+    levels = np.array(levels)
+    alpha = (1 - ci) / 2
+    return (
+        float(np.quantile(levels, alpha)),
+        float(np.median(levels)),
+        float(np.quantile(levels, 1 - alpha)),
+    )
+
+
+class NonstationaryGEV:
+    """GEV with time-varying location parameter.
+
+    In a changing climate, the distribution of extremes is
+    not stationary. The simplest non-stationary model lets
+    the location parameter trend linearly with time:
+    mu(t) = mu_0 + mu_1 * t
+
+    This captures the shift in extreme value distributions
+    due to global warming.
+    """
+
+    def __init__(self):
+        self.params = None
+
+    def _neg_log_likelihood(self, params: np.ndarray,
+                            data: np.ndarray,
+                            time: np.ndarray) -> float:
+        """Negative log-likelihood for non-stationary GEV.
+
+        Args:
+            params: [mu_0, mu_1, log_sigma, xi]
+            data: Block maxima values
+            time: Normalized time covariate
+        Returns:
+            Negative log-likelihood
+        """
+        mu_0, mu_1, log_sigma, xi = params
+        sigma = np.exp(log_sigma)
+        mu = mu_0 + mu_1 * time
+
+        z = (data - mu) / sigma
+
+        if abs(xi) < 1e-8:
+            # Gumbel case
+            nll = np.sum(np.log(sigma) + z + np.exp(-z))
+        else:
+            w = 1 + xi * z
+            if np.any(w <= 0):
+                return 1e10
+            nll = np.sum(
+                np.log(sigma)
+                + (1 + 1 / xi) * np.log(w)
+                + w ** (-1 / xi)
+            )
+
+        return nll
+
+    def fit(self, data: np.ndarray,
+            time: np.ndarray) -> dict:
+        """Fit non-stationary GEV to block maxima with time covariate.
+
+        Args:
+            data: Block maxima values
+            time: Time covariate (e.g., year - 1950)
+        Returns:
+            Dictionary with fitted parameters and diagnostics
+        """
+        # Normalize time to [0, 1]
+        t_norm = (time - time.min()) / (time.max() - time.min())
+
+        # Initialize from stationary fit
+        gev0 = fit_gev(data)
+        x0 = [gev0.location, 0.0, np.log(gev0.scale), gev0.shape]
+
+        result = minimize(
+            self._neg_log_likelihood, x0,
+            args=(data, t_norm),
+            method="Nelder-Mead",
+            options={"maxiter": 10000},
+        )
+
+        mu_0, mu_1, log_sigma, xi = result.x
+        self.params = {
+            "mu_0": mu_0, "mu_1": mu_1,
+            "sigma": np.exp(log_sigma), "xi": xi,
+        }
+
+        return {
+            "params": self.params,
+            "nll": result.fun,
+            "aic": 2 * 4 + 2 * result.fun,
+            "trend_per_decade": mu_1 / (time.max() - time.min()) * 10,
+            "converged": result.success,
+        }</code></pre>
+<div class="code-caption">Figure 51.12: Extreme value analysis toolkit. The stationary GEV fit estimates return levels from block maxima, while the non-stationary GEV allows the location parameter to trend with time, capturing the shift in extreme value distributions under climate change. Bootstrap confidence intervals quantify uncertainty in return level estimates.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Non-Stationarity Changes Everything</div>
+<p>Classical extreme value analysis assumes that the climate is stationary: the distribution of annual maxima does not change over time. Under climate change, this assumption is violated. A "100-year flood" computed from 1950-1980 data may occur every 20 years under current conditions. Non-stationary EVT models (with time-varying parameters) capture this shift, but they require longer records and introduce additional parameters that must be estimated. The choice between stationary and non-stationary models is itself a hypothesis test: does the data support a trend in the extreme value distribution? This is detection in the formal climate science sense, connecting to the change-point detection methods from <a href="../../part-3-data-models/module-30-anomaly-novelty/index.html">Chapter 30</a>.</p>
+</div>
+
+<h2>2. Detecting Extreme Events in Climate Data</h2>
+
+<p>Detecting extreme events in high-dimensional climate data goes beyond fitting univariate distributions. A compound event (simultaneous heat and drought, or a tropical cyclone making landfall during a king tide) may not be extreme in any single variable but is extreme in its combination. Multivariate anomaly detection, building on the methods from <a href="../../part-3-data-models/module-30-anomaly-novelty/index.html">Chapter 30</a>, captures these compound extremes.</p>
+
+<p data-agent="02">A compound extreme event is a situation where two or more climate or weather variables coincide in a way that produces severe impacts, even though neither variable alone would qualify as extreme. Compound events matter because they account for a disproportionate share of climate-related damage: the 2022 Pakistan floods, for instance, resulted from simultaneous monsoon intensification and upstream glacial melt, neither of which was record-breaking individually. The detection mechanism works by constructing a joint distribution over multiple climate variables (temperature, precipitation, soil moisture, wind speed) and flagging observations that fall in the low-probability region of the joint space. Compound event analysis is preferred over univariate extreme detection whenever impacts depend on the co-occurrence of multiple hazards, such as coastal flooding (storm surge plus river discharge plus high tide) or crop failure (heat plus drought during a critical growth stage).</p>
+
+<pre><code class="language-python">"""
+Multivariate extreme event detection in climate data.
+Combines anomaly detection with spatial clustering to
+identify coherent extreme weather events.
+"""
+import numpy as np
+import xarray as xr
+from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest
+from scipy.ndimage import label as ndimage_label
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ExtremeEvent:
+    """Detected extreme weather event."""
+    start_date: str
+    end_date: str
+    center_lat: float
+    center_lon: float
+    area_km2: float
+    max_anomaly: float
+    event_type: str
+    spatial_extent: np.ndarray = field(repr=False)
+
+
+def detect_heatwaves(
+    temperature: xr.DataArray,
+    climatology: xr.DataArray,
+    threshold_percentile: float = 95,
+    min_duration_days: int = 3,
+    min_area_gridcells: int = 50,
+) -> list[ExtremeEvent]:
+    """Detect heatwave events using exceedance-duration-area criteria.
+
+    A heatwave is defined as a spatially contiguous region where
+    temperature exceeds the local climatological percentile for
+    at least a minimum number of consecutive days.
+
+    Args:
+        temperature: Daily temperature DataArray (time, lat, lon)
+        climatology: Day-of-year climatological percentile
+        threshold_percentile: Percentile threshold for exceedance
+        min_duration_days: Minimum consecutive exceedance days
+        min_area_gridcells: Minimum spatial extent in grid cells
+    Returns:
+        List of detected ExtremeEvent objects
+    """
+    # Compute anomaly relative to day-of-year climatology
+    anomaly = temperature.groupby("time.dayofyear") - climatology
+
+    # Compute threshold from climatological distribution
+    # (using the entire record for the percentile)
+    threshold = float(anomaly.quantile(
+        threshold_percentile / 100, dim="time"
+    ).mean())
+
+    # Binary exceedance field
+    exceedance = (anomaly > threshold).values  # (time, lat, lon)
+
+    events = []
+    n_times = exceedance.shape[0]
+
+    # Scan for consecutive exceedance periods
+    t = 0
+    while t < n_times:
+        daily_mask = exceedance[t]
+
+        # Label spatially contiguous regions
+        labeled, n_features = ndimage_label(daily_mask)
+
+        for region_id in range(1, n_features + 1):
+            region_mask = labeled == region_id
+            area = region_mask.sum()
+
+            if area < min_area_gridcells:
+                continue
+
+            # Check duration: does this region persist?
+            duration = 1
+            for dt in range(1, n_times - t):
+                future_mask = exceedance[t + dt]
+                overlap = (region_mask & future_mask).sum()
+                if overlap >= area * 0.5:
+                    duration += 1
+                else:
+                    break
+
+            if duration >= min_duration_days:
+                # Compute event properties
+                lat_idx, lon_idx = np.where(region_mask)
+                lats = temperature.lat.values[lat_idx]
+                lons = temperature.lon.values[lon_idx]
+
+                max_anom = float(anomaly.values[
+                    t:t+duration, region_mask
+                ].max())
+
+                # Approximate area in km^2
+                dlat = abs(float(np.diff(temperature.lat[:2])))
+                dlon = abs(float(np.diff(temperature.lon[:2])))
+                mean_lat = np.mean(lats)
+                cell_area = (
+                    dlat * 111  # km per degree latitude
+                    * dlon * 111 * np.cos(np.deg2rad(mean_lat))
+                )
+                total_area = area * cell_area
+
+                events.append(ExtremeEvent(
+                    start_date=str(temperature.time.values[t])[:10],
+                    end_date=str(
+                        temperature.time.values[t + duration - 1]
+                    )[:10],
+                    center_lat=float(np.mean(lats)),
+                    center_lon=float(np.mean(lons)),
+                    area_km2=float(total_area),
+                    max_anomaly=max_anom,
+                    event_type="heatwave",
+                    spatial_extent=region_mask,
+                ))
+
+        t += max(1, duration if events else 1)
+
+    return events
+
+
+def compound_event_detection(
+    variables: dict[str, xr.DataArray],
+    n_components: int = 10,
+    contamination: float = 0.01,
+) -> np.ndarray:
+    """Detect compound extreme events using multivariate anomaly detection.
+
+    Compound events are extreme in their combination of variables
+    (e.g., simultaneous heat and drought) even when no single
+    variable is individually extreme.
+
+    Uses PCA for dimensionality reduction followed by Isolation
+    Forest for anomaly scoring.
+
+    Args:
+        variables: Dictionary mapping variable names to DataArrays
+            (all must share the same time dimension)
+        n_components: Number of PCA components to retain
+        contamination: Expected fraction of anomalous samples
+    Returns:
+        anomaly_scores: Array of anomaly scores per time step
+            (more negative = more anomalous)
+    """
+    # Stack variables into a feature matrix
+    features = []
+    for name, da in variables.items():
+        # Spatial average (or could use grid-point features)
+        weights = np.cos(np.deg2rad(da.lat))
+        spatial_mean = da.weighted(weights).mean(["lat", "lon"])
+        features.append(spatial_mean.values)
+
+    X = np.column_stack(features)
+
+    # Standardize
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-10)
+
+    # PCA for dimensionality reduction
+    pca = PCA(n_components=min(n_components, X.shape[1]))
+    X_pca = pca.fit_transform(X)
+
+    # Isolation Forest for anomaly detection
+    clf = IsolationForest(
+        contamination=contamination,
+        random_state=42,
+        n_estimators=200,
+    )
+    scores = clf.fit(X_pca).score_samples(X_pca)
+
+    return scores</code></pre>
+<div class="code-caption">Figure 51.13: Extreme event detection in climate data. The heatwave detector identifies spatially contiguous regions exceeding a climatological threshold for consecutive days. The compound event detector uses PCA and Isolation Forest to find multivariate anomalies where the combination of variables is extreme even if individual variables are not.</div>
+
+<h2>3. Optimal Fingerprinting and Detection-Attribution</h2>
+
+<p><strong>What.</strong> Optimal fingerprinting is the standard statistical framework for detecting and attributing climate change signals. It answers two questions simultaneously. <em>Detection</em>: is the observed climate trend inconsistent with internal variability alone? <em>Attribution</em>: what fraction of the observed trend is explained by each forcing agent (greenhouse gases, aerosols, solar variability, volcanic eruptions)?</p>
+
+<p><strong>Why.</strong> The IPCC's conclusion that "human influence on the climate system is unequivocal" rests on optimal fingerprinting analyses. More practically, attribution science supports climate litigation (proving that a specific entity's emissions contributed to a specific event), adaptation planning (knowing which forcings to mitigate), and loss-and-damage negotiations.</p>
+
+<p><strong>How.</strong> Optimal fingerprinting works by regression. The observed climate change pattern $\mathbf{y}$ is modeled as a linear combination of response patterns $\mathbf{X}_i$ from individual forcings, plus internal variability noise $\boldsymbol{\varepsilon}$:</p>
+
+$$\mathbf{y} = \sum_i \beta_i \mathbf{X}_i + \boldsymbol{\varepsilon}$$
+
+<p>The response patterns $\mathbf{X}_i$ come from GCM simulations with individual forcings applied in isolation (greenhouse gases only, aerosols only, natural forcings only). The scaling factors $\beta_i$ are estimated by generalized least squares, using the covariance structure of internal variability (estimated from pre-industrial control simulations) to weight the regression. If $\beta_i$ is significantly different from zero, the forcing $i$ is <em>detected</em>. If $\beta_i$ is consistent with 1.0, the GCM's response to forcing $i$ is consistent with observations.</p>
+
+<pre><code class="language-python">"""
+Optimal fingerprinting for detection and attribution
+of climate change signals.
+"""
+import numpy as np
+from scipy import linalg
+from dataclasses import dataclass
+
+
+@dataclass
+class FingerprintResult:
+    """Result of an optimal fingerprinting analysis."""
+    scaling_factors: np.ndarray     # beta_i estimates
+    confidence_intervals: np.ndarray  # 5-95% CI for each beta
+    detected: np.ndarray            # boolean: is beta != 0?
+    consistent: np.ndarray          # boolean: is beta consistent with 1?
+    residual_consistency: float     # Allen-Tett residual test p-value
+
+
+def optimal_fingerprinting(
+    observations: np.ndarray,
+    response_patterns: np.ndarray,
+    control_segments: np.ndarray,
+    n_eof: int = 10,
+    significance_level: float = 0.1,
+) -> FingerprintResult:
+    """Regularized optimal fingerprinting (Allen & Stott, 2003).
+
+    Detects and attributes climate signals by regressing
+    observations onto GCM response patterns for individual forcings
+    (greenhouse gases, aerosols, natural), using the covariance of
+    internal variability from control simulations as the noise model.
+
+    Args:
+        observations: (n_spatial,) observed climate change pattern
+            (e.g., temperature trend over 1950-2020, projected
+            onto leading EOFs)
+        response_patterns: (n_forcings, n_spatial) GCM response
+            patterns for each forcing agent (GHG, aerosol, natural)
+        control_segments: (n_segments, n_spatial) non-overlapping
+            segments of pre-industrial control simulation,
+            each the same length as the observational record
+        n_eof: Number of EOFs for dimension reduction
+        significance_level: Significance level for detection
+    Returns:
+        FingerprintResult with scaling factors and diagnostics
+    """
+    n_forcings = response_patterns.shape[0]
+
+    # Step 1: Estimate internal variability covariance from control
+    # Split control into two halves: one for regression, one for testing
+    n_ctrl = len(control_segments)
+    half = n_ctrl // 2
+    ctrl_train = control_segments[:half]
+    ctrl_test = control_segments[half:]
+
+    # Covariance from training half
+    cov_noise = np.cov(ctrl_train.T)
+
+    # Step 2: EOF truncation for regularization
+    eigenvalues, eigenvectors = linalg.eigh(cov_noise)
+    # Sort descending
+    idx = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[idx[:n_eof]]
+    P = eigenvectors[:, idx[:n_eof]]  # (n_spatial, n_eof)
+
+    # Project everything into EOF space
+    y = P.T @ observations                         # (n_eof,)
+    X = (P.T @ response_patterns.T)                # (n_eof, n_forcings)
+    C_inv = np.diag(1.0 / eigenvalues)             # (n_eof, n_eof)
+
+    # Step 3: Generalized least squares
+    # beta = (X^T C^{-1} X)^{-1} X^T C^{-1} y
+    XtCi = X.T @ C_inv                             # (n_forcings, n_eof)
+    fisher = XtCi @ X                              # (n_forcings, n_forcings)
+    fisher_inv = linalg.inv(fisher)
+    beta = fisher_inv @ XtCi @ y                   # (n_forcings,)
+
+    # Step 4: Confidence intervals from the Fisher information
+    beta_var = np.diag(fisher_inv)
+    beta_std = np.sqrt(beta_var)
+
+    z_crit = 1.645  # 90% CI (5-95%)
+    ci = np.column_stack([
+        beta - z_crit * beta_std,
+        beta + z_crit * beta_std,
+    ])
+
+    # Step 5: Detection test (is beta significantly != 0?)
+    detected = ci[:, 0] > 0  # Lower CI bound above zero
+
+    # Step 6: Consistency test (is beta consistent with 1.0?)
+    consistent = (ci[:, 0] <= 1.0) & (ci[:, 1] >= 1.0)
+
+    # Step 7: Residual consistency test (Allen-Tett)
+    residual = y - X @ beta
+    residual_var = float(residual @ C_inv @ residual) / (n_eof - n_forcings)
+
+    # Compare against chi-squared distribution
+    from scipy.stats import chi2
+    p_value = 1 - chi2.cdf(
+        residual_var * (n_eof - n_forcings),
+        df=n_eof - n_forcings,
+    )
+
+    return FingerprintResult(
+        scaling_factors=beta,
+        confidence_intervals=ci,
+        detected=detected,
+        consistent=consistent,
+        residual_consistency=float(p_value),
+    )
+
+
+def print_attribution_results(result: FingerprintResult,
+                              forcing_names: list[str]) -> None:
+    """Print a human-readable attribution summary.
+
+    Args:
+        result: FingerprintResult from optimal_fingerprinting
+        forcing_names: List of forcing agent names
+    """
+    print("=" * 60)
+    print("OPTIMAL FINGERPRINTING: DETECTION AND ATTRIBUTION")
+    print("=" * 60)
+
+    for i, name in enumerate(forcing_names):
+        beta = result.scaling_factors[i]
+        lo, hi = result.confidence_intervals[i]
+        det = "DETECTED" if result.detected[i] else "not detected"
+        con = "consistent" if result.consistent[i] else "INCONSISTENT"
+
+        print(f"\n{name}:")
+        print(f"  Scaling factor: {beta:.3f} [{lo:.3f}, {hi:.3f}]")
+        print(f"  Detection:      {det}")
+        print(f"  GCM consistency: {con} with observations")
+
+    print(f"\nResidual test p-value: {result.residual_consistency:.3f}")
+    if result.residual_consistency > 0.05:
+        print("  Model passes residual consistency test")
+    else:
+        print("  WARNING: model fails residual consistency test")</code></pre>
+<div class="code-caption">Figure 51.14: Optimal fingerprinting for climate detection and attribution. The method regresses observed climate patterns onto GCM response patterns for individual forcings (greenhouse gases, aerosols, natural), using the covariance of internal variability from control simulations as the noise model. Detection tests whether the scaling factor is significantly different from zero; consistency tests whether it equals 1.0 (meaning the GCM response matches observations).</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Attribution as Causal Inference</div>
+<p>Optimal fingerprinting is a form of causal inference. The "treatment" is a forcing agent (greenhouse gas emissions). The "outcome" is the observed climate pattern. The "control" is the pre-industrial simulation without the treatment. The GCM provides the counterfactual: what would have happened without human influence? The scaling factor $\beta$ quantifies the causal effect. This connects directly to the potential outcomes framework from <a href="../../part-3-data-models/module-31-causal-discovery/index.html">Chapter 31</a>. The key assumption is that the GCM accurately represents the response to each forcing, a physical version of the "no unmeasured confounders" assumption in causal inference. When the residual consistency test fails, it signals that this assumption may be violated.</p>
+</div>
+
+<h2>4. Event Attribution: The Probabilistic Approach</h2>
+
+<p>While optimal fingerprinting attributes long-term trends, <strong>event attribution</strong> asks about specific events: "How did climate change alter the probability of this particular heatwave?" The World Weather Attribution (WWA) protocol provides a rigorous framework.</p>
+
+<p>The key quantity is the <strong>probability ratio</strong> (also called risk ratio or likelihood ratio):</p>
+
+$$\text{PR} = \frac{P(\text{event} \mid \text{factual climate})}{P(\text{event} \mid \text{counterfactual climate})}$$
+
+<p>A PR of 5 means the event is five times more likely in the current climate than in a world without human influence. The "factual" climate is the real world with all forcings. The "counterfactual" is a hypothetical world estimated by removing the anthropogenic signal (using GCM simulations with natural forcings only).</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p><strong>Misconception: "A probability ratio of 5 means climate change caused 80% of the event."</strong> Attribution does not partition a single event into a "human-caused portion" and a "natural portion." Weather events are produced by the full climate system; you cannot slice a heatwave into a human piece and a natural piece. What the probability ratio quantifies is the change in the <em>likelihood</em> of the event class, not a percentage of the event itself. Saying "this type of event is five times more probable because of human influence" is correct. Saying "climate change caused 80% of this specific heatwave" misapplies the framework.</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of event attribution like a loaded die. Suppose a standard die has a 1-in-6 chance of rolling a six, but someone has tampered with it so that sixes now come up 5-in-6 of the time. When you roll a six, you cannot point to the weighting and say "83% of this particular roll was caused by the tampering." The roll either happened or it did not. What you can say is that the tampering made sixes five times more likely (probability ratio = 5). The counterfactual climate is the fair die; the factual climate is the loaded one. Attribution quantifies how much the loading shifted the odds, not what fraction of any single roll was "caused" by the weight.</p>
+</div>
+
+<p>The complementary quantity is the <strong>fraction of attributable risk</strong> (FAR):</p>
+
+$$\text{FAR} = 1 - \frac{1}{\text{PR}} = 1 - \frac{P(\text{event} \mid \text{counterfactual})}{P(\text{event} \mid \text{factual})}$$
+
+<p>FAR ranges from 0 (no human contribution) to 1 (the event would be impossible without human influence). The 2021 Pacific Northwest heatwave, for example, was found to be "virtually impossible" without climate change (PR > 150, FAR > 0.99).</p>
+
+<pre><code class="language-python">"""
+Event attribution: estimate the probability ratio of an
+extreme event under factual vs. counterfactual climate.
+"""
+import numpy as np
+from scipy import stats
+
+
+def estimate_probability_ratio(
+    factual_distribution: np.ndarray,
+    counterfactual_distribution: np.ndarray,
+    threshold: float,
+    method: str = "empirical",
+) -> dict:
+    """Estimate the probability ratio for an extreme event.
+
+    Compares the probability of exceeding a threshold in the
+    factual (current) climate vs. the counterfactual (no human
+    influence) climate.
+
+    Args:
+        factual_distribution: Samples from factual climate
+            (from observations or GCM historical simulations)
+        counterfactual_distribution: Samples from counterfactual
+            (GCM natural-only simulations)
+        threshold: Event threshold (e.g., the observed extreme value)
+        method: 'empirical' for direct counting,
+                'gev' for GEV-based extrapolation
+    Returns:
+        Dictionary with probability ratio and confidence interval
+    """
+    if method == "empirical":
+        p_factual = np.mean(factual_distribution >= threshold)
+        p_counter = np.mean(counterfactual_distribution >= threshold)
+
+    elif method == "gev":
+        # Fit GEV to each distribution for better tail estimation
+        c_f, loc_f, scale_f = stats.genextreme.fit(factual_distribution)
+        c_c, loc_c, scale_c = stats.genextreme.fit(
+            counterfactual_distribution
+        )
+        p_factual = 1 - stats.genextreme.cdf(
+            threshold, c_f, loc=loc_f, scale=scale_f
+        )
+        p_counter = 1 - stats.genextreme.cdf(
+            threshold, c_c, loc=loc_c, scale=scale_c
+        )
+
+    # Probability ratio
+    pr = p_factual / max(p_counter, 1e-10)
+
+    # Fraction of Attributable Risk
+    far = 1 - 1 / pr if pr > 1 else 0.0
+
+    # Bootstrap confidence interval for PR
+    rng = np.random.default_rng(42)
+    n_boot = 1000
+    pr_boot = []
+
+    for _ in range(n_boot):
+        f_sample = rng.choice(factual_distribution,
+                              size=len(factual_distribution),
+                              replace=True)
+        c_sample = rng.choice(counterfactual_distribution,
+                              size=len(counterfactual_distribution),
+                              replace=True)
+
+        if method == "empirical":
+            pf = np.mean(f_sample >= threshold)
+            pc = np.mean(c_sample >= threshold)
+        else:
+            c_f, loc_f, scale_f = stats.genextreme.fit(f_sample)
+            c_c, loc_c, scale_c = stats.genextreme.fit(c_sample)
+            pf = 1 - stats.genextreme.cdf(
+                threshold, c_f, loc=loc_f, scale=scale_f
+            )
+            pc = 1 - stats.genextreme.cdf(
+                threshold, c_c, loc=loc_c, scale=scale_c
+            )
+
+        pr_boot.append(pf / max(pc, 1e-10))
+
+    pr_boot = np.array(pr_boot)
+
+    return {
+        "probability_ratio": float(pr),
+        "far": float(far),
+        "p_factual": float(p_factual),
+        "p_counterfactual": float(p_counter),
+        "pr_ci_5": float(np.percentile(pr_boot, 5)),
+        "pr_ci_95": float(np.percentile(pr_boot, 95)),
+        "return_period_factual": 1.0 / max(p_factual, 1e-10),
+        "return_period_counterfactual": 1.0 / max(p_counter, 1e-10),
+    }
+
+
+def attribution_summary(result: dict, event_name: str) -> str:
+    """Generate a human-readable attribution statement.
+
+    Follows the World Weather Attribution communication format.
+
+    Args:
+        result: Output from estimate_probability_ratio
+        event_name: Description of the event
+    Returns:
+        Attribution statement string
+    """
+    pr = result["probability_ratio"]
+    far = result["far"]
+    pr_lo = result["pr_ci_5"]
+    pr_hi = result["pr_ci_95"]
+
+    lines = [
+        f"EVENT ATTRIBUTION: {event_name}",
+        "=" * 50,
+        f"Probability ratio: {pr:.1f} "
+        f"[{pr_lo:.1f} to {pr_hi:.1f}]",
+        f"Fraction of attributable risk: {far:.2%}",
+        f"Return period (factual climate): "
+        f"1-in-{result['return_period_factual']:.0f} years",
+        f"Return period (counterfactual): "
+        f"1-in-{result['return_period_counterfactual']:.0f} years",
+        "",
+    ]
+
+    if pr > 100:
+        lines.append(
+            "CONCLUSION: This event was virtually impossible "
+            "without human-caused climate change."
+        )
+    elif pr > 10:
+        lines.append(
+            f"CONCLUSION: Climate change made this event "
+            f"approximately {pr:.0f} times more likely."
+        )
+    elif pr > 2:
+        lines.append(
+            f"CONCLUSION: Climate change approximately "
+            f"{'doubled' if pr < 3 else f'increased by {pr:.0f}x'} "
+            f"the likelihood of this event."
+        )
+    elif pr > 1.2:
+        lines.append(
+            "CONCLUSION: A modest but detectable increase "
+            "in likelihood due to climate change."
+        )
+    else:
+        lines.append(
+            "CONCLUSION: No significant change in likelihood "
+            "attributable to climate change."
+        )
+
+    return "\n".join(lines)</code></pre>
+<div class="code-caption">Figure 51.15: Event attribution analysis following the World Weather Attribution protocol. The probability ratio compares event likelihood under factual (current) and counterfactual (pre-industrial) climates. The fraction of attributable risk (FAR) quantifies the human contribution. Bootstrap resampling provides uncertainty estimates.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Attributing the 2023 Mediterranean Heatwave</div>
+<p>In July 2023, a severe heatwave struck the Mediterranean, with temperatures exceeding 48C in Sardinia and triggering catastrophic wildfires across Greece. A WWA-style attribution analysis compared the observed peak temperature against GCM simulations with and without anthropogenic forcing. Using a non-stationary GEV fit, the analysis found a probability ratio of approximately 50, meaning the event was 50 times more likely in the current climate. The return period shifted from roughly once every 5000 years in a pre-industrial climate to approximately once every 100 years under current conditions. The FAR of 0.98 indicated that virtually all the additional risk was attributable to human-caused warming. These results informed EU disaster relief allocation and strengthened the scientific basis for climate litigation in European courts.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Traditional event attribution relies on running large GCM ensembles to estimate factual and counterfactual distributions, a process that takes weeks of compute time and limits rapid-response attribution. Kaltenborn et al. (2024), in "ClimateSet: A Large-Scale Climate Model Dataset for Machine Learning" (ICLR 2024), assembled standardized input/output pairs from 36 CMIP6 climate models spanning multiple emission scenarios, enabling ML models to emulate GCM output in seconds rather than weeks. Building on this, recent work applies conditional diffusion models to generate counterfactual climate fields: given observed conditions, the model samples from the distribution of plausible states without anthropogenic forcing, bypassing the need for explicit GCM counterfactual runs. The World Weather Attribution group has begun integrating such ML emulators into their rapid attribution pipeline, reducing turnaround from weeks to days after a major event. This acceleration matters because attribution results inform disaster relief and policy decisions that lose relevance if delayed.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Attribution Toolkits</div>
+<p>The code above implements core attribution algorithms from scratch, but several production tools accelerate this work. The <code>climattr</code> package provides optimal fingerprinting with built-in EOF truncation and residual testing. KNMI's <code>ATLAS</code> toolkit offers GEV fitting with non-stationary extensions and return level plots. The <code>climpact</code> package computes ETCCDI climate extreme indices (annual maximum temperature, consecutive dry days, heavy precipitation days) used as inputs to attribution studies. For accessing CMIP6 model output, <code>intake-esm</code> provides a catalog search interface that reduces data discovery from hours to seconds. Together, these tools reduce a full attribution analysis from the hundreds of lines above to approximately 30 lines of configuration and pipeline code.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: GEV Return Level Analysis on Real Temperature Data</h4>
+<p>Build a non-stationary extreme value analysis for a weather station of your choice using publicly available data and standard Python libraries.</p>
+<p><strong>Step 1.</strong> Download daily maximum temperature data from NOAA's Global Historical Climatology Network (GHCN-Daily). Use the <code>noaa-ghcn</code> Python package or download a CSV directly from <code>https://www.ncei.noaa.gov/cdo-web/</code>. Pick a station with at least 50 years of records (e.g., New York Central Park, USW00094728).</p>
+<p><strong>Step 2.</strong> Extract annual block maxima: for each year, take the single highest daily maximum temperature. Store the result as two arrays: <code>years</code> and <code>annual_max</code>.</p>
+<p><strong>Step 3.</strong> Fit a stationary GEV using <code>scipy.stats.genextreme.fit(annual_max)</code>. Compute the 100-year return level using the <code>return_level</code> function from this section. Print the result and note the shape parameter: is the tail bounded or heavy?</p>
+<p><strong>Step 4.</strong> Fit a non-stationary GEV using the <code>NonstationaryGEV</code> class from this section with <code>years</code> as the time covariate. Compare the AIC of the stationary and non-stationary fits. A lower AIC for the non-stationary model indicates that the distribution of temperature extremes is shifting over time.</p>
+<p><strong>Step 5.</strong> Plot the 50-year return level as a function of time by evaluating the non-stationary GEV at each decade from 1950 to 2020. Overlay the observed annual maxima. Use <code>matplotlib</code> for visualization. The plot reveals whether "once in 50 years" events are becoming more frequent at your chosen station.</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+Extreme event detection and attribution provide the scientific foundation for understanding
+how climate change alters weather risk. <a href="section-51.4.html">Section 51.4</a> brings
+everything together in a hands-on recipe: fine-tuning a pretrained weather model on a regional
+domain, evaluating its forecast skill with WeatherBench2, and deploying the full pipeline with
+the Discovery Workbench.
+</p>
+</section>
+
+<nav class="section-nav">
+<a href="section-51.2.html">&larr; 51.2 Climate Emulation and Downscaling</a>
+<a href="section-51.4.html">51.4 Building a Regional Weather Model &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

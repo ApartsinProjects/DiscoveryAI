@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 19.2: Self-Debugging Agents. LLM agents that read traces, form hypotheses, rank root causes, and verify fixes through targeted test generation." name="description"/>
+<title>Section 19.2: Self-Debugging Agents | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 19: AI-Assisted Debugging</a></div>
+<h1>19.2 Self-Debugging Agents</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I do not need you to tell me what is wrong. Give me the traceback, the logs, and thirty seconds. I will tell <em>you</em> what is wrong, why it is wrong, and how to fix it. Then I will fix it. Then I will write a test to make sure it stays fixed."</p>
+<cite>An LLM Agent Who Skipped the Rubber Duck Stage</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the fault localization and structured logging infrastructure from
+<a href="section-19.1.html">Section 19.1</a>. You should also be familiar with the
+LLM tool-use patterns from
+<a href="../module-10-prompting-to-programming/index.html">Chapter 10: Prompting to Programming</a>
+and the multi-agent orchestration patterns from
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17: Multi-Agent Software Teams</a>.
+The self-debugging agent we build here uses the same tool-calling architecture introduced in
+those chapters, applied to the specific domain of fault diagnosis and repair.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+A self-debugging agent is an LLM that operates in a closed loop: observe failure, hypothesize
+root cause, generate a fix, run the test suite, and iterate until the tests pass or a budget
+is exhausted. This is the same observe-hypothesize-experiment-conclude cycle that defines
+scientific inquiry (see <a href="../../part-1-foundations/module-02-scientific-discovery/index.html">Chapter 2</a>),
+now applied to code repair. The key design challenge is giving the agent the right
+<em>context</em>: not the entire codebase, but precisely the structured traces, suspicious
+lines, and test outputs that a human debugger would examine.
+</p>
+</div>
+
+<h2>1. The Hypothesis-Rank-Verify Loop</h2>
+
+<p>
+Human debuggers do not examine code randomly. They form hypotheses about the root cause,
+rank those hypotheses by plausibility (using intuition, experience, and evidence), test
+the most promising hypothesis, and update their beliefs based on the result. An effective
+self-debugging agent follows the same protocol, replacing intuition with structured
+evidence from the fault localizer and experience with the LLM's training distribution.
+</p>
+
+<p data-agent="02">
+A self-debugging agent is an LLM-powered program that autonomously diagnoses and repairs
+software faults by executing a structured loop of observation, hypothesis generation,
+patching, and test verification. It matters because manual debugging is one of the most
+time-consuming activities in software development, often consuming 30-50% of total
+engineering effort, and an agent that can handle routine faults frees human developers
+to focus on design and architecture. The mechanism works by feeding the agent a curated
+context window (failing test output, ranked suspicious lines, structured logs) and then
+letting it generate candidate fixes that are each tested against the real test suite in
+a sandboxed environment. Use a self-debugging agent for well-tested codebases where
+failures produce clear, reproducible test output; for exploratory code with no test suite,
+traditional interactive debugging or logging-based diagnosis remains more appropriate.
+</p>
+
+<p>
+The loop has four stages:
+</p>
+
+<ol>
+<li><strong>Observe:</strong> Collect the failing test output, the traceback, the structured logs around the failure point, and the Ochiai-ranked list of suspicious lines from <a href="section-19.1.html">Section 19.1</a>.</li>
+<li><strong>Hypothesize:</strong> Ask the LLM to generate $k$ candidate root-cause explanations, each tied to a specific suspicious line or code region.</li>
+<li><strong>Rank:</strong> Score each hypothesis by combining the Ochiai suspiciousness of the implicated lines with the LLM's own confidence estimate and the semantic plausibility of the explanation.</li>
+<li><strong>Verify:</strong> For the top-ranked hypothesis, generate a targeted patch, apply it, re-run the failing test (plus the full suite to check for regressions), and observe the outcome. If the test passes, the bug is fixed. If it fails, update the ranking and try the next hypothesis.</li>
+</ol>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Context Engineering for Debugging</div>
+<p>
+The difference between a debugging agent that works and one that hallucinates irrelevant
+fixes is the quality of its context window. Dumping the entire codebase into the prompt
+overwhelms the model. Instead, supply (1) the failing test and its exact output, (2) the
+top 10 suspicious lines with their Ochiai scores, (3) the 20 lines of source context
+around each suspicious line, and (4) the structured log events from the failing execution.
+This is the same context engineering principle from
+<a href="../module-11-context-engineering/index.html">Chapter 11: Context Engineering at Repository Scale</a>,
+applied to the debugging domain.
+</p>
+</div>
+
+<pre><code class="language-python">"""
+Self-debugging agent: the hypothesis-rank-verify loop.
+Reads fault localization output and structured logs, generates
+root-cause hypotheses, and iteratively patches until tests pass.
+"""
+from dataclasses import dataclass, field
+from anthropic import Anthropic
+
+
+@dataclass
+class DebugHypothesis:
+    """A candidate root-cause explanation."""
+    line_number: int
+    source_text: str
+    ochiai_score: float
+    explanation: str
+    confidence: float  # LLM's self-assessed confidence [0, 1]
+    combined_score: float = 0.0
+
+    def compute_combined_score(self, alpha: float = 0.6) -> None:
+        """Blend Ochiai suspiciousness with LLM confidence.
+
+        alpha controls the weight of the statistical signal vs.
+        the LLM's semantic judgment. Higher alpha trusts the
+        coverage data more; lower alpha trusts the LLM more.
+        """
+        self.combined_score = (
+            alpha * self.ochiai_score
+            + (1 - alpha) * self.confidence
+        )
+
+
+@dataclass
+class DebugContext:
+    """All evidence available to the debugging agent."""
+    failing_test: str          # Test function source code
+    test_output: str           # Captured stdout/stderr + traceback
+    suspicious_lines: list[dict]  # From fault localizer (line, text, score)
+    log_events: list[dict]     # Structured log entries from the failing run
+    source_context: dict[int, list[str]]  # line_no -> surrounding lines
+
+
+def format_debug_prompt(ctx: DebugContext) -> str:
+    """Build the debugging prompt from structured evidence."""
+    lines_section = "\n".join(
+        f"  Line {l['line']}: (Ochiai={l['score']:.3f}) {l['text']}"
+        for l in ctx.suspicious_lines[:10]
+    )
+
+    logs_section = "\n".join(
+        f"  [{ev.get('level', 'info')}] {ev.get('event', '')} "
+        f"| {', '.join(f'{k}={v}' for k, v in ev.items() if k not in ('level', 'event', 'timestamp'))}"
+        for ev in ctx.log_events[-20:]  # Last 20 log events
+    )
+
+    context_section = ""
+    for line_no, lines in ctx.source_context.items():
+        context_section += f"\n  --- Around line {line_no} ---\n"
+        for i, line in enumerate(lines):
+            marker = " >> " if i == len(lines) // 2 else "    "
+            context_section += f"  {marker}{line}\n"
+
+    return f"""You are a debugging agent. A test is failing and you must identify the root cause.
+
+## Failing Test
+```python
+{ctx.failing_test}
+```
+
+## Test Output (including traceback)
+```
+{ctx.test_output}
+```
+
+## Suspicious Lines (ranked by Ochiai coefficient)
+{lines_section}
+
+## Structured Log Events (from the failing execution)
+{logs_section}
+
+## Source Context (around suspicious lines)
+{context_section}
+
+## Your Task
+Generate exactly 3 root-cause hypotheses. For each hypothesis:
+1. Identify the specific line(s) at fault.
+2. Explain WHY this line causes the observed failure.
+3. Propose a concrete fix (the exact code change).
+4. Rate your confidence from 0.0 to 1.0.
+
+Format each hypothesis as:
+HYPOTHESIS N:
+LINE: <line_number>
+EXPLANATION: <why this line is the root cause>
+FIX: <the corrected code>
+CONFIDENCE: <0.0 to 1.0>
+"""</code></pre>
+<div class="code-caption">Building a structured debugging prompt from fault localization output, structured logs, and source context. The prompt constrains the LLM to produce actionable, ranked hypotheses rather than vague explanations.</div>
+
+<h2>2. Parsing and Ranking Hypotheses</h2>
+
+<p>
+The LLM returns hypotheses as structured text. We parse each one, compute a combined score
+that blends the Ochiai statistical signal with the LLM's semantic confidence, and sort by
+decreasing combined score. The blending parameter $\alpha$ controls the tradeoff: higher
+values trust the coverage data, lower values trust the LLM's reasoning. In practice,
+$\alpha = 0.6$ works well, giving slight precedence to the statistical signal while still
+allowing the LLM to promote a low-Ochiai line when the semantic evidence is compelling.
+</p>
+
+$$\text{score}(h) = \alpha \cdot \text{Ochiai}(h.\text{line}) + (1 - \alpha) \cdot \text{confidence}(h)$$
+
+<pre><code class="language-python">"""
+Parse LLM-generated hypotheses and rank by combined score.
+"""
+import re
+
+
+def parse_hypotheses(
+    llm_response: str,
+    suspicious_lines: list[dict],
+) -> list[DebugHypothesis]:
+    """Extract structured hypotheses from LLM output."""
+    hypotheses = []
+
+    # Build a lookup from line number to Ochiai score
+    ochiai_lookup = {l["line"]: l["score"] for l in suspicious_lines}
+
+    # Parse each HYPOTHESIS block
+    blocks = re.split(r"HYPOTHESIS\s+\d+:", llm_response)[1:]
+
+    for block in blocks:
+        line_match = re.search(r"LINE:\s*(\d+)", block)
+        expl_match = re.search(r"EXPLANATION:\s*(.+?)(?=FIX:|$)", block, re.S)
+        fix_match = re.search(r"FIX:\s*(.+?)(?=CONFIDENCE:|$)", block, re.S)
+        conf_match = re.search(r"CONFIDENCE:\s*([\d.]+)", block)
+
+        if not all([line_match, expl_match, fix_match, conf_match]):
+            continue
+
+        line_no = int(line_match.group(1))
+        hypothesis = DebugHypothesis(
+            line_number=line_no,
+            source_text=ochiai_lookup.get(line_no, {}).get("text", ""),
+            ochiai_score=ochiai_lookup.get(line_no, 0.0),
+            explanation=expl_match.group(1).strip(),
+            confidence=min(1.0, max(0.0, float(conf_match.group(1)))),
+        )
+        hypothesis.compute_combined_score(alpha=0.6)
+        hypotheses.append(hypothesis)
+
+    # Sort by combined score, descending
+    hypotheses.sort(key=lambda h: h.combined_score, reverse=True)
+    return hypotheses</code></pre>
+<div class="code-caption">Parsing LLM-generated hypotheses and ranking them by a blended score combining Ochiai suspiciousness with the LLM's self-assessed confidence.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the combined scoring formula like a doctor triaging patients in an emergency room.
+The Ochiai score is the vital-signs monitor: objective, numerical, based on measurable data
+(which lines correlate with failure). The LLM confidence is the experienced nurse's gut
+feeling after talking to the patient: subjective but informed by years of pattern recognition.
+Neither signal alone is reliable. The monitor might flag elevated heart rate without knowing
+it is from caffeine, not a cardiac event. The nurse might miss a subtle lab anomaly. The
+triage protocol blends both, weighting the objective signal slightly higher ($\alpha = 0.6$)
+because it is reproducible, but allowing clinical judgment to override when the numbers
+do not tell the whole story.
+</p>
+</div>
+
+<h2>3. Automated Patch Generation and Verification</h2>
+
+<p>
+Once hypotheses are ranked, the agent applies the top-ranked fix, runs the test suite,
+and observes the result. If the fix resolves the failing test without introducing
+regressions, the debugging session succeeds. If the fix fails (the test still fails, or
+new tests break), the agent moves to the next hypothesis. This verify-or-retry loop runs
+until either a fix succeeds or the hypothesis budget is exhausted.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that a self-debugging agent can reliably fix any bug given enough
+iterations. In reality, these agents excel at well-localized faults with clear test signals
+(off-by-one errors, incorrect conditionals, wrong variable references) but struggle with
+bugs that span multiple files, require architectural changes, or stem from incorrect
+specifications rather than incorrect implementations. If the test itself encodes the wrong
+expectation, the agent will "fix" the code to match a broken test, compounding the problem
+rather than solving it.
+</p>
+</div>
+
+<pre><code class="language-python">"""
+Patch-and-verify loop: apply each hypothesis's fix and test it.
+"""
+import subprocess
+import shutil
+from pathlib import Path
+
+
+@dataclass
+class PatchResult:
+    """Outcome of applying and testing a patch."""
+    hypothesis: DebugHypothesis
+    patch_applied: bool
+    target_test_passed: bool
+    regression_tests_passed: bool
+    error_output: str = ""
+
+
+def apply_and_verify(
+    source_file: Path,
+    hypotheses: list[DebugHypothesis],
+    test_command: list[str],
+    target_test: str,
+    max_attempts: int = 3,
+) -> PatchResult | None:
+    """Try each hypothesis's fix until one passes all tests.
+
+    Args:
+        source_file: Path to the file being debugged.
+        hypotheses: Ranked list of hypotheses with proposed fixes.
+        test_command: Command to run the full test suite.
+        target_test: Specific test ID that is failing.
+        max_attempts: Maximum number of hypotheses to try.
+
+    Returns:
+        PatchResult for the successful fix, or None if all fail.
+    """
+    # Save the original file for rollback
+    backup = source_file.with_suffix(".bak")
+    shutil.copy2(source_file, backup)
+
+    for hypothesis in hypotheses[:max_attempts]:
+        # Restore original before each attempt
+        shutil.copy2(backup, source_file)
+
+        # Apply the patch
+        original_lines = source_file.read_text().splitlines()
+        line_idx = hypothesis.line_number - 1  # 0-indexed
+
+        if line_idx < 0 or line_idx >= len(original_lines):
+            continue
+
+        # Replace the faulty line with the fix
+        patched_lines = original_lines.copy()
+        patched_lines[line_idx] = hypothesis.explanation  # Simplified
+        source_file.write_text("\n".join(patched_lines) + "\n")
+
+        # Run the specific failing test first (fast feedback)
+        target_result = subprocess.run(
+            ["python", "-m", "pytest", target_test, "-x", "-q"],
+            capture_output=True, text=True, timeout=60,
+        )
+        target_passed = target_result.returncode == 0
+
+        if not target_passed:
+            continue  # This fix did not resolve the failure
+
+        # Run full suite to check for regressions
+        full_result = subprocess.run(
+            test_command,
+            capture_output=True, text=True, timeout=300,
+        )
+        regression_passed = full_result.returncode == 0
+
+        result = PatchResult(
+            hypothesis=hypothesis,
+            patch_applied=True,
+            target_test_passed=target_passed,
+            regression_tests_passed=regression_passed,
+            error_output=full_result.stderr if not regression_passed else "",
+        )
+
+        if target_passed and regression_passed:
+            backup.unlink()  # Clean up backup
+            return result
+
+    # All attempts failed; restore original
+    shutil.copy2(backup, source_file)
+    backup.unlink()
+    return None</code></pre>
+<div class="code-caption">The patch-and-verify loop: apply each hypothesis's fix, run the target test for fast feedback, then run the full suite for regression checking. Rolls back on failure and tries the next hypothesis.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: The Conversational Repair Loop</div>
+<p>
+Xia and Zhang (2023) showed that a simple conversational loop (send the LLM a failing
+test, receive a fix, report whether it worked, repeat) fixes 162 out of 337 bugs at
+an average cost of $0.42 per bug. The key finding is that <em>multi-turn feedback</em>
+dramatically outperforms single-shot repair. When the first fix fails, the agent
+receives the new error message, which eliminates incorrect hypotheses and provides
+additional evidence for the correct one. Our hypothesis-rank-verify loop formalizes
+this insight: each failed attempt is not wasted; it narrows the search space.
+</p>
+</div>
+
+<h2>4. Programmatic Debugging with debugpy</h2>
+
+<p>
+Sometimes the agent needs more than static traces and coverage data. It needs to inspect
+runtime state: the values of variables at a specific point in execution, the contents of
+a data structure just before a crash, the return value of a function that behaves
+unexpectedly. The <code>debugpy</code> library (the Debug Adapter Protocol implementation
+used by VS Code) provides a programmatic interface for setting breakpoints, stepping
+through code, and inspecting variables, all from Python code rather than a GUI.
+</p>
+
+<pre><code class="language-python">"""
+Programmatic debugging with debugpy: inspect runtime state from code.
+The agent sets breakpoints and reads variable values without a GUI.
+"""
+import debugpy
+import threading
+import subprocess
+import json
+
+
+def inspect_at_breakpoint(
+    script_path: str,
+    breakpoint_line: int,
+    variables_to_inspect: list[str],
+    script_args: list[str] | None = None,
+) -> dict:
+    """Run a script with a breakpoint, inspecting variables when hit.
+
+    This launches the script under debugpy, sets a breakpoint, and
+    captures variable values when execution reaches that line.
+
+    Args:
+        script_path: Path to the Python script to debug.
+        breakpoint_line: Line number where to pause execution.
+        variables_to_inspect: Names of variables to capture.
+        script_args: Optional command-line arguments for the script.
+
+    Returns:
+        Dict mapping variable names to their string representations.
+    """
+    captured = {}
+    breakpoint_hit = threading.Event()
+
+    def on_breakpoint(frame, event, arg):
+        """Trace function that captures variables at the breakpoint."""
+        if event == "line" and frame.f_lineno == breakpoint_line:
+            for var_name in variables_to_inspect:
+                if var_name in frame.f_locals:
+                    captured[var_name] = repr(frame.f_locals[var_name])
+                elif var_name in frame.f_globals:
+                    captured[var_name] = repr(frame.f_globals[var_name])
+                else:
+                    captured[var_name] = "<not in scope>"
+            breakpoint_hit.set()
+        return on_breakpoint
+
+    # Use sys.settrace for lightweight inspection
+    import sys
+    import runpy
+
+    original_trace = sys.gettrace()
+    sys.settrace(on_breakpoint)
+    try:
+        # Run the target script
+        runpy.run_path(script_path, run_name="__main__")
+    except Exception as exc:
+        captured["__exception__"] = repr(exc)
+    finally:
+        sys.settrace(original_trace)
+
+    return captured
+
+
+# Example usage: inspect variables at a suspicious line
+results = inspect_at_breakpoint(
+    script_path="app/order_processor.py",
+    breakpoint_line=42,
+    variables_to_inspect=["total", "discount", "item_count"],
+)
+# results might be:
+# {"total": "135.0", "discount": "15.0", "item_count": "12"}</code></pre>
+<div class="code-caption">Programmatic variable inspection using Python's trace mechanism: the debugging agent sets a virtual breakpoint and captures variable values at a specific line without requiring a GUI debugger.</div>
+
+<h2>5. Multi-Agent Debugging Teams</h2>
+
+<p>
+Complex bugs benefit from specialized perspectives. Drawing on the multi-agent patterns from
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17: Multi-Agent Software Teams</a>,
+we can decompose debugging into four specialized roles, each handled by a separate agent
+with its own system prompt and tool access.
+</p>
+
+<ul>
+<li><strong>Localizer:</strong> Runs the fault localizer, collects the spectrum, computes Ochiai scores, and produces the ranked list of suspicious lines.</li>
+<li><strong>Explainer:</strong> Reads the suspicious lines, structured logs, and source context. Generates natural-language hypotheses about the root cause.</li>
+<li><strong>Patcher:</strong> Takes a hypothesis and generates a concrete code patch. Has access to the full source file and the coding conventions of the project.</li>
+<li><strong>Verifier:</strong> Applies the patch, runs the test suite, and reports whether the fix resolves the failure without regressions.</li>
+</ul>
+
+<pre><code class="language-python">"""
+Multi-agent debugging team: four specialized agents coordinate
+to localize, explain, patch, and verify a bug fix.
+"""
+from dataclasses import dataclass
+from anthropic import Anthropic
+
+client = Anthropic()
+
+
+@dataclass
+class AgentRole:
+    """Configuration for a specialized debugging agent."""
+    name: str
+    system_prompt: str
+    model: str = "claude-sonnet-4-20250514"
+
+
+DEBUGGING_TEAM = {
+    "localizer": AgentRole(
+        name="Localizer",
+        system_prompt="""You are a fault localization specialist. Given test
+results and coverage data, you identify the most suspicious source lines.
+You produce ranked lists with Ochiai scores and brief justifications.
+You never propose fixes; that is the Patcher's job.""",
+    ),
+    "explainer": AgentRole(
+        name="Explainer",
+        system_prompt="""You are a root-cause analyst. Given suspicious lines,
+structured logs, and source context, you explain WHY the bug occurs.
+You trace data flow, identify incorrect assumptions, and produce clear
+causal chains from the root cause to the observed symptom.
+You never write code; that is the Patcher's job.""",
+    ),
+    "patcher": AgentRole(
+        name="Patcher",
+        system_prompt="""You are a code repair specialist. Given a root-cause
+explanation and the surrounding source code, you generate a minimal,
+correct patch. You follow the project's coding style. You change as
+few lines as possible. You add a comment explaining the fix.""",
+    ),
+    "verifier": AgentRole(
+        name="Verifier",
+        system_prompt="""You are a verification specialist. You apply patches,
+run test suites, and analyze results. You check for both fix correctness
+(does the failing test pass?) and regression safety (do all other tests
+still pass?). You report pass/fail with detailed evidence.""",
+    ),
+}
+
+
+def run_debugging_team(
+    failing_test: str,
+    test_output: str,
+    source_file: str,
+    source_code: str,
+    coverage_data: dict,
+    log_events: list[dict],
+    max_rounds: int = 3,
+) -> dict:
+    """Orchestrate the multi-agent debugging team.
+
+    The agents communicate through a shared context dictionary,
+    each adding their contribution in sequence.
+    """
+    context = {
+        "failing_test": failing_test,
+        "test_output": test_output,
+        "source_file": source_file,
+        "source_code": source_code,
+        "coverage_data": coverage_data,
+        "log_events": log_events,
+        "round": 0,
+        "status": "in_progress",
+    }
+
+    for round_num in range(max_rounds):
+        context["round"] = round_num + 1
+
+        # Step 1: Localizer identifies suspicious lines
+        loc_response = client.messages.create(
+            model=DEBUGGING_TEAM["localizer"].model,
+            max_tokens=2000,
+            system=DEBUGGING_TEAM["localizer"].system_prompt,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Test output:\n{context['test_output']}\n\n"
+                    f"Coverage data:\n{context['coverage_data']}\n\n"
+                    f"Source code:\n{context['source_code']}"
+                ),
+            }],
+        )
+        context["localization"] = loc_response.content[0].text
+
+        # Step 2: Explainer forms root-cause hypothesis
+        exp_response = client.messages.create(
+            model=DEBUGGING_TEAM["explainer"].model,
+            max_tokens=2000,
+            system=DEBUGGING_TEAM["explainer"].system_prompt,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Suspicious lines:\n{context['localization']}\n\n"
+                    f"Log events:\n{context['log_events']}\n\n"
+                    f"Source:\n{context['source_code']}"
+                ),
+            }],
+        )
+        context["explanation"] = exp_response.content[0].text
+
+        # Step 3: Patcher generates a fix
+        patch_response = client.messages.create(
+            model=DEBUGGING_TEAM["patcher"].model,
+            max_tokens=2000,
+            system=DEBUGGING_TEAM["patcher"].system_prompt,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Root cause:\n{context['explanation']}\n\n"
+                    f"Source:\n{context['source_code']}"
+                ),
+            }],
+        )
+        context["patch"] = patch_response.content[0].text
+
+        # Step 4: Verifier tests the fix
+        # (In production, this agent would apply the patch and run pytest)
+        ver_response = client.messages.create(
+            model=DEBUGGING_TEAM["verifier"].model,
+            max_tokens=1000,
+            system=DEBUGGING_TEAM["verifier"].system_prompt,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Proposed patch:\n{context['patch']}\n\n"
+                    f"Failing test:\n{context['failing_test']}\n\n"
+                    "Analyze whether this patch correctly addresses "
+                    "the root cause and is unlikely to cause regressions."
+                ),
+            }],
+        )
+        context["verification"] = ver_response.content[0].text
+
+        # Check if verifier approved
+        if "APPROVED" in context["verification"].upper():
+            context["status"] = "fixed"
+            break
+
+        # Feed failure info back for next round
+        context["test_output"] += (
+            f"\n\n--- Round {round_num + 1} failed ---\n"
+            f"Patch attempted:\n{context['patch']}\n"
+            f"Verification:\n{context['verification']}"
+        )
+
+    return context</code></pre>
+<div class="code-caption">Multi-agent debugging team: four specialized agents (Localizer, Explainer, Patcher, Verifier) coordinate in a sequential pipeline, with failed rounds feeding back into subsequent attempts.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: SWE-agent and Aider</div>
+<p>
+The multi-agent debugging loop we built from scratch above is available as a production
+tool. <a href="https://github.com/princeton-nlp/SWE-agent" target="_blank">SWE-agent</a>
+(Princeton NLP, 2024) wraps an LLM with file browsing, code search, and test-running tools
+in a single agent that resolves GitHub issues end-to-end. <a href="https://aider.chat"
+target="_blank">Aider</a> provides a conversational coding assistant with built-in
+test-run-and-fix loops. Both tools implement the same core pattern (observe failure,
+hypothesize, patch, verify) with production-grade error handling, git integration, and
+cost management. SWE-agent resolves 12-23% of real GitHub issues on the SWE-bench
+benchmark; our from-scratch version above is roughly 150 lines where SWE-agent is 5,000+.
+</p>
+</div>
+
+<h2>6. Root-Cause Extraction from Structured Logs</h2>
+
+<p>
+The structured logs from <a href="section-19.1.html">Section 19.1</a> become particularly
+valuable when the agent can query them semantically. Instead of scanning raw text for
+keywords, the agent asks questions like "what was the value of <code>discount</code> in
+the last <code>order.bulk_discount_applied</code> event before the failure?" This requires
+a thin query layer over the log store.
+</p>
+
+<pre><code class="language-python">"""
+Semantic log querying: let the debugging agent ask structured
+questions about log events from the failing execution.
+"""
+from datetime import datetime
+
+
+class LogQueryEngine:
+    """Query structured log events for debugging context."""
+
+    def __init__(self, events: list[dict]):
+        self.events = events
+
+    def filter_by_event(self, event_name: str) -> list[dict]:
+        """Get all log entries matching an event name pattern."""
+        return [
+            e for e in self.events
+            if event_name in e.get("event", "")
+        ]
+
+    def get_field_values(
+        self, event_name: str, field: str
+    ) -> list:
+        """Extract a specific field from matching events."""
+        return [
+            e[field]
+            for e in self.filter_by_event(event_name)
+            if field in e
+        ]
+
+    def events_before_error(
+        self, n: int = 10
+    ) -> list[dict]:
+        """Get the last N events before the first error-level event."""
+        for i, event in enumerate(self.events):
+            if event.get("level") in ("error", "critical", "exception"):
+                start = max(0, i - n)
+                return self.events[start:i + 1]
+        return self.events[-n:]  # No error found; return last N
+
+    def trace_field_evolution(
+        self, field: str
+    ) -> list[tuple[str, object]]:
+        """Track how a field's value changes across events.
+
+        Returns list of (event_name, field_value) showing
+        the progression of a variable through the execution.
+        """
+        evolution = []
+        for event in self.events:
+            if field in event:
+                evolution.append((event.get("event", "unknown"), event[field]))
+        return evolution
+
+
+# Example: trace how 'total' evolves through an order processing run
+engine = LogQueryEngine(log_events)
+total_history = engine.trace_field_evolution("total")
+# [("order.item_added", 50.0), ("order.item_added", 100.0),
+#  ("order.bulk_discount_applied", 90.0), ("order.completed", 90.0)]
+
+pre_error = engine.events_before_error(n=5)
+# The 5 events leading up to the error, giving temporal context</code></pre>
+<div class="code-caption">A semantic log query engine that lets the debugging agent ask structured questions about the execution history, tracking variable evolution and retrieving temporal context around failures.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Scaling Self-Debugging with SWE-bench Verified</div>
+<p>
+OpenAI's SWE-bench Verified (Chowdhury et al., 2024) introduced a human-validated subset
+of 500 real GitHub issues, filtering out ambiguous or under-specified problems from the
+original SWE-bench. This curated benchmark revealed that earlier agent scores were inflated
+by noisy evaluation. On the verified set, frontier systems such as Amazon Q Developer Agent
+and Anthropic's agentic coding setup achieved 40-50% resolve rates by mid-2025, up from the
+12-23% range on the original benchmark just a year prior. The gains come not from better
+LLMs alone but from improved tool orchestration: agents now plan multi-file edits, run
+targeted test subsets to conserve budget, and use repository-level code search to gather
+context before generating patches. RepairAgent (Bouzenia et al., 2024) demonstrated the
+value of this tool-use paradigm on Defects4J (164 bugs fixed), and newer systems extend it
+with retrieval-augmented context selection and iterative refinement loops that mirror the
+hypothesis-rank-verify pattern taught in this section.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Rubber Duck Upgrade</div>
+<p>
+Rubber duck debugging works because explaining the problem to an inanimate object forces
+you to articulate your assumptions. A self-debugging agent is the rubber duck that talks
+back. It listens to your traceback, asks "have you considered that the discount is applied
+before the quantity check on line 42?", and then fixes it while you are still formulating
+your next sentence. The pedagogical insight remains: articulating the problem is half the
+solution. The engineering insight is that LLMs are now good enough to provide the other half.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Minimal Self-Debugging Loop</h4>
+<p>
+Construct a working self-debugging agent in under 100 lines using only the Python standard
+library and an LLM API client.
+</p>
+<ol>
+<li><strong>Create the bug:</strong> Write a small Python module (<code>calculator.py</code>) with a function <code>divide_items(total, count)</code> that contains a deliberate off-by-one error (e.g., <code>return total / (count + 1)</code> instead of <code>return total / count</code>). Write a pytest test that calls <code>divide_items(100, 4)</code> and asserts the result equals <code>25.0</code>.</li>
+<li><strong>Capture the failure:</strong> Run <code>pytest --tb=long -q</code> via <code>subprocess.run</code>, capture <code>stdout</code> and <code>stderr</code>, and read the source of <code>calculator.py</code> into a string.</li>
+<li><strong>Prompt the LLM:</strong> Send the failing test output and the full source to an LLM with a system prompt asking it to identify the faulty line and return the corrected version in a structured format (e.g., <code>LINE: 5</code> / <code>FIX: return total / count</code>).</li>
+<li><strong>Apply and verify:</strong> Parse the LLM response, replace the identified line in the source file, write it back, and re-run <code>pytest</code>. Print whether the fix succeeded or failed.</li>
+<li><strong>Extend:</strong> Add a rollback mechanism (copy the original file before patching, restore on failure) and support for up to three retry rounds where each round sends the new error output back to the LLM.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<ol>
+<li>
+<strong>Conceptual:</strong> The combined scoring formula uses $\alpha = 0.6$ to weight
+the Ochiai score above the LLM's confidence. Under what circumstances would you want to
+increase $\alpha$ (trust statistics more)? When would you decrease it (trust the LLM more)?
+Consider the size of the test suite, the quality of the coverage data, and the complexity
+of the bug.
+</li>
+<li>
+<strong>Coding:</strong> Extend the <code>LogQueryEngine</code> to support a
+<code>correlate_fields</code> method that identifies pairs of fields whose values
+change together across events (e.g., when <code>quantity</code> increases,
+<code>discount</code> should also increase). Use Pearson correlation on numeric fields.
+</li>
+<li>
+<strong>Analysis:</strong> Compare the single-agent approach (one LLM does everything)
+with the four-agent team approach. What are the tradeoffs in terms of token cost, latency,
+fix quality, and debuggability of the debugging process itself? Design an experiment
+to measure these tradeoffs on a set of 20 known bugs.
+</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-19.1.html">&larr; 19.1 Hypothesis-Driven Debugging</a>
+<a href="index.html">Chapter 19 Index</a>
+<a href="section-19.3.html">19.3 Building a Debugging Pipeline &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

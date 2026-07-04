@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 48.2: Protein Structure and Design. AlphaFold2/3 architecture, ESMFold, RFDiffusion for backbone generation, ProteinMPNN for sequence design, and SE(3) generative models." name="description"/>
+<title>Section 48.2: Protein Structure and Design | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Discovery in Scientific Domains</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 48: Discovery AI For Biology And Medicine</a></div>
+<h1>48.2 Protein Structure and Design</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"They asked me to predict structure. I said: why predict what you can design? They gave me a Nobel Prize and a longer GPU allocation."</p>
+<cite>A Foundation Model Pretending to Be a Scientist</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Protein structure prediction has been "solved" in the sense that AlphaFold2 predicts
+most single-chain structures to experimental accuracy. But prediction was never the
+end goal; it was a prerequisite. The real revolution is <strong>protein design</strong>:
+creating novel proteins with specified structures and functions that do not exist in
+nature. This section traces the arc from prediction (AlphaFold2/3, ESMFold) through
+generation (RFDiffusion, FrameDiff, FoldFlow) to design (ProteinMPNN, LigandMPNN),
+giving you the tools to build proteins computationally.
+</p>
+</div>
+
+<h2>1. Protein Structure Primer</h2>
+
+<p>
+Proteins are linear chains of amino acids (20 standard types) that fold into 3D
+structures determined by their sequence. Structure is described at four levels:
+</p>
+
+<ul>
+<li><strong>Primary</strong>: the amino acid sequence, a string over a 20-letter alphabet.</li>
+<li><strong>Secondary</strong>: local structural motifs, primarily alpha-helices and beta-sheets, determined by backbone hydrogen bonding patterns.</li>
+<li><strong>Tertiary</strong>: the full 3D arrangement of a single chain, specified by the coordinates of every atom (or, more compactly, by backbone torsion angles $\phi$, $\psi$, $\omega$).</li>
+<li><strong>Quaternary</strong>: the arrangement of multiple chains in a complex.</li>
+</ul>
+
+<p>
+The backbone geometry of each residue is described by three dihedral angles. The
+peptide bond angle $\omega$ is nearly always 180 degrees (trans configuration), leaving two
+degrees of freedom per residue: $\phi$ (rotation around the N-C$_\alpha$ bond) and
+$\psi$ (rotation around the C$_\alpha$-C bond). The Ramachandran plot shows which
+$(\phi, \psi)$ combinations are sterically allowed.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+The protein structure prediction problem asks: given a sequence, what 3D structure
+does it fold into? The protein design problem asks the inverse: given a desired 3D
+structure (or function), what sequence will fold into it? These are fundamentally
+different computational challenges. Prediction is a many-to-one mapping (many
+sequences fold similarly); design is a one-to-many problem (many sequences can
+realize a given fold). AI has solved prediction; it has made design tractable.
+</p>
+</div>
+
+<h2>2. AlphaFold2: The Prediction Revolution</h2>
+
+<p>
+AlphaFold2 (AF2) predicts protein structures with accuracy matching X-ray
+crystallography (median GDT-TS > 92 on CASP14 free-modeling targets). Its
+architecture has two key innovations:
+</p>
+
+<h3>2.1 The Evoformer</h3>
+
+<p>
+AF2 processes two representations simultaneously: a <strong>multiple sequence
+alignment (MSA) representation</strong> of shape $(N_{\text{seq}}, L, c_m)$ and a
+<strong>pair representation</strong> of shape $(L, L, c_z)$, where $L$ is the
+sequence length. The evoformer block updates both representations through
+alternating attention operations:
+</p>
+
+<ol>
+<li><strong>Row-wise MSA attention</strong>: each row of the MSA (a homologous sequence) attends to other positions within the same row, biased by the pair representation. This captures intra-sequence correlations.</li>
+<li><strong>Column-wise MSA attention</strong>: each column of the MSA (a position across homologs) attends to the same position in other sequences. This captures evolutionary covariation, the signal that two positions covary across evolution because they are in spatial contact.</li>
+<li><strong>Pair update via outer product mean</strong>: the MSA representation updates the pair representation through an outer product of column vectors, converting coevolutionary signal into pairwise distance information.</li>
+<li><strong>Triangle attention and updates</strong>: the pair representation refines itself through operations that enforce geometric consistency (if residues $i$ and $j$ are close, and $j$ and $k$ are close, this constrains the $i$-$k$ distance).</li>
+</ol>
+
+<p>
+The pair representation $z_{ij}$ encodes the relationship between every pair of
+residues. After 48 evoformer blocks, this representation contains sufficient
+information to determine the 3D structure.
+</p>
+
+<h3>2.2 Structure Module</h3>
+
+<p>
+The structure module converts the pair and MSA representations into 3D coordinates
+using Invariant Point Attention (IPA), which operates on rigid-body frames
+$(R_i, \mathbf{t}_i) \in \text{SE}(3)$ attached to each residue. IPA computes
+attention scores using both the embedding space and the 3D coordinate space,
+ensuring that the attention is equivariant to global rotations and translations:
+</p>
+
+$$a_{ij} = \text{softmax}_j\left( \frac{1}{\sqrt{c}} \mathbf{q}_i^T \mathbf{k}_j + \sum_h w_h \| R_i^T (\mathbf{p}_{j}^{(h)} - \mathbf{t}_i) - R_j^T (\mathbf{p}_{i}^{(h)} - \mathbf{t}_j) \| + b_{ij} \right)$$
+
+<p>
+where $\mathbf{q}_i, \mathbf{k}_j$ are query and key vectors in embedding space,
+$\mathbf{p}^{(h)}$ are learned 3D query/key points, $R_i, \mathbf{t}_i$ are the
+current frame for residue $i$, and $b_{ij}$ is a bias from the pair representation.
+The structure module iterates 8 times, refining the frames from an initial
+identity-frame configuration to the predicted structure.
+</p>
+
+<h3>2.3 Using AlphaFold3</h3>
+
+<p>
+AlphaFold3 extends prediction to biomolecular complexes: protein-protein,
+protein-ligand, protein-nucleic acid, and even post-translationally modified
+proteins. Its architecture replaces the structure module with a diffusion-based
+generator that denoises atom coordinates from Gaussian noise, conditioned on the
+evoformer output. This allows AF3 to handle arbitrary molecular entities (small
+molecules, ions, modified residues) without specialized structure modules for each.
+</p>
+
+<pre><code class="language-python">from Bio.PDB import PDBParser, PDBIO
+import subprocess
+import json
+
+def predict_structure_alphafold3(
+    sequences: list[str],
+    job_name: str = "af3_prediction",
+    output_dir: str = "./af3_output",
+) -> dict:
+    """Predict protein complex structure using AlphaFold3.
+
+    Accepts multiple sequences for complex prediction.
+    Returns paths to predicted structures and confidence scores.
+
+    Requires: AlphaFold3 installed with model weights.
+    """
+    # Prepare input JSON for AF3
+    input_data = {
+        "name": job_name,
+        "modelSeeds": [42],
+        "sequences": [
+            {"proteinChain": {"sequence": seq, "count": 1}}
+            for seq in sequences
+        ],
+    }
+
+    input_path = f"{output_dir}/{job_name}_input.json"
+    with open(input_path, "w") as f:
+        json.dump(input_data, f)
+
+    # Run AF3 prediction
+    subprocess.run([
+        "python", "-m", "alphafold3",
+        f"--json_path={input_path}",
+        f"--output_dir={output_dir}",
+        "--model_dir=/data/af3_weights",
+    ], check=True)
+
+    # Parse results
+    result_dir = f"{output_dir}/{job_name}"
+    return {
+        "structure": f"{result_dir}/ranked_0.cif",
+        "confidence": _parse_af3_confidence(result_dir),
+    }
+
+
+def _parse_af3_confidence(result_dir: str) -> dict:
+    """Parse AlphaFold3 confidence metrics.
+
+    pLDDT: per-residue confidence (0-100, >90 is high confidence)
+    PAE: predicted aligned error between residue pairs
+    ipTM: interface predicted TM-score for complex accuracy
+    """
+    with open(f"{result_dir}/confidence.json") as f:
+        conf = json.load(f)
+    return {
+        "plddt_mean": sum(conf["plddt"]) / len(conf["plddt"]),
+        "iptm": conf.get("iptm", None),
+        "ptm": conf["ptm"],
+    }</code></pre>
+<div class="code-caption">Listing 48.8: Running AlphaFold3 for protein complex structure prediction. The pLDDT score measures per-residue confidence (above 90 indicates high-accuracy regions); ipTM measures the quality of predicted protein-protein interfaces.</div>
+
+<h2>3. ESMFold: Fast Single-Sequence Prediction</h2>
+
+<p>
+ESMFold achieves near-AF2 accuracy without requiring multiple sequence alignments.
+Instead, it uses a protein language model (ESM-2, with up to 15 billion parameters)
+pretrained on millions of protein sequences via masked language modeling. The key
+insight: the internal representations of a large language model trained on
+evolutionary data implicitly encode the same coevolutionary information that AF2
+extracts explicitly from MSAs.
+</p>
+
+<p>
+ESMFold's practical advantage is speed. AF2 requires computing MSAs against
+sequence databases (minutes to hours per protein); ESMFold runs in under a second
+for typical proteins on a single GPU. This makes ESMFold ideal for filtering large
+numbers of designed sequences (as we do in
+<a href="section-48.5.html">Section 48.5</a>).
+</p>
+
+<pre><code class="language-python">import torch
+import esm
+
+def predict_structure_esmfold(sequence: str) -> dict:
+    """Predict protein structure using ESMFold.
+
+    Returns the predicted structure as a PDB string and
+    per-residue pLDDT confidence scores.
+
+    ESMFold processes a single sequence (no MSA needed),
+    making it 100-1000x faster than AlphaFold2 per prediction.
+    """
+    model = esm.pretrained.esmfold_v1()
+    model = model.eval().cuda()
+
+    # Optionally reduce memory usage for long sequences
+    model.set_chunk_size(128)
+
+    with torch.no_grad():
+        output = model.infer_pdb(sequence)
+
+    # Extract per-residue confidence scores
+    with torch.no_grad():
+        result = model.infer(sequence)
+        plddt = result["plddt"].cpu().numpy().squeeze()
+
+    return {
+        "pdb_string": output,
+        "plddt_scores": plddt,
+        "mean_plddt": float(plddt.mean()),
+    }
+
+
+def batch_predict_esmfold(
+    sequences: list[str],
+    min_plddt: float = 70.0,
+) -> list[dict]:
+    """Predict structures for many sequences and filter by confidence.
+
+    Used in design pipelines to rapidly assess whether designed
+    sequences are predicted to fold into the intended structure.
+    """
+    model = esm.pretrained.esmfold_v1()
+    model = model.eval().cuda()
+    model.set_chunk_size(128)
+
+    results = []
+    for i, seq in enumerate(sequences):
+        with torch.no_grad():
+            output = model.infer(seq)
+            plddt = output["plddt"].cpu().numpy().squeeze()
+            mean_plddt = float(plddt.mean())
+
+        if mean_plddt >= min_plddt:
+            results.append({
+                "sequence": seq,
+                "index": i,
+                "mean_plddt": mean_plddt,
+                "pdb_string": model.output_to_pdb(output)[0],
+            })
+
+    return sorted(results, key=lambda x: x["mean_plddt"], reverse=True)</code></pre>
+<div class="code-caption">Listing 48.9: ESMFold for fast structure prediction and design filtering. The batch_predict_esmfold function processes hundreds of designed sequences per minute and filters by predicted folding confidence, acting as a computational quality gate before expensive experimental validation.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: BioPython for Structure Analysis</div>
+<p>
+BioPython's <code>Bio.PDB</code> module provides structure parsing, RMSD
+calculation, and contact map computation in a few lines:
+</p>
+<pre><code class="language-python">from Bio.PDB import PDBParser, Superimposer
+import numpy as np
+
+def compute_rmsd(pdb_file1: str, pdb_file2: str) -> float:
+    """Compute backbone RMSD between two structures."""
+    parser = PDBParser(QUIET=True)
+    s1 = parser.get_structure("s1", pdb_file1)
+    s2 = parser.get_structure("s2", pdb_file2)
+
+    atoms1 = [a for a in s1.get_atoms() if a.name in ("N", "CA", "C", "O")]
+    atoms2 = [a for a in s2.get_atoms() if a.name in ("N", "CA", "C", "O")]
+
+    sup = Superimposer()
+    sup.set_atoms(atoms1, atoms2)
+    return sup.rms  # RMSD in Angstroms
+</code></pre>
+<p>
+This replaces approximately 50 lines of manual coordinate extraction, Kabsch
+alignment, and RMSD computation. BioPython handles PDB format parsing, atom
+selection, and optimal superposition internally.
+</p>
+</div>
+
+<h2>4. RFDiffusion: Generating Novel Protein Backbones</h2>
+
+<p>
+While AF2 and ESMFold predict the structure of natural proteins, RFDiffusion
+<em>generates</em> novel protein backbones that do not exist in nature. Built on
+the denoising diffusion framework from
+<a href="../../part-3-data-models/module-34-generative-models/index.html">Chapter 34</a>,
+RFDiffusion operates on the SE(3) manifold of rigid-body frames, diffusing protein
+backbone coordinates to noise and learning to reverse the process.
+</p>
+
+<h3>4.1 Diffusion on SE(3)</h3>
+
+<p>
+Each residue $i$ is represented by a frame $T_i = (R_i, \mathbf{t}_i) \in \text{SE}(3)$,
+where $R_i \in \text{SO}(3)$ is a rotation matrix and $\mathbf{t}_i \in \mathbb{R}^3$
+is a translation. The forward diffusion process adds noise to both components:
+</p>
+
+$$\mathbf{t}_i^{(t)} = \sqrt{\bar{\alpha}_t}\, \mathbf{t}_i^{(0)} + \sqrt{1 - \bar{\alpha}_t}\, \boldsymbol{\epsilon}_i, \quad \boldsymbol{\epsilon}_i \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$$
+
+<p>
+For rotations, the noise is applied via the Lie algebra $\mathfrak{so}(3)$:
+</p>
+
+$$R_i^{(t)} = R_i^{(0)} \cdot \exp\left(\sqrt{1 - \bar{\alpha}_t}\, \boldsymbol{\omega}_i\right), \quad \boldsymbol{\omega}_i \sim \mathcal{N}(\mathbf{0}, \sigma_t^2 \mathbf{I})$$
+
+<p>
+where $\exp(\cdot)$ is the exponential map from $\mathfrak{so}(3)$ to SO(3). The
+reverse process uses RoseTTAFold as the denoising network, predicting clean frames
+from noisy frames at each diffusion timestep.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of SE(3) diffusion as sculpting from a fog of clay dust. Each residue starts as a
+grain of dust drifting in random position and orientation (pure noise). At each denoising
+step, the network nudges every grain toward a coherent shape, the way a potter's hands
+gradually compress loose clay into a recognizable bowl. The rotation component (SO(3))
+controls the tilt of each grain; the translation component ($\mathbb{R}^3$) controls
+where it sits. Early steps establish the rough silhouette (helix here, sheet there),
+while later steps refine exact bond angles and inter-residue contacts. The critical
+difference from image diffusion: the "pixels" here are rigid bodies with orientation,
+so the noise schedule must respect curved geometry (the SO(3) manifold) rather than
+simply adding Gaussian noise in flat Euclidean space.
+</p>
+</div>
+
+<h3>4.2 Design Modes</h3>
+
+<p>
+RFDiffusion supports several design modes, each specified by different conditioning:
+</p>
+
+<ul>
+<li><strong>Unconditional generation</strong>: generate novel folds with no structural constraints. Specify only the desired length.</li>
+<li><strong>Motif scaffolding</strong>: design a protein that places a functional motif (e.g., a binding epitope) in a specified position within a novel scaffold. The motif residues are fixed; the surrounding structure is generated.</li>
+<li><strong>Binder design</strong>: generate a protein that binds a specified target protein surface. The target structure is provided as context.</li>
+<li><strong>Symmetric design</strong>: generate symmetric assemblies (dimers, trimers, icosahedral cages) with specified symmetry operations.</li>
+</ul>
+
+<pre><code class="language-python">import subprocess
+from pathlib import Path
+
+def run_rfdiffusion(
+    output_dir: str,
+    contigs: str,
+    num_designs: int = 100,
+    target_pdb: str = None,
+    hotspot_residues: list[str] = None,
+    diffusion_steps: int = 50,
+) -> list[str]:
+    """Run RFDiffusion to generate protein backbone designs.
+
+    Args:
+        contigs: Residue specification string.
+            "100" = unconditional, 100 residues
+            "A1-50/0 70-100" = scaffold motif from residues 1-50
+                of chain A with 70-100 new residues
+        target_pdb: PDB file for binder design conditioning
+        hotspot_residues: Target residues to design binders against
+        diffusion_steps: Number of denoising steps (50 is standard)
+
+    Returns: list of paths to generated PDB backbone files
+    """
+    cmd = [
+        "python", "scripts/run_inference.py",
+        f"inference.output_prefix={output_dir}/design",
+        f"inference.num_designs={num_designs}",
+        f"contigmap.contigs=[{contigs}]",
+        f"diffuser.T={diffusion_steps}",
+    ]
+
+    if target_pdb is not None:
+        cmd.append(f"inference.input_pdb={target_pdb}")
+
+    if hotspot_residues is not None:
+        hotspots = ",".join(hotspot_residues)
+        cmd.append(f"ppi.hotspot_res=[{hotspots}]")
+
+    subprocess.run(cmd, check=True, cwd="/path/to/RFdiffusion")
+
+    # Collect generated backbone PDB files
+    output_path = Path(output_dir)
+    return sorted(str(p) for p in output_path.glob("design_*.pdb"))
+
+
+# Example: unconditional generation of 100-residue proteins
+backbones = run_rfdiffusion(
+    output_dir="./designs/unconditional",
+    contigs="100",
+    num_designs=50,
+)
+
+# Example: binder design against a target protein
+binder_backbones = run_rfdiffusion(
+    output_dir="./designs/binders",
+    contigs="A1-150/0 70-100",
+    target_pdb="target.pdb",
+    hotspot_residues=["A30", "A33", "A34"],
+    num_designs=100,
+)</code></pre>
+<div class="code-caption">Listing 48.10: Running RFDiffusion for backbone generation. The contig string specifies which residues are fixed (motif scaffolding) or free (de novo design). Binder design conditions on a target structure and specifies hotspot residues to design contacts against.</div>
+
+<h2>5. ProteinMPNN: From Backbone to Sequence</h2>
+
+<p>
+RFDiffusion generates protein backbones (3D coordinates without amino acid
+identities). The <strong>inverse folding</strong> problem asks: which amino acid
+sequence will fold into this backbone? ProteinMPNN solves this using a message-passing
+neural network that takes backbone coordinates as input and outputs a probability
+distribution over amino acids at each position.
+</p>
+
+<p data-agent="02">
+Inverse folding is the computational task of finding an amino acid sequence that will
+spontaneously fold into a given three-dimensional backbone structure. It matters because
+generative models like RFDiffusion produce backbones with no associated sequence, and a
+protein cannot be synthesized or tested without one. The mechanism works by encoding the
+backbone as a spatial graph and predicting, residue by residue, which amino acid best
+satisfies the local geometric and chemical environment at each position. Use inverse
+folding (ProteinMPNN or LigandMPNN) whenever you have a target backbone from any source
+(diffusion, experimental template, or manual design); use direct sequence optimization
+methods instead when you lack a specific backbone target and want to search sequence
+space guided by a fitness function.
+</p>
+
+<p>
+The model processes the protein as a $k$-nearest-neighbor graph in 3D space. Each
+node (residue) receives messages from its spatial neighbors, and the network
+autoregressively samples amino acids conditioned on the backbone geometry and
+previously sampled residues:
+</p>
+
+$$p(\mathbf{s} \mid \mathbf{X}) = \prod_{i=1}^{L} p(s_i \mid s_{<i}, \mathbf{X})$$
+
+<p>
+where $\mathbf{s}$ is the sequence, $\mathbf{X}$ are the backbone coordinates, and
+$s_{<i}$ denotes previously sampled residues. The autoregressive factorization allows
+diverse sampling: running the model multiple times with different random seeds
+produces different valid sequences for the same backbone.
+</p>
+
+<pre><code class="language-python">import subprocess
+import json
+
+def run_proteinmpnn(
+    pdb_path: str,
+    output_dir: str,
+    num_sequences: int = 8,
+    temperature: float = 0.1,
+    fixed_positions: dict = None,
+) -> list[dict]:
+    """Design sequences for a protein backbone using ProteinMPNN.
+
+    Args:
+        pdb_path: path to backbone PDB (from RFDiffusion or experiment)
+        num_sequences: number of diverse sequences to generate
+        temperature: sampling temperature (lower = more conservative)
+        fixed_positions: dict mapping chain to list of fixed residue indices
+
+    Returns: list of designed sequences with scores
+    """
+    cmd = [
+        "python", "protein_mpnn_run.py",
+        "--pdb_path", pdb_path,
+        "--out_folder", output_dir,
+        "--num_seq_per_target", str(num_sequences),
+        "--sampling_temp", str(temperature),
+        "--seed", "42",
+        "--batch_size", "1",
+    ]
+
+    if fixed_positions is not None:
+        # Write fixed positions JSON
+        fixed_path = f"{output_dir}/fixed_positions.json"
+        with open(fixed_path, "w") as f:
+            json.dump(fixed_positions, f)
+        cmd.extend(["--fixed_positions_jsonl", fixed_path])
+
+    subprocess.run(cmd, check=True, cwd="/path/to/ProteinMPNN")
+
+    # Parse output sequences
+    results = []
+    fasta_path = f"{output_dir}/seqs/{Path(pdb_path).stem}.fa"
+    with open(fasta_path) as f:
+        lines = f.readlines()
+    for i in range(0, len(lines), 2):
+        header = lines[i].strip()
+        sequence = lines[i + 1].strip()
+        # Parse score from header
+        score = float(header.split("score=")[1].split(",")[0])
+        results.append({
+            "sequence": sequence,
+            "score": score,
+            "recovery": _compute_sequence_recovery(pdb_path, sequence),
+        })
+
+    return sorted(results, key=lambda x: x["score"])</code></pre>
+<div class="code-caption">Listing 48.11: Running ProteinMPNN for inverse folding. Lower scores indicate sequences more compatible with the backbone geometry. The temperature parameter controls diversity: 0.1 produces conservative, high-confidence sequences; 0.5 produces more diverse alternatives.</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that a high pLDDT score from ESMFold (or AlphaFold) on a
+designed sequence proves the protein will fold correctly and function as intended.
+In reality, pLDDT measures only how confidently the prediction network places each
+residue, not whether the protein will actually fold in a test tube, remain stable at
+physiological temperature, or perform the desired catalytic or binding function.
+Designed proteins with pLDDT above 90 can still misfold, aggregate, or be non-functional;
+experimental validation remains essential, and metrics like circular dichroism, size
+exclusion chromatography, and binding assays are needed to confirm that a design works.
+</p>
+</div>
+
+<h3>5.1 LigandMPNN</h3>
+
+<p>
+LigandMPNN extends ProteinMPNN to design sequences in the context of bound ligands
+(small molecules, metal ions, nucleic acids). The network receives both backbone
+coordinates and ligand atom positions, designing sequences that form favorable
+interactions with the ligand. This is essential for enzyme design (where the active
+site must accommodate a substrate) and receptor design (where the binding pocket must
+complement a drug molecule).
+</p>
+
+<h2>6. FrameDiff and FoldFlow: Alternative Generative Approaches</h2>
+
+<p>
+RFDiffusion is not the only approach to protein backbone generation. Two alternatives
+offer different trade-offs:
+</p>
+
+<p>
+<strong>FrameDiff</strong> formulates backbone generation as diffusion on the product
+manifold $\text{SE}(3)^L$, where each residue has an independent frame. The key
+difference from RFDiffusion: FrameDiff uses a simpler network architecture
+(a modified version of IPA from AlphaFold2) and trains on the full PDB without
+requiring the RoseTTAFold backbone. This makes it easier to retrain on custom
+datasets. The trade-off is lower designability on unconditional generation tasks.
+</p>
+
+<p>
+<strong>FoldFlow</strong> replaces diffusion with continuous normalizing flows on
+SE(3), using Riemannian flow matching. Instead of learning a denoising process,
+FoldFlow learns a vector field that transports samples from a simple base distribution
+to the data distribution along geodesics on the SE(3) manifold:
+</p>
+
+$$\frac{d T_i}{dt} = v_\theta(T_i, t), \quad t \in [0, 1]$$
+
+<p>
+where $v_\theta$ is a learned vector field on SE(3). Flow matching avoids the need
+for reverse-process simulation and can be more sample-efficient than diffusion.
+</p>
+
+<div class="callout connection">
+<div class="callout-title">Connection: Diffusion Models and Generative Discovery</div>
+<p>
+The diffusion framework for protein design connects directly to
+<a href="../../part-3-data-models/module-34-generative-models/index.html">Chapter 34</a>.
+RFDiffusion is a conditional DDPM operating on SE(3) rather than pixel space. The
+same principles apply: noise scheduling controls sample quality, classifier-free
+guidance steers generation toward desired properties, and the number of diffusion
+steps trades generation quality against computational cost. The flow-matching
+alternative in FoldFlow connects to the continuous normalizing flows also covered
+in Chapter 34. The domain-specific contribution is the choice of manifold: SE(3)
+for rigid-body protein frames rather than $\mathbb{R}^n$ for images.
+</p>
+</div>
+
+<h2>7. The Structure-to-Function Gap</h2>
+
+<p>
+A critical limitation of current protein design tools: designing a protein that
+folds correctly does not guarantee it will function correctly. A designed enzyme
+might fold into the intended shape but fail to catalyze the target reaction because
+subtle electronic or dynamic effects are not captured by the backbone representation.
+Bridging this gap requires:
+</p>
+
+<ul>
+<li><strong>Molecular dynamics simulations</strong> to assess conformational dynamics and binding thermodynamics (connecting to <a href="../../part-5-simulation-optimization/module-43-scientific-simulation/index.html">Chapter 43</a>).</li>
+<li><strong>Quantum chemistry calculations</strong> for active-site electronic structure.</li>
+<li><strong>Experimental validation</strong>, which remains the ultimate arbiter. The fastest path from design to experiment is the self-driving laboratory (<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">Chapter 55</a>).</li>
+</ul>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: De Novo Luciferase Design</div>
+<p>
+In 2024, the Baker lab used RFDiffusion and ProteinMPNN to design a family of
+luciferase enzymes (proteins that produce light) with no sequence similarity to
+any natural luciferase. The pipeline generated 10,000 backbone scaffolds
+conditioned on the diphenylterazine substrate, designed 8 sequences per backbone
+with ProteinMPNN, filtered by ESMFold confidence (pLDDT > 80), and experimentally
+tested 7,648 designs. Of these, 6 showed luminescence activity, and the best
+was subsequently optimized through directed evolution to achieve brightness
+comparable to natural luciferases. The entire computational pipeline, from initial
+scaffold generation to experimental testing, took 3 weeks. A traditional
+enzyme-engineering campaign would require months of iterative mutagenesis.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+In late 2024, the Baker lab introduced RFDiffusion All-Atom (RFDiffusion-AA), which
+extends backbone diffusion to jointly generate protein backbones and small-molecule
+ligand poses in a single unified diffusion process (Krishna et al., "Generalized
+Biomolecular Modeling and Design with RoseTTAFold All-Atom," <em>Science</em>, 2024).
+Unlike the original RFDiffusion (which generates only protein backbone frames and
+relies on a separate docking step for ligands), RFDiffusion-AA diffuses over a
+combined representation of protein residue frames and ligand atom coordinates. This
+enables de novo design of enzyme active sites around a substrate, metal-binding
+proteins around a target ion, and protein-small molecule interfaces, all in one pass.
+Early benchmarks show that RFDiffusion-AA designs achieve experimental success rates
+two to five times higher than two-stage (generate-then-dock) pipelines for
+small-molecule binding tasks.
+</p>
+</div>
+
+<h2>8. Discovery Workbench Integration</h2>
+
+<p>
+The Discovery Workbench gains a <code>ProteinDesigner</code> component that wraps
+the RFDiffusion, ProteinMPNN, and ESMFold pipeline into a single interface. Users
+specify the design task (unconditional, motif scaffolding, or binder design), and
+the component orchestrates backbone generation, sequence design, structure validation,
+and ranking. All intermediate results are logged to the experiment registry for
+provenance tracking.
+</p>
+
+<pre><code class="language-python">from discovery_workbench import Designer, ExperimentRegistry
+
+class ProteinDesigner(Designer):
+    """Protein design pipeline for the Discovery Workbench."""
+
+    def design_binder(
+        self,
+        target_pdb: str,
+        hotspot_residues: list[str],
+        num_backbones: int = 100,
+        seqs_per_backbone: int = 8,
+        min_plddt: float = 75.0,
+    ) -> list[dict]:
+        """Design proteins that bind a specified target.
+
+        Pipeline: RFDiffusion -> ProteinMPNN -> ESMFold filtering
+        """
+        # Step 1: Generate backbones
+        backbones = run_rfdiffusion(
+            output_dir=self.work_dir / "backbones",
+            contigs="A1-150/0 70-100",
+            target_pdb=target_pdb,
+            hotspot_residues=hotspot_residues,
+            num_designs=num_backbones,
+        )
+        self.registry.log("backbone_generation", {"n": len(backbones)})
+
+        # Step 2: Design sequences for each backbone
+        all_designs = []
+        for bb_path in backbones:
+            seqs = run_proteinmpnn(
+                pdb_path=bb_path,
+                output_dir=self.work_dir / "sequences",
+                num_sequences=seqs_per_backbone,
+            )
+            for seq_info in seqs:
+                seq_info["backbone"] = bb_path
+            all_designs.extend(seqs)
+        self.registry.log("sequence_design", {"n": len(all_designs)})
+
+        # Step 3: Filter by ESMFold confidence
+        validated = batch_predict_esmfold(
+            [d["sequence"] for d in all_designs],
+            min_plddt=min_plddt,
+        )
+        self.registry.log("esmfold_filter", {
+            "input": len(all_designs),
+            "passed": len(validated),
+        })
+
+        return validated</code></pre>
+<div class="code-caption">Listing 48.12: Discovery Workbench protein designer orchestrating the RFDiffusion, ProteinMPNN, ESMFold pipeline. The three-stage workflow generates backbones, designs sequences, and validates predicted folding, logging each stage for provenance.</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Predict and Compare Protein Structures with ESMFold</h4>
+<p>
+Use ESMFold and BioPython to predict structures for related protein sequences and
+analyze how sequence changes affect predicted fold confidence. This project requires
+only a laptop with Python, PyTorch, and the <code>esm</code> and <code>biopython</code>
+packages (no GPU required for short sequences under 200 residues using the ESM-2 650M
+checkpoint).
+</p>
+<ol>
+<li><strong>Pick two homologous sequences.</strong> Go to UniProt and retrieve the
+sequences for human lysozyme (P61626) and hen egg-white lysozyme (P00698). Save each
+as a plain string variable in a Python script.</li>
+<li><strong>Predict both structures with ESMFold.</strong> Use
+<code>esm.pretrained.esmfold_v1()</code> to predict the structure of each sequence.
+Save the output PDB strings to files (<code>human_lyso.pdb</code> and
+<code>hen_lyso.pdb</code>).</li>
+<li><strong>Extract and plot pLDDT profiles.</strong> For each prediction, extract the
+per-residue pLDDT scores. Plot both profiles on the same matplotlib figure (x-axis:
+residue index, y-axis: pLDDT). Identify regions where the model is most and least
+confident.</li>
+<li><strong>Compute backbone RMSD.</strong> Using BioPython's
+<code>Superimposer</code> (as shown in the Library Shortcut above), superimpose the
+two predicted structures and compute their backbone RMSD. A value under 1.5 angstroms
+confirms that the two homologs share a conserved fold despite ~60% sequence identity.</li>
+<li><strong>Mutate and re-predict.</strong> Introduce three alanine substitutions at
+positions in the hen lysozyme active site (e.g., positions 35, 52, 62) and re-run
+ESMFold. Compare the mutant pLDDT profile to the wild-type profile. Regions near the
+mutations should show reduced confidence, illustrating that ESMFold captures
+sequence-structure coupling even without explicit training on mutational data.</li>
+</ol>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+Proteins are the machines of the cell, but understanding the cell itself requires
+analyzing gene expression at single-cell resolution.
+<a href="section-48.3.html">Section 48.3: Single-Cell Genomics</a> covers the
+foundation models (scVI, scGPT, Geneformer) that learn cell-level representations
+from transcriptomic data, enabling cell-type discovery, batch correction, and
+perturbation prediction.
+</p>
+</section>
+
+</main>
+
+<footer>
+<nav class="section-nav">
+<a href="section-48.1.html">&larr; Section 48.1</a>
+<a href="section-48.3.html">Section 48.3 &rarr;</a>
+</nav>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

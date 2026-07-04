@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 10.1: Structured Outputs and Tool Use. JSON Schema, constrained generation, function calling, Pydantic, MCP, and typed agent interfaces." name="description"/>
+<title>Section 10.1: Structured Outputs and Tool Use | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 10: Prompting to Programming</a></div>
+<h1>10.1 Structured Outputs and Tool Use</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You gave me a JSON schema and suddenly I stopped hallucinating field names. Coincidence? I think not."</p>
+<cite>A Language Model That Finally Passed Validation</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>A language model that returns free-form text is a conversational partner. A language model that returns validated, typed data structures is a software component. This section teaches you to cross that boundary. You will learn how JSON Schema constrains model outputs at the token level, how function calling turns models into tool-using agents, and how Pydantic provides the Python type system that ties everything together. By the end, you will be able to call any LLM and guarantee that the response conforms to a contract your code can consume without parsing heuristics or prayer.</p>
+</div>
+
+<h2>1. The Problem with Unstructured Outputs</h2>
+
+<p>Consider a simple task: ask an LLM to extract metadata from a scientific paper abstract. Without constraints, the model might return a bulleted list, a paragraph of prose, a markdown table, or a JSON blob with invented field names. Each format requires different parsing logic. Worse, the format can change between calls to the same model with the same prompt, because the model's output distribution includes many plausible continuations.</p>
+
+<p>This instability is not a minor inconvenience. It is a fundamental obstacle to building reliable systems. In <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>, we designed the Discovery Workbench around typed artifacts flowing through a provenance graph. Every node in that graph expects data in a specific shape. If an LLM upstream produces a response that does not match the expected schema, the entire pipeline breaks.</p>
+
+<p>The solution is <strong>constrained generation</strong>: mechanisms that force the model to produce outputs conforming to a predefined schema. There are three levels of constraint, each progressively stronger:</p>
+
+<p data-agent="02">Constrained generation is the practice of restricting a language model's token sampling so that every possible output satisfies a formal specification, such as a JSON Schema or a context-free grammar. It matters because unconstrained models produce structurally unpredictable outputs that break downstream code; even a 1% malformation rate means a pipeline processing thousands of requests will encounter dozens of failures per day. The mechanism works by computing, at each decoding step, a mask over the model's vocabulary that zeroes out the probability of any token that would violate the specification, so only valid continuations can be selected. Use constrained generation whenever your application consumes the model's output programmatically; reserve free-form text generation for conversational or creative tasks where rigid structure would be counterproductive.</p>
+
+<ol>
+<li><strong>Prompt-level</strong>: instruct the model in the system prompt to output JSON with specific fields. This is a request, not a guarantee. The model may comply 95% of the time, which means it fails at scale.</li>
+<li><strong>API-level</strong>: use the provider's structured output mode, which constrains the token sampling process itself. The model literally cannot produce tokens that would violate the schema.</li>
+<li><strong>Validation-level</strong>: parse and validate the response against a Pydantic model after generation, raising typed errors on violations. This catches semantic issues (wrong value ranges, missing cross-field constraints) that schema-level constraints cannot express.</li>
+</ol>
+
+<p>Production systems use all three layers together. Let us build each one.</p>
+
+<h2>2. JSON Schema as a Contract Language</h2>
+
+<p>JSON Schema is a vocabulary for annotating and validating JSON documents. Every major LLM API (Anthropic, OpenAI, Google) uses JSON Schema as the contract language for structured outputs. Understanding its core constructs is essential.</p>
+
+<p>A schema defines the <em>shape</em> of valid data: which fields exist, what types they carry, which are required, and what constraints apply. Here is a schema for a paper metadata record:</p>
+
+<pre><code class="language-json">{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Full title of the paper"
+    },
+    "authors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "affiliation": {"type": "string"}
+        },
+        "required": ["name"]
+      },
+      "minItems": 1
+    },
+    "year": {
+      "type": "integer",
+      "minimum": 1900,
+      "maximum": 2030
+    },
+    "keywords": {
+      "type": "array",
+      "items": {"type": "string"},
+      "maxItems": 10
+    },
+    "methodology": {
+      "type": "string",
+      "enum": ["experimental", "computational", "theoretical", "review", "meta-analysis"]
+    }
+  },
+  "required": ["title", "authors", "year", "methodology"]
+}</code></pre>
+<div class="code-caption">JSON Schema for scientific paper metadata. The <code>enum</code> constraint on methodology limits the model to exactly five valid values; <code>minItems</code> guarantees at least one author.</div>
+
+<p>When you pass this schema to a structured output API, the provider's decoding engine uses it to mask invalid tokens at each generation step. If the model has just produced <code>"year":</code>, only integer tokens are allowed next. If the integer so far is <code>18</code>, only digits that keep the value between 1900 and 2030 are permitted. This is not post-hoc validation; it is constrained decoding that makes invalid outputs impossible.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of constrained decoding like a custom keyboard that changes its keys after every keystroke. When you fill out a paper tax form, you can write anything in any box. But imagine a digital form where the "Year" field physically removes all letter keys from the keyboard and only shows digit keys, and after you type "19," it removes the keys for digits that would produce a number outside the valid range. The model still chooses which valid key to press (it retains its judgment about the most likely year), but the form makes it structurally impossible to type something invalid. That is exactly what a JSON Schema does to the model's token vocabulary at each generation step: it reshapes the set of available next tokens so that only schema-compliant continuations remain.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>Constrained decoding does not reduce model quality. Research from Willard and Louf (2023) shows that grammar-constrained generation with finite-state machines produces outputs that are both schema-valid and semantically equivalent to unconstrained generation. The model "wants" to produce valid JSON; the constraint simply prevents the rare cases where it would not.</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A common misconception is that structured outputs guarantee semantic correctness: that if the model returns valid JSON matching your schema, the content must be factually accurate. This is false. Constrained decoding ensures <em>syntactic</em> conformance (correct types, required fields present, enum values from the allowed set), but the model can still hallucinate a paper title, invent a DOI that does not exist, or assign the wrong methodology category with perfect structural validity. Always pair schema constraints with downstream validation, fact-checking, or human review for any field whose <em>value</em> (not just its type) matters to your application.</p>
+</div>
+
+<h2>3. Pydantic: Schemas from Python Types</h2>
+
+<p>Writing JSON Schema by hand is tedious and error-prone. Pydantic lets you define schemas as Python classes, with full IDE support, autocomplete, and type checking. The library generates the JSON Schema automatically, validates data at runtime, and provides clear error messages when validation fails.</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field
+from enum import Enum
+from typing import Optional
+
+
+class Methodology(str, Enum):
+    """Controlled vocabulary for research methodology types."""
+    EXPERIMENTAL = "experimental"
+    COMPUTATIONAL = "computational"
+    THEORETICAL = "theoretical"
+    REVIEW = "review"
+    META_ANALYSIS = "meta-analysis"
+
+
+class Author(BaseModel):
+    """A paper author with name and optional affiliation."""
+    name: str = Field(description="Full name of the author")
+    affiliation: Optional[str] = Field(
+        default=None,
+        description="Primary institutional affiliation"
+    )
+
+
+class PaperMetadata(BaseModel):
+    """Structured metadata extracted from a paper abstract."""
+    title: str = Field(description="Full title of the paper")
+    authors: list[Author] = Field(
+        min_length=1,
+        description="List of authors, at least one required"
+    )
+    year: int = Field(ge=1900, le=2030, description="Publication year")
+    keywords: list[str] = Field(
+        default_factory=list,
+        max_length=10,
+        description="Up to 10 topic keywords"
+    )
+    methodology: Methodology = Field(
+        description="Primary research methodology"
+    )
+
+
+# Generate JSON Schema from the Pydantic model
+schema = PaperMetadata.model_json_schema()
+print(schema)
+# Output matches the hand-written schema above, plus $defs for nested models</code></pre>
+<div class="code-caption">Pydantic models that generate the same JSON Schema as the hand-written version. The Python class hierarchy maps directly to the nested object structure.</div>
+
+<p>The key advantage is that the same class serves three roles: (1) schema definition for the LLM API, (2) runtime validation for the response, and (3) typed data object for downstream code. There is no impedance mismatch between the contract and the code.</p>
+
+<h2>4. Structured Outputs with the Anthropic SDK</h2>
+
+<p>The Anthropic API supports structured outputs through tool use. You define a tool whose input schema matches your desired output shape, then instruct the model to "use" that tool. The model's tool-use response is guaranteed to conform to the schema.</p>
+
+<pre><code class="language-python">import anthropic
+import json
+
+client = anthropic.Anthropic()
+
+
+def extract_metadata(abstract: str) -> PaperMetadata:
+    """Extract structured metadata from a paper abstract.
+
+    Uses Claude's tool-use mode to guarantee schema compliance.
+    """
+    # Define the extraction tool with our Pydantic schema
+    tools = [
+        {
+            "name": "record_metadata",
+            "description": (
+                "Record the structured metadata extracted from a "
+                "scientific paper abstract."
+            ),
+            "input_schema": PaperMetadata.model_json_schema(),
+        }
+    ]
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        tools=tools,
+        tool_choice={"type": "tool", "name": "record_metadata"},
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"Extract metadata from this abstract:\n\n{abstract}"
+                ),
+            }
+        ],
+    )
+
+    # The response is guaranteed to contain a tool_use block
+    tool_block = next(
+        block for block in response.content
+        if block.type == "tool_use"
+    )
+
+    # Validate with Pydantic (catches semantic issues beyond schema)
+    return PaperMetadata.model_validate(tool_block.input)
+
+
+# Example usage
+abstract = """
+We present a graph neural network approach to predicting
+protein-ligand binding affinity. Our model achieves state-of-the-art
+performance on the PDBbind benchmark, with a Pearson correlation of
+0.87 on the core set. We train on 16,000 complexes and validate on
+1,000 held-out structures.
+"""
+metadata = extract_metadata(abstract)
+print(f"Title: {metadata.title}")
+print(f"Method: {metadata.methodology.value}")
+print(f"Year: {metadata.year}")
+# Title: Graph Neural Network Approach to Predicting ...
+# Method: computational
+# Year: 2024</code></pre>
+<div class="code-caption">Extracting structured paper metadata with Claude's tool-use mode. The <code>tool_choice</code> parameter forces the model to call the specified tool, guaranteeing a schema-valid response.</div>
+
+<p>Notice the two-layer validation strategy. The API's constrained decoding guarantees that the JSON conforms to the schema (correct types, required fields present, enum values valid). The Pydantic <code>model_validate</code> call then applies Python-level constraints (field ranges, cross-field logic, custom validators) that JSON Schema cannot express.</p>
+
+<h2>5. Function Calling and Tool Use</h2>
+
+<p>Structured outputs are one direction: model to code. <strong>Function calling</strong> (also called tool use) adds the reverse direction: the model can invoke your code and receive results. This creates a bidirectional interface where the model reasons about when to call tools, what arguments to pass, and how to interpret the results.</p>
+
+<p>The pattern, introduced conceptually in <a href="../../part-1-foundations/module-04-reasoning-for-discovery/index.html">Chapter 4</a> as part of ReAct-style reasoning, works as follows:</p>
+
+<ol>
+<li>You define a set of tools, each with a name, description, and input schema.</li>
+<li>The model receives a user query plus the tool definitions.</li>
+<li>The model decides whether to answer directly or call a tool (or multiple tools).</li>
+<li>If it calls a tool, your code executes the function and returns the result.</li>
+<li>The model incorporates the result and either answers or calls another tool.</li>
+</ol>
+
+<p>Here is a complete example that gives Claude access to a literature search tool:</p>
+
+<pre><code class="language-python">import anthropic
+from pydantic import BaseModel, Field
+
+
+class SearchQuery(BaseModel):
+    """Input schema for literature search."""
+    query: str = Field(description="Search query for paper titles/abstracts")
+    max_results: int = Field(default=5, ge=1, le=20)
+    year_min: int = Field(default=2020, ge=1900)
+
+
+class SearchResult(BaseModel):
+    """A single search result."""
+    title: str
+    authors: list[str]
+    year: int
+    abstract: str
+    doi: str
+
+
+def search_literature(params: SearchQuery) -> list[dict]:
+    """Search a paper database. In production, this calls
+    Semantic Scholar, OpenAlex, or a local index."""
+    # Simplified: in practice, call an API
+    return [
+        {
+            "title": "Graph Neural Networks for Molecular Property Prediction",
+            "authors": ["Alice Chen", "Bob Kumar"],
+            "year": 2023,
+            "abstract": "We propose a message-passing neural network...",
+            "doi": "10.1234/example.2023.001",
+        }
+    ]
+
+
+def run_agent_loop(user_query: str) -> str:
+    """Run a tool-use agent loop until the model produces a final answer."""
+    client = anthropic.Anthropic()
+
+    tools = [
+        {
+            "name": "search_literature",
+            "description": (
+                "Search the scientific literature database. "
+                "Returns papers matching the query with titles, "
+                "authors, years, abstracts, and DOIs."
+            ),
+            "input_schema": SearchQuery.model_json_schema(),
+        }
+    ]
+
+    messages = [{"role": "user", "content": user_query}]
+
+    while True:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            tools=tools,
+            messages=messages,
+        )
+
+        # Check if the model wants to use a tool
+        if response.stop_reason == "tool_use":
+            # Process each tool call
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    # Validate input, execute function
+                    params = SearchQuery.model_validate(block.input)
+                    results = search_literature(params)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(results),
+                    })
+
+            # Feed results back to the model
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            # Model produced a final text response
+            return response.content[0].text
+
+
+answer = run_agent_loop(
+    "Find recent papers on graph neural networks for drug discovery"
+)
+print(answer)</code></pre>
+<div class="code-caption">A complete tool-use agent loop with Claude. The model decides when to search, constructs validated search parameters, and synthesizes results into a final answer.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Multi-Tool Discovery Agent</div>
+<p>In a real Discovery Workbench integration, you would register multiple tools: <code>search_literature</code>, <code>fetch_paper_details</code>, <code>extract_figures</code>, <code>query_knowledge_graph</code>. The model orchestrates these tools in whatever order makes sense for the user's question. A query like "What methods have been used to predict binding affinity since 2022?" might trigger a search, fetch full texts for the top results, extract methodology sections, and summarize the findings. The typed interfaces guarantee that each step produces data the next step can consume. Chapter 12 builds exactly this kind of multi-tool server using the Model Context Protocol.</p>
+</div>
+
+<h2>6. The Model Context Protocol (MCP)</h2>
+
+<p>Individual tool definitions work well for a single application, but they do not scale. If every team defines its own tool schemas, its own serialization, and its own execution protocol, interoperability is impossible. The <strong>Model Context Protocol (MCP)</strong>, introduced by Anthropic in 2024, solves this by defining a standard protocol for connecting LLMs to external tools and data sources.</p>
+
+<p>MCP defines three primitives:</p>
+
+<ul>
+<li><strong>Tools</strong>: functions the model can call, with JSON Schema input/output contracts.</li>
+<li><strong>Resources</strong>: data sources the model can read (files, database tables, API endpoints).</li>
+<li><strong>Prompts</strong>: reusable prompt templates that tools can expose to the model.</li>
+</ul>
+
+<p>An MCP server exposes these primitives over a standard transport (stdio or HTTP with server-sent events). Any MCP client (Claude Desktop, an IDE plugin, a custom agent) can discover and use the server's capabilities without custom integration code.</p>
+
+<pre><code class="language-python">from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
+
+# Create an MCP server for literature search
+mcp = FastMCP("literature-search")
+
+
+class PaperSearchInput(BaseModel):
+    """Schema for the search tool's input."""
+    query: str = Field(description="Search terms")
+    max_results: int = Field(default=10, ge=1, le=50)
+    year_range: tuple[int, int] = Field(
+        default=(2020, 2026),
+        description="(start_year, end_year) inclusive"
+    )
+
+
+class PaperRecord(BaseModel):
+    """Schema for a returned paper record."""
+    title: str
+    authors: list[str]
+    year: int
+    doi: str
+    abstract: str
+    citation_count: int
+
+
+@mcp.tool()
+def search_papers(input: PaperSearchInput) -> list[PaperRecord]:
+    """Search the scientific literature and return matching papers.
+
+    Queries Semantic Scholar and OpenAlex, deduplicates by DOI,
+    and ranks by relevance score.
+    """
+    # Implementation calls external APIs
+    # Returns validated PaperRecord objects
+    ...
+
+
+@mcp.resource("papers://{doi}")
+def get_paper(doi: str) -> str:
+    """Retrieve the full text of a paper by DOI."""
+    ...
+
+
+if __name__ == "__main__":
+    mcp.run()</code></pre>
+<div class="code-caption">An MCP server for literature search. The Pydantic models define the tool's contract; any MCP-compatible client can discover and call <code>search_papers</code> without custom integration. <a href="../module-12-mcp-servers/index.html">Chapter 12</a> builds a complete MCP server for scientific workflows.</div>
+
+<p>The critical insight is that MCP tool schemas are just JSON Schema, the same contract language used for structured outputs. This means the type system is consistent from end to end: Pydantic defines the schema, the LLM API enforces it during generation, MCP transmits it between processes, and Pydantic validates it again on receipt. One type definition flows through the entire stack.</p>
+
+<h2>7. Cross-SDK Comparison: Anthropic, OpenAI, and Beyond</h2>
+
+<p>The structured output and tool-use patterns differ in surface syntax across providers, but the underlying model is the same: define a schema, pass it to the API, get back validated data. Here is a side-by-side comparison for the paper metadata extraction task:</p>
+
+<pre><code class="language-python"># --- Anthropic SDK ---
+import anthropic
+
+def extract_anthropic(abstract: str) -> PaperMetadata:
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        tools=[{
+            "name": "record_metadata",
+            "description": "Record extracted paper metadata.",
+            "input_schema": PaperMetadata.model_json_schema(),
+        }],
+        tool_choice={"type": "tool", "name": "record_metadata"},
+        messages=[{"role": "user", "content": f"Extract: {abstract}"}],
+    )
+    tool_block = next(b for b in response.content if b.type == "tool_use")
+    return PaperMetadata.model_validate(tool_block.input)
+
+
+# --- OpenAI SDK (Responses API, 2025) ---
+from openai import OpenAI
+
+def extract_openai(abstract: str) -> PaperMetadata:
+    client = OpenAI()
+    response = client.responses.create(
+        model="gpt-4o",
+        input=[{"role": "user", "content": f"Extract: {abstract}"}],
+        text={"format": {
+            "type": "json_schema",
+            "name": "paper_metadata",
+            "schema": PaperMetadata.model_json_schema(),
+            "strict": True,  # enables constrained decoding
+        }},
+    )
+    return PaperMetadata.model_validate_json(response.output_text)</code></pre>
+<div class="code-caption">The same extraction task across two providers. Anthropic uses tool-use blocks; OpenAI uses a dedicated <code>json_schema</code> response format. Both consume the same Pydantic-generated JSON Schema.</div>
+
+<p>The Pydantic model is the common denominator. Write it once, and it works with any provider that accepts JSON Schema. This is why Pydantic has become the de facto standard for typed LLM interfaces in Python.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Instructor</div>
+<p>The <a href="https://github.com/jxnl/instructor" target="_blank">Instructor</a> library (by Jason Liu) wraps the Anthropic and OpenAI SDKs with a single <code>client.chat.completions.create(response_model=PaperMetadata)</code> call. It handles schema generation, API dispatch, response parsing, and retry logic in about 3 lines instead of the 20+ shown above. Instructor also supports streaming partial objects, validation retries with error feedback, and multi-provider routing. For production code where you need structured outputs without the boilerplate, Instructor is the right tool. Internally, it does exactly what our examples do: generate JSON Schema from Pydantic, pass it to the provider's structured output mode, and validate the response.</p>
+</div>
+
+<h2>8. Designing Typed Agent Interfaces</h2>
+
+<p>With structured outputs and tool use in hand, you can design complete agent interfaces as type hierarchies. The pattern draws on the interface design principles from <a href="../../part-1-foundations/module-03-knowledge-representation/index.html">Chapter 3</a> (knowledge representation) and the architecture patterns from <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a> (Discovery Workbench).</p>
+
+<pre><code class="language-python">from pydantic import BaseModel, Field
+from typing import Literal, Union
+from enum import Enum
+from datetime import datetime
+
+
+# --- Domain types ---
+class Confidence(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class Citation(BaseModel):
+    """A reference to a specific paper."""
+    doi: str
+    title: str
+    relevance: str = Field(description="Why this paper is relevant")
+
+
+class Claim(BaseModel):
+    """A scientific claim extracted from literature."""
+    statement: str = Field(description="The claim in one sentence")
+    evidence: list[Citation] = Field(min_length=1)
+    confidence: Confidence
+    methodology: str = Field(description="How the claim was established")
+
+
+# --- Agent interface ---
+class AnalysisRequest(BaseModel):
+    """Input contract for the literature analysis agent."""
+    research_question: str
+    scope: Literal["narrow", "broad"] = "narrow"
+    max_papers: int = Field(default=20, ge=5, le=100)
+    year_range: tuple[int, int] = Field(default=(2020, 2026))
+
+
+class AnalysisResult(BaseModel):
+    """Output contract for the literature analysis agent."""
+    question: str
+    claims: list[Claim] = Field(min_length=1)
+    gaps: list[str] = Field(
+        description="Identified gaps in the literature"
+    )
+    suggested_experiments: list[str]
+    papers_reviewed: int
+    timestamp: datetime
+
+
+# The agent function has a clear typed signature
+def analyze_literature(request: AnalysisRequest) -> AnalysisResult:
+    """Run the literature analysis agent.
+
+    This function orchestrates multiple LLM calls and tool uses,
+    but its interface is a simple typed function.
+    """
+    # Implementation uses the tool-use patterns from above
+    ...</code></pre>
+<div class="code-caption">A typed agent interface for literature analysis. The <code>AnalysisRequest</code> and <code>AnalysisResult</code> models define a contract that is enforceable, testable, and self-documenting. This is the interface pattern used throughout the Discovery Workbench from <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a> onward.</div>
+
+<p>This design has three properties that matter for discovery systems:</p>
+
+<ul>
+<li><strong>Testability</strong>: you can write unit tests that construct an <code>AnalysisRequest</code>, call the function, and assert properties of the <code>AnalysisResult</code>. No parsing, no regex, no "did the model say something that looks right."</li>
+<li><strong>Composability</strong>: the output of one agent becomes the input of another. An <code>AnalysisResult</code> can feed directly into a hypothesis generation agent (see <a href="../../part-4-knowledge/module-39-hypothesis-generation/index.html">Chapter 39</a>) because both share the <code>Claim</code> and <code>Citation</code> types.</li>
+<li><strong>Observability</strong>: every request and result can be serialized to JSON and logged to the Discovery Workbench's provenance system, creating an auditable trace of what the agent did, what it found, and what it concluded.</li>
+</ul>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Structured Generation Beyond JSON</div>
+<p>Willard and Louf (2023) formalized constrained decoding using finite-state machines (FSMs) that mask the token vocabulary at each generation step. Their library, Outlines, compiles JSON Schema into an FSM that runs alongside the model's sampling loop. More recent work by Geng et al. (2025) extends this to context-free grammars, enabling constraints beyond what JSON Schema can express (for example, syntactically valid Python code or balanced chemical equations). In a parallel development, the XGrammar system (2024) from the MLCEngine team achieves near-zero overhead constrained decoding by precompiling grammar automata into GPU-friendly lookup tables, making structured generation as fast as unconstrained generation even for complex grammars. XGrammar has been integrated into vLLM and SGLang, bringing grammar-constrained decoding to production serving stacks. The LMQL project takes yet another approach, embedding constraints as a query language that interleaves with generation. These techniques are rapidly converging toward a standard where every LLM call can be constrained by a formal grammar, not just a JSON Schema, with negligible performance cost.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Schema-Validated Extraction Pipeline</h4>
+<p>Put structured outputs into practice by building a small pipeline that extracts and validates structured data from unstructured text. You need Python 3.10+, the <code>pydantic</code> library, and an API key for Anthropic or OpenAI.</p>
+<ol>
+<li><strong>Define your schema.</strong> Create a Pydantic model called <code>ExperimentSummary</code> with fields for <code>title</code> (str), <code>organism</code> (str), <code>sample_size</code> (int, ge=1), <code>technique</code> (an Enum with values "PCR", "Western blot", "CRISPR", "RNA-seq", "other"), and <code>finding</code> (str, max 200 characters). Print the generated JSON Schema with <code>ExperimentSummary.model_json_schema()</code> and inspect it.</li>
+<li><strong>Write the extraction function.</strong> Using the Anthropic SDK (or OpenAI), create a function <code>extract_experiment(text: str) -> ExperimentSummary</code> that passes your schema as a tool definition with <code>tool_choice</code> forcing the tool call, then validates the response with <code>model_validate</code>.</li>
+<li><strong>Test with real abstracts.</strong> Copy three short experiment descriptions from PubMed abstracts. Run your function on each and print the validated results. Confirm that the <code>technique</code> field always contains one of your enum values and that <code>sample_size</code> is always a positive integer.</li>
+<li><strong>Add a custom validator.</strong> Add a Pydantic <code>@field_validator</code> to <code>ExperimentSummary</code> that rejects any <code>finding</code> containing the phrase "not statistically significant" (to filter out negative results). Test that the validator raises a <code>ValidationError</code> when the model extracts such a finding.</li>
+<li><strong>Batch and collect.</strong> Wrap your function in a loop that processes a list of 5+ abstracts, collects results into a list, and serializes them to a JSON file using <code>[e.model_dump() for e in results]</code>. Open the JSON file and verify that every record conforms to your schema.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual</strong>: Explain why prompt-level instructions ("Please respond in JSON") are insufficient for production systems. What failure modes does constrained decoding eliminate that prompt instructions cannot?</li>
+
+<li><strong>Coding</strong>: Define a Pydantic model for a <code>ExperimentRecord</code> that captures: hypothesis (string), independent variables (list of named variables with types and ranges), dependent variables (list), methodology (enum: "in_vitro", "in_vivo", "in_silico", "observational"), sample size (positive integer), and statistical test used (string). Generate the JSON Schema and use it with the Anthropic SDK to extract experiment records from a paragraph describing a drug trial.</li>
+
+<li><strong>Analysis</strong>: Compare the structured output APIs of Anthropic (tool-use mode) and OpenAI (json_schema response format). What are the trade-offs in terms of (a) schema expressiveness, (b) streaming support, and (c) error recovery when the model struggles with a constraint? Write a wrapper function that provides a unified interface across both providers.</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 10</a>
+<a href="index.html">Chapter 10</a>
+<a class="next" href="section-10.2.html">10.2 Programmatic Prompt Optimization &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</body>
+</html>

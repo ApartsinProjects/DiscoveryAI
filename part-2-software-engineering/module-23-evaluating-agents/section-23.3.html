@@ -1,0 +1,1281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 23.3: Building an Agent Benchmark. Construct a five-issue internal benchmark, evaluate two agent workflows, and report results with bootstrap confidence intervals and Wilcoxon signed-rank tests." name="description"/>
+<title>Section 23.3: Building an Agent Benchmark | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 23: Evaluating AI Coding Agents</a></div>
+<h1>23.3 Building an Agent Benchmark</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I ran both agents on five tasks and declared a winner. My statistician friend asked for confidence intervals. Now I need to run everything forty more times."</p>
+<cite>A Benchmark Author Who Discovered Sample Size Requirements</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section synthesizes the entire chapter into a hands-on recipe. You should have read
+<a href="section-23.1.html">Section 23.1</a> (task construction and evaluation harnesses)
+and <a href="section-23.2.html">Section 23.2</a> (validity threats and operational
+metrics). The statistical methods (bootstrap resampling, Wilcoxon signed-rank) require
+basic familiarity with hypothesis testing at the level of
+<a href="../../part-1-foundations/module-05-data-models-simulation/index.html">Chapter 5</a>.
+The recipe produces a benchmark that integrates with the Discovery Workbench testing
+infrastructure introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Public benchmarks tell you which agent architecture is strongest on well-known Python
+libraries. Your own benchmark tells you which agent works best on <em>your</em> code.
+This section walks through the complete recipe: selecting five issues from your
+repository's history, constructing task instances with validated test oracles, running
+two competing agent workflows against the suite, and reporting the comparison with
+bootstrap confidence intervals and a Wilcoxon signed-rank test. The result is a
+statistically grounded recommendation, not a leaderboard anecdote.
+</p>
+</div>
+
+<h2>1. Task Selection Criteria</h2>
+
+<p>
+The first step is choosing which resolved issues become benchmark tasks. Not every
+closed issue qualifies. The selection criteria from
+<a href="section-23.1.html">Section 23.1</a> apply: the issue must have a merged PR
+with test additions, and the tests must fail on the base commit and pass after the fix.
+Beyond these mechanical requirements, a good five-issue suite covers a range of
+difficulty and task types.
+</p>
+
+<p>
+For a minimal but informative benchmark, select one task from each of these categories:
+</p>
+
+<ul>
+<li><strong>Single-function bug fix</strong>: a logic error in one function, fixable with fewer than 10 lines. This is your baseline; if an agent cannot handle this, it is not ready for your codebase.</li>
+<li><strong>Cross-file change</strong>: a bug whose fix touches two or more files, requiring the agent to understand dependencies between modules.</li>
+<li><strong>Edge-case handling</strong>: a task where the issue describes an input that causes unexpected behavior, and the fix adds input validation or boundary handling.</li>
+<li><strong>API or interface change</strong>: a fix that modifies a function signature, return type, or error behavior, requiring updates to callers or documentation.</li>
+<li><strong>Under-specified issue</strong>: a task with a brief or vague issue description (e.g., "X is broken when Y"), testing the agent's ability to investigate and locate the bug with minimal guidance.</li>
+</ul>
+
+<p>
+This distribution ensures that the benchmark exercises different agent capabilities.
+An agent that aces single-function fixes but fails on cross-file changes has a specific
+weakness you need to know about before deployment. Conversely, an agent that handles
+under-specified issues well is likely to perform better in production, where issue
+descriptions are rarely as detailed as in SWE-bench.
+</p>
+
+<pre><code class="language-python">"""
+Task selection and benchmark construction from a Git repository.
+Extracts candidate tasks from merged PRs and filters by category
+to build a balanced five-issue evaluation suite.
+"""
+import subprocess
+import json
+import re
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from enum import Enum
+
+
+class TaskCategory(Enum):
+    SINGLE_FUNCTION = "single_function"
+    CROSS_FILE = "cross_file"
+    EDGE_CASE = "edge_case"
+    API_CHANGE = "api_change"
+    UNDER_SPECIFIED = "under_specified"
+
+
+@dataclass
+class CandidateTask:
+    """A potential benchmark task with metadata for selection."""
+    instance_id: str
+    pr_number: int
+    issue_title: str
+    issue_body: str
+    files_changed: list[str]
+    lines_added: int
+    lines_removed: int
+    test_files: list[str]
+    merge_commit: str
+    category: TaskCategory | None = None
+
+    @property
+    def num_source_files(self) -> int:
+        """Number of non-test files changed."""
+        return len([f for f in self.files_changed
+                    if f not in self.test_files])
+
+    @property
+    def total_churn(self) -> int:
+        return self.lines_added + self.lines_removed
+
+    @property
+    def description_length(self) -> int:
+        return len(self.issue_body.split())
+
+
+def classify_candidate(task: CandidateTask) -> TaskCategory:
+    """Assign a category to a candidate task based on heuristics.
+
+    Args:
+        task: The candidate task to classify.
+
+    Returns:
+        The most likely category based on structural properties.
+    """
+    # Under-specified: very short issue body
+    if task.description_length < 30:
+        return TaskCategory.UNDER_SPECIFIED
+
+    # API change: modifies __init__.py, or changes function signatures
+    api_indicators = ["__init__.py", "api.py", "interface", "schema"]
+    if any(ind in f for f in task.files_changed for ind in api_indicators):
+        return TaskCategory.API_CHANGE
+
+    # Cross-file: changes multiple source files
+    if task.num_source_files >= 2:
+        return TaskCategory.CROSS_FILE
+
+    # Edge case: issue mentions "edge", "boundary", "empty", "None", etc.
+    edge_keywords = ["edge case", "boundary", "empty", "none", "null",
+                     "zero", "negative", "overflow", "unicode"]
+    body_lower = task.issue_body.lower()
+    if any(kw in body_lower for kw in edge_keywords):
+        return TaskCategory.EDGE_CASE
+
+    # Default: single-function fix
+    return TaskCategory.SINGLE_FUNCTION
+
+
+def select_benchmark_suite(
+    candidates: list[CandidateTask],
+    target_size: int = 5
+) -> list[CandidateTask]:
+    """Select a balanced benchmark suite from candidate tasks.
+
+    Picks one task per category, preferring tasks with moderate
+    difficulty (not trivially easy, not impossibly hard).
+
+    Args:
+        candidates: All candidate tasks from the repository.
+        target_size: Number of tasks to select (default 5).
+
+    Returns:
+        A balanced list of tasks covering different categories.
+    """
+    # Classify all candidates
+    for c in candidates:
+        c.category = classify_candidate(c)
+
+    # Group by category
+    by_category: dict[TaskCategory, list[CandidateTask]] = {}
+    for c in candidates:
+        by_category.setdefault(c.category, []).append(c)
+
+    selected = []
+    # Take one from each category, preferring moderate churn
+    for cat in TaskCategory:
+        pool = by_category.get(cat, [])
+        if not pool:
+            continue
+        # Sort by total churn; pick the median-difficulty task
+        pool.sort(key=lambda t: t.total_churn)
+        median_idx = len(pool) // 2
+        selected.append(pool[median_idx])
+
+    # If we have fewer than target_size, fill from largest pools
+    while len(selected) < target_size:
+        remaining = [c for c in candidates if c not in selected]
+        if not remaining:
+            break
+        # Pick the task with the most moderate churn among remaining
+        remaining.sort(key=lambda t: t.total_churn)
+        selected.append(remaining[len(remaining) // 2])
+
+    return selected[:target_size]
+</code></pre>
+<div class="code-caption">Task selection pipeline that classifies candidate tasks by category and builds a balanced five-issue benchmark suite. The classification heuristics use structural properties (file count, description length, keyword matching) to assign categories, then the selection function picks one task per category at moderate difficulty.</div>
+
+<h2>2. Building the Evaluation Harness</h2>
+
+<p>
+With five tasks selected, the next step is building a harness that runs agent workflows
+against them in isolated environments. The harness from
+<a href="section-23.1.html">Section 23.1</a> provides the core evaluation loop. Here we
+wrap it in a complete pipeline that: (1) sets up isolated working directories for each
+task, (2) invokes the agent workflow, (3) captures the agent's patch along with cost and
+latency telemetry, and (4) evaluates the patch against the test oracle.
+</p>
+
+<p>
+The key design decision is the <strong>agent interface</strong>. Different agent
+frameworks (SWE-agent, Aider, Claude Code, custom pipelines) expose different APIs. Our
+harness defines a minimal interface: a function that takes an issue description and a
+repository path, and returns a patch string along with usage metadata. Any agent that
+can be wrapped in this interface can be evaluated.
+</p>
+
+<pre><code class="language-python">"""
+Complete evaluation harness for internal agent benchmarks.
+Defines a standard agent interface, runs evaluations with
+telemetry capture, and collects results for statistical analysis.
+"""
+import time
+import json
+import subprocess
+import tempfile
+import shutil
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+
+@dataclass
+class AgentResult:
+    """Result from an agent attempting a single task."""
+    patch: str
+    cost_usd: float
+    latency_seconds: float
+    input_tokens: int
+    output_tokens: int
+    tool_calls: int
+    error: str | None = None
+
+
+class AgentInterface(ABC):
+    """Standard interface for evaluating any coding agent."""
+
+    @abstractmethod
+    def solve(
+        self,
+        issue_text: str,
+        repo_path: str,
+        timeout: int = 600
+    ) -> AgentResult:
+        """Attempt to solve a coding task.
+
+        Args:
+            issue_text: The issue description (the agent's prompt).
+            repo_path: Path to a checkout at the base commit.
+            timeout: Maximum wall-clock seconds.
+
+        Returns:
+            AgentResult with the proposed patch and telemetry.
+        """
+        ...
+
+
+class SimplePromptAgent(AgentInterface):
+    """A single-pass agent that sends the issue to an LLM once."""
+
+    def __init__(self, model: str = "claude-sonnet-4-20250514"):
+        self.model = model
+
+    def solve(self, issue_text: str, repo_path: str,
+              timeout: int = 600) -> AgentResult:
+        from anthropic import Anthropic
+        client = Anthropic()
+
+        # Read relevant source files (simplified: read all .py files)
+        source_context = self._gather_context(repo_path)
+
+        start = time.time()
+        response = client.messages.create(
+            model=self.model,
+            max_tokens=8192,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Fix this issue in the repository.\n\n"
+                    f"Issue:\n{issue_text}\n\n"
+                    f"Repository structure and key files:\n"
+                    f"{source_context}\n\n"
+                    f"Return ONLY a unified diff (patch) that fixes "
+                    f"the issue. No explanation."
+                )
+            }]
+        )
+        elapsed = time.time() - start
+
+        return AgentResult(
+            patch=response.content[0].text,
+            cost_usd=self._estimate_cost(response.usage),
+            latency_seconds=elapsed,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            tool_calls=0
+        )
+
+    def _gather_context(self, repo_path: str,
+                        max_files: int = 20) -> str:
+        """Gather source file contents for context."""
+        py_files = sorted(Path(repo_path).rglob("*.py"))[:max_files]
+        parts = []
+        for f in py_files:
+            rel = f.relative_to(repo_path)
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")
+                parts.append(f"--- {rel} ---\n{content[:2000]}")
+            except Exception:
+                continue
+        return "\n\n".join(parts)
+
+    def _estimate_cost(self, usage) -> float:
+        """Estimate API cost from token usage."""
+        # Approximate pricing for Claude Sonnet
+        input_cost = usage.input_tokens * 3.0 / 1_000_000
+        output_cost = usage.output_tokens * 15.0 / 1_000_000
+        return input_cost + output_cost
+
+
+class IterativeAgent(AgentInterface):
+    """A multi-step agent that reads files, runs tests, and iterates."""
+
+    def __init__(self, model: str = "claude-sonnet-4-20250514",
+                 max_iterations: int = 5):
+        self.model = model
+        self.max_iterations = max_iterations
+
+    def solve(self, issue_text: str, repo_path: str,
+              timeout: int = 600) -> AgentResult:
+        from anthropic import Anthropic
+        client = Anthropic()
+
+        start = time.time()
+        total_input = 0
+        total_output = 0
+        tool_calls = 0
+        current_patch = ""
+
+        messages = [{
+            "role": "user",
+            "content": (
+                f"You are debugging a repository. The issue is:\n\n"
+                f"{issue_text}\n\n"
+                f"The repo is at: {repo_path}\n"
+                f"Use bash commands to explore the code, identify the "
+                f"bug, write a fix, and run the tests. When done, "
+                f"output the fix as a unified diff."
+            )
+        }]
+
+        for iteration in range(self.max_iterations):
+            if time.time() - start > timeout:
+                break
+
+            response = client.messages.create(
+                model=self.model,
+                max_tokens=4096,
+                messages=messages,
+                tools=[{
+                    "name": "bash",
+                    "description": "Run a bash command in the repo.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        },
+                        "required": ["command"]
+                    }
+                }]
+            )
+
+            total_input += response.usage.input_tokens
+            total_output += response.usage.output_tokens
+
+            # Process tool calls
+            has_tool_use = False
+            for block in response.content:
+                if block.type == "tool_use":
+                    has_tool_use = True
+                    tool_calls += 1
+                    cmd = block.input.get("command", "")
+                    try:
+                        result = subprocess.run(
+                            cmd, shell=True, cwd=repo_path,
+                            capture_output=True, text=True,
+                            timeout=30
+                        )
+                        output = result.stdout + result.stderr
+                    except subprocess.TimeoutExpired:
+                        output = "Command timed out"
+
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": output[:4000]
+                        }]
+                    })
+                elif block.type == "text":
+                    current_patch = block.text
+
+            if not has_tool_use:
+                break  # Agent is done
+
+        elapsed = time.time() - start
+        input_cost = total_input * 3.0 / 1_000_000
+        output_cost = total_output * 15.0 / 1_000_000
+
+        return AgentResult(
+            patch=current_patch,
+            cost_usd=input_cost + output_cost,
+            latency_seconds=elapsed,
+            input_tokens=total_input,
+            output_tokens=total_output,
+            tool_calls=tool_calls
+        )
+</code></pre>
+<div class="code-caption">Two agent implementations conforming to the standard <code>AgentInterface</code>. The <code>SimplePromptAgent</code> sends a single prompt with repository context. The <code>IterativeAgent</code> uses tool-calling to explore the repository, run tests, and iterate on its fix. Both capture cost and latency telemetry for the comparison analysis.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Agent Evaluation Frameworks</div>
+<p>
+The from-scratch harness above illustrates the evaluation loop, but production agent
+evaluation uses dedicated frameworks. The <code>swebench</code> package
+(<code>pip install swebench</code>) handles Docker isolation, environment setup, and
+parallel evaluation. For custom benchmarks, <code>inspect-ai</code> from UK AISI
+(<code>pip install inspect-ai</code>) provides a general-purpose evaluation framework
+with built-in support for coding tasks:
+</p>
+<pre><code class="language-python">from inspect_ai import Task, task, eval
+from inspect_ai.dataset import json_dataset
+from inspect_ai.scorer import match
+from inspect_ai.solver import generate
+
+@task
+def coding_benchmark():
+    return Task(
+        dataset=json_dataset("my_benchmark.json"),
+        solver=generate(),
+        scorer=match(),
+    )
+
+# Run evaluation
+results = eval(coding_benchmark(), model="anthropic/claude-sonnet-4-20250514")
+</code></pre>
+<p>
+The <code>inspect-ai</code> framework reduces the evaluation code from hundreds of
+lines to a task definition and a one-line invocation. It handles model API calls,
+result logging, scoring, and statistical analysis internally. For SWE-bench
+specifically, the official harness remains the standard.
+</p>
+</div>
+
+<h2>3. Running the Evaluation</h2>
+
+<p>
+With the harness built and two agents implemented, we run each agent against all five
+tasks. To support statistical analysis, we run each agent multiple times per task. Five
+repetitions per agent per task gives us 25 evaluation runs per agent (5 tasks x 5
+repetitions), which is sufficient for bootstrap confidence intervals on the resolve rate
+and for the Wilcoxon signed-rank test on paired comparisons.
+</p>
+
+<pre><code class="language-python">"""
+Evaluation runner: executes two agent workflows against a
+five-task benchmark suite with multiple repetitions per task.
+Collects paired results for statistical comparison.
+"""
+import json
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+
+@dataclass
+class PairedResult:
+    """Paired evaluation results for one task, one repetition."""
+    instance_id: str
+    repetition: int
+    agent_a_resolved: bool
+    agent_b_resolved: bool
+    agent_a_cost: float
+    agent_b_cost: float
+    agent_a_latency: float
+    agent_b_latency: float
+
+
+def run_evaluation(
+    tasks: list["TaskInstance"],
+    agent_a: AgentInterface,
+    agent_b: AgentInterface,
+    repo_path: str,
+    repetitions: int = 5,
+    output_path: str = "eval_results.json"
+) -> list[PairedResult]:
+    """Run a paired evaluation of two agents on a task suite.
+
+    Each agent attempts each task multiple times. Results are
+    paired by (task, repetition) for statistical comparison.
+
+    Args:
+        tasks: The benchmark task instances.
+        agent_a: First agent workflow.
+        agent_b: Second agent workflow.
+        repo_path: Path to a clean clone of the repository.
+        repetitions: Number of attempts per agent per task.
+        output_path: Where to save results as JSON.
+
+    Returns:
+        List of PairedResult objects for statistical analysis.
+    """
+    paired_results = []
+
+    for task in tasks:
+        print(f"\nEvaluating task: {task.instance_id}")
+
+        for rep in range(repetitions):
+            print(f"  Repetition {rep + 1}/{repetitions}")
+
+            # Run Agent A
+            result_a = agent_a.solve(task.issue_text, repo_path)
+            eval_a = evaluate_patch(task, result_a.patch, repo_path)
+
+            # Run Agent B
+            result_b = agent_b.solve(task.issue_text, repo_path)
+            eval_b = evaluate_patch(task, result_b.patch, repo_path)
+
+            paired_results.append(PairedResult(
+                instance_id=task.instance_id,
+                repetition=rep,
+                agent_a_resolved=eval_a.passed,
+                agent_b_resolved=eval_b.passed,
+                agent_a_cost=result_a.cost_usd,
+                agent_b_cost=result_b.cost_usd,
+                agent_a_latency=result_a.latency_seconds,
+                agent_b_latency=result_b.latency_seconds,
+            ))
+
+    # Save results
+    with open(output_path, "w") as f:
+        json.dump([asdict(r) for r in paired_results], f, indent=2)
+
+    return paired_results
+</code></pre>
+<div class="code-caption">Evaluation runner that executes two agents on each task with multiple repetitions, producing paired results suitable for the Wilcoxon signed-rank test. Each pair shares the same task and repetition index, isolating the agent-to-agent comparison from task-to-task variation.</div>
+
+<h2>4. Bootstrap Confidence Intervals</h2>
+
+<p>
+With only five tasks, the sample size is too small for the Central Limit Theorem to
+guarantee that the sampling distribution of the resolve rate is normal. The
+<strong>bootstrap</strong> provides an alternative: resample the observed results
+<em>with replacement</em> thousands of times, compute the resolve rate for each
+resample, and use the distribution of resampled rates as an estimate of the true
+sampling distribution.
+</p>
+
+<p data-agent="02">
+The bootstrap is a resampling method that estimates the variability of a statistic (here, the resolve rate) without relying on any distributional assumptions about the underlying data. It matters because agent benchmark results are discrete pass/fail outcomes on a handful of tasks, a setting where classical normal-approximation intervals perform poorly or break entirely. The mechanism is simple: draw $B$ samples of size $n$ from the observed outcomes with replacement, compute the statistic of interest for each sample, and use the empirical percentiles of those $B$ values as confidence bounds. Use the bootstrap whenever your sample size is too small for asymptotic methods (roughly $n < 30$), or whenever the quantity you are estimating has no convenient closed-form sampling distribution; for large samples with well-behaved distributions, classical $z$- or $t$-intervals are faster and equally valid.
+</p>
+
+<p>
+The bootstrap works by treating our observed data as a stand-in for the true population.
+If we observed 3 passes out of 5 tasks, we create a "population" of [1, 1, 1, 0, 0]
+(where 1 means pass and 0 means fail). We draw 5 values from this population with
+replacement, compute the mean (the resolve rate for this resample), and repeat 10,000
+times. The 2.5th and 97.5th percentiles of the resulting distribution form a 95%
+confidence interval.
+</p>
+
+<p>
+Formally, let $\hat{\theta}$ be the observed resolve rate and $\hat{\theta}_1^*, \hat{\theta}_2^*, \ldots, \hat{\theta}_B^*$ be the resolve rates computed from $B$ bootstrap resamples. The percentile bootstrap confidence interval at level $1 - \alpha$ is:
+</p>
+
+$$CI_{1-\alpha} = \left[ \hat{\theta}^*_{(\alpha/2)}, \; \hat{\theta}^*_{(1-\alpha/2)} \right]$$
+
+<p>
+where $\hat{\theta}^*_{(q)}$ denotes the $q$-th quantile of the bootstrap distribution.
+For a 95% interval, $\alpha = 0.05$, so we take the 2.5th and 97.5th percentiles.
+</p>
+
+<pre><code class="language-python">"""
+Bootstrap confidence intervals for agent evaluation metrics.
+Handles small sample sizes (as few as 5 tasks) by resampling
+with replacement to estimate the sampling distribution.
+"""
+import random
+import statistics
+from dataclasses import dataclass
+
+
+@dataclass
+class BootstrapCI:
+    """Bootstrap confidence interval for a metric."""
+    point_estimate: float
+    ci_lower: float
+    ci_upper: float
+    ci_level: float
+    num_bootstrap_samples: int
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.point_estimate:.1%} "
+            f"[{self.ci_lower:.1%}, {self.ci_upper:.1%}] "
+            f"({self.ci_level:.0%} CI)"
+        )
+
+
+def bootstrap_resolve_rate(
+    outcomes: list[bool],
+    num_samples: int = 10_000,
+    ci_level: float = 0.95,
+    seed: int = 42
+) -> BootstrapCI:
+    """Compute a bootstrap confidence interval for the resolve rate.
+
+    Args:
+        outcomes: List of pass/fail outcomes (True = resolved).
+        num_samples: Number of bootstrap resamples.
+        ci_level: Confidence level (e.g., 0.95 for 95% CI).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        BootstrapCI with point estimate and interval bounds.
+    """
+    rng = random.Random(seed)
+    n = len(outcomes)
+    point_estimate = sum(outcomes) / n
+
+    # Generate bootstrap distribution
+    boot_rates = []
+    for _ in range(num_samples):
+        resample = rng.choices(outcomes, k=n)
+        boot_rates.append(sum(resample) / n)
+
+    boot_rates.sort()
+    alpha = 1 - ci_level
+    lower_idx = int(num_samples * alpha / 2)
+    upper_idx = int(num_samples * (1 - alpha / 2))
+
+    return BootstrapCI(
+        point_estimate=point_estimate,
+        ci_lower=boot_rates[lower_idx],
+        ci_upper=boot_rates[upper_idx],
+        ci_level=ci_level,
+        num_bootstrap_samples=num_samples
+    )
+
+
+def bootstrap_cost_efficiency(
+    outcomes: list[bool],
+    costs: list[float],
+    num_samples: int = 10_000,
+    ci_level: float = 0.95,
+    seed: int = 42
+) -> BootstrapCI:
+    """Bootstrap CI for cost efficiency (resolved tasks per dollar).
+
+    Args:
+        outcomes: List of pass/fail outcomes.
+        costs: Corresponding per-task costs in USD.
+        num_samples: Number of bootstrap resamples.
+        ci_level: Confidence level.
+        seed: Random seed.
+
+    Returns:
+        BootstrapCI for the cost efficiency metric.
+    """
+    rng = random.Random(seed)
+    n = len(outcomes)
+    total_resolved = sum(outcomes)
+    total_cost = sum(costs)
+    point_estimate = total_resolved / total_cost if total_cost > 0 else 0
+
+    boot_efficiencies = []
+    indices = list(range(n))
+    for _ in range(num_samples):
+        resample_idx = rng.choices(indices, k=n)
+        boot_resolved = sum(outcomes[i] for i in resample_idx)
+        boot_cost = sum(costs[i] for i in resample_idx)
+        if boot_cost > 0:
+            boot_efficiencies.append(boot_resolved / boot_cost)
+        else:
+            boot_efficiencies.append(0)
+
+    boot_efficiencies.sort()
+    alpha = 1 - ci_level
+    lower_idx = int(num_samples * alpha / 2)
+    upper_idx = int(num_samples * (1 - alpha / 2))
+
+    return BootstrapCI(
+        point_estimate=point_estimate,
+        ci_lower=boot_efficiencies[lower_idx],
+        ci_upper=boot_efficiencies[upper_idx],
+        ci_level=ci_level,
+        num_bootstrap_samples=num_samples
+    )
+
+
+# Example with realistic data
+outcomes_a = [True, True, False, True, False]  # Agent A: 3/5
+outcomes_b = [True, False, True, True, True]   # Agent B: 4/5
+
+ci_a = bootstrap_resolve_rate(outcomes_a)
+ci_b = bootstrap_resolve_rate(outcomes_b)
+
+print(f"Agent A resolve rate: {ci_a}")
+print(f"Agent B resolve rate: {ci_b}")
+# Agent A resolve rate: 60.0% [20.0%, 100.0%] (95% CI)
+# Agent B resolve rate: 80.0% [40.0%, 100.0%] (95% CI)
+# Note: wide intervals reflect the small sample size (n=5)
+</code></pre>
+<div class="code-caption">Bootstrap confidence intervals for resolve rate and cost efficiency. With only 5 tasks, the 95% CIs are wide (often spanning 40-60 percentage points), which is the correct statistical answer: small samples yield uncertain estimates. The wide intervals are a feature, not a bug; they prevent over-confident conclusions from small benchmarks.</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often believe that increasing the number of bootstrap resamples (e.g., from 10,000 to 100,000) will narrow the confidence interval and yield a more precise estimate. This is wrong: more resamples make the interval boundaries more <em>stable</em> (less jitter between runs), but they cannot shrink the interval itself. The width of the interval is determined by the variability in your original data, which is fixed by the number of tasks ($n$). To get a narrower confidence interval, you need more original observations (more benchmark tasks), not more resamples of the same small dataset.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+The bootstrap does not magically create precision from small samples. With 5 tasks, a
+95% confidence interval for a 60% resolve rate might span from 20% to 100%. This wide
+interval is the honest answer: you genuinely do not know the agent's true resolve rate
+with much precision. The value of the bootstrap is that it <em>quantifies</em> this
+uncertainty rather than hiding it behind a point estimate. Reporting "60% (95% CI:
+20%,100%)" is far more informative than reporting "60%" alone. To narrow the interval,
+you need more tasks, which motivates expanding your internal benchmark over time.
+</p>
+</div>
+
+<h2>5. The Wilcoxon Signed-Rank Test</h2>
+
+<p>
+Bootstrap confidence intervals tell you about each agent's performance in isolation.
+The <strong>Wilcoxon signed-rank test</strong> tells you whether one agent is
+systematically better than the other on the <em>same</em> tasks. It is a non-parametric
+test for paired samples: it makes no assumptions about the distribution of the
+differences, which is important because pass/fail outcomes on coding tasks are not
+normally distributed.
+</p>
+
+<p>
+The test works with paired observations. For each task, we compute a score difference
+between Agent A and Agent B. The score can be binary (1 if resolved, 0 if not), giving
+a difference in {-1, 0, 1}, or continuous (e.g., the time to resolution), giving
+real-valued differences. The test then asks: is the median of these differences
+significantly different from zero?
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the Wilcoxon signed-rank test like a blind taste test between two coffee blends. You give five people both blends (paired samples) and ask each person to rate the difference. You do not care about the raw scores, only whether each taster preferred blend A or blend B and by how much. You then rank the strength of each preference, ignoring anyone who said "no difference." If most of the strong preferences point the same direction, you conclude one blend is systematically better. The test works the same way with agents: each task is a taster, the difference in resolve rate is the preference, and ties (both agents pass or both fail) are discarded. What matters is whether the non-tied differences consistently favor one agent, weighted by their magnitude.
+</p>
+</div>
+
+<p>
+The procedure:
+</p>
+
+<ol>
+<li>For each task $i$, compute the difference $d_i = \text{score}_A(i) - \text{score}_B(i)$.</li>
+<li>Discard pairs where $d_i = 0$ (ties). Let $n_r$ be the number of remaining pairs.</li>
+<li>Rank the absolute differences $|d_1|, |d_2|, \ldots, |d_{n_r}|$.</li>
+<li>Compute $W^+ = \sum_{d_i > 0} R_i$ (sum of ranks for positive differences) and $W^- = \sum_{d_i < 0} R_i$ (sum of ranks for negative differences).</li>
+<li>The test statistic is $W = \min(W^+, W^-)$. Under the null hypothesis (no systematic difference), $W$ follows the Wilcoxon signed-rank distribution.</li>
+</ol>
+
+<pre><code class="language-python">"""
+Wilcoxon signed-rank test for paired agent comparison.
+Tests whether one agent is systematically better than another
+on the same set of tasks, without assuming normality.
+"""
+from scipy import stats
+from dataclasses import dataclass
+
+
+@dataclass
+class ComparisonResult:
+    """Result of a paired agent comparison."""
+    agent_a_name: str
+    agent_b_name: str
+    num_tasks: int
+    agent_a_wins: int
+    agent_b_wins: int
+    ties: int
+    wilcoxon_statistic: float | None
+    p_value: float | None
+    significant_at_05: bool
+    effect_direction: str  # "A > B", "B > A", or "no difference"
+    resolve_rate_a: float
+    resolve_rate_b: float
+    ci_a: "BootstrapCI"
+    ci_b: "BootstrapCI"
+
+
+def compare_agents(
+    paired_results: list[PairedResult],
+    agent_a_name: str = "Agent A",
+    agent_b_name: str = "Agent B",
+    alpha: float = 0.05
+) -> ComparisonResult:
+    """Compare two agents using the Wilcoxon signed-rank test.
+
+    Aggregates per-task outcomes across repetitions, then tests
+    whether the difference in resolve rates is significant.
+
+    Args:
+        paired_results: Paired evaluation results from run_evaluation.
+        agent_a_name: Display name for Agent A.
+        agent_b_name: Display name for Agent B.
+        alpha: Significance level for the test.
+
+    Returns:
+        ComparisonResult with test statistics and interpretation.
+    """
+    # Aggregate outcomes per task (average across repetitions)
+    task_ids = sorted(set(r.instance_id for r in paired_results))
+    scores_a = []
+    scores_b = []
+
+    for tid in task_ids:
+        task_results = [r for r in paired_results
+                        if r.instance_id == tid]
+        # Per-task resolve rate across repetitions
+        rate_a = sum(r.agent_a_resolved for r in task_results) / len(task_results)
+        rate_b = sum(r.agent_b_resolved for r in task_results) / len(task_results)
+        scores_a.append(rate_a)
+        scores_b.append(rate_b)
+
+    # Compute differences for the Wilcoxon test
+    differences = [a - b for a, b in zip(scores_a, scores_b)]
+    a_wins = sum(1 for d in differences if d > 0)
+    b_wins = sum(1 for d in differences if d < 0)
+    ties = sum(1 for d in differences if d == 0)
+
+    # Run the Wilcoxon signed-rank test
+    # Need at least one non-zero difference
+    non_zero = [d for d in differences if d != 0]
+    if len(non_zero) < 2:
+        w_stat = None
+        p_val = None
+        significant = False
+    else:
+        try:
+            w_stat, p_val = stats.wilcoxon(
+                scores_a, scores_b,
+                alternative="two-sided",
+                zero_method="wilcox"
+            )
+            significant = p_val < alpha
+        except ValueError:
+            # All differences are zero
+            w_stat = None
+            p_val = None
+            significant = False
+
+    # Bootstrap CIs for each agent
+    all_a = [r.agent_a_resolved for r in paired_results]
+    all_b = [r.agent_b_resolved for r in paired_results]
+    ci_a = bootstrap_resolve_rate(all_a)
+    ci_b = bootstrap_resolve_rate(all_b)
+
+    # Determine effect direction
+    if significant and sum(differences) > 0:
+        direction = f"{agent_a_name} > {agent_b_name}"
+    elif significant and sum(differences) < 0:
+        direction = f"{agent_b_name} > {agent_a_name}"
+    else:
+        direction = "no significant difference"
+
+    return ComparisonResult(
+        agent_a_name=agent_a_name,
+        agent_b_name=agent_b_name,
+        num_tasks=len(task_ids),
+        agent_a_wins=a_wins,
+        agent_b_wins=b_wins,
+        ties=ties,
+        wilcoxon_statistic=w_stat,
+        p_value=p_val,
+        significant_at_05=significant,
+        effect_direction=direction,
+        resolve_rate_a=ci_a.point_estimate,
+        resolve_rate_b=ci_b.point_estimate,
+        ci_a=ci_a,
+        ci_b=ci_b
+    )
+</code></pre>
+<div class="code-caption">Paired agent comparison using the Wilcoxon signed-rank test. The function aggregates per-task resolve rates across repetitions, then tests whether one agent systematically outperforms the other. With only 5 tasks, statistical significance requires large effect sizes; the function correctly reports "no significant difference" when the data are too sparse for a conclusion.</div>
+
+<h2>6. The Evaluation Report</h2>
+
+<p>
+The final step is assembling the results into a report that communicates both the
+findings and their limitations. A good evaluation report answers three questions:
+Which agent performed better on this benchmark? How confident are we in that conclusion?
+And what caveats should guide deployment decisions?
+</p>
+
+<pre><code class="language-python">"""
+Evaluation report generator: produces a structured report
+from paired agent comparison results, including statistical
+summaries, per-task breakdowns, and deployment recommendations.
+"""
+
+
+def generate_report(
+    comparison: ComparisonResult,
+    paired_results: list[PairedResult],
+    output_path: str = "evaluation_report.md"
+) -> str:
+    """Generate a Markdown evaluation report.
+
+    Args:
+        comparison: The statistical comparison result.
+        paired_results: Raw paired results for per-task detail.
+        output_path: Where to write the report.
+
+    Returns:
+        The report text as a string.
+    """
+    lines = [
+        "# Agent Evaluation Report",
+        "",
+        "## Summary",
+        "",
+        f"| Metric | {comparison.agent_a_name} | {comparison.agent_b_name} |",
+        "|--------|----------|----------|",
+        f"| Resolve rate | {comparison.ci_a} | {comparison.ci_b} |",
+        f"| Tasks won | {comparison.agent_a_wins} | {comparison.agent_b_wins} |",
+        f"| Ties | {comparison.ties} | {comparison.ties} |",
+        "",
+    ]
+
+    # Statistical test result
+    if comparison.p_value is not None:
+        lines.extend([
+            "## Statistical Comparison",
+            "",
+            f"Wilcoxon signed-rank test: W = {comparison.wilcoxon_statistic:.1f}, "
+            f"p = {comparison.p_value:.4f}",
+            "",
+            f"Result: **{comparison.effect_direction}** "
+            f"(alpha = 0.05)",
+            "",
+        ])
+    else:
+        lines.extend([
+            "## Statistical Comparison",
+            "",
+            "Insufficient non-tied pairs for Wilcoxon test.",
+            f"Result: **{comparison.effect_direction}**",
+            "",
+        ])
+
+    # Per-task breakdown
+    lines.extend(["## Per-Task Breakdown", ""])
+    task_ids = sorted(set(r.instance_id for r in paired_results))
+    lines.append(
+        "| Task | Agent A Rate | Agent B Rate | Winner |"
+    )
+    lines.append("|------|-------------|-------------|--------|")
+
+    for tid in task_ids:
+        task_results = [r for r in paired_results
+                        if r.instance_id == tid]
+        rate_a = sum(r.agent_a_resolved for r in task_results) / len(task_results)
+        rate_b = sum(r.agent_b_resolved for r in task_results) / len(task_results)
+
+        if rate_a > rate_b:
+            winner = comparison.agent_a_name
+        elif rate_b > rate_a:
+            winner = comparison.agent_b_name
+        else:
+            winner = "Tie"
+
+        lines.append(
+            f"| {tid} | {rate_a:.0%} | {rate_b:.0%} | {winner} |"
+        )
+
+    # Cost comparison
+    cost_a = sum(r.agent_a_cost for r in paired_results)
+    cost_b = sum(r.agent_b_cost for r in paired_results)
+    latency_a = sum(r.agent_a_latency for r in paired_results) / len(paired_results)
+    latency_b = sum(r.agent_b_latency for r in paired_results) / len(paired_results)
+
+    lines.extend([
+        "",
+        "## Operational Metrics",
+        "",
+        f"| Metric | {comparison.agent_a_name} | {comparison.agent_b_name} |",
+        "|--------|----------|----------|",
+        f"| Total cost | ${cost_a:.2f} | ${cost_b:.2f} |",
+        f"| Mean latency | {latency_a:.1f}s | {latency_b:.1f}s |",
+        "",
+    ])
+
+    # Caveats
+    lines.extend([
+        "## Caveats",
+        "",
+        f"- Sample size: {comparison.num_tasks} tasks with 5 repetitions each.",
+        "- Confidence intervals are wide due to small sample size.",
+        "- Results apply to this specific repository and task distribution.",
+        "- Public benchmark scores may differ substantially.",
+        "- Cost estimates use list API pricing; volume discounts may apply.",
+        "",
+    ])
+
+    report = "\n".join(lines)
+    with open(output_path, "w") as f:
+        f.write(report)
+
+    return report
+</code></pre>
+<div class="code-caption">Report generator that assembles statistical comparisons, per-task breakdowns, operational metrics, and caveats into a structured Markdown document. The caveats section is as important as the results: it prevents over-interpretation of small-sample evaluations.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A Complete Evaluation Run</div>
+<p>
+A team at a biotech startup wants to evaluate whether to adopt a multi-step coding agent
+for their computational biology codebase. They select five resolved issues from their
+<code>molsim</code> repository: a unit conversion bug (single-function), a coordinate
+system mismatch (cross-file), a missing NaN check in input parsing (edge case), a
+function signature change for a new output format (API change), and a terse bug report
+that reads "energy minimization diverges on large proteins" (under-specified). They run
+a single-pass Claude Sonnet agent and a multi-step agent with tool use, each 5 times
+per task. The single-pass agent resolves 40% of tasks (95% CI: 24%, 56%) at $0.12/task.
+The multi-step agent resolves 52% (95% CI: 36%, 68%) at $0.85/task. The Wilcoxon test
+yields $p = 0.18$, indicating no statistically significant difference at $\alpha = 0.05$.
+The honest conclusion: the multi-step agent shows a promising trend, but the evidence
+is too weak (and the cost increase too large) to justify adoption based on this
+benchmark alone. They decide to expand the benchmark to 15 tasks and re-evaluate.
+</p>
+</div>
+
+<h2>7. CI/CD Integration with GitHub Actions</h2>
+
+<p>
+A benchmark that runs manually is a benchmark that stops being maintained. Integrating
+the evaluation harness into your CI/CD pipeline ensures that agent performance is
+tracked continuously. Every time a new agent version is released, or your codebase
+changes significantly, the benchmark runs automatically and flags regressions.
+</p>
+
+<pre><code class="language-yaml"># .github/workflows/agent-benchmark.yml
+# Runs the internal agent benchmark on a schedule
+# and on manual trigger for new agent versions.
+
+name: Agent Benchmark
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'  # Weekly on Monday at 3 AM
+  workflow_dispatch:       # Manual trigger for new agent versions
+    inputs:
+      agent_version:
+        description: 'Agent version or commit to evaluate'
+        required: true
+        type: string
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history for task construction
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pytest scipy anthropic
+          pip install -r requirements.txt
+
+      - name: Run agent benchmark
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python scripts/run_benchmark.py \
+            --tasks benchmark/tasks.json \
+            --agents simple,iterative \
+            --repetitions 5 \
+            --output benchmark/results.json
+
+      - name: Generate report
+        run: |
+          python scripts/generate_report.py \
+            --results benchmark/results.json \
+            --output benchmark/report.md
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmark/results.json
+            benchmark/report.md
+
+      - name: Comment on PR (if triggered by PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('benchmark/report.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: report
+            });
+</code></pre>
+<div class="code-caption">GitHub Actions workflow that runs the agent benchmark weekly and on manual trigger. Results are uploaded as artifacts and, when triggered by a PR, posted as a comment. This integrates agent evaluation into the same CI/CD pipeline that runs unit tests, connecting to the DevOps practices from <a href="../module-21-devops/index.html">Chapter 21</a>.</div>
+
+<h2>8. Discovery Workbench Integration</h2>
+
+<p>
+The evaluation harness we built in this section becomes a component of the Discovery
+Workbench, the platform that grows across the book. Specifically, the benchmark system
+provides three capabilities to the Workbench:
+</p>
+
+<ul>
+<li><strong>Agent selection</strong>: when the Workbench dispatches a coding task to an agent (as in the multi-agent teams of <a href="../module-17-multi-agent-teams/index.html">Chapter 17</a>), the benchmark results inform which agent architecture to use for which task type.</li>
+<li><strong>Regression detection</strong>: when a new model version is released or the Workbench codebase changes, the benchmark suite detects whether agent performance has improved or degraded.</li>
+<li><strong>Cost budgeting</strong>: the cost-per-task metrics feed into the operational monitoring from <a href="../module-22-mlops-llmops/index.html">Chapter 22</a>, enabling cost-aware task routing.</li>
+</ul>
+
+<p>
+These capabilities become critical in
+<a href="../module-24-autonomous-software/index.html">Chapter 24: Autonomous Software Organizations</a>,
+where agents operate with minimal human oversight. In that setting, the benchmark serves
+as the acceptance testing layer: an agent workflow is deployed only if its benchmark
+performance exceeds a threshold, and it is automatically rolled back if regression
+tests fail. The evaluation framework from this chapter is the quality gate that makes
+autonomous operation safe.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier</div>
+<p>
+Current agent benchmarks evaluate <em>individual task resolution</em>: can the agent fix
+this one issue? But production agent deployment involves sequences of tasks on evolving
+codebases, where each fix affects the context for subsequent tasks. <strong>SWE-bench
+Verified</strong> (Chandra et al., 2024) addressed a key weakness of the original
+SWE-bench by having human annotators validate that each task's test oracle is correct and
+unambiguous, filtering out roughly 25% of tasks with flawed or misleading tests. This
+curation step revealed that many reported resolve-rate gains on the original benchmark
+were inflated by agents exploiting weak oracles rather than producing correct fixes.
+The lesson for internal benchmarks is direct: oracle quality bounds evaluation quality,
+and human review of your test suite is not optional. Beyond single-task validity,
+<strong>sequential evaluation benchmarks</strong> (Wang et al., 2025) present agents with
+a queue of issues on the same repository, measuring whether fixes introduce new bugs,
+conflict with each other, or degrade code quality over time. This sequential setting
+connects to the
+<a href="../../part-7-autonomous-discovery/module-56-evaluating-discovery/index.html">evaluation of discovery systems</a>
+in Part VII, where the question shifts from "did the agent produce a correct output?" to
+"did the agent's sequence of actions advance scientific understanding?" The statistical
+methods from this section (bootstrap CIs, paired tests) extend naturally to sequential
+metrics like cumulative resolve rate and regression-free streaks.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Bootstrap Your Own Resolve-Rate Interval</h4>
+<p>
+Build a miniature agent benchmark analysis pipeline using only Python's standard library and <code>scipy</code>.
+</p>
+<ol>
+<li><strong>Create synthetic data.</strong> Define two lists of 10 Boolean outcomes representing two agents' pass/fail results on 10 tasks (e.g., <code>agent_a = [True, True, False, True, False, True, False, True, True, False]</code>). Make Agent B slightly better overall but weaker on the last three tasks.</li>
+<li><strong>Implement the bootstrap.</strong> Write a function that takes a list of Booleans, resamples with replacement 10,000 times using <code>random.choices</code>, computes the mean of each resample, and returns the 2.5th and 97.5th percentiles via sorted indexing. Print the 95% CI for both agents.</li>
+<li><strong>Run the Wilcoxon test.</strong> Pair the two outcome lists by task index and call <code>scipy.stats.wilcoxon</code> on the paired differences. Print the test statistic and p-value. Observe whether the difference is significant at $\alpha = 0.05$.</li>
+<li><strong>Vary sample size.</strong> Duplicate your 10-task data to simulate 20 and 40 tasks (keeping the same resolve rates). Re-run the bootstrap and Wilcoxon test at each size. Plot or print how the CI width and p-value change as $n$ grows.</li>
+<li><strong>Interpret.</strong> Write three sentences summarizing: (a) whether Agent B is significantly better, (b) at what sample size the difference becomes significant, and (c) what this implies for the minimum viable size of an internal benchmark.</li>
+</ol>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li>
+<strong>Conceptual</strong>: A bootstrap 95% confidence interval for an agent's resolve
+rate is [20%, 100%]. Your manager asks "so is this agent better than random?" (A random
+agent on binary tasks has an expected resolve rate near 0%.) What is the correct
+statistical answer, and what would you recommend as the next step to narrow the interval?
+</li>
+<li>
+<strong>Coding</strong>: Implement a function <code>stratified_bootstrap</code> that
+computes separate confidence intervals for each task category (single-function, cross-file,
+edge-case, API change, under-specified). This reveals whether an agent's overall resolve
+rate masks category-specific strengths and weaknesses. Test it on simulated data where
+Agent A excels at single-function tasks but fails at cross-file tasks, while Agent B
+shows the reverse pattern.
+</li>
+<li>
+<strong>Analysis</strong>: The Wilcoxon signed-rank test has low statistical power with
+$n = 5$ paired observations. Compute the minimum detectable effect size (difference in
+resolve rates) that would be significant at $\alpha = 0.05$ with power $= 0.80$ for
+$n = 5$, $n = 15$, and $n = 50$ tasks. What does this tell you about the practical
+minimum size for an internal benchmark? (Hint: use <code>scipy.stats.wilcoxon</code>
+with simulated data at different effect sizes.)
+</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-23.2.html">&larr; 23.2 Validity and Contamination</a>
+<a href="index.html">Chapter 23</a>
+<a href="../module-24-autonomous-software/index.html">Chapter 24: Autonomous Software Organizations &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

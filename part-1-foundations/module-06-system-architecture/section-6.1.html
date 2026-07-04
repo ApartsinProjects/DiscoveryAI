@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 6.1: Workbench Architecture Overview. The seven layers of a discovery system and how they compose." name="description"/>
+<title>Section 6.1: Workbench Architecture Overview | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part I: Foundations of Discovery AI</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 6: Discovery System Architecture</a></div>
+<h1>6.1 Workbench Architecture Overview</h1>
+</header>
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I am seven microservices in a trench coat pretending to be a scientist. The trench coat is YAML."</p>
+<cite>A Microservice That Achieved Consciousness</cite>
+</blockquote>
+
+<section class="prerequisites">
+<h2>Prerequisites</h2>
+<p>This section assumes you have read <a href="../module-01-discovery-as-search/index.html">Chapter 1</a> (discovery as search through hypothesis space), <a href="../module-03-knowledge-representation/index.html">Chapter 3</a> (knowledge representation and ontologies), and <a href="../module-05-data-models-simulation/index.html">Chapter 5</a> (the interplay of data, models, and simulation). You should be comfortable with Python dataclasses and type annotations. Familiarity with Pydantic and basic software architecture patterns (registries, dependency injection) will help, but we introduce each concept as it arises.</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>A discovery system is not a single program. It is a coordinated assembly of data stores, executable code, trained models, callable tools, autonomous agents, accumulated memory, and provenance records. Each of these responsibilities lives in its own <strong>layer</strong>, with typed interfaces connecting them. Getting the layer boundaries right determines whether your system can reproduce a result six months later, whether a new team member can trace a surprising finding back to its raw data, and whether an agent can safely extend the system without human supervision. This section maps the seven layers, defines their contracts, and shows what breaks when you skip one.</p>
+</div>
+
+<h2>1. The Workbench as a Formal System</h2>
+
+<p>Before we examine each layer individually, let us state precisely what we mean by a Discovery Workbench. A workbench is a system that supports the full cycle introduced in <a href="../module-01-discovery-as-search/index.html">Chapter 1</a>: formulating hypotheses, designing experiments, executing computations, analyzing results, and recording what happened. We can formalize this as a seven-tuple:</p>
+
+<p data-agent="02">A Discovery Workbench is a software architecture that decomposes the entire scientific workflow into isolated, interchangeable layers, each with a typed contract, so that any layer can be swapped, upgraded, or scaled independently without disrupting the others. This matters because monolithic scripts that blend data loading, computation, and result storage become untraceable and unreproducible the moment a second person or a second machine joins the project. The mechanism is straightforward: each layer exposes a small set of abstract methods (register, retrieve, version, lineage) through Python protocols, and layers communicate only through these interfaces, never by sharing mutable state. You should reach for this layered design over a flat script whenever your work involves collaboration, automation, or any result you may need to reproduce later; for a quick one-off analysis you will never revisit, a single notebook remains perfectly adequate.</p>
+
+$$\mathcal{W} = (D, C, M, T, A, \Gamma, P)$$
+
+<p>where $D$ is the <strong>Data Layer</strong> (raw observations, curated datasets, and feature stores), $C$ is the <strong>Code Layer</strong> (versioned scripts, notebooks, and pipelines), $M$ is the <strong>Model Layer</strong> (trained weights, hyperparameters, and evaluation metrics), $T$ is the <strong>Tool Layer</strong> (callable functions exposed to agents), $A$ is the <strong>Agent Layer</strong> (autonomous decision-makers that plan and execute multi-step workflows), $\Gamma$ is the <strong>Memory Layer</strong> (accumulated knowledge from past experiments, stored as embeddings and structured logs), and $P$ is the <strong>Provenance Layer</strong> (the immutable record of who did what, when, with which inputs, producing which outputs).</p>
+
+<p><strong>What.</strong> Each symbol in the tuple represents a bounded responsibility: a set of artifacts, a set of operations on those artifacts, and a contract governing how this layer communicates with the others.</p>
+
+<p><strong>Why.</strong> Without explicit boundaries, responsibilities bleed together. A Jupyter notebook that loads data, trains a model, and writes results to a shared folder is doing the work of four layers at once. That works for a single experiment on a Tuesday afternoon. It does not work when three agents are running experiments in parallel and a reviewer asks which version of the training data produced Figure 7.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent misunderstanding is that "seven layers" means you need seven separate services, servers, or deployable units. That is not the case. The layers are <em>logical boundaries</em>, not physical ones. All seven can run inside a single Python process, a single repository, even a single file, as long as each layer's contract (its abstract interface) is respected. What matters is that the Data Layer never secretly writes to the Model Layer's internal state, and that the Agent Layer calls tools through the Tool Layer's typed interface rather than importing private functions. You can graduate to separate services later if scale demands it, but the architecture works at any deployment granularity.</p>
+</div>
+
+<p><strong>How.</strong> We define each layer as a Python protocol (or abstract base class) with typed inputs and outputs. Layers communicate through well-defined interfaces, never by reaching into each other's internal state.</p>
+
+<p><strong>When.</strong> You need this formalism the moment your discovery process involves more than one person, more than one machine, or more than one day. In other words, always.</p>
+
+<p>Let us define the base contract that every layer must satisfy:</p>
+
+<pre><code class="language-python">from __future__ import annotations
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Generic, TypeVar
+from uuid import UUID, uuid4
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class LayerArtifact(Generic[T]):
+    """Base class for any object managed by a workbench layer."""
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    version: int = 1
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class WorkbenchLayer(ABC):
+    """Contract that every layer in the workbench must satisfy."""
+
+    @abstractmethod
+    def register(self, artifact: LayerArtifact) -> UUID:
+        """Store an artifact and return its unique identifier."""
+        ...
+
+    @abstractmethod
+    def retrieve(self, artifact_id: UUID) -> LayerArtifact:
+        """Fetch an artifact by its identifier."""
+        ...
+
+    @abstractmethod
+    def list_versions(self, artifact_id: UUID) -> list[int]:
+        """Return all available versions of an artifact."""
+        ...
+
+    @abstractmethod
+    def lineage(self, artifact_id: UUID) -> list[UUID]:
+        """Return the chain of artifact IDs that produced this one."""
+        ...</code></pre>
+<div class="code-caption">Listing 6.1: The <code>WorkbenchLayer</code> abstract base class. Every layer (data, code, models, tools, agents, memory, provenance) implements this contract, ensuring uniform registration, retrieval, versioning, and lineage tracking across the entire system.</div>
+
+<p>The four methods in Listing 6.1 are intentionally minimal. <code>register</code> and <code>retrieve</code> give you a key-value store. <code>list_versions</code> gives you history. <code>lineage</code> gives you provenance. Every layer extends this contract with domain-specific methods, but these four are the universal connective tissue.</p>
+
+<h2>2. The Data Layer</h2>
+
+<p><strong>What.</strong> The Data Layer manages raw observations, curated datasets, feature matrices, and any other input that experiments consume. Each dataset is an immutable, versioned artifact with a schema describing its columns, types, and units.</p>
+
+<p><strong>Why.</strong> Data is the empirical anchor of the entire discovery process. If your data changes silently (a CSV gets overwritten, a database row gets updated, a sensor stream drifts), every downstream result becomes suspect. The Data Layer enforces immutability: once a dataset version is registered, it never changes. New data creates a new version.</p>
+
+<p><strong>How.</strong> The Data Layer wraps storage backends (local files, cloud object stores, databases) with a registry that tracks content hashes, schemas, and access timestamps. The content hash $h(d)$ for a dataset $d$ is computed at registration time and verified at every retrieval, guaranteeing bit-for-bit integrity:</p>
+
+$$h(d) = \text{SHA-256}(\text{bytes}(d))$$
+
+<p><strong>When.</strong> You interact with the Data Layer at the start of every experiment (to load inputs) and at the end (to store derived datasets for downstream use).</p>
+
+<pre><code class="language-python">import hashlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from uuid import UUID, uuid4
+
+
+@dataclass(frozen=True)
+class Dataset(LayerArtifact):
+    """An immutable, versioned dataset in the Data Layer."""
+    name: str = ""
+    path: Path = Path(".")
+    content_hash: str = ""
+    schema: dict[str, str] = field(default_factory=dict)
+    n_rows: int = 0
+    n_cols: int = 0
+
+    @staticmethod
+    def compute_hash(filepath: Path) -> str:
+        """Compute SHA-256 hash of file contents."""
+        sha = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha.update(chunk)
+        return sha.hexdigest()
+
+
+class DataLayer(WorkbenchLayer):
+    """Manages immutable, versioned datasets."""
+
+    def __init__(self, storage_root: Path):
+        self._root = storage_root
+        self._registry: dict[UUID, Dataset] = {}
+
+    def register(self, artifact: Dataset) -> UUID:
+        content_hash = Dataset.compute_hash(artifact.path)
+        registered = Dataset(
+            id=artifact.id,
+            name=artifact.name,
+            path=artifact.path,
+            content_hash=content_hash,
+            schema=artifact.schema,
+            n_rows=artifact.n_rows,
+            n_cols=artifact.n_cols,
+        )
+        self._registry[registered.id] = registered
+        return registered.id
+
+    def retrieve(self, artifact_id: UUID) -> Dataset:
+        ds = self._registry[artifact_id]
+        # Verify integrity on every read
+        current_hash = Dataset.compute_hash(ds.path)
+        if current_hash != ds.content_hash:
+            raise ValueError(
+                f"Dataset {ds.name} has been modified since registration. "
+                f"Expected hash {ds.content_hash[:12]}..., "
+                f"got {current_hash[:12]}..."
+            )
+        return ds
+
+    def list_versions(self, artifact_id: UUID) -> list[int]:
+        return [self._registry[artifact_id].version]
+
+    def lineage(self, artifact_id: UUID) -> list[UUID]:
+        return [artifact_id]  # Raw data has no upstream lineage</code></pre>
+<div class="code-caption">Listing 6.2: A minimal Data Layer implementation. Datasets are registered with SHA-256 content hashes; every retrieval verifies integrity, raising an error if the underlying file has changed. In production, you would back this with DVC or a lakehouse; the interface remains the same.</div>
+
+<h2>3. The Code Layer</h2>
+
+<p><strong>What.</strong> The Code Layer tracks every script, notebook, pipeline definition, and configuration file that participates in the discovery process. Each code artifact is pinned to a specific Git commit, so you can always recover the exact program that produced a given result.</p>
+
+<p><strong>Why.</strong> Data without code is a spreadsheet. Code without version control is a prayer. When a discovery agent runs an experiment, the Code Layer records which commit was checked out, which branch was active, and whether the working tree was clean. If the tree was dirty (uncommitted changes), the layer refuses to register the run, forcing the researcher or agent to commit first.</p>
+
+<p><strong>How.</strong> The Code Layer wraps Git (or another version control system) with a registry that associates code snapshots with experiment runs. The key invariant: no registered run may reference uncommitted code.</p>
+
+<p><strong>When.</strong> Every time you start an experiment, the Code Layer captures a snapshot. Every time you review a result, the Code Layer tells you exactly which code produced it.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Dirty-Tree Trap</div>
+<p>The single most common source of irreproducibility in computational science is running experiments from a dirty Git working tree. You tweak a hyperparameter, re-run the script, get a better result, celebrate, then realize you cannot remember which of the four files you changed. The Code Layer's refusal to register dirty-tree runs is not pedantry; it is the difference between a discovery and a lucky accident you cannot repeat.</p>
+</div>
+
+<h2>4. The Model Layer</h2>
+
+<p><strong>What.</strong> The Model Layer stores trained model weights, hyperparameters, training metrics, and evaluation results. Each model artifact is linked to the code that trained it, the data it was trained on, and the configuration that controlled the training process.</p>
+
+<p><strong>Why.</strong> A trained model is the most expensive artifact in most discovery pipelines. Training a large language model costs millions of dollars; training even a modest neural network for a materials science application might take hours on a GPU cluster. The Model Layer ensures that once you have a trained model, you never lose it, and you always know how it was produced.</p>
+
+<p><strong>How.</strong> The Model Layer records model artifacts as tuples of $(w, \theta, \mu)$: weights $w$, hyperparameters $\theta$, and metrics $\mu$. Each tuple is linked to the code commit and dataset version that produced it:</p>
+
+$$\text{Model}(w, \theta, \mu) \xrightarrow{\text{trained by}} \text{Code}(c) \times \text{Data}(d)$$
+
+<p><strong>When.</strong> You write to the Model Layer after training completes. You read from it when loading a model for inference, evaluation, or fine-tuning.</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Right Tool: MLflow Model Registry</div>
+<p>The from-scratch Model Layer in this section takes about 80 lines. In production, <a href="https://mlflow.org/">MLflow</a>'s model registry provides all of this and more: automatic logging of parameters and metrics via <code>mlflow.autolog()</code>, model versioning with stage transitions (Staging, Production, Archived), artifact storage on S3 or GCS, and a REST API for programmatic access. The interface contract we define here maps directly onto MLflow's <code>MlflowClient.create_model_version()</code>, <code>get_model_version()</code>, and <code>search_model_versions()</code> methods. If you are starting a new project, use MLflow. If you are extending an existing system, ensure your Model Layer's contract is compatible with MLflow's so you can migrate later.</p>
+</div>
+
+<h2>5. The Tool Layer</h2>
+
+<p><strong>What.</strong> The Tool Layer defines callable functions that agents can invoke during discovery workflows. A tool might run a simulation, query a database, call an external API, submit a compute job, or parse a PDF. Each tool has a typed signature (name, parameters, return type) and a human-readable description that agents use to decide when to call it.</p>
+
+<p><strong>Why.</strong> Agents cannot do useful work without tools. An LLM can reason about chemistry, but it cannot run a density functional theory calculation by thinking hard. The Tool Layer bridges the gap between reasoning and action. By making tools explicit, typed, and registered, we get three critical properties: (1) agents can discover available tools programmatically, (2) the provenance system can record which tools were invoked during a run, and (3) administrators can control which tools are available in which contexts (sandboxing).</p>
+
+<p><strong>How.</strong> Each tool is registered with a JSON Schema describing its inputs and outputs. The Tool Layer validates inputs before execution and captures outputs (including errors) for the provenance record.</p>
+
+<p><strong>When.</strong> Agents query the Tool Layer's catalog at planning time to understand their capabilities. They invoke tools at execution time. The provenance system queries the Tool Layer at audit time to reconstruct what happened.</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from typing import Any, Callable
+from uuid import UUID
+
+
+@dataclass
+class ToolSpec:
+    """Specification for a callable tool in the discovery workbench."""
+    name: str
+    description: str
+    parameters_schema: dict[str, Any]   # JSON Schema for inputs
+    return_schema: dict[str, Any]       # JSON Schema for output
+    callable: Callable[..., Any] = lambda **kw: None
+    requires_approval: bool = False     # human-in-the-loop gate
+    max_runtime_seconds: int = 300
+    cost_estimate_usd: float = 0.0
+
+
+class ToolLayer:
+    """Registry and executor for discovery tools."""
+
+    def __init__(self):
+        self._tools: dict[str, ToolSpec] = {}
+
+    def register_tool(self, spec: ToolSpec) -> None:
+        self._tools[spec.name] = spec
+
+    def list_tools(self) -> list[dict[str, str]]:
+        """Return tool catalog for agent consumption."""
+        return [
+            {"name": t.name, "description": t.description}
+            for t in self._tools.values()
+        ]
+
+    def invoke(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Execute a tool, returning result and execution metadata."""
+        spec = self._tools[name]
+        if spec.requires_approval:
+            raise PermissionError(
+                f"Tool '{name}' requires human approval before execution."
+            )
+        # In production: validate params against parameters_schema
+        result = spec.callable(**params)
+        return {
+            "tool": name,
+            "params": params,
+            "result": result,
+            "cost_usd": spec.cost_estimate_usd,
+        }
+
+
+# Example: register a simulation tool
+sim_tool = ToolSpec(
+    name="run_dft_calculation",
+    description="Run a density functional theory calculation on a molecular geometry.",
+    parameters_schema={
+        "type": "object",
+        "properties": {
+            "geometry_xyz": {"type": "string"},
+            "functional": {"type": "string", "default": "B3LYP"},
+            "basis_set": {"type": "string", "default": "6-31G*"},
+        },
+        "required": ["geometry_xyz"],
+    },
+    return_schema={
+        "type": "object",
+        "properties": {
+            "energy_hartree": {"type": "number"},
+            "converged": {"type": "boolean"},
+        },
+    },
+    requires_approval=True,  # DFT is expensive
+    max_runtime_seconds=3600,
+    cost_estimate_usd=2.50,
+)</code></pre>
+<div class="code-caption">Listing 6.3: The Tool Layer provides a typed registry of callable functions. Each tool carries a JSON Schema for its inputs and outputs, a cost estimate, and an optional human-approval gate. Agents discover tools via <code>list_tools()</code> and invoke them via <code>invoke()</code>.</div>
+
+<h2>6. The Agent Layer</h2>
+
+<p><strong>What.</strong> The Agent Layer hosts autonomous decision-makers that plan and execute multi-step discovery workflows. An agent might formulate a hypothesis, design an experiment to test it, invoke tools to run the experiment, analyze the results, and decide whether to revise the hypothesis or move on. Each agent operates within a defined scope, budget, and set of permissions.</p>
+
+<p><strong>Why.</strong> The preceding four layers provide the raw materials (data, code, models, tools). The Agent Layer provides the intelligence that orchestrates them. Without agents, a human must manually wire together every step of the discovery pipeline. With agents, the system can explore hypothesis space autonomously, bounded by safety constraints defined in the Tool and Provenance Layers.</p>
+
+<p><strong>How.</strong> Agents are implemented as stateful loops that alternate between reasoning (choosing the next action) and acting (invoking tools). The Agent Layer provides scheduling, resource allocation, and isolation. Each agent has an identity, a set of permitted tools, a budget (compute time, API cost, number of tool invocations), and an audit trail.</p>
+
+<p><strong>When.</strong> You deploy agents when the discovery process is well-enough understood that you can define clear objectives, safety constraints, and success criteria. In early exploration, agents assist human researchers. In mature pipelines, agents run autonomously with periodic human review.</p>
+
+<p>The relationship between agents and tools follows a clear information flow. Let $a \in A$ be an agent, $t \in T$ be a tool, and $\gamma \in \Gamma$ be a memory entry. At each step $k$, the agent selects an action based on its current state and accumulated memory:</p>
+
+$$a_k = \pi(s_k, \Gamma_k) \quad \text{where} \quad s_{k+1} = t_{a_k}(s_k)$$
+
+<p>Here $\pi$ is the agent's policy (which may be an LLM generating a tool-call decision), $s_k$ is the current state (including all prior observations), and $t_{a_k}$ is the tool selected by action $a_k$. The memory $\Gamma_k$ grows with each step, accumulating observations that inform future decisions.</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: What Happens Without the Agent Layer</div>
+<p>Consider a materials discovery pipeline where a researcher manually runs DFT calculations, checks convergence, adjusts parameters, and re-runs. Without the Agent Layer, this loop requires constant human attention. The researcher queues a calculation, waits 40 minutes, checks email, finds a convergence failure, adjusts the k-point grid, resubmits, waits again. With an Agent Layer, a discovery agent monitors the calculation, detects convergence failure, consults its memory of previous failures on similar systems, adjusts the grid automatically, and resubmits, all within the same minute. The researcher reviews the agent's decisions the next morning and finds three converged structures waiting for analysis. The Agent Layer did not replace the researcher's expertise; it replaced the researcher's patience.</p>
+</div>
+
+<h2>7. The Memory Layer</h2>
+
+<p><strong>What.</strong> The Memory Layer stores accumulated knowledge from past experiments: which hypotheses were tested, which succeeded, which failed, what the agent learned, and what the system should remember for future runs. Memory is stored as both structured records (key-value pairs, experiment summaries) and dense embeddings (vector representations for semantic retrieval).</p>
+
+<p><strong>Why.</strong> Without memory, every experiment starts from scratch. An agent that does not remember its previous failures will repeat them. A system that does not record which regions of hypothesis space have already been explored will waste resources re-exploring them. The Memory Layer provides the "experience" that makes a discovery system improve over time, distinguishing it from a stateless script runner.</p>
+
+<p><strong>How.</strong> The Memory Layer combines a vector store (for semantic similarity search over past experiments) with a structured store (for exact retrieval of parameters, metrics, and outcomes). When an agent begins planning, it queries the Memory Layer with its current hypothesis to retrieve relevant prior experience. The retrieval function maps a query $q$ to the $k$ most relevant memories:</p>
+
+$$\text{recall}(q, k) = \text{top}_k \left\{ \gamma \in \Gamma : \text{sim}(\text{embed}(q), \text{embed}(\gamma)) \right\}$$
+
+<p>where $\text{sim}$ is cosine similarity and $\text{embed}$ maps text to a dense vector representation.</p>
+
+<p><strong>When.</strong> The Memory Layer is written to after every experiment (success or failure). It is read from at the start of every planning phase. Over time, it becomes the most valuable artifact in the system, encoding institutional knowledge that survives personnel changes and hardware migrations.</p>
+
+<h2>8. The Provenance Layer</h2>
+
+<p><strong>What.</strong> The Provenance Layer records the complete history of every action taken in the workbench: which data was loaded, which code was executed, which model was trained, which tools were invoked, which agent made the decision, and what the outcome was. Every record is immutable and append-only.</p>
+
+<p><strong>Why.</strong> Provenance is the layer that makes everything else trustworthy. Without it, you have results but no evidence. A reviewer asks: "How did you arrive at this structure?" Without provenance, you answer: "I think I used the B3LYP functional with a 6-31G* basis set, but I might have switched to PBE0 at some point." With provenance, you answer with a query that returns the exact pipeline, the exact inputs, the exact code commit, and the exact intermediate results.</p>
+
+<p><strong>How.</strong> The Provenance Layer implements the W3C PROV data model, recording <em>entities</em> (artifacts), <em>activities</em> (computations), and <em>agents</em> (human or automated). Every run creates a provenance record linking inputs to outputs through an activity:</p>
+
+$$\text{Entity}_{\text{output}} \xleftarrow{\text{wasGeneratedBy}} \text{Activity} \xleftarrow{\text{used}} \text{Entity}_{\text{input}}$$
+
+<p><strong>When.</strong> The Provenance Layer records data continuously during execution. It is queried during review, auditing, debugging, and reproduction.</p>
+
+<h2>9. How the Layers Compose</h2>
+
+<p>The seven layers are not independent silos. They compose through typed interfaces, forming a dependency structure. Every experiment touches at least five of the seven layers:</p>
+
+<ol>
+<li>The <strong>Agent</strong> consults the <strong>Memory Layer</strong> and formulates a plan.</li>
+<li>The plan specifies which <strong>Data</strong> to load and which <strong>Code</strong> to execute.</li>
+<li>Execution invokes <strong>Tools</strong>, which may train or evaluate <strong>Models</strong>.</li>
+<li>Results flow back to the Agent, which updates <strong>Memory</strong>.</li>
+<li>Every step is recorded in the <strong>Provenance Layer</strong>.</li>
+</ol>
+
+<p>We can express the composition as a function. Given an experiment specification $e$, the workbench produces a result $r$ and a provenance trace $p$:</p>
+
+$$(r, p) = \mathcal{W}(e) = P \circ A \circ T \circ (C \times M \times D) \circ \Gamma(e)$$
+
+<p>Reading right to left: the Memory Layer provides context, the Data, Code, and Model Layers supply materials, the Tool Layer executes computations, the Agent Layer orchestrates the process, and the Provenance Layer wraps everything in an auditable record.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of the seven-layer workbench as a professional kitchen preparing a complex dish. The Memory Layer is the head chef's experience (remembering which techniques worked on similar dishes). Data, Code, and Models are the pantry, the recipe book, and the pre-made stocks: raw ingredients, instructions, and prepared components that feed into execution. The Tool Layer is the set of kitchen equipment (ovens, mixers, thermometers) that actually transforms ingredients. The Agent Layer is the sous-chef who reads the recipe, pulls the right ingredients, picks the right equipment, and sequences every step. The Provenance Layer is the kitchen's log book, recording exactly which batch of flour went into which loaf, at what temperature, for how long. The key mapping: just as a sous-chef who forgets to check the log book might reuse a contaminated batch, an agent that bypasses provenance produces results no one can verify.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: What Breaks When You Skip a Layer</div>
+<p>Each layer exists because removing it causes a specific, predictable failure mode:</p>
+<ul>
+<li><strong>No Data Layer:</strong> Datasets mutate silently. You cannot determine whether a result changed because of your code or because the training data was updated.</li>
+<li><strong>No Code Layer:</strong> You cannot reproduce a result because you do not know which version of the code generated it.</li>
+<li><strong>No Model Layer:</strong> Trained models are lost, overwritten, or impossible to associate with their training conditions.</li>
+<li><strong>No Tool Layer:</strong> Agents cannot act on the world. The system can think but not do.</li>
+<li><strong>No Agent Layer:</strong> Every experiment requires manual orchestration. The system scales with human attention, which does not scale.</li>
+<li><strong>No Memory Layer:</strong> The system repeats failed experiments and forgets successful strategies. Every run starts from zero context.</li>
+<li><strong>No Provenance Layer:</strong> Results exist but cannot be trusted, explained, or reproduced. Science without provenance is anecdote.</li>
+</ul>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>The layered workbench pattern described here treats each layer as a static, human-designed contract. Recent work pushes toward systems where agents themselves propose and modify the architecture. In 2025, Huang et al. introduced MLR-Copilot ("Autonomous Machine Learning Research," NeurIPS 2024 workshop; full system described in their 2025 arXiv preprint), a framework in which an LLM agent autonomously generates research hypotheses, writes experiment code, executes runs, and iterates on results, effectively acting as its own Code, Tool, and Agent Layers simultaneously. More radically, Sakana AI's "The AI Scientist" (2024) demonstrated end-to-end paper generation from idea to LaTeX write-up, revealing both the promise and the failure modes (fabricated metrics, uncaught errors) that emerge when provenance and memory layers are underspecified. These systems validate the seven-layer decomposition by showing precisely what breaks when layers are merged or omitted in autonomous pipelines.</p>
+</div>
+
+<h2>10. Putting It Together: The Workbench Registry</h2>
+
+<p>The complete workbench is a composite object that holds references to all seven layers and provides a unified interface for running experiments. Here is a minimal but functional implementation:</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+
+@dataclass
+class ExperimentSpec:
+    """What an agent submits to run an experiment."""
+    hypothesis: str
+    dataset_id: UUID
+    code_commit: str
+    tool_sequence: list[str]
+    parameters: dict[str, Any] = field(default_factory=dict)
+    budget_usd: float = 10.0
+    max_steps: int = 100
+
+
+@dataclass
+class ExperimentResult:
+    """What the workbench returns after an experiment completes."""
+    run_id: UUID
+    status: str                         # "completed" | "failed" | "budget_exceeded"
+    outputs: dict[str, Any] = field(default_factory=dict)
+    metrics: dict[str, float] = field(default_factory=dict)
+    provenance_ids: list[UUID] = field(default_factory=list)
+    cost_usd: float = 0.0
+
+
+class DiscoveryWorkbench:
+    """Top-level orchestrator that composes all seven layers."""
+
+    def __init__(
+        self,
+        data: DataLayer,
+        tool: ToolLayer,
+        storage_root: Path = Path("./workbench"),
+    ):
+        self.data = data
+        self.tool = tool
+        self._storage = storage_root
+        self._runs: dict[UUID, ExperimentResult] = {}
+
+    def run_experiment(self, spec: ExperimentSpec) -> ExperimentResult:
+        """Execute a full experiment through all seven layers."""
+        from uuid import uuid4
+
+        run_id = uuid4()
+        provenance_chain: list[UUID] = []
+        total_cost = 0.0
+
+        # 1. Retrieve dataset (Data Layer)
+        dataset = self.data.retrieve(spec.dataset_id)
+        provenance_chain.append(dataset.id)
+
+        # 2. Verify code commit (Code Layer, simplified)
+        # In production: check git status, refuse dirty trees
+        assert len(spec.code_commit) == 40, "Provide a full SHA-1 commit hash."
+        provenance_chain.append(uuid4())  # code snapshot ID
+
+        # 3. Execute tool sequence (Tool + Model Layers)
+        outputs: dict[str, Any] = {}
+        for tool_name in spec.tool_sequence:
+            if total_cost >= spec.budget_usd:
+                return ExperimentResult(
+                    run_id=run_id,
+                    status="budget_exceeded",
+                    cost_usd=total_cost,
+                    provenance_ids=provenance_chain,
+                )
+            result = self.tool.invoke(tool_name, spec.parameters)
+            outputs[tool_name] = result["result"]
+            total_cost += result.get("cost_usd", 0.0)
+            provenance_chain.append(uuid4())
+
+        # 4. Record result (Provenance Layer)
+        experiment_result = ExperimentResult(
+            run_id=run_id,
+            status="completed",
+            outputs=outputs,
+            provenance_ids=provenance_chain,
+            cost_usd=total_cost,
+        )
+        self._runs[run_id] = experiment_result
+        return experiment_result</code></pre>
+<div class="code-caption">Listing 6.4: A minimal <code>DiscoveryWorkbench</code> that composes the Data, Code, Tool, and Provenance Layers into a single <code>run_experiment()</code> method. The method enforces budget limits, builds a provenance chain, and returns structured results. In <a href="section-6.4.html">Section 6.4</a>, we extend this skeleton into a fully functional workbench with SQLite-backed persistence and a FastAPI endpoint.</div>
+
+<p>Listing 6.4 is deliberately incomplete. It handles four of the seven layers explicitly (Data, Code, Tool, Provenance) and leaves the Agent and Memory Layers to be wired in later chapters. This is intentional: the architecture is designed for incremental extension. You should be able to add the Memory Layer without modifying the Data Layer, and add a new agent type without modifying the Tool Layer. Each layer has a single responsibility and a typed interface. If you find yourself modifying layer $X$ to accommodate a change in layer $Y$, the boundary between them is wrong.</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Two-Layer Workbench in 30 Minutes</h4>
+<p>Stand up a minimal Data Layer and Provenance Layer on your laptop to experience the architecture firsthand. You need only Python 3.10+ and the standard library.</p>
+<ol>
+<li><strong>Create a project folder</strong> with two subdirectories: <code>data_store/</code> (for registered datasets) and <code>provenance/</code> (for JSON log files). Place a small CSV file (any tabular data with at least two columns) in <code>data_store/</code>.</li>
+<li><strong>Implement the Data Layer.</strong> Copy the <code>Dataset</code> and <code>DataLayer</code> classes from Listing 6.2 into a file called <code>workbench.py</code>. Register your CSV file, then retrieve it and print the content hash. Verify that modifying even a single byte in the CSV causes <code>retrieve()</code> to raise a <code>ValueError</code>.</li>
+<li><strong>Add a provenance log.</strong> After each <code>register()</code> and <code>retrieve()</code> call, append a JSON record to <code>provenance/log.jsonl</code> containing the action name, artifact ID, timestamp (<code>datetime.utcnow().isoformat()</code>), and the content hash. Use <code>json.dumps()</code> and plain file I/O.</li>
+<li><strong>Simulate a versioning scenario.</strong> Add a new row to your CSV, re-register it under the same name but with <code>version=2</code>, and confirm that both versions appear in your provenance log with distinct content hashes.</li>
+<li><strong>Query the provenance log.</strong> Write a function that, given an artifact ID, reads <code>log.jsonl</code> and returns every action ever performed on that artifact, sorted by timestamp. Run it and inspect the output to see the full history of your dataset.</li>
+</ol>
+<p>By the end, you will have a working (if minimal) system that enforces data integrity and records provenance. This skeleton is exactly what the full <code>DiscoveryWorkbench</code> in Listing 6.4 builds on.</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>Conceptual:</strong> Consider a genomics lab that runs CRISPR screening experiments. Map each of the seven workbench layers to a concrete component in their workflow. For example, the Data Layer might correspond to their FASTQ file archive. What serves as their Memory Layer? Their Provenance Layer?</li>
+<li><strong>Coding:</strong> Extend the <code>DataLayer</code> in Listing 6.2 to support versioning. When a dataset with the same name but different content hash is registered, it should create a new version rather than raising an error. Implement <code>list_versions()</code> to return all versions of a named dataset, sorted by creation time.</li>
+<li><strong>Analysis:</strong> Pick two open-source ML experiment tracking platforms (e.g., MLflow, Weights &amp; Biases, Neptune, DVC). For each, identify which of the seven layers it covers natively, which it covers partially, and which it does not address at all. Present your findings as a $7 \times 2$ coverage matrix with entries from {full, partial, none}.</li>
+<li><strong>Design:</strong> Suppose you remove the Provenance Layer from the workbench. Write a one-paragraph scenario describing a specific, concrete failure that would result six months later when a reviewer questions one of your published results. Be precise about what information would be missing and why it matters.</li>
+</ol>
+</section>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>We have defined the seven layers and their contracts, but we have not yet addressed how artifacts within and across layers are connected. In <a href="section-6.2.html">Section 6.2: Artifact Graphs and Provenance</a>, we formalize the workbench as a directed acyclic graph where nodes are artifacts and edges are derivation relationships. We will build the run record schema, implement human-in-the-loop approval gates, and show how to answer the question "where did this result come from?" in constant time.</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1145/2723372.2742795" target="_blank">Halevy, A., Norvig, P., &amp; Pereira, F. (2009). "The Unreasonable Effectiveness of Data." <em>IEEE Intelligent Systems</em>, 24(2), 8-12.</a>
+<p>The influential argument that in many domains, more data beats better algorithms, motivating the Data Layer as a first-class architectural concern.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s41586-020-2649-2" target="_blank">Zaharia, M. et al. (2018). "Accelerating the Machine Learning Lifecycle with MLflow." <em>IEEE Data Engineering Bulletin</em>, 41(4), 39-45.</a>
+<p>Introduced MLflow's design for tracking experiments, packaging code, and managing model versions, directly inspiring the Model Layer contract in this chapter.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://www.w3.org/TR/prov-dm/" target="_blank">Moreau, L. &amp; Missier, P. (2013). "PROV-DM: The PROV Data Model." W3C Recommendation.</a>
+<p>The W3C standard for representing provenance information, defining the entity-activity-agent model used by our Provenance Layer.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s41586-023-06221-2" target="_blank">Boiko, D. A. et al. (2023). "Autonomous chemical research with large language models." <em>Nature</em>, 624, 570-578.</a>
+<p>Demonstrated an LLM-driven agent that autonomously plans and executes chemistry experiments, exemplifying the Agent and Tool Layers working in concert.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2210.03629" target="_blank">Schick, T. et al. (2023). "Toolformer: Language Models Can Teach Themselves to Use Tools." <em>NeurIPS</em>.</a>
+<p>Showed that language models can learn when and how to invoke external tools, providing the conceptual foundation for the Tool Layer's agent-facing catalog.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://dvc.org/" target="_blank">Iterative.ai (2020). DVC: Data Version Control.</a>
+<p>The open-source tool for versioning datasets and ML pipelines alongside Git, implementing many Data Layer and Code Layer contracts described in this section.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1145/3357223.3362707" target="_blank">Park, J. S. et al. (2023). "Generative Agents: Interactive Simulacra of Human Behavior." <em>UIST</em>.</a>
+<p>Introduced memory architectures for LLM-based agents (reflection, retrieval, planning), directly informing the Memory Layer's design in this chapter.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2005.11401" target="_blank">Lewis, P. et al. (2020). "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks." <em>NeurIPS</em>.</a>
+<p>The foundational RAG paper, establishing the embed-retrieve-generate pattern that underlies the Memory Layer's semantic recall mechanism.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://doi.org/10.1038/s41586-023-06735-9" target="_blank">Merchant, A. et al. (2023). "Scaling deep learning for materials discovery." <em>Nature</em>, 624, 80-85.</a>
+<p>Google DeepMind's GNoME system, a real-world example of all seven layers operating at scale: massive crystallographic data, versioned models, autonomous agent loops, and full provenance.</p>
+</div>
+
+<div class="bib-card">
+<a href="https://langchain.com/" target="_blank">LangChain (2023). LangChain: Building applications with LLMs through composability.</a>
+<p>The widely adopted framework for composing LLM agents with tools and memory, providing production implementations of the Agent, Tool, and Memory Layer patterns.</p>
+</div>
+</section>
+
+<nav class="chapter-nav">
+<a class="prev" href="index.html">&#8592; Chapter 6 Overview</a>
+<a href="../../toc.html">Contents</a>
+<a class="next" href="section-6.2.html">6.2 Artifact Graphs and Provenance &#8594;</a>
+</nav>
+
+<footer>
+<p class="footer-title">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p>&#169; 2026 Alexander Apartsin &amp; Yehudit Aperstein &#183; <a href="../../toc.html">Contents</a></p>
+<p class="footer-updated">Last updated: <script>document.write(new Date(document.lastModified).toLocaleDateString('en-US', {year:'numeric', month:'long', day:'numeric'}))</script></p>
+</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,1168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 38.3: Building a Scientific Knowledge Graph. End-to-end pipeline from paper relations to RotatE link prediction to ranked discovery hypotheses using Neo4j, NetworkX, PyKEEN, and RDFLib." name="description"/>
+<title>Section 38.3: Building a Scientific Knowledge Graph | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 38: Knowledge Graph Discovery</a></div>
+<h1>38.3 Building a Scientific Knowledge Graph</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"They fed me 12,000 abstracts and I produced 47,000 triples. Then they asked which triples I was least sure about. Those, it turns out, were the interesting ones."</p>
+<cite>A Relation Extraction Pipeline With Philosophical Leanings</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section synthesizes the entire chapter into a working pipeline. You should understand the embedding models from <a href="section-38.1.html">Section 38.1</a> (particularly RotatE scoring and MRR evaluation) and the GNN concepts from <a href="section-38.2.html">Section 38.2</a> (message passing, encoder-decoder architecture). The relation extraction step builds on <a href="../module-36-literature-mining/index.html">Chapter 36: Literature Mining</a>, where we covered named entity recognition and relation extraction from scientific text. Familiarity with NetworkX for graph manipulation and basic Cypher queries for Neo4j is helpful but not required; we introduce both as needed.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The previous two sections provided the mathematical tools: scoring functions that quantify triple plausibility (Section 38.1) and message-passing encoders that incorporate neighborhood context (Section 38.2). This section connects those tools to the real world. We start with raw scientific papers, extract structured relation triples, construct a knowledge graph, train a link prediction model, and surface the highest-scoring missing links as discovery hypotheses. The output is a ranked list of predictions like "Compound X may inhibit Target Y (score: 0.87, rank: 3/15,000)" that a domain scientist can evaluate, prioritize, and test experimentally. This is the knowledge graph as a discovery engine.
+</p>
+</div>
+
+<h2>1. The End-to-End Pipeline</h2>
+
+<p>
+Building a scientific knowledge graph for discovery involves five stages, each feeding into the next:
+</p>
+
+<ol>
+<li><strong>Relation extraction</strong>: process scientific papers to extract (entity, relation, entity) triples with confidence scores.</li>
+<li><strong>Graph construction</strong>: assemble triples into a graph data structure, merge duplicate entities, and validate schema constraints.</li>
+<li><strong>Embedding training</strong>: train a link prediction model (RotatE) on the constructed graph.</li>
+<li><strong>Link prediction</strong>: score all possible missing triples and rank them by plausibility.</li>
+<li><strong>Hypothesis surfacing</strong>: filter, rank, and present the top predictions as actionable discovery hypotheses.</li>
+</ol>
+
+<p>
+We will implement each stage with production-quality code, using the tools introduced throughout this chapter: NetworkX for prototyping, Neo4j for scalable storage and querying, PyKEEN for embedding training, and RDFLib for semantic web interoperability.
+</p>
+
+<h2>2. Stage 1: Relation Extraction from Papers</h2>
+
+<p>
+The raw material for a scientific knowledge graph is the literature itself. <a href="../module-36-literature-mining/index.html">Chapter 36</a> covered named entity recognition (NER) and relation extraction (RE) in detail. Here we use those tools as a black box, focusing on how extracted relations flow into graph construction.
+</p>
+
+<p data-agent="02">
+Relation extraction (RE) is the NLP task of reading a sentence and outputting a structured triple: (subject entity, relation type, object entity). It matters because scientific knowledge locked in unstructured prose cannot be reasoned over computationally; RE converts natural language statements like "Metformin activates AMPK" into the graph edge <code>(metformin, activates, AMPK)</code> that embedding models and graph algorithms can process. Modern RE systems work by passing a sentence through a transformer encoder (such as PubMedBERT), marking the spans of two candidate entities, and classifying the relation type between them from a predefined schema. Use RE when you need to populate a knowledge graph from text at scale; for small, curated datasets where domain experts can annotate edges manually, direct curation is faster and more accurate.
+</p>
+
+<p>
+A relation extraction pipeline processes each sentence in a scientific abstract or full text and produces candidate triples with confidence scores. For biomedical text, state-of-the-art RE models (PubMedBERT-based, fine-tuned on ChemProt or DDI datasets) achieve F1 scores of 0.70 to 0.85 on standard benchmarks. This means roughly 15 to 30 percent of extracted triples are incorrect, a noise level that link prediction models must tolerate.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from typing import Optional
+import json
+
+@dataclass
+class ExtractedTriple:
+    """A relation triple extracted from scientific text."""
+    head: str                    # normalized entity name
+    relation: str                # relation type
+    tail: str                    # normalized entity name
+    confidence: float            # RE model confidence [0, 1]
+    source_paper: str            # DOI or paper ID
+    source_sentence: str         # original sentence
+    head_type: str = ""          # entity type (Drug, Gene, Disease, ...)
+    tail_type: str = ""          # entity type
+    metadata: dict = field(default_factory=dict)
+
+    def to_dict(self):
+        return {
+            "head": self.head, "relation": self.relation,
+            "tail": self.tail, "confidence": self.confidence,
+            "source_paper": self.source_paper,
+            "source_sentence": self.source_sentence,
+            "head_type": self.head_type, "tail_type": self.tail_type,
+        }
+
+
+def extract_relations_from_abstracts(abstracts, re_model=None):
+    """
+    Extract relation triples from a list of scientific abstracts.
+
+    In production, re_model would be a fine-tuned PubMedBERT
+    or BioGPT relation extraction model (see Chapter 36).
+    Here we simulate extraction for demonstration.
+
+    Args:
+        abstracts: list of (paper_id, abstract_text) tuples
+        re_model: relation extraction model (or None for simulation)
+
+    Returns:
+        List of ExtractedTriple objects
+    """
+    # Simulated extractions from real biomedical abstracts
+    simulated_extractions = [
+        ExtractedTriple(
+            head="metformin", relation="activates", tail="AMPK",
+            confidence=0.94, source_paper="10.1038/nature06264",
+            source_sentence="Metformin activates AMPK through "
+                          "inhibition of mitochondrial complex I.",
+            head_type="Drug", tail_type="Gene",
+        ),
+        ExtractedTriple(
+            head="metformin", relation="inhibits",
+            tail="mitochondrial_complex_I",
+            confidence=0.91, source_paper="10.1038/nature06264",
+            source_sentence="Metformin activates AMPK through "
+                          "inhibition of mitochondrial complex I.",
+            head_type="Drug", tail_type="Protein",
+        ),
+        ExtractedTriple(
+            head="AMPK", relation="inhibits", tail="mTOR",
+            confidence=0.88, source_paper="10.1016/j.cell.2012.01.005",
+            source_sentence="AMPK directly phosphorylates and "
+                          "inhibits mTOR signaling.",
+            head_type="Gene", tail_type="Gene",
+        ),
+        ExtractedTriple(
+            head="mTOR", relation="activates",
+            tail="cell_proliferation",
+            confidence=0.82, source_paper="10.1126/science.1160809",
+            source_sentence="mTOR promotes cell proliferation "
+                          "through S6K and 4E-BP1 signaling.",
+            head_type="Gene", tail_type="Biological_Process",
+        ),
+        ExtractedTriple(
+            head="metformin", relation="treats",
+            tail="type_2_diabetes",
+            confidence=0.97, source_paper="10.1056/NEJMoa022450",
+            source_sentence="Metformin remains the first-line "
+                          "treatment for type 2 diabetes.",
+            head_type="Drug", tail_type="Disease",
+        ),
+        ExtractedTriple(
+            head="BRCA1", relation="associated_with",
+            tail="breast_cancer",
+            confidence=0.96, source_paper="10.1126/science.7545954",
+            source_sentence="Germline mutations in BRCA1 confer "
+                          "high risk of breast cancer.",
+            head_type="Gene", tail_type="Disease",
+        ),
+        ExtractedTriple(
+            head="tamoxifen", relation="inhibits",
+            tail="estrogen_receptor",
+            confidence=0.93, source_paper="10.1016/S0140-6736(11)61177-8",
+            source_sentence="Tamoxifen competitively inhibits "
+                          "estrogen receptor binding.",
+            head_type="Drug", tail_type="Gene",
+        ),
+        ExtractedTriple(
+            head="estrogen_receptor", relation="activates",
+            tail="cell_proliferation",
+            confidence=0.79, source_paper="10.1210/er.2004-0005",
+            source_sentence="Estrogen receptor signaling drives "
+                          "proliferation in hormone-responsive tissues.",
+            head_type="Gene", tail_type="Biological_Process",
+        ),
+        ExtractedTriple(
+            head="tamoxifen", relation="treats",
+            tail="breast_cancer",
+            confidence=0.95, source_paper="10.1016/S0140-6736(11)61177-8",
+            source_sentence="Tamoxifen significantly reduces "
+                          "breast cancer recurrence.",
+            head_type="Drug", tail_type="Disease",
+        ),
+        ExtractedTriple(
+            head="rapamycin", relation="inhibits", tail="mTOR",
+            confidence=0.96, source_paper="10.1016/j.cell.2006.02.013",
+            source_sentence="Rapamycin directly inhibits mTOR complex 1 "
+                          "through FKBP12 binding.",
+            head_type="Drug", tail_type="Gene",
+        ),
+        ExtractedTriple(
+            head="AMPK", relation="activates", tail="autophagy",
+            confidence=0.85, source_paper="10.1126/science.1215135",
+            source_sentence="AMPK activates autophagy through "
+                          "ULK1 phosphorylation.",
+            head_type="Gene", tail_type="Biological_Process",
+        ),
+        ExtractedTriple(
+            head="mTOR", relation="inhibits", tail="autophagy",
+            confidence=0.87, source_paper="10.1126/science.1215135",
+            source_sentence="mTOR is a master negative regulator "
+                          "of autophagy.",
+            head_type="Gene", tail_type="Biological_Process",
+        ),
+    ]
+
+    # In production: filter by confidence threshold
+    min_confidence = 0.75
+    filtered = [t for t in simulated_extractions
+                if t.confidence >= min_confidence]
+
+    print(f"Extracted {len(simulated_extractions)} triples, "
+          f"{len(filtered)} above confidence threshold {min_confidence}")
+
+    return filtered
+
+
+# Run extraction
+triples = extract_relations_from_abstracts([])
+for t in triples[:3]:
+    print(f"  ({t.head}, {t.relation}, {t.tail}) "
+          f"conf={t.confidence:.2f}")
+</code></pre>
+<div class="code-caption">Listing 38.9: Relation extraction pipeline producing structured triples from scientific text. Each triple carries a confidence score, source paper reference, and entity types. In production, the simulated extractions would be replaced by a fine-tuned PubMedBERT model (see Chapter 36).</div>
+
+<h2>3. Stage 2: Graph Construction with NetworkX</h2>
+
+<p>
+With triples in hand, we assemble them into a graph. For prototyping and analysis, NetworkX provides a flexible, pure-Python graph API. For production deployment with millions of nodes, we migrate to Neo4j (covered later in this section).
+</p>
+
+<p>
+Graph construction involves three key steps: entity normalization (merging "metformin" and "Metformin" into a single node), schema validation (ensuring relation types connect the correct entity types), and provenance tracking (recording which papers support each edge).
+</p>
+
+<pre><code class="language-python">import networkx as nx
+from collections import defaultdict
+
+class ScientificKnowledgeGraph:
+    """A knowledge graph built from extracted scientific relations."""
+
+    # Schema: which entity types can be connected by each relation
+    RELATION_SCHEMA = {
+        "inhibits":        [("Drug", "Gene"), ("Gene", "Gene"),
+                            ("Drug", "Protein"), ("Gene", "Biological_Process")],
+        "activates":       [("Drug", "Gene"), ("Gene", "Gene"),
+                            ("Gene", "Biological_Process")],
+        "treats":          [("Drug", "Disease")],
+        "associated_with": [("Gene", "Disease")],
+        "binds_to":        [("Drug", "Protein"), ("Protein", "Protein")],
+        "causes":          [("Gene", "Disease"), ("Drug", "Side_Effect")],
+    }
+
+    def __init__(self):
+        self.graph = nx.MultiDiGraph()  # directed, multi-edge
+        self.entity_index = {}   # normalized_name -> entity_id
+        self.entity_types = {}   # entity_id -> entity_type
+        self.edge_provenance = defaultdict(list)  # (h,r,t) -> [sources]
+        self._next_id = 0
+
+    def _normalize_entity(self, name):
+        """Normalize entity names for deduplication."""
+        return name.lower().strip().replace(" ", "_")
+
+    def _get_or_create_entity(self, name, entity_type=""):
+        """Get existing entity ID or create a new one."""
+        normalized = self._normalize_entity(name)
+        if normalized not in self.entity_index:
+            eid = self._next_id
+            self._next_id += 1
+            self.entity_index[normalized] = eid
+            self.entity_types[eid] = entity_type
+            self.graph.add_node(eid, name=normalized, type=entity_type)
+        return self.entity_index[normalized]
+
+    def validate_triple(self, triple):
+        """Check if a triple conforms to the relation schema."""
+        if triple.relation not in self.RELATION_SCHEMA:
+            return True  # unknown relation types pass through
+        allowed_pairs = self.RELATION_SCHEMA[triple.relation]
+        return (triple.head_type, triple.tail_type) in allowed_pairs
+
+    def add_triple(self, triple):
+        """Add an extracted triple to the knowledge graph."""
+        if not self.validate_triple(triple):
+            return False
+
+        head_id = self._get_or_create_entity(
+            triple.head, triple.head_type
+        )
+        tail_id = self._get_or_create_entity(
+            triple.tail, triple.tail_type
+        )
+
+        # Add edge (or update existing edge with new provenance)
+        key = (head_id, triple.relation, tail_id)
+        self.edge_provenance[key].append({
+            "paper": triple.source_paper,
+            "confidence": triple.confidence,
+            "sentence": triple.source_sentence,
+        })
+
+        # Store max confidence across all supporting sources
+        max_conf = max(
+            p["confidence"] for p in self.edge_provenance[key]
+        )
+        self.graph.add_edge(
+            head_id, tail_id,
+            relation=triple.relation,
+            confidence=max_conf,
+            num_sources=len(self.edge_provenance[key]),
+        )
+        return True
+
+    def build_from_triples(self, triples, min_confidence=0.75):
+        """Construct the full graph from extracted triples."""
+        added, rejected = 0, 0
+        for triple in triples:
+            if triple.confidence < min_confidence:
+                rejected += 1
+                continue
+            if self.add_triple(triple):
+                added += 1
+            else:
+                rejected += 1
+
+        print(f"Knowledge Graph Statistics:")
+        print(f"  Entities:  {self.graph.number_of_nodes()}")
+        print(f"  Relations: {self.graph.number_of_edges()}")
+        print(f"  Added:     {added}, Rejected: {rejected}")
+
+        # Report entity type distribution
+        type_counts = defaultdict(int)
+        for eid, etype in self.entity_types.items():
+            type_counts[etype] += 1
+        print(f"  Entity types: {dict(type_counts)}")
+
+        # Report relation type distribution
+        rel_counts = defaultdict(int)
+        for u, v, data in self.graph.edges(data=True):
+            rel_counts[data["relation"]] += 1
+        print(f"  Relation types: {dict(rel_counts)}")
+
+        return self
+
+    def get_neighbors(self, entity_name, relation=None):
+        """Get all neighbors of an entity, optionally filtered by relation."""
+        normalized = self._normalize_entity(entity_name)
+        if normalized not in self.entity_index:
+            return []
+
+        eid = self.entity_index[normalized]
+        neighbors = []
+        for _, target, data in self.graph.edges(eid, data=True):
+            if relation is None or data["relation"] == relation:
+                target_name = self.graph.nodes[target]["name"]
+                neighbors.append((target_name, data["relation"],
+                                  data["confidence"]))
+        return neighbors
+
+    def to_triples_tensor(self):
+        """Convert graph to integer triple tensor for embedding training."""
+        # Build entity and relation vocabularies
+        entity_to_id = {}
+        for node in self.graph.nodes():
+            entity_to_id[node] = len(entity_to_id)
+
+        relation_to_id = {}
+        triples_list = []
+
+        for u, v, data in self.graph.edges(data=True):
+            rel = data["relation"]
+            if rel not in relation_to_id:
+                relation_to_id[rel] = len(relation_to_id)
+            triples_list.append([
+                entity_to_id[u],
+                relation_to_id[rel],
+                entity_to_id[v],
+            ])
+
+        import torch
+        triples_tensor = torch.tensor(triples_list, dtype=torch.long)
+
+        return triples_tensor, entity_to_id, relation_to_id
+
+
+# Build knowledge graph from extracted triples
+kg = ScientificKnowledgeGraph()
+kg.build_from_triples(triples, min_confidence=0.75)
+
+# Query the graph
+print("\nNeighbors of metformin:")
+for name, rel, conf in kg.get_neighbors("metformin"):
+    print(f"  -[{rel}]-> {name} (confidence: {conf:.2f})")
+
+print("\nNeighbors of AMPK:")
+for name, rel, conf in kg.get_neighbors("AMPK"):
+    print(f"  -[{rel}]-> {name} (confidence: {conf:.2f})")
+</code></pre>
+<div class="code-caption">Listing 38.10: Scientific knowledge graph construction with entity normalization, schema validation, and provenance tracking. The graph stores both the relational structure and the supporting evidence (source papers, confidence scores) for each edge.</div>
+
+<h2>4. Representing Knowledge as RDF</h2>
+
+<p>
+For interoperability with semantic web standards and federated scientific databases, we can represent our knowledge graph in <strong>RDF</strong> (Resource Description Framework). RDF is the W3C standard for structured data on the web, and scientific databases like UniProt, ChEBI, and the Gene Ontology all publish their data as RDF. Using RDFLib, we can export our graph in RDF format and query it with SPARQL.
+</p>
+
+<pre><code class="language-python">from rdflib import Graph as RDFGraph, Namespace, Literal, URIRef
+from rdflib.namespace import RDF, RDFS, XSD
+
+def export_to_rdf(kg, output_path="scientific_kg.ttl"):
+    """
+    Export a ScientificKnowledgeGraph to RDF Turtle format.
+
+    Uses custom namespaces for entities and relations,
+    with links to standard biomedical ontologies.
+    """
+    g = RDFGraph()
+
+    # Define namespaces
+    DISCO = Namespace("http://discoveryai.org/kg/")
+    BIO = Namespace("http://discoveryai.org/bio/")
+    REL = Namespace("http://discoveryai.org/rel/")
+
+    g.bind("disco", DISCO)
+    g.bind("bio", BIO)
+    g.bind("rel", REL)
+
+    # Add entity type hierarchy
+    entity_type_uris = {
+        "Drug": BIO["Drug"],
+        "Gene": BIO["Gene"],
+        "Disease": BIO["Disease"],
+        "Protein": BIO["Protein"],
+        "Biological_Process": BIO["BiologicalProcess"],
+    }
+
+    # Add entities as RDF resources
+    entity_uris = {}
+    for node_id in kg.graph.nodes():
+        node_data = kg.graph.nodes[node_id]
+        name = node_data["name"]
+        etype = node_data.get("type", "")
+
+        uri = DISCO[name]
+        entity_uris[node_id] = uri
+
+        g.add((uri, RDF.type, entity_type_uris.get(etype, BIO["Entity"])))
+        g.add((uri, RDFS.label, Literal(name)))
+
+    # Add relations as RDF predicates
+    for u, v, data in kg.graph.edges(data=True):
+        rel_uri = REL[data["relation"]]
+        g.add((entity_uris[u], rel_uri, entity_uris[v]))
+
+        # Add confidence as edge annotation (using reification)
+        stmt_uri = DISCO[f"stmt_{u}_{data['relation']}_{v}"]
+        g.add((stmt_uri, RDF.type, RDF.Statement))
+        g.add((stmt_uri, RDF.subject, entity_uris[u]))
+        g.add((stmt_uri, RDF.predicate, rel_uri))
+        g.add((stmt_uri, RDF.object, entity_uris[v]))
+        g.add((stmt_uri, DISCO["confidence"],
+               Literal(data["confidence"], datatype=XSD.float)))
+
+    # Serialize to Turtle format
+    g.serialize(destination=output_path, format="turtle")
+    print(f"Exported {len(g)} RDF triples to {output_path}")
+
+    # SPARQL query example: find all drug-disease treatment pairs
+    query = """
+    PREFIX rel: <http://discoveryai.org/rel/>
+    PREFIX bio: <http://discoveryai.org/bio/>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+    SELECT ?drug ?disease
+    WHERE {
+        ?drug a bio:Drug .
+        ?disease a bio:Disease .
+        ?drug rel:treats ?disease .
+        ?drug rdfs:label ?drug_name .
+        ?disease rdfs:label ?disease_name .
+    }
+    """
+    results = g.query(query)
+    print("\nSPARQL: Drug-Disease treatment pairs:")
+    for row in results:
+        print(f"  {row[0].split('/')[-1]} treats "
+              f"{row[1].split('/')[-1]}")
+
+    return g
+
+
+rdf_graph = export_to_rdf(kg)
+</code></pre>
+<div class="code-caption">Listing 38.11: RDF export and SPARQL querying of the scientific knowledge graph. The Turtle serialization enables interoperability with standard biomedical databases (UniProt, ChEBI, Gene Ontology), while SPARQL provides a declarative query language for complex graph patterns.</div>
+
+<h2>5. Stage 3: Training RotatE with PyKEEN</h2>
+
+<p>
+With the knowledge graph constructed, we train a RotatE link prediction model using PyKEEN. PyKEEN provides a unified pipeline that handles train/test splitting, negative sampling, training loop management, and standardized evaluation.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Training on Noisy Extraction vs. Curated Databases</div>
+<p>
+Knowledge graphs built from relation extraction contain noise: roughly 15 to 30 percent of extracted triples may be incorrect. Link prediction models are surprisingly robust to this noise, for two reasons. First, the embedding training process acts as a denoising filter: incorrect triples that contradict the dominant graph structure receive low scores after training, because the model learns patterns from the majority of correct triples. Second, confidence-weighted training (using extraction confidence as a loss weight) further reduces the influence of noisy triples. In practice, RotatE trained on noisy extracted graphs achieves MRR within 5 to 10 percent of RotatE trained on curated databases, when the extraction F1 exceeds 0.70.
+</p>
+</div>
+
+<pre><code class="language-python">from pykeen.pipeline import pipeline
+from pykeen.triples import TriplesFactory
+import numpy as np
+import torch
+
+def train_rotate_on_kg(kg, embedding_dim=256, num_epochs=200,
+                        batch_size=256, lr=1e-4):
+    """
+    Train a RotatE model on a ScientificKnowledgeGraph using PyKEEN.
+
+    Args:
+        kg: ScientificKnowledgeGraph instance
+        embedding_dim: dimension of entity/relation embeddings
+        num_epochs: training epochs
+        batch_size: training batch size
+        lr: learning rate
+
+    Returns:
+        PyKEEN pipeline result with trained model and metrics
+    """
+    # Convert graph to PyKEEN triples format
+    triples_list = []
+    for u, v, data in kg.graph.edges(data=True):
+        head_name = kg.graph.nodes[u]["name"]
+        tail_name = kg.graph.nodes[v]["name"]
+        triples_list.append([head_name, data["relation"], tail_name])
+
+    triples_array = np.array(triples_list)
+
+    # Create PyKEEN TriplesFactory with automatic train/test split
+    tf = TriplesFactory.from_labeled_triples(triples_array)
+    training, testing = tf.split([0.8, 0.2], random_state=42)
+
+    print(f"Training triples: {training.num_triples}")
+    print(f"Testing triples:  {testing.num_triples}")
+    print(f"Entities:         {tf.num_entities}")
+    print(f"Relations:        {tf.num_relations}")
+
+    # Run the PyKEEN training pipeline
+    result = pipeline(
+        training=training,
+        testing=testing,
+        model="RotatE",
+        model_kwargs=dict(
+            embedding_dim=embedding_dim,
+        ),
+        training_kwargs=dict(
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+        ),
+        optimizer_kwargs=dict(
+            lr=lr,
+        ),
+        negative_sampler="basic",
+        negative_sampler_kwargs=dict(
+            num_negs_per_pos=32,
+        ),
+        evaluation_kwargs=dict(
+            batch_size=64,
+        ),
+        random_seed=42,
+    )
+
+    # Print evaluation results
+    print("\nLink Prediction Results:")
+    metrics = result.metric_results
+    print(f"  MRR:     {metrics.get_metric('both.realistic.inverse_harmonic_mean_rank'):.4f}")
+    print(f"  Hits@1:  {metrics.get_metric('both.realistic.hits_at_1'):.4f}")
+    print(f"  Hits@3:  {metrics.get_metric('both.realistic.hits_at_3'):.4f}")
+    print(f"  Hits@10: {metrics.get_metric('both.realistic.hits_at_10'):.4f}")
+
+    return result
+
+
+# Train RotatE on our scientific KG
+# (In production, use a larger graph; our example is for demonstration)
+result = train_rotate_on_kg(kg, embedding_dim=64, num_epochs=50)
+</code></pre>
+<div class="code-caption">Listing 38.12: RotatE training on the scientific knowledge graph using PyKEEN's unified pipeline. PyKEEN handles train/test splitting, negative sampling, learning rate scheduling, and filtered MRR/Hits@k evaluation automatically.</div>
+
+<h2>6. Stage 4: Link Prediction and Hypothesis Ranking</h2>
+
+<p>
+The trained RotatE model can now score any candidate triple. For discovery, we systematically generate all missing triples of interest, score them, and rank by predicted plausibility. This is the moment where the knowledge graph becomes a hypothesis generator.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of link prediction like a librarian who has shelved thousands of books by topic and noticed which subjects always appear near each other. When someone asks "might there be a book connecting gardening and psychology?", the librarian does not search every shelf from scratch. Instead, she checks whether gardening books already sit close to behavioral science, which sits close to psychology, and estimates the likelihood based on that proximity pattern. The trained embedding model works the same way: it has learned where each entity "sits" in a high-dimensional space from the existing edges, and it scores a missing link by measuring how well the candidate triple fits the geometric neighborhood patterns it already knows. High scores mean "this missing connection fits the same patterns as thousands of known connections," not "this connection is proven true."
+</p>
+</div>
+
+<pre><code class="language-python">from pykeen.predict import predict_target
+import pandas as pd
+
+def discover_missing_links(result, kg, relation_filter=None,
+                            top_k=20, min_score=0.0):
+    """
+    Surface missing links as ranked discovery hypotheses.
+
+    Args:
+        result: PyKEEN pipeline result with trained model
+        kg: ScientificKnowledgeGraph with entity names
+        relation_filter: optional relation type to focus on
+        top_k: number of top predictions to return
+        min_score: minimum score threshold
+
+    Returns:
+        DataFrame of ranked hypothesis predictions
+    """
+    model = result.model
+    training = result.training
+
+    hypotheses = []
+
+    # Get all entity and relation labels
+    entity_to_id = training.entity_to_id
+    relation_to_id = training.relation_to_id
+    id_to_entity = {v: k for k, v in entity_to_id.items()}
+    id_to_relation = {v: k for k, v in relation_to_id.items()}
+
+    # Known triples for filtering
+    known_triples = set()
+    for h, r, t in training.mapped_triples.tolist():
+        known_triples.add((h, r, t))
+
+    # For each entity, predict missing links for each relation
+    relations = ([relation_filter] if relation_filter
+                 else list(relation_to_id.keys()))
+
+    for rel_name in relations:
+        if rel_name not in relation_to_id:
+            continue
+        rel_id = relation_to_id[rel_name]
+
+        for head_name, head_id in entity_to_id.items():
+            # Score all possible tails
+            head_tensor = torch.tensor([head_id])
+            rel_tensor = torch.tensor([rel_id])
+
+            for tail_name, tail_id in entity_to_id.items():
+                if head_id == tail_id:
+                    continue
+                if (head_id, rel_id, tail_id) in known_triples:
+                    continue  # skip known edges
+
+                tail_tensor = torch.tensor([tail_id])
+                with torch.no_grad():
+                    score = model.score_hrt(
+                        torch.stack([head_tensor, rel_tensor,
+                                     tail_tensor], dim=1)
+                    ).item()
+
+                if score >= min_score:
+                    hypotheses.append({
+                        "head": head_name,
+                        "relation": rel_name,
+                        "tail": tail_name,
+                        "score": score,
+                        "head_type": kg.entity_types.get(
+                            kg.entity_index.get(head_name, -1), ""
+                        ),
+                        "tail_type": kg.entity_types.get(
+                            kg.entity_index.get(tail_name, -1), ""
+                        ),
+                    })
+
+    # Rank by score
+    hypotheses.sort(key=lambda x: -x["score"])
+    df = pd.DataFrame(hypotheses[:top_k])
+
+    if len(df) > 0:
+        print(f"\nTop {min(top_k, len(df))} Discovery Hypotheses "
+              f"(relation: {relation_filter or 'all'}):")
+        print(df[["head", "relation", "tail", "score"]].to_string(
+            index=False
+        ))
+
+    return df
+
+
+# Discover missing treatment links
+treatment_hypotheses = discover_missing_links(
+    result, kg,
+    relation_filter="treats",
+    top_k=10
+)
+
+# Discover missing inhibition links
+inhibition_hypotheses = discover_missing_links(
+    result, kg,
+    relation_filter="inhibits",
+    top_k=10
+)
+</code></pre>
+<div class="code-caption">Listing 38.13: Hypothesis discovery through systematic link prediction. For each entity pair not connected by a relation in the known graph, the trained RotatE model scores the candidate triple. Top-ranked missing links become discovery hypotheses with quantified plausibility scores.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Discovering Drug Repurposing Candidates</div>
+<p>
+A computational biology team builds a knowledge graph from 50,000 PubMed abstracts covering oncology. The graph contains 8,000 entities (drugs, genes, diseases, pathways) and 65,000 edges. They train RotatE (256-dim, 200 epochs) and query all missing (Drug, treats, Cancer_Type) triples. The top prediction is (metformin, treats, breast_cancer) with a score of 0.89. The reasoning path through the graph reveals why: metformin activates AMPK, AMPK inhibits mTOR, mTOR drives cell proliferation in breast cancer. This multi-hop inference, which the embedding model captures implicitly through the geometry of the learned space, matches the mechanistic hypothesis that led to clinical trials of metformin for breast cancer treatment (NCT01101438). The team validates the top 20 predictions against ClinicalTrials.gov and finds that 7 have corresponding active or completed trials, a 35% hit rate that far exceeds random baseline (estimated at 2 to 5%).
+</p>
+</div>
+
+<h2>7. Scaling to Neo4j for Production</h2>
+
+<p>
+NetworkX stores the entire graph in memory, which limits scalability to roughly 1 to 5 million edges on a standard workstation. For production scientific knowledge graphs with tens of millions of edges, we use <strong>Neo4j</strong>, a native graph database that supports disk-backed storage, ACID transactions, and the Cypher query language.
+</p>
+
+<pre><code class="language-python">from neo4j import GraphDatabase
+
+class Neo4jKnowledgeGraph:
+    """Production knowledge graph backed by Neo4j."""
+
+    def __init__(self, uri="bolt://localhost:7687",
+                 user="neo4j", password="discovery"):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
+    def create_schema(self):
+        """Set up indexes and constraints for performance."""
+        with self.driver.session() as session:
+            # Unique constraint on entity names per type
+            session.run("""
+                CREATE CONSTRAINT entity_name IF NOT EXISTS
+                FOR (e:Entity) REQUIRE e.name IS UNIQUE
+            """)
+            # Index on relation types for fast edge queries
+            session.run("""
+                CREATE INDEX rel_type IF NOT EXISTS
+                FOR ()-[r:RELATION]-() ON (r.type)
+            """)
+
+    def ingest_triples(self, triples):
+        """Bulk-load extracted triples into Neo4j."""
+        with self.driver.session() as session:
+            for triple in triples:
+                session.run("""
+                    MERGE (h:Entity {name: $head, type: $head_type})
+                    MERGE (t:Entity {name: $tail, type: $tail_type})
+                    MERGE (h)-[r:RELATION {type: $relation}]->(t)
+                    SET r.confidence = $confidence,
+                        r.source_paper = $source_paper
+                """,
+                head=triple.head, tail=triple.tail,
+                relation=triple.relation,
+                head_type=triple.head_type,
+                tail_type=triple.tail_type,
+                confidence=triple.confidence,
+                source_paper=triple.source_paper,
+                )
+
+        print(f"Ingested {len(triples)} triples into Neo4j")
+
+    def find_paths(self, source, target, max_hops=3):
+        """Find all paths between two entities up to max_hops."""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH path = (s:Entity {name: $source})
+                             -[:RELATION*1..""" + str(max_hops) + """]->
+                             (t:Entity {name: $target})
+                RETURN [n IN nodes(path) | n.name] AS entities,
+                       [r IN relationships(path) | r.type] AS relations,
+                       length(path) AS hops
+                ORDER BY hops
+                LIMIT 10
+            """, source=source, target=target)
+
+            paths = []
+            for record in result:
+                entities = record["entities"]
+                relations = record["relations"]
+                path_str = entities[0]
+                for i, rel in enumerate(relations):
+                    path_str += f" -[{rel}]-> {entities[i+1]}"
+                paths.append({
+                    "path": path_str,
+                    "hops": record["hops"],
+                })
+            return paths
+
+    def get_entity_subgraph(self, entity_name, depth=2):
+        """Extract the local subgraph around an entity."""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (center:Entity {name: $name})
+                CALL apoc.path.subgraphAll(center, {
+                    maxLevel: $depth
+                }) YIELD nodes, relationships
+                RETURN nodes, relationships
+            """, name=entity_name, depth=depth)
+
+            record = result.single()
+            if record:
+                return {
+                    "nodes": len(record["nodes"]),
+                    "edges": len(record["relationships"]),
+                }
+            return {"nodes": 0, "edges": 0}
+
+    def find_hypothesis_evidence(self, head, relation, tail,
+                                  max_hops=3):
+        """
+        Find supporting evidence paths for a hypothesis.
+        Given a predicted link (head, relation, tail), find
+        indirect paths that could explain the prediction.
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH path = (h:Entity {name: $head})
+                             -[:RELATION*2..""" + str(max_hops) + """]->
+                             (t:Entity {name: $tail})
+                WITH path,
+                     [r IN relationships(path) | r.confidence] AS confs,
+                     [r IN relationships(path) | r.type] AS rels,
+                     [n IN nodes(path) | n.name] AS names
+                WITH path, names, rels,
+                     reduce(s = 1.0, c IN confs | s * c) AS path_conf
+                RETURN names, rels, path_conf
+                ORDER BY path_conf DESC
+                LIMIT 5
+            """, head=head, tail=tail)
+
+            evidence = []
+            for record in result:
+                names = record["names"]
+                rels = record["rels"]
+                path_str = names[0]
+                for i, rel in enumerate(rels):
+                    path_str += f" -[{rel}]-> {names[i+1]}"
+                evidence.append({
+                    "path": path_str,
+                    "confidence": record["path_conf"],
+                })
+            return evidence
+
+
+# Example usage (requires running Neo4j instance)
+# neo4j_kg = Neo4jKnowledgeGraph()
+# neo4j_kg.create_schema()
+# neo4j_kg.ingest_triples(triples)
+#
+# # Find evidence for a hypothesis
+# evidence = neo4j_kg.find_hypothesis_evidence(
+#     head="metformin", relation="treats", tail="breast_cancer"
+# )
+# for e in evidence:
+#     print(f"  Path: {e['path']} (conf: {e['confidence']:.3f})")
+</code></pre>
+<div class="code-caption">Listing 38.14: Neo4j-backed knowledge graph with Cypher queries for path finding and hypothesis evidence discovery. The find_hypothesis_evidence method traces multi-hop paths that explain why a predicted link might be true, providing mechanistic support for discovery hypotheses.</div>
+
+<h2>8. The Discovery Workbench KG Module</h2>
+
+<p>
+The complete pipeline, from relation extraction through hypothesis ranking, integrates into the Discovery Workbench (introduced in <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>) as a reusable module. The module exposes three core operations: graph construction from extracted triples, model training with automatic hyperparameter selection, and interactive hypothesis exploration.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+from pathlib import Path
+import json
+
+@dataclass
+class DiscoveryHypothesis:
+    """A hypothesis generated by knowledge graph link prediction."""
+    head: str
+    relation: str
+    tail: str
+    score: float
+    rank: int
+    evidence_paths: list        # supporting multi-hop paths
+    source_method: str = "RotatE"
+    head_type: str = ""
+    tail_type: str = ""
+
+    @property
+    def description(self):
+        return f"{self.head} {self.relation} {self.tail}"
+
+    def to_dict(self):
+        return {
+            "hypothesis": self.description,
+            "score": round(self.score, 4),
+            "rank": self.rank,
+            "evidence_paths": self.evidence_paths,
+            "method": self.source_method,
+            "entity_types": {
+                "head": self.head_type, "tail": self.tail_type
+            },
+        }
+
+
+class KnowledgeGraphDiscoveryModule:
+    """
+    Discovery Workbench module for knowledge graph-based
+    hypothesis generation.
+
+    Integrates: relation extraction -> graph construction ->
+    embedding training -> link prediction -> hypothesis ranking.
+    """
+
+    def __init__(self, output_dir="kg_discovery_output"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.kg = None
+        self.model_result = None
+
+    def build_graph(self, triples, min_confidence=0.75):
+        """Stage 1-2: Build KG from extracted triples."""
+        self.kg = ScientificKnowledgeGraph()
+        self.kg.build_from_triples(triples, min_confidence)
+        return self
+
+    def train_model(self, model_name="RotatE", embedding_dim=256,
+                     num_epochs=200, **kwargs):
+        """Stage 3: Train link prediction model."""
+        if self.kg is None:
+            raise ValueError("Build the graph first with build_graph()")
+
+        self.model_result = train_rotate_on_kg(
+            self.kg, embedding_dim=embedding_dim,
+            num_epochs=num_epochs, **kwargs
+        )
+        return self
+
+    def generate_hypotheses(self, relation=None, top_k=50,
+                             explain=True):
+        """Stage 4-5: Generate and rank discovery hypotheses."""
+        if self.model_result is None:
+            raise ValueError("Train the model first with train_model()")
+
+        # Get ranked predictions
+        predictions_df = discover_missing_links(
+            self.model_result, self.kg,
+            relation_filter=relation,
+            top_k=top_k
+        )
+
+        # Convert to structured hypotheses with evidence
+        hypotheses = []
+        for rank, row in predictions_df.iterrows():
+            evidence = []
+            if explain:
+                # Find supporting paths in the graph
+                paths = self._find_evidence_paths(
+                    row["head"], row["tail"], max_hops=3
+                )
+                evidence = [{"path": p, "type": "indirect"}
+                            for p in paths]
+
+            hypothesis = DiscoveryHypothesis(
+                head=row["head"],
+                relation=row["relation"],
+                tail=row["tail"],
+                score=row["score"],
+                rank=rank + 1,
+                evidence_paths=evidence,
+                head_type=row.get("head_type", ""),
+                tail_type=row.get("tail_type", ""),
+            )
+            hypotheses.append(hypothesis)
+
+        # Save results
+        output_file = self.output_dir / "hypotheses.json"
+        with open(output_file, "w") as f:
+            json.dump(
+                [h.to_dict() for h in hypotheses], f, indent=2
+            )
+        print(f"\nSaved {len(hypotheses)} hypotheses to {output_file}")
+
+        return hypotheses
+
+    def _find_evidence_paths(self, head, tail, max_hops=3):
+        """Find indirect paths supporting a predicted link."""
+        if self.kg is None:
+            return []
+
+        head_norm = self.kg._normalize_entity(head)
+        tail_norm = self.kg._normalize_entity(tail)
+
+        if (head_norm not in self.kg.entity_index or
+            tail_norm not in self.kg.entity_index):
+            return []
+
+        head_id = self.kg.entity_index[head_norm]
+        tail_id = self.kg.entity_index[tail_norm]
+
+        # BFS for paths up to max_hops
+        paths = []
+        try:
+            for path in nx.all_simple_paths(
+                self.kg.graph, head_id, tail_id,
+                cutoff=max_hops
+            ):
+                path_str = self.kg.graph.nodes[path[0]]["name"]
+                for i in range(len(path) - 1):
+                    edge_data = self.kg.graph.edges[
+                        path[i], path[i+1], 0
+                    ]
+                    next_name = self.kg.graph.nodes[path[i+1]]["name"]
+                    path_str += (f" -[{edge_data['relation']}]-> "
+                                f"{next_name}")
+                paths.append(path_str)
+        except nx.NetworkXError:
+            pass
+
+        return paths[:5]  # limit to top 5 paths
+
+
+# Complete pipeline demonstration
+module = KnowledgeGraphDiscoveryModule(output_dir="discovery_results")
+
+# Build -> Train -> Discover
+hypotheses = (
+    module
+    .build_graph(triples, min_confidence=0.75)
+    .train_model(model_name="RotatE", embedding_dim=64, num_epochs=50)
+    .generate_hypotheses(relation="treats", top_k=10, explain=True)
+)
+
+# Inspect top hypotheses
+for h in hypotheses[:3]:
+    print(f"\nHypothesis #{h.rank}: {h.description}")
+    print(f"  Score: {h.score:.4f}")
+    for ev in h.evidence_paths:
+        print(f"  Evidence: {ev['path']}")
+</code></pre>
+<div class="code-caption">Listing 38.15: The Discovery Workbench KG module providing a fluent API for the complete pipeline: graph construction, model training, and hypothesis generation with evidence paths. The output is a ranked, explained set of discovery hypotheses ready for domain expert review.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: PyKEEN + Neo4j for Production KG Discovery</div>
+<p>
+The custom pipeline above totals roughly 400 lines across five stages. In production, you can reduce this significantly by combining PyKEEN's built-in dataset handling with Neo4j's graph algorithms library (GDS):
+</p>
+<pre><code class="language-python"># PyKEEN: complete training + evaluation in 10 lines
+from pykeen.pipeline import pipeline
+result = pipeline(
+    model="RotatE", dataset="Hetionet",
+    training_kwargs=dict(num_epochs=200),
+)
+
+# Neo4j GDS: built-in link prediction algorithms
+# (run in Cypher)
+# CALL gds.beta.pipeline.linkPrediction.predict.stream(
+#   'biomedical-graph', {topN: 100}
+# ) YIELD node1, node2, probability
+</code></pre>
+<p>
+PyKEEN supports 40+ datasets and 35+ models out of the box. Neo4j GDS provides graph-native link prediction (common neighbors, Adamic-Adar, preferential attachment) and GNN-based prediction (GraphSAGE) directly in the database. Together, they replace the custom pipeline with roughly 20 lines of configuration. Use the custom pipeline for understanding; use PyKEEN + Neo4j for production.
+</p>
+</div>
+
+<h2>9. Validating Knowledge Graph Predictions</h2>
+
+<p>
+A link prediction score is not evidence. Before a predicted triple becomes an actionable hypothesis, it must pass several validation checks that connect the statistical prediction back to scientific reasoning.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often assume that a high link prediction score (say, 0.92) means there is a 92% probability that the predicted relationship is true. This is incorrect: the score is a relative plausibility ranking derived from geometric proximity in embedding space, not a calibrated probability. Two predictions with scores 0.92 and 0.88 tell you only that the first fits the learned graph patterns slightly better than the second; neither score can be interpreted as a likelihood of experimental confirmation without external calibration against held-out validated data.
+</p>
+</div>
+
+<p>
+<strong>Structural validation</strong> checks whether the predicted link is consistent with known graph patterns. Does the predicted relation type match the entity types? Are there supporting indirect paths? How many hops separate the head and tail in the current graph? Predictions with no indirect path support (isolated entity pairs) are typically less reliable than predictions with rich multi-hop evidence.
+</p>
+
+<p>
+<strong>Literature validation</strong> searches for textual evidence that the predicted relationship has been discussed, hypothesized, or partially supported in the literature, even if it was not extracted as a confident triple. The RAG techniques from <a href="../module-37-rag-discovery/index.html">Chapter 37</a> enable this search: given a predicted triple (Drug X, treats, Disease Y), retrieve the most relevant paragraphs from the corpus and check whether they mention both entities in a suggestive context.
+</p>
+
+<p>
+<strong>Domain constraint validation</strong> applies domain-specific rules. In drug repurposing, a predicted drug-disease link should be checked against known toxicity profiles, drug-drug interactions, and mechanism plausibility. A prediction that a known hepatotoxic drug treats a liver disease may be statistically plausible (both involve the liver) but pharmacologically dangerous.
+</p>
+
+<p>
+The validated, ranked hypotheses from this pipeline feed into <a href="../module-39-hypothesis-generation/index.html">Chapter 39: Hypothesis Generation</a>, where they join hypotheses from other sources (literature analysis, causal reasoning, generative models) in a unified ranking and evaluation framework. The knowledge graph is one lens on the discovery landscape; combining it with other lenses produces a more complete picture.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: LLM-Augmented Knowledge Graph Completion</div>
+<p>
+The embedding models in this chapter learn patterns purely from graph structure. The 2024-2025 frontier augments these models with large language models that bring external world knowledge to link prediction. <strong>KICGPT</strong> (Wei et al., 2023) uses an LLM as a re-ranker: a conventional embedding model generates a candidate list, then GPT-4 re-scores candidates using its parametric knowledge, improving Hits@1 by 10-15% on standard benchmarks. <strong>KG-LLaMA</strong> (Yao et al., 2024) fine-tunes a language model directly on verbalized triples so that it can both predict missing links and generate natural-language explanations of why a prediction is plausible. For scientific discovery, the combination is powerful: the embedding model provides fast, structure-aware candidate generation over millions of entities, while the LLM contributes semantic reasoning and free-text justification that domain experts can evaluate. The key open challenge is faithfulness: ensuring that LLM-generated explanations accurately reflect the graph evidence rather than hallucinating plausible-sounding but unsupported reasoning chains.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Knowledge Graph from Wikipedia Categories</h4>
+<p>
+You can run through a complete knowledge graph discovery cycle in under an hour using free tools and data you already have access to.
+</p>
+<ol>
+<li><strong>Gather triples.</strong> Install <code>wikipedia-api</code> (<code>pip install wikipedia-api</code>) and write a script that, for 20 Wikipedia articles in a single domain (e.g., "diabetes", "insulin", "pancreas"), extracts the article categories and "See also" links. Convert each (article, has_category, category) and (article, related_to, article) pair into a triple list of at least 100 entries.</li>
+<li><strong>Build the graph.</strong> Load the triples into a NetworkX <code>MultiDiGraph</code>. Print the number of nodes, edges, and connected components. Visualize the largest connected component with <code>matplotlib</code> using <code>nx.spring_layout</code>.</li>
+<li><strong>Train embeddings.</strong> Convert your graph to a PyKEEN <code>TriplesFactory</code>, split 80/20, and train a RotatE model for 100 epochs with <code>embedding_dim=32</code>. Record the MRR and Hits@10.</li>
+<li><strong>Predict missing links.</strong> Score all missing (article, related_to, article) triples and print the top 10 predictions. For each, open the two Wikipedia articles and check whether the predicted connection is plausible.</li>
+<li><strong>Measure precision.</strong> Manually label your top 10 predictions as plausible or implausible. Report precision@10 and compare it against a random baseline (pick 10 random unconnected pairs and label those too).</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Coding)</strong> Build a knowledge graph from abstracts in a scientific domain of your choice using the Semantic Scholar API. Extract at least 500 triples, train RotatE with PyKEEN, and report MRR and Hits@10. Present the top 10 predicted missing links and evaluate their plausibility using manual literature search.
+</li>
+<li>
+<strong>(Analysis)</strong> Implement confidence-weighted training: modify the PyKEEN training loop so that each triple's contribution to the loss is weighted by its extraction confidence. Compare MRR against uniform (unweighted) training. Under what conditions does confidence weighting help most?
+</li>
+<li>
+<strong>(Project)</strong> Extend the Discovery Workbench KG module to support incremental graph updates: when new papers are published and new triples are extracted, update the graph and retrain the model without starting from scratch. Use PyKEEN's model checkpointing to warm-start training from the previous model. Measure how prediction quality changes as the graph grows from 1,000 to 10,000 to 50,000 triples.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+The knowledge graph discovery pipeline in this chapter surfaces missing links as ranked hypotheses with plausibility scores and evidence paths. But a ranked list of predictions is not the same as a scientific hypothesis. <a href="../module-39-hypothesis-generation/index.html">Chapter 39: Hypothesis Generation</a> transforms these predictions into structured, testable hypotheses. You will learn to formulate hypotheses with explicit mechanisms, predictions, and falsification criteria; to combine evidence from knowledge graphs, literature, and causal models; and to rank hypotheses by expected information gain rather than raw prediction scores. The knowledge graph becomes one input among several into a systematic hypothesis generation and evaluation framework.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-38.2.html">&larr; 38.2 GNNs for Knowledge Completion</a>
+<a href="index.html">Chapter 38</a>
+<a href="../module-39-hypothesis-generation/index.html">Chapter 39: Hypothesis Generation &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

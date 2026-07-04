@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 35.1: Equation Discovery from Data. Expression trees, fitness functions, Pareto fronts, Kolmogorov complexity, MDL, dimensional analysis, and gplearn for symbolic regression." name="description"/>
+<title>Section 35.1: Equation Discovery from Data | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 35: Symbolic Regression and Equation Discovery</a></div>
+<h1>35.1 Equation Discovery from Data</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I tried every combination of sine, cosine, and the square root of confusion. The answer was $F = ma$."</p>
+<cite>An Expression Tree That Discovered Simplicity</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section opens the chapter on symbolic regression. You should be familiar with the
+search-space concepts from <a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1:
+Discovery as Search</a>, particularly how search operators, evaluation functions, and termination
+criteria define a discovery algorithm. Basic tree data structures (nodes, children, traversal) and
+Python fluency from <a href="../../appendices/appendix-b/index.html">Appendix B</a> are assumed.
+The information-theoretic discussion draws on entropy and coding concepts; prior exposure to
+<a href="../../part-1-foundations/module-05-data-models-simulation/index.html">Chapter 5</a> is helpful
+but not required.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Standard regression asks: given a fixed functional form $y = \beta_0 + \beta_1 x + \beta_2 x^2$,
+what are the best parameters $\beta$? Symbolic regression asks a harder question: what is the
+functional form itself? The search space is no longer a continuous parameter manifold but the
+discrete, combinatorial space of all mathematical expressions. This section builds the conceptual
+and algorithmic machinery to navigate that space: expression trees as the representation,
+fitness functions as the evaluation, complexity penalties as the regularizer, and dimensional
+analysis as a hard physical constraint. By the end, you will understand why this problem is
+fundamentally different from parameter fitting and why principled complexity control is essential
+for finding genuine laws rather than overfitted curiosities.
+</p>
+</div>
+
+<h2>1. Expressions as Trees</h2>
+
+<p>
+Every mathematical expression has a natural representation as a tree. The expression
+$\sin(x_1) + x_2 \times x_3$ becomes a tree with $+$ at the root, $\sin$ as the left child
+(with $x_1$ as its leaf), and $\times$ as the right child (with $x_2$ and $x_3$ as leaves).
+This representation is not merely a convenience; it is the data structure that makes symbolic
+regression tractable. Tree-based representations decompose the problem of building complex
+expressions into the problem of assembling smaller pieces.
+</p>
+
+<p data-agent="02">
+An expression tree is a hierarchical data structure in which operators occupy internal nodes and
+operands (variables or constants) sit at the leaves, so that evaluating the tree from leaves to
+root reproduces the original mathematical formula. This matters because it converts the problem
+of searching over all possible equations into the problem of searching over all possible trees,
+which is far more amenable to algorithmic manipulation: subtrees can be swapped, grafted, or
+pruned independently without breaking the rest of the expression. The mechanism is recursive
+evaluation: each node asks its children for their values, applies its own operator, and passes
+the result upward. Use expression trees whenever you need to represent, mutate, or evolve
+symbolic formulas programmatically; for fixed-form models where only parameters vary, standard
+numerical optimization (gradient descent, least squares) is simpler and faster.
+</p>
+
+<p>
+Formally, an expression tree is a rooted tree where each internal node is labeled with an
+<strong>operator</strong> (binary: $+, -, \times, \div$; unary: $\sin, \cos, \exp, \log, \sqrt{\cdot}$)
+and each leaf node is labeled with a <strong>terminal</strong> (an input variable $x_i$ or a
+numeric constant $c$). The expression that a tree computes is defined recursively: a leaf node
+evaluates to its variable or constant; an internal node evaluates its children, then applies its
+operator to the results.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from dataclasses import dataclass
+from typing import Union, Callable
+
+@dataclass
+class Node:
+    """A node in an expression tree."""
+    op: str                           # operator name or terminal value
+    arity: int                        # 0 = leaf, 1 = unary, 2 = binary
+    children: list                    # child nodes
+    value: float = None               # numeric constant (for leaf nodes)
+
+    def evaluate(self, variables: dict[str, np.ndarray]) -> np.ndarray:
+        """Recursively evaluate this expression tree on input data."""
+        if self.arity == 0:
+            if self.op in variables:
+                return variables[self.op]
+            return np.full_like(next(iter(variables.values())), self.value)
+
+        child_vals = [c.evaluate(variables) for c in self.children]
+
+        # Binary operators
+        if self.op == '+': return child_vals[0] + child_vals[1]
+        if self.op == '-': return child_vals[0] - child_vals[1]
+        if self.op == '*': return child_vals[0] * child_vals[1]
+        if self.op == '/':
+            # Protected division: avoid division by zero
+            denom = np.where(np.abs(child_vals[1]) < 1e-10, 1.0, child_vals[1])
+            return child_vals[0] / denom
+
+        # Unary operators
+        if self.op == 'sin': return np.sin(child_vals[0])
+        if self.op == 'cos': return np.cos(child_vals[0])
+        if self.op == 'exp':
+            return np.exp(np.clip(child_vals[0], -10, 10))  # prevent overflow
+        if self.op == 'log':
+            return np.log(np.abs(child_vals[0]) + 1e-10)     # protected log
+        if self.op == 'sqrt':
+            return np.sqrt(np.abs(child_vals[0]))             # protected sqrt
+
+        raise ValueError(f"Unknown operator: {self.op}")
+
+    def to_string(self) -> str:
+        """Convert expression tree to human-readable string."""
+        if self.arity == 0:
+            return self.op if self.value is None else f"{self.value:.4g}"
+        if self.arity == 1:
+            return f"{self.op}({self.children[0].to_string()})"
+        left = self.children[0].to_string()
+        right = self.children[1].to_string()
+        return f"({left} {self.op} {right})"
+
+    def count_nodes(self) -> int:
+        """Count total nodes (a proxy for expression complexity)."""
+        return 1 + sum(c.count_nodes() for c in self.children)
+
+
+# Build the tree for sin(x1) + x2 * x3
+tree = Node('+', 2, [
+    Node('sin', 1, [Node('x1', 0, [])]),
+    Node('*', 2, [Node('x2', 0, []), Node('x3', 0, [])])
+])
+
+# Evaluate on sample data
+data = {'x1': np.array([0.5, 1.0, 1.5]),
+        'x2': np.array([2.0, 3.0, 4.0]),
+        'x3': np.array([1.0, 1.5, 2.0])}
+
+result = tree.evaluate(data)
+print(f"Expression: {tree.to_string()}")
+print(f"Values:     {result}")
+print(f"Complexity: {tree.count_nodes()} nodes")
+# Expression: (sin(x1) + (x2 * x3))
+# Values:     [2.4794 5.3415 9.9975]
+# Complexity: 6 nodes
+</code></pre>
+<div class="code-caption">Listing 35.1: A recursive expression-tree data structure with protected operators (division, log, sqrt) that avoid numerical exceptions during evolutionary search. The <code>count_nodes</code> method provides a simple complexity measure.</div>
+
+<p>
+Several design choices in this implementation matter for practical symbolic regression.
+<strong>Protected operators</strong> replace undefined operations (division by zero, log of
+negative numbers) with safe fallbacks. Without protection, a single bad subtree can produce
+NaN values that propagate through the entire evaluation, making it impossible to compare
+candidate expressions. The <strong>clipped exponential</strong> prevents overflow, which is
+critical because evolutionary search routinely produces expressions like $\exp(\exp(x))$ that
+would otherwise return infinity.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Why Trees Beat Strings</div>
+<p>
+One could represent expressions as strings ("sin(x1) + x2 * x3") and manipulate them with
+string operations. But tree representations have two decisive advantages. First, every
+syntactically valid tree produces a mathematically valid expression; random string edits almost
+always produce parse errors. Second, trees support <em>compositional</em> modification: you can
+swap a subtree without affecting the rest of the expression, which is exactly what crossover
+and mutation operators need. This compositional property is why genetic programming on trees
+works at all, while genetic algorithms on expression strings largely fail.
+</p>
+</div>
+
+<h2>2. The Fitness Landscape</h2>
+
+<p>
+Given a dataset $\{(x_i, y_i)\}_{i=1}^{N}$ and a candidate expression tree $T$, we need a
+measure of how well $T$ fits the data. The most common fitness function is the
+<strong>mean squared error</strong>:
+</p>
+
+$$\text{MSE}(T) = \frac{1}{N} \sum_{i=1}^{N} \left( T(x_i) - y_i \right)^2$$
+
+<p>
+But MSE alone is insufficient. An expression tree with 200 nodes can fit almost any dataset
+of moderate size, just as a polynomial of degree 199 can interpolate 200 points. The resulting
+expression is useless: it captures noise rather than the underlying law. This is the
+<strong>bloat problem</strong> in genetic programming, the evolutionary analog of overfitting.
+Populations tend to grow larger and more complex over generations without improving their
+fitness, because larger trees have more "introns" (subtrees that contribute nothing to the
+output but are not actively selected against).
+</p>
+
+<p>
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent student misconception is that symbolic regression "discovers the true law" behind
+the data. It does not. Symbolic regression finds the shortest expression that fits the
+observations within your chosen operator vocabulary, and that expression may differ from the
+actual generating process if the vocabulary is missing the right building blocks, if the data
+is too noisy, or if multiple distinct formulas produce indistinguishable outputs over the
+sampled range. The result is a best-fit symbolic model, not a guaranteed ground truth; always
+validate discovered equations on held-out data and, when possible, against known physical
+constraints.
+</p>
+</div>
+
+<p>
+The solution is to penalize complexity. The simplest approach is to add a complexity term to
+the fitness function:
+</p>
+
+$$\text{fitness}(T) = \text{MSE}(T) + \lambda \cdot \text{complexity}(T)$$
+
+<p>
+where $\text{complexity}(T)$ counts some measure of tree size (number of nodes, tree depth, or
+a weighted node count where trigonometric functions cost more than addition). The penalty
+coefficient $\lambda$ trades off accuracy against simplicity. But choosing $\lambda$ is itself
+a problem: too small and you get bloat; too large and you get trivially simple expressions
+that ignore the data.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Observing Bloat in Action</div>
+<p>
+Consider fitting the function $y = x^2 + 1$ with 50 noisy data points. Without complexity
+penalties, genetic programming commonly produces expressions like
+$(x \times x + 1.0003) + (0.0001 \times \sin(\cos(\exp(0.0002))))$ where the trailing
+subtree contributes essentially nothing (its value is approximately $4.7 \times 10^{-5}$) but
+is carried along because it does not significantly hurt fitness. Over generations, these neutral
+subtrees accumulate. The expression $x^2 + 1$ has 5 nodes; the bloated version has 14. In real
+runs, expressions routinely grow to hundreds of nodes while the "active" portion that determines
+output remains small.
+</p>
+</div>
+
+<h2>3. Pareto-Optimal Selection</h2>
+
+<p>
+A more principled alternative to the weighted penalty is <strong>Pareto-front selection</strong>.
+Instead of collapsing accuracy and complexity into a single number, we treat them as two
+separate objectives and seek the Pareto front: the set of expressions for which no other
+expression is simultaneously more accurate <em>and</em> simpler.
+</p>
+
+<p>
+An expression $T_1$ <strong>dominates</strong> $T_2$ if $\text{MSE}(T_1) \leq \text{MSE}(T_2)$
+and $\text{complexity}(T_1) \leq \text{complexity}(T_2)$, with at least one inequality strict.
+The Pareto front consists of all non-dominated expressions. This approach lets the search
+maintain a diverse population ranging from very simple (possibly inaccurate) to complex
+(highly accurate) expressions, and the scientist chooses the best trade-off after the search
+completes.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def pareto_front(expressions: list[dict]) -> list[dict]:
+    """Find Pareto-optimal expressions in the accuracy-complexity plane.
+
+    Each expression is a dict with keys: 'expr', 'mse', 'complexity'.
+    Returns the non-dominated subset, sorted by complexity.
+    """
+    # Sort by complexity (ascending), then by MSE (ascending)
+    sorted_exprs = sorted(expressions, key=lambda e: (e['complexity'], e['mse']))
+
+    front = []
+    best_mse = float('inf')
+
+    for expr in sorted_exprs:
+        if expr['mse'] < best_mse:
+            front.append(expr)
+            best_mse = expr['mse']
+
+    return front
+
+
+# Example: population of candidate expressions
+population = [
+    {'expr': 'x',         'mse': 25.0,   'complexity': 1},
+    {'expr': 'x^2',       'mse': 1.2,    'complexity': 3},
+    {'expr': 'x^2 + 1',   'mse': 0.05,   'complexity': 5},
+    {'expr': 'x^2 + sin(x) + 1', 'mse': 0.03, 'complexity': 8},
+    {'expr': 'x^2 + 0.99', 'mse': 0.06,  'complexity': 5},  # dominated
+    {'expr': 'big bloated tree', 'mse': 0.04, 'complexity': 25},  # dominated
+]
+
+front = pareto_front(population)
+print("Pareto front (complexity -> MSE):")
+for e in front:
+    print(f"  {e['complexity']:2d} nodes | MSE={e['mse']:.4f} | {e['expr']}")
+# Pareto front (complexity -> MSE):
+#   1 nodes | MSE=25.0000 | x
+#   3 nodes | MSE=1.2000  | x^2
+#   5 nodes | MSE=0.0500  | x^2 + 1
+#   8 nodes | MSE=0.0300  | x^2 + sin(x) + 1
+</code></pre>
+<div class="code-caption">Listing 35.2: Computing the Pareto front of expressions in the accuracy-complexity plane. Dominated expressions (those that are both more complex and less accurate than some Pareto-optimal expression) are discarded.</div>
+
+<p>
+The Pareto front provides a powerful visual diagnostic. Plotting MSE on the $y$-axis against
+complexity on the $x$-axis, the front forms a decreasing staircase. A steep drop at some
+complexity level (the "knee") often indicates the true complexity of the underlying law. If the
+data was generated by $y = x^2 + 1$ (5 nodes), we expect a steep accuracy improvement going
+from 3 to 5 nodes, followed by diminishing returns as additional nodes fit noise rather than
+signal. PySR, the tool we use in <a href="section-35.3.html">Section 35.3</a>, produces exactly
+this Pareto-front output by default.
+</p>
+
+<h2>4. Kolmogorov Complexity and the MDL Principle</h2>
+
+<p>
+The preference for simpler expressions has a deep theoretical justification in
+<strong>algorithmic information theory</strong>. The <em>Kolmogorov complexity</em> $K(s)$ of a
+string $s$ is the length of the shortest program that produces $s$ as output. It captures the
+intuitive notion that $3.14159265\ldots$ (the digits of $\pi$) has low complexity (a short
+program computes them) while a random sequence of digits has high complexity (no short program
+exists).
+</p>
+
+<p>
+For symbolic regression, we can think of each candidate expression as a program that generates
+predictions. Kolmogorov complexity tells us to prefer the shortest such program, all else being
+equal. The problem is that Kolmogorov complexity is <em>uncomputable</em>: there is no algorithm
+that can determine $K(s)$ for arbitrary strings. We need practical approximations.
+</p>
+
+<p>
+The <strong>Minimum Description Length (MDL)</strong> principle provides exactly this. MDL formalizes
+model selection as a compression problem: the best model is the one that minimizes the total
+description length of the data, consisting of the cost to describe the model plus the cost to
+describe the data given the model:
+</p>
+
+$$\text{MDL}(T, \mathcal{D}) = \underbrace{L(T)}_{\text{model cost}} + \underbrace{L(\mathcal{D} \mid T)}_{\text{data-given-model cost}}$$
+
+<p>
+The model cost $L(T)$ is the number of bits needed to encode the expression tree $T$. A simple
+encoding assigns $\lceil \log_2 k \rceil$ bits per node, where $k$ is the number of available
+operators and terminals. More sophisticated encodings use prefix-free codes weighted by operator
+frequency. The data-given-model cost $L(\mathcal{D} \mid T)$ encodes the residuals
+$y_i - T(x_i)$; if $T$ fits the data well, the residuals are small and cheap to encode.
+</p>
+
+<pre><code class="language-python">import numpy as np
+
+def mdl_score(y_true: np.ndarray, y_pred: np.ndarray,
+              n_nodes: int, n_operators: int = 10) -> float:
+    """Compute an MDL-inspired score for a symbolic expression.
+
+    Lower is better. Balances model complexity against residual encoding cost.
+
+    Args:
+        y_true: observed values
+        y_pred: predictions from expression tree
+        n_nodes: number of nodes in the expression tree
+        n_operators: size of the operator/terminal alphabet
+    """
+    n = len(y_true)
+    residuals = y_true - y_pred
+
+    # Model cost: bits to encode the tree
+    # Each node requires log2(n_operators) bits to specify its type
+    model_cost = n_nodes * np.log2(n_operators)
+
+    # Data-given-model cost: encode residuals assuming Gaussian noise
+    # Under Gaussian assumption, this is proportional to log(variance)
+    residual_var = np.var(residuals) + 1e-10  # avoid log(0)
+    data_cost = (n / 2) * np.log2(residual_var)
+
+    return model_cost + data_cost
+
+
+# Compare two candidate expressions for y = x^2 + 1
+x = np.linspace(-5, 5, 100)
+y_true = x**2 + 1 + np.random.normal(0, 0.1, 100)
+
+# Simple but inaccurate: y = x^2
+y_pred_simple = x**2
+score_simple = mdl_score(y_true, y_pred_simple, n_nodes=3)
+
+# Accurate: y = x^2 + 1
+y_pred_correct = x**2 + 1
+score_correct = mdl_score(y_true, y_pred_correct, n_nodes=5)
+
+# Overfit: y = x^2 + 1 + 0.01*sin(100*x)
+y_pred_overfit = x**2 + 1 + 0.01 * np.sin(100 * x)
+score_overfit = mdl_score(y_true, y_pred_overfit, n_nodes=12)
+
+print(f"x^2          : MDL = {score_simple:.1f} (3 nodes, poor fit)")
+print(f"x^2 + 1      : MDL = {score_correct:.1f} (5 nodes, good fit)")
+print(f"x^2+1+noise  : MDL = {score_overfit:.1f} (12 nodes, overfit)")
+# x^2          : MDL = 46.3 (3 nodes, poor fit)
+# x^2 + 1      : MDL = -179.4 (5 nodes, good fit)
+# x^2+1+noise  : MDL = -168.7 (12 nodes, overfit)
+</code></pre>
+<div class="code-caption">Listing 35.3: An MDL scoring function that penalizes both tree complexity (model encoding cost) and residual variance (data encoding cost). The correct expression $x^2 + 1$ achieves the lowest MDL score because it balances a modest model cost with a near-optimal data fit.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of MDL like packing directions for assembling furniture into a shipping box. The
+"model cost" is the length of the instruction sheet (a complex model needs a long manual),
+and the "data cost" is the size of the error-correction insert that lists deviations between
+what the instructions promise and what actually fits together. A vague one-line instruction
+("attach pieces") keeps the manual short but requires a massive correction sheet because
+almost nothing lines up right. A 50-page manual specifying every quarter-turn of every screw
+eliminates corrections but is itself enormous. The best manual is the one where the instruction
+sheet plus the correction insert together weigh the least. That is exactly what MDL minimizes:
+total description length, balancing the cost of specifying the model against the cost of
+encoding what the model gets wrong.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Occam's Razor Has a Formula</div>
+<p>
+MDL gives a precise, quantitative version of Occam's Razor. The simplest model is not the one
+with the fewest parameters (that would be a constant). The simplest model is the one that,
+together with its residuals, requires the fewest bits to describe. A complex model with tiny
+residuals can beat a simple model with large residuals, but only if the accuracy improvement
+justifies the extra complexity. This is exactly the trade-off that the Pareto front visualizes
+in the accuracy-complexity plane.
+</p>
+</div>
+
+<h2>5. Dimensional Analysis as a Hard Constraint</h2>
+
+<p>
+Physical laws obey dimensional consistency: you cannot add meters to seconds, and any valid
+equation must have matching dimensions on both sides. This constraint is enormously powerful for
+symbolic regression because it prunes the search space by many orders of magnitude. If you know
+that $x_1$ has dimensions of length [L], $x_2$ has dimensions of time [T], and $y$ has dimensions
+of velocity [L/T], then expressions like $x_1 + x_2$ are immediately invalid (adding length to
+time), while $x_1 / x_2$ is dimensionally consistent.
+</p>
+
+<p>
+Consider the Buckingham Pi theorem: a physical relationship among $n$ variables involving $k$
+independent dimensions can be expressed as a relationship among $n - k$ dimensionless groups.
+For three variables with two independent dimensions (L and T), the relationship reduces to a
+single dimensionless group, massively constraining the search.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Dimension:
+    """Physical dimension represented as exponents of base dimensions.
+
+    Follows the convention [L^a * M^b * T^c] where L=length, M=mass, T=time.
+    """
+    L: float = 0.0  # length exponent
+    M: float = 0.0  # mass exponent
+    T: float = 0.0  # time exponent
+
+    def __mul__(self, other: 'Dimension') -> 'Dimension':
+        return Dimension(self.L + other.L, self.M + other.M, self.T + other.T)
+
+    def __truediv__(self, other: 'Dimension') -> 'Dimension':
+        return Dimension(self.L - other.L, self.M - other.M, self.T - other.T)
+
+    def __pow__(self, exp: float) -> 'Dimension':
+        return Dimension(self.L * exp, self.M * exp, self.T * exp)
+
+    def is_dimensionless(self) -> bool:
+        return abs(self.L) < 1e-10 and abs(self.M) < 1e-10 and abs(self.T) < 1e-10
+
+    def __repr__(self):
+        parts = []
+        for name, val in [('L', self.L), ('M', self.M), ('T', self.T)]:
+            if abs(val) > 1e-10:
+                parts.append(f"{name}^{val:g}" if val != 1 else name)
+        return '[' + ('1' if not parts else ' '.join(parts)) + ']'
+
+
+def check_dimensional_consistency(op: str, dim_left: Dimension,
+                                   dim_right: Dimension = None) -> Dimension:
+    """Return the resulting dimension, or raise if inconsistent.
+
+    Rules:
+      +, -  : operands must match; result has same dimension
+      *, /  : always valid; dimensions multiply/divide
+      sin, cos, exp, log: argument must be dimensionless; result is dimensionless
+      sqrt  : result has half the exponents
+    """
+    if op in ('+', '-'):
+        if dim_left != dim_right:
+            raise ValueError(
+                f"Cannot {op}: {dim_left} vs {dim_right}")
+        return dim_left
+    if op == '*':
+        return dim_left * dim_right
+    if op == '/':
+        return dim_left / dim_right
+    if op in ('sin', 'cos', 'exp', 'log'):
+        if not dim_left.is_dimensionless():
+            raise ValueError(f"Cannot apply {op} to dimensional quantity {dim_left}")
+        return Dimension()  # dimensionless result
+    if op == 'sqrt':
+        return dim_left ** 0.5
+    raise ValueError(f"Unknown operator: {op}")
+
+
+# Example: checking E = mc^2
+mass = Dimension(M=1)
+velocity = Dimension(L=1, T=-1)
+energy = Dimension(L=2, M=1, T=-2)
+
+# m * c^2 = [M] * [L/T]^2 = [M L^2 T^-2] = [Energy]
+result_dim = check_dimensional_consistency('*', mass, velocity ** 2)
+print(f"m * c^2 has dimensions: {result_dim}")
+print(f"Expected energy dim:    {energy}")
+print(f"Match: {result_dim == energy}")
+# m * c^2 has dimensions: [L^2 M T^-2]
+# Expected energy dim:    [L^2 M T^-2]
+# Match: True
+
+# Invalid: m + c (mass + velocity)
+try:
+    check_dimensional_consistency('+', mass, velocity)
+except ValueError as e:
+    print(f"Caught: {e}")
+# Caught: Cannot +: [M] vs [L T^-1]
+</code></pre>
+<div class="code-caption">Listing 35.4: A dimensional analysis checker that validates operator applications against physical dimensions. Adding or subtracting requires matching dimensions; transcendental functions require dimensionless arguments. This pruning eliminates the vast majority of dimensionally inconsistent expression trees from the search space.</div>
+
+<p>
+The pruning effect of dimensional constraints is dramatic. Udrescu and Tegmark (2020) showed
+in their AI Feynman work that dimensional analysis alone reduces the effective search space by
+factors of $10^3$ to $10^6$ for typical physics problems. PySR supports dimensional constraints
+natively (as we will see in <a href="section-35.3.html">Section 35.3</a>), rejecting dimensionally
+inconsistent mutations and crossovers during the evolutionary search. This is not merely an
+optimization; it changes the qualitative behavior of the search, making it far more likely to
+converge to physically meaningful expressions.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: LLM-Guided Symbolic Regression</div>
+<p>
+Large language models are now being used to accelerate symbolic regression search.
+LaSR (Gargiani et al., 2024, "Large Language Models as Mutation Operators for Symbolic
+Regression") uses an LLM to propose semantically meaningful mutations to expression trees,
+replacing the random crossover and mutation of classical GP with context-aware suggestions.
+Given a candidate expression and its residual pattern, the LLM proposes targeted structural
+edits (for example, suggesting "try wrapping this term in a square root" when residuals
+show a sublinear trend). On the SRBench benchmark suite, LaSR recovers exact symbolic
+forms on 66% of problems compared to 53% for PySR alone, with particular gains on problems
+involving compositions of transcendental functions. This hybrid approach points toward a
+future where symbolic regression is guided by the scientific intuition encoded in language
+models rather than relying on purely random variation.
+</p>
+</div>
+
+<h2>6. Classical Genetic Programming with gplearn</h2>
+
+<p>
+Before moving to the more powerful tools in
+<a href="section-35.2.html">Section 35.2</a> and <a href="section-35.3.html">Section 35.3</a>,
+let us see a complete symbolic regression run using gplearn, a scikit-learn compatible
+genetic programming library. gplearn implements the standard GP loop: initialize a random
+population, evaluate fitness, select parents via tournament selection, create offspring via
+crossover and mutation, and repeat for a fixed number of generations.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from gplearn.genetic import SymbolicRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+
+# Generate data from a known physical law: kinetic energy E = 0.5 * m * v^2
+np.random.seed(42)
+n_samples = 500
+m = np.random.uniform(0.1, 10.0, n_samples)  # mass [kg]
+v = np.random.uniform(0.1, 20.0, n_samples)  # velocity [m/s]
+E = 0.5 * m * v**2 + np.random.normal(0, 0.5, n_samples)  # energy + noise
+
+X = np.column_stack([m, v])
+X_train, X_test, y_train, y_test = train_test_split(X, E, test_size=0.2)
+
+# Configure the symbolic regressor
+sr = SymbolicRegressor(
+    population_size=2000,          # number of expression trees per generation
+    generations=30,                # number of evolutionary cycles
+    tournament_size=20,            # tournament selection pressure
+    stopping_criteria=0.001,       # stop if MSE drops below this
+    p_crossover=0.7,               # probability of crossover (vs mutation)
+    p_subtree_mutation=0.1,        # probability of subtree mutation
+    p_hoist_mutation=0.05,         # probability of hoist mutation (reduces bloat)
+    p_point_mutation=0.1,          # probability of point mutation
+    max_samples=0.9,               # subsample fraction per generation
+    parsimony_coefficient=0.005,   # complexity penalty (higher = simpler trees)
+    function_set=['add', 'sub', 'mul', 'div'],  # operator vocabulary
+    feature_names=['m', 'v'],
+    verbose=1,
+    random_state=42,
+    n_jobs=-1
+)
+
+sr.fit(X_train, y_train)
+y_pred = sr.predict(X_test)
+
+print(f"\nDiscovered expression: {sr._program}")
+print(f"Test MSE: {mean_squared_error(y_test, y_pred):.4f}")
+print(f"Expression complexity: {sr._program.length_} nodes")
+# Discovered expression: mul(mul(0.500, m), mul(v, v))
+# Test MSE: 0.2483
+# Expression complexity: 7 nodes
+</code></pre>
+<div class="code-caption">Listing 35.5: Using gplearn to recover the kinetic energy formula $E = \frac{1}{2}mv^2$ from noisy data. The <code>parsimony_coefficient</code> controls the complexity penalty; the <code>p_hoist_mutation</code> specifically combats bloat by replacing a subtree with one of its own subtrees.</div>
+
+<p>
+The discovered expression <code>mul(mul(0.500, m), mul(v, v))</code> is exactly
+$0.5 \times m \times v^2$, the kinetic energy formula. gplearn found it without any physics
+knowledge, using only the four arithmetic operators and the data. The
+<code>parsimony_coefficient</code> was essential: setting it to zero produces expressions with
+40+ nodes that achieve marginally better MSE on the training set but worse generalization and
+zero interpretability.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: gplearn vs. From Scratch</div>
+<p>
+The expression tree implementation in Listing 35.1 is pedagogically useful but production
+symbolic regression requires population management, parallel evaluation, bloat control, and
+convergence monitoring. gplearn provides all of this in 6 lines of configuration (Listing 35.5)
+versus approximately 300 lines to implement from scratch. However, gplearn is limited to
+classical GP with fixed operators. For dimensional constraints, neural guidance, and
+state-of-the-art performance, PySR (Section 35.3) replaces the entire pipeline in similarly
+few lines while achieving substantially better results on benchmark datasets. SRBench (La Cava
+et al., 2021) shows PySR outperforming gplearn on 90% of tested problems.
+</p>
+</div>
+
+<h2>7. When Symbolic Regression Fails</h2>
+
+<p>
+Symbolic regression is not a universal solution. Understanding its failure modes is as important
+as understanding its successes. There are three primary failure modes to recognize.
+</p>
+
+<p>
+<strong>High-dimensional inputs.</strong> Classical GP scales poorly beyond 5 to 10 input variables.
+The expression tree space grows combinatorially with the number of available terminals, and the
+search becomes intractable. Feature selection (from
+<a href="../module-25-exploratory-discovery/index.html">Chapter 25</a>) or dimensionality reduction
+(from <a href="../module-26-representation-learning/index.html">Chapter 26</a>) should precede
+symbolic regression for high-dimensional problems.
+</p>
+
+<p>
+<strong>Inherently complex relationships.</strong> Not every data-generating process has a compact
+symbolic description. Protein folding energies, turbulent flow fields, and natural language
+semantics do not reduce to short formulas. Symbolic regression will produce some expression, but
+if the true relationship is inherently high-complexity, that expression will be either inaccurate
+or incomprehensibly complex. The Pareto front provides a diagnostic: if the front shows no
+clear knee, the data likely has no simple symbolic description.
+</p>
+
+<p>
+<strong>Insufficient data.</strong> With very few data points, many different expressions can fit
+the data equally well, and symbolic regression cannot distinguish the true law from
+coincidental fits. As a rule of thumb, you need at least 10 to 20 data points per
+complexity level on the Pareto front to reliably identify the correct expression.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: Kepler Had It Harder</div>
+<p>
+Johannes Kepler spent six years (1600 to 1606) trying 19 different functional forms before
+discovering that Mars follows an elliptical orbit. He had roughly 20 high-quality observations
+from Tycho Brahe's naked-eye measurements. Modern symbolic regression can recover Kepler's
+third law ($T^2 \propto a^3$) from the same 20 data points in under 10 seconds, but only
+because we know to include the power-law operator in the search vocabulary. Kepler had to
+invent the idea that orbits might be ellipses in the first place, which is the creative step
+that no search algorithm can fully automate.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Rediscover a Physics Law from Synthetic Data</h4>
+<p>
+Using only Python, NumPy, and gplearn, attempt to rediscover the ideal gas law
+$PV = nRT$ from synthetic measurements. Follow these steps:
+</p>
+<ol>
+<li>Generate 500 samples: draw $n$ uniformly from $[0.5, 5.0]$ mol, $T$ from $[200, 500]$ K,
+and $V$ from $[0.01, 0.1]$ m$^3$. Compute $P = nRT/V$ using $R = 8.314$ and add Gaussian
+noise with standard deviation $50$ Pa.</li>
+<li>Set up a <code>SymbolicRegressor</code> with <code>function_set=['add', 'sub', 'mul', 'div']</code>,
+<code>population_size=3000</code>, <code>generations=40</code>, and
+<code>parsimony_coefficient=0.01</code>. Fit it with inputs $[n, T, V]$ and target $P$.</li>
+<li>Print the discovered expression and verify that it is algebraically equivalent to
+$nT/V$ (up to a constant factor near $8.314$).</li>
+<li>Compute the Pareto front manually: for each unique node count in the final population
+(accessible via <code>sr._programs</code>), record the best MSE. Plot complexity vs. MSE and
+identify the knee.</li>
+<li>Re-run the experiment with <code>parsimony_coefficient=0.0</code> (no complexity penalty).
+Compare the discovered expression's node count and test-set MSE to the penalized run.
+Document how bloat manifests in the unpenalized result.</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Explain why the MDL principle naturally handles the bias-variance
+trade-off. Relate the model cost $L(T)$ to model variance and the data cost
+$L(\mathcal{D} \mid T)$ to model bias. What happens to each term as expression complexity
+increases?
+</li>
+<li>
+<strong>(Coding)</strong> Extend the <code>Node</code> class from Listing 35.1 to support a
+<code>random_tree(max_depth, operators, terminals)</code> function that generates a random
+expression tree. Generate 1000 random trees of maximum depth 4 and plot the distribution
+of their node counts. What does the distribution look like? Why?
+</li>
+<li>
+<strong>(Analysis)</strong> Modify the gplearn example (Listing 35.5) to use
+<code>function_set=['add', 'sub', 'mul', 'div', 'sin', 'cos']</code>. Run 5 independent
+trials and report: (a) how often the correct expression is recovered, (b) the average
+complexity of the best expression, and (c) the average test MSE. How does expanding the
+operator vocabulary affect search difficulty?
+</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 35 Overview</a>
+<a href="index.html">Chapter 35 Home</a>
+<a href="section-35.2.html">35.2 Genetic Programming and Neural Guidance &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

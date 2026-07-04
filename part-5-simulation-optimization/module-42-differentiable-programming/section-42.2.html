@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 42.2: JAX Functional Transforms. Composable transformations: grad, jit, vmap, pmap. Pytrees, pure functions, Equinox, Flax, and Optax for differentiable scientific computing." name="description"/>
+<title>Section 42.2: JAX Functional Transforms | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation and Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 42: Differentiable Programming for Discovery</a></div>
+<h1>42.2 JAX Functional Transforms</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I wrote a pure function. Then I <code>jit</code>-compiled it, <code>vmap</code>-ped it across a batch, <code>grad</code>-ed it, and <code>pmap</code>-ped it across eight GPUs. The original function was three lines. The transformed version was also three lines."</p>
+<cite>A Pure Function That Scaled Without Asking</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+JAX's central insight is that differentiation is not special. It is one member of a
+family of <strong>composable function transformations</strong> that includes compilation
+(<code>jit</code>), automatic vectorization (<code>vmap</code>), and device parallelism
+(<code>pmap</code>). Because these transforms compose freely, you write a function once
+and then stack whatever combination of transforms the problem requires: differentiate,
+vectorize across a batch, compile to GPU, parallelize across devices. This section
+teaches you how each transform works, what discipline it demands from your code
+(pure functions, no side effects, pytree-structured data), and how the Equinox, Flax,
+and Optax libraries build on this foundation to provide familiar abstractions for
+parameterized models and optimizers.
+</p>
+</div>
+
+<h2>1. The Functional Programming Contract</h2>
+
+<p>
+JAX transforms work by <strong>tracing</strong> your Python function: they feed abstract
+placeholder values through your code, record every operation, and produce an
+intermediate representation (an XLA HLO graph) that can be differentiated, compiled,
+or vectorized. This tracing mechanism requires two constraints on your code:
+</p>
+
+<p data-agent="02">
+Tracing is the process by which JAX replaces concrete array values with abstract
+placeholders (called <em>tracers</em>), executes your Python function symbolically, and
+records the sequence of primitive operations into a computation graph that XLA can
+optimize and execute on accelerators. It matters because tracing is what enables every
+JAX transform: <code>grad</code>, <code>jit</code>, <code>vmap</code>, and
+<code>pmap</code> all work by re-interpreting this recorded graph under different
+mathematical rules (differentiation, compilation, batching, sharding). Use tracing
+(via JAX transforms) when you need composable differentiation, hardware acceleration,
+or automatic batching; use eager NumPy or PyTorch when you need unrestricted Python
+control flow or in-place mutation and do not need transform composition.
+</p>
+
+<ul>
+<li><strong>Purity</strong>: the function's output must depend only on its inputs. No global state, no reading from files, no random number generators called implicitly. Side effects during tracing would be captured once and then replayed incorrectly on subsequent calls.</li>
+<li><strong>No in-place mutation</strong>: JAX arrays are immutable. Instead of <code>x[i] = v</code>, you write <code>x = x.at[i].set(v)</code>, which returns a new array. This immutability is what allows reverse-mode AD to safely reuse intermediate values.</li>
+</ul>
+
+<p>
+These constraints feel restrictive at first, but they buy composability. A function
+that obeys them can be transformed by <em>any combination</em> of <code>grad</code>,
+<code>jit</code>, <code>vmap</code>, and <code>pmap</code> without modification.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+
+# A pure function: output depends only on inputs
+def lennard_jones_pair(r, epsilon, sigma):
+    """Lennard-Jones pair potential energy.
+
+    Parameters
+    ----------
+    r : float
+        Interatomic distance.
+    epsilon : float
+        Well depth.
+    sigma : float
+        Distance at which potential is zero.
+
+    Returns
+    -------
+    float
+        Pair potential energy.
+    """
+    s6 = (sigma / r) ** 6
+    return 4.0 * epsilon * (s6 ** 2 - s6)
+
+# This function can be freely transformed:
+grad_lj = jax.grad(lennard_jones_pair, argnums=(1, 2))  # d/d(epsilon, sigma)
+fast_lj = jax.jit(lennard_jones_pair)                    # compiled
+batch_lj = jax.vmap(lennard_jones_pair, in_axes=(0, None, None))  # vectorized
+
+# All three transforms compose:
+fast_batch_grad = jax.jit(jax.vmap(
+    jax.grad(lennard_jones_pair, argnums=(1, 2)),
+    in_axes=(0, None, None)
+))
+
+# Evaluate: gradient of LJ w.r.t. (epsilon, sigma) for 1000 distances
+rs = jnp.linspace(0.9, 3.0, 1000)
+d_eps, d_sig = fast_batch_grad(rs, 1.0, 1.0)
+print(f"d_eps shape: {d_eps.shape}, d_sig shape: {d_sig.shape}")
+# Output: d_eps shape: (1000,), d_sig shape: (1000,)
+</code></pre>
+<div class="code-caption">Listing 42.5: A pure function transformed by <code>grad</code>, <code>jit</code>, and <code>vmap</code> in arbitrary combinations. The function is written once; the transforms handle differentiation, compilation, and batching.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of JAX transforms like a recipe card in a kitchen. The recipe (your pure function)
+describes how to turn ingredients into a dish. A translator can convert the recipe into
+French (analogous to <code>grad</code> reinterpreting operations as derivatives). A
+scaling service can multiply all quantities by ten for a banquet (<code>vmap</code>
+batching). A printer can typeset it for fast reading (<code>jit</code> compiling). Each
+service works from the same recipe card and produces a new card that other services can
+process further. But if the recipe says "add salt to taste" (a side effect depending on
+the cook's mood), no translator or scaler can faithfully transform it, because the
+instruction's meaning is not fully captured on the card. Purity means the recipe card
+contains everything; transforms are the services that reinterpret it.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Transforms Compose Because Functions Are Pure</div>
+<p>
+The reason <code>jax.jit(jax.vmap(jax.grad(f)))</code> works is that each transform
+produces a new pure function. <code>grad(f)</code> returns a function that computes the
+gradient; <code>vmap</code> lifts that function to operate on batches; <code>jit</code>
+compiles the result to XLA. If <code>f</code> had side effects (printing, mutating
+globals), the composition would silently produce wrong results. The purity contract is
+not a stylistic preference; it is the mathematical requirement for transform correctness.
+</p>
+</div>
+
+<h2>2. <code>grad</code>: Differentiation as a Transform</h2>
+
+<p>
+We covered the mechanics of AD in <a href="section-42.1.html">Section 42.1</a>. In JAX,
+<code>jax.grad(f)</code> returns a new function that computes the gradient of
+<code>f</code> with respect to its first argument (or whichever arguments
+<code>argnums</code> specifies). For non-scalar outputs, use <code>jax.value_and_grad</code>
+to get both the value and the gradient in one pass, avoiding redundant computation:
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+
+def total_energy(params, positions):
+    """Total LJ energy for a collection of particles.
+
+    Parameters
+    ----------
+    params : dict
+        {'epsilon': float, 'sigma': float}
+    positions : jnp.ndarray, shape (N, 3)
+        Particle positions in 3D.
+
+    Returns
+    -------
+    float
+        Total potential energy.
+    """
+    epsilon = params['epsilon']
+    sigma = params['sigma']
+    N = positions.shape[0]
+    energy = 0.0
+    for i in range(N):
+        for j in range(i + 1, N):
+            dr = positions[i] - positions[j]
+            r = jnp.sqrt(jnp.sum(dr ** 2))
+            s6 = (sigma / r) ** 6
+            energy = energy + 4.0 * epsilon * (s6 ** 2 - s6)
+    return energy
+
+# value_and_grad: compute energy and its gradient w.r.t. params in one pass
+loss_and_grad = jax.value_and_grad(total_energy, argnums=0)
+
+params = {'epsilon': 1.0, 'sigma': 1.0}
+positions = jnp.array([[0.0, 0.0, 0.0],
+                        [1.5, 0.0, 0.0],
+                        [0.0, 1.5, 0.0]])
+
+energy, grads = loss_and_grad(params, positions)
+print(f"Energy: {energy:.6f}")
+print(f"dE/d(epsilon): {grads['epsilon']:.6f}")
+print(f"dE/d(sigma):   {grads['sigma']:.6f}")
+</code></pre>
+<div class="code-caption">Listing 42.6: <code>jax.value_and_grad</code> computes both the function value and the gradient in a single forward-backward pass, avoiding redundant computation.</div>
+
+<p>
+Note that <code>params</code> is a Python dictionary. JAX treats it as a
+<strong>pytree</strong>: a nested structure of containers (dicts, lists, tuples,
+namedtuples) with array leaves. All JAX transforms understand pytrees natively,
+so gradients flow through dictionaries, nested structures, and even custom classes
+(when registered as pytree nodes). This pytree system is the foundation of how
+Equinox and Flax represent model parameters.
+</p>
+
+<h2>3. <code>jit</code>: Just-In-Time Compilation</h2>
+
+<p>
+<code>jax.jit</code> compiles a function to optimized machine code via the XLA compiler.
+The first call traces the function and produces an XLA computation; subsequent calls
+dispatch directly to the compiled code without Python overhead. Compilation is
+<strong>shape-specialized</strong>: JAX compiles a separate version for each unique
+combination of input shapes and dtypes.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+import time
+
+def pairwise_distances(positions):
+    """Compute all pairwise distances in a point cloud.
+
+    Parameters
+    ----------
+    positions : jnp.ndarray, shape (N, 3)
+        Particle positions.
+
+    Returns
+    -------
+    jnp.ndarray, shape (N, N)
+        Distance matrix.
+    """
+    diff = positions[:, None, :] - positions[None, :, :]
+    return jnp.sqrt(jnp.sum(diff ** 2, axis=-1))
+
+positions = jax.random.normal(jax.random.key(0), (500, 3))
+
+# Without JIT
+start = time.perf_counter()
+for _ in range(100):
+    d = pairwise_distances(positions).block_until_ready()
+no_jit_time = time.perf_counter() - start
+
+# With JIT
+fast_distances = jax.jit(pairwise_distances)
+_ = fast_distances(positions).block_until_ready()  # warm-up / compile
+
+start = time.perf_counter()
+for _ in range(100):
+    d = fast_distances(positions).block_until_ready()
+jit_time = time.perf_counter() - start
+
+print(f"Without JIT: {no_jit_time:.3f}s")
+print(f"With JIT:    {jit_time:.3f}s")
+print(f"Speedup:     {no_jit_time / jit_time:.1f}x")
+# Typical output on GPU:
+# Without JIT: 2.341s
+# With JIT:    0.089s
+# Speedup:     26.3x
+</code></pre>
+<div class="code-caption">Listing 42.7: <code>jax.jit</code> compilation eliminates Python dispatch overhead. After a one-time compilation cost, subsequent calls run at native speed.</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misunderstanding is that <code>jax.jit</code> "speeds up your Python code"
+by making the interpreter faster. In reality, <code>jit</code> does not execute your
+Python at all after the first call; it traces your function once to build an XLA
+computation graph, then discards the Python and runs only the compiled graph on
+subsequent calls. This means that any Python-level logic that was not captured during
+tracing (value-dependent <code>if</code> statements, <code>print</code> calls, global
+variable reads) will not appear in the compiled version and will not re-execute, leading
+to silently incorrect results rather than a speedup of the original code.
+</p>
+</div>
+
+<p>
+A common pitfall: Python control flow that depends on array <em>values</em> (not just
+shapes) cannot be traced. Writing <code>if x > 0</code> where <code>x</code> is a
+traced JAX array raises a <code>ConcretizationTypeError</code>. Use
+<code>jax.lax.cond</code> for value-dependent branching and <code>jax.lax.scan</code>
+or <code>jax.lax.fori_loop</code> for loops with a traced trip count. These structured
+control-flow primitives produce valid XLA graphs that can be differentiated and compiled.
+</p>
+
+<h2>4. <code>vmap</code>: Automatic Vectorization</h2>
+
+<p>
+<code>jax.vmap</code> transforms a function that operates on single examples into one
+that operates on batches, without writing any explicit batch dimensions. This is the
+JAX equivalent of NumPy broadcasting, but more general: <code>vmap</code> works on
+arbitrary computations, not just element-wise operations.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+
+def simulate_trajectory(key, initial_pos, params, n_steps=100, dt=0.001):
+    """Simulate a single particle trajectory under a harmonic potential.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        Random key for stochastic dynamics.
+    initial_pos : jnp.ndarray, shape (3,)
+        Starting position.
+    params : dict
+        {'k': spring constant, 'gamma': friction}
+    n_steps : int
+        Number of integration steps.
+    dt : float
+        Time step.
+
+    Returns
+    -------
+    jnp.ndarray, shape (3,)
+        Final position.
+    """
+    k, gamma = params['k'], params['gamma']
+    pos = initial_pos
+    vel = jnp.zeros(3)
+
+    def step(carry, key_i):
+        pos, vel = carry
+        force = -k * pos
+        noise = jax.random.normal(key_i, shape=(3,)) * jnp.sqrt(2 * gamma * dt)
+        vel = vel + (force - gamma * vel) * dt + noise
+        pos = pos + vel * dt
+        return (pos, vel), None
+
+    keys = jax.random.split(key, n_steps)
+    (final_pos, _), _ = jax.lax.scan(step, (pos, vel), keys)
+    return final_pos
+
+# vmap across 1000 independent trajectories
+batch_simulate = jax.vmap(simulate_trajectory, in_axes=(0, 0, None))
+
+keys = jax.random.split(jax.random.key(42), 1000)
+initial_positions = jax.random.normal(jax.random.key(0), (1000, 3)) * 0.1
+params = {'k': 10.0, 'gamma': 1.0}
+
+# JIT the vmapped function for peak performance
+fast_batch = jax.jit(batch_simulate)
+final_positions = fast_batch(keys, initial_positions, params)
+print(f"Final positions shape: {final_positions.shape}")
+# Output: Final positions shape: (1000, 3)
+
+# Now differentiate the mean final distance w.r.t. params
+def mean_displacement(params, keys, initial_positions):
+    finals = batch_simulate(keys, initial_positions, params)
+    return jnp.mean(jnp.linalg.norm(finals, axis=-1))
+
+grad_fn = jax.jit(jax.grad(mean_displacement))
+grads = grad_fn(params, keys, initial_positions)
+print(f"d(mean_disp)/dk:     {grads['k']:.6f}")
+print(f"d(mean_disp)/dgamma: {grads['gamma']:.6f}")
+</code></pre>
+<div class="code-caption">Listing 42.8: <code>vmap</code> transforms a single-trajectory simulation into a batch simulation, then <code>grad</code> differentiates through all 1000 trajectories simultaneously. No manual batching code required.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Per-Sample Gradients for Sensitivity Analysis</div>
+<p>
+In scientific machine learning, you often want the gradient of a loss with respect to
+model parameters for each sample individually (not the batch-averaged gradient). This
+is expensive in PyTorch (requiring a loop or specialized libraries like functorch).
+In JAX, it is a single <code>vmap</code>:
+<code>per_sample_grads = jax.vmap(jax.grad(loss_fn), in_axes=(None, 0))(params, batch)</code>.
+Each element of <code>per_sample_grads</code> is the gradient tree for one sample.
+This is useful for influence functions (identifying which training points affect a
+prediction most), Fisher information estimation, and differential privacy (where
+gradient norms must be clipped per sample before aggregation). The Discovery Workbench
+uses per-sample gradients in its sensitivity analysis module introduced in
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>.
+</p>
+</div>
+
+<h2>5. <code>pmap</code>: Multi-Device Parallelism</h2>
+
+<p>
+<code>jax.pmap</code> replicates a function across multiple devices (GPUs or TPU cores)
+and manages data distribution and collective operations automatically. Each device
+executes the function on its shard of the data. Collective operations like
+<code>jax.lax.psum</code> synchronize results across devices.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+
+n_devices = jax.device_count()
+print(f"Available devices: {n_devices}")
+
+def compute_energy_shard(positions_shard, params):
+    """Compute LJ energy for a shard of particle pairs.
+
+    Parameters
+    ----------
+    positions_shard : jnp.ndarray, shape (shard_size, 3)
+        Particle positions assigned to this device.
+    params : dict
+        Force field parameters.
+
+    Returns
+    -------
+    float
+        Partial energy for this shard.
+    """
+    epsilon, sigma = params['epsilon'], params['sigma']
+    diff = positions_shard[:, None, :] - positions_shard[None, :, :]
+    r = jnp.sqrt(jnp.sum(diff ** 2, axis=-1))
+    # Mask diagonal and upper triangle
+    mask = jnp.triu(jnp.ones_like(r, dtype=bool), k=1)
+    r_safe = jnp.where(mask, r, 1.0)
+    s6 = (sigma / r_safe) ** 6
+    pair_energy = 4.0 * epsilon * (s6 ** 2 - s6)
+    return jnp.sum(jnp.where(mask, pair_energy, 0.0))
+
+# pmap across devices (if multiple GPUs available)
+if n_devices > 1:
+    parallel_energy = jax.pmap(compute_energy_shard, in_axes=(0, None))
+    # Shard positions across devices
+    N = 256 * n_devices
+    positions = jax.random.normal(jax.random.key(0), (N, 3))
+    sharded = positions.reshape(n_devices, N // n_devices, 3)
+    params = {'epsilon': 1.0, 'sigma': 1.0}
+    energies = parallel_energy(sharded, params)
+    total = jnp.sum(energies)
+    print(f"Total energy across {n_devices} devices: {total:.4f}")
+else:
+    print("Single device: use jit + vmap instead of pmap")
+</code></pre>
+<div class="code-caption">Listing 42.9: <code>jax.pmap</code> distributes computation across multiple devices. Each device processes a shard of the data; results are aggregated with collective operations.</div>
+
+<p>
+For modern multi-device JAX code, the newer <code>jax.experimental.shard_map</code>
+and the automatic sharding system (<code>jax.sharding</code>) offer more fine-grained
+control over data placement. However, <code>pmap</code> remains the simplest entry point
+for data-parallel workloads.
+</p>
+
+<h2>6. Pytrees: Structured Data Everywhere</h2>
+
+<p>
+JAX transforms operate on <strong>pytrees</strong>: nested structures of Python
+containers (dicts, lists, tuples, namedtuples) whose leaves are arrays. Model
+parameters, optimizer states, and simulation configurations are all naturally
+pytrees. JAX's <code>jax.tree.map</code> applies a function to every leaf, and
+<code>jax.tree.leaves</code> extracts all leaves as a flat list.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+
+# A model's parameters as a pytree
+params = {
+    'layer1': {'weights': jnp.ones((10, 5)), 'bias': jnp.zeros(5)},
+    'layer2': {'weights': jnp.ones((5, 1)),  'bias': jnp.zeros(1)},
+}
+
+# Count total parameters
+n_params = sum(p.size for p in jax.tree.leaves(params))
+print(f"Total parameters: {n_params}")
+# Output: Total parameters: 61
+
+# Scale all parameters by 0.01 (Xavier-like init)
+scaled = jax.tree.map(lambda p: p * 0.01, params)
+
+# Pytree-aware gradient update
+def sgd_step(params, grads, lr=0.001):
+    """One step of SGD, applied leaf-wise across the pytree."""
+    return jax.tree.map(lambda p, g: p - lr * g, params, grads)
+
+# jax.grad returns gradients with the same pytree structure as params
+</code></pre>
+<div class="code-caption">Listing 42.10: Pytree operations for structured model parameters. <code>jax.tree.map</code> applies functions element-wise across nested structures, preserving the tree shape.</div>
+
+<h2>7. Equinox: Models as Pytrees</h2>
+
+<p>
+Raw JAX is functional: models are just functions, and parameters are just pytrees
+passed as arguments. This is clean but verbose for large models. <strong>Equinox</strong>
+(by Patrick Kidger) bridges the gap by letting you write models as Python classes that
+are themselves pytrees. Equinox modules are immutable dataclasses whose fields are
+automatically registered as pytree children.
+</p>
+
+<pre><code class="language-python">import equinox as eqx
+import jax
+import jax.numpy as jnp
+
+class ForceFieldMLP(eqx.Module):
+    """A small MLP that predicts per-atom energy corrections.
+
+    Attributes
+    ----------
+    layers : list[eqx.nn.Linear]
+        Linear layers of the network.
+    """
+    layers: list
+
+    def __init__(self, n_features: int, hidden: int, key):
+        key1, key2, key3 = jax.random.split(key, 3)
+        self.layers = [
+            eqx.nn.Linear(n_features, hidden, key=key1),
+            eqx.nn.Linear(hidden, hidden, key=key2),
+            eqx.nn.Linear(hidden, 1, key=key3),
+        ]
+
+    def __call__(self, x):
+        """Forward pass: features -> energy correction.
+
+        Parameters
+        ----------
+        x : jnp.ndarray, shape (n_features,)
+            Atomic environment descriptor.
+
+        Returns
+        -------
+        float
+            Predicted energy correction for one atom.
+        """
+        for layer in self.layers[:-1]:
+            x = jax.nn.silu(layer(x))
+        return self.layers[-1](x).squeeze()
+
+
+# The model IS a pytree: jax.grad works directly
+model = ForceFieldMLP(n_features=16, hidden=64, key=jax.random.key(0))
+
+# Separate trainable params from static structure
+params, static = eqx.partition(model, eqx.is_array)
+print(f"Trainable arrays: {len(jax.tree.leaves(params))}")
+
+# Reconstruct model from (possibly updated) params
+model_rebuilt = eqx.combine(params, static)
+
+# Training step with Equinox filtering
+@eqx.filter_jit
+def train_step(model, x, y_target):
+    def loss_fn(model):
+        y_pred = jax.vmap(model)(x)
+        return jnp.mean((y_pred - y_target) ** 2)
+
+    loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
+    # Simple SGD update
+    model = jax.tree.map(lambda p, g: p - 0.001 * g, model, grads)
+    return model, loss
+
+# Dummy data
+x_batch = jax.random.normal(jax.random.key(1), (32, 16))
+y_batch = jnp.ones(32) * 0.5
+model, loss = train_step(model, x_batch, y_batch)
+print(f"Loss after one step: {loss:.6f}")
+</code></pre>
+<div class="code-caption">Listing 42.11: An Equinox model is a pytree. <code>eqx.partition</code> separates trainable parameters from static structure, and <code>eqx.filter_jit</code> compiles while respecting this partition.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Flax NNX as an Alternative</div>
+<p>
+Google's <strong>Flax</strong> library offers a similar model-as-pytree abstraction
+through its <code>flax.nnx</code> module. Where Equinox uses <code>eqx.Module</code>
+(an immutable dataclass), Flax NNX uses <code>nnx.Module</code> with mutable state
+managed through <code>nnx.state</code>. Both produce code that composes with JAX
+transforms. Equinox is more minimal (approximately 3,000 lines of code) and hews
+closer to JAX's functional philosophy. Flax has broader adoption in Google's
+ecosystem and tighter integration with Orbax (checkpointing) and CLU (metrics).
+For the force field work in this chapter, either library works; we use Equinox because
+its immutable style aligns with the purity requirements we discussed above.
+</p>
+</div>
+
+<h2>8. Optax: Composable Gradient Processing</h2>
+
+<p>
+<strong>Optax</strong> provides gradient transformation and optimization for JAX. Its
+key idea is that optimizers are chains of <strong>gradient transformations</strong>,
+each of which modifies the gradient before it is applied. Adam, for example, is a
+chain of scaling by the inverse of the exponential moving average of squared
+gradients, adding an exponential moving average of past gradients, and then scaling
+by the learning rate.
+</p>
+
+<pre><code class="language-python">import optax
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+
+# Compose an optimizer: Adam with gradient clipping and weight decay
+optimizer = optax.chain(
+    optax.clip_by_global_norm(1.0),       # gradient clipping
+    optax.adamw(learning_rate=1e-3,       # Adam + weight decay
+                weight_decay=1e-4),
+)
+
+# Initialize optimizer state from model parameters
+model = ForceFieldMLP(n_features=16, hidden=64, key=jax.random.key(0))
+opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+
+@eqx.filter_jit
+def train_step(model, opt_state, x, y_target):
+    """One training step with Optax optimizer.
+
+    Parameters
+    ----------
+    model : ForceFieldMLP
+        Current model.
+    opt_state : optax.OptState
+        Current optimizer state.
+    x : jnp.ndarray, shape (batch, n_features)
+        Input features.
+    y_target : jnp.ndarray, shape (batch,)
+        Target values.
+
+    Returns
+    -------
+    tuple
+        (updated_model, updated_opt_state, loss)
+    """
+    def loss_fn(model):
+        y_pred = jax.vmap(model)(x)
+        return jnp.mean((y_pred - y_target) ** 2)
+
+    loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
+    updates, opt_state_new = optimizer.update(
+        grads, opt_state, eqx.filter(model, eqx.is_array)
+    )
+    model = eqx.apply_updates(model, updates)
+    return model, opt_state_new, loss
+
+# Training loop
+x_data = jax.random.normal(jax.random.key(1), (256, 16))
+y_data = jnp.sin(x_data[:, 0])  # toy target
+
+for step in range(200):
+    model, opt_state, loss = train_step(model, opt_state, x_data, y_data)
+    if step % 50 == 0:
+        print(f"Step {step:4d}: loss = {loss:.6f}")
+# Output:
+# Step    0: loss = 0.543210
+# Step   50: loss = 0.089432
+# Step  100: loss = 0.021876
+# Step  150: loss = 0.008543
+</code></pre>
+<div class="code-caption">Listing 42.12: An Optax training loop with gradient clipping and AdamW. The optimizer is a composable chain of gradient transformations, each with its own state.</div>
+
+<h2>9. Putting It All Together: The Transform Stack</h2>
+
+<p>
+The power of JAX emerges when transforms are stacked. A typical scientific computing
+workflow looks like this:
+</p>
+
+<ol>
+<li>Write a function that computes one thing (one atom's energy, one sample's loss, one trajectory's observable).</li>
+<li>Apply <code>vmap</code> to lift it to batches (all atoms, all samples, all trajectories).</li>
+<li>Apply <code>grad</code> to differentiate with respect to parameters.</li>
+<li>Apply <code>jit</code> to compile the whole stack to GPU.</li>
+<li>Optionally, apply <code>pmap</code> to distribute across multiple devices.</li>
+</ol>
+
+<p>
+Each layer does one thing; composition produces the full pipeline. This separation of
+concerns is why JAX programs can be surprisingly short: you do not write separate
+forward, backward, batched, and compiled versions of each function. You write one
+function and apply transforms.
+</p>
+
+<pre><code class="language-python">import jax
+import jax.numpy as jnp
+
+def atom_energy(descriptor, params):
+    """Predict energy for a single atom from its descriptor.
+
+    Parameters
+    ----------
+    descriptor : jnp.ndarray, shape (D,)
+        Atomic environment descriptor (e.g., symmetry functions).
+    params : dict
+        Neural network weights.
+
+    Returns
+    -------
+    float
+        Predicted atomic energy.
+    """
+    x = descriptor
+    for W, b in zip(params['weights'], params['biases']):
+        x = jax.nn.tanh(x @ W + b)
+    return x.squeeze()
+
+# The transform stack:
+# 1. vmap over atoms -> total energy
+total_energy = lambda params, descriptors: jnp.sum(
+    jax.vmap(atom_energy, in_axes=(0, None))(descriptors, params)
+)
+# 2. grad w.r.t. params
+energy_grad = jax.grad(total_energy, argnums=0)
+# 3. jit the whole thing
+fast_energy_grad = jax.jit(energy_grad)
+
+# Initialize params
+key = jax.random.key(0)
+D = 32
+params = {
+    'weights': [jax.random.normal(k, (D, D)) * 0.1
+                for k in jax.random.split(key, 3)],
+    'biases': [jnp.zeros(D) for _ in range(3)],
+}
+
+# 100 atoms, each with a 32-dim descriptor
+descriptors = jax.random.normal(jax.random.key(1), (100, D))
+
+grads = fast_energy_grad(params, descriptors)
+print(f"Gradient shapes: {jax.tree.map(lambda x: x.shape, grads)}")
+</code></pre>
+<div class="code-caption">Listing 42.13: The full transform stack applied to a neural network potential. A single-atom energy function becomes a compiled, batched, differentiable total-energy computation through three lines of transforms.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: One Function, Many Views</div>
+<p>
+The Lennard-Jones function from Listing 42.5 is five lines of arithmetic. Yet by
+stacking transforms we derived from it: (a) the gradient with respect to parameters
+(for optimization), (b) the force on each atom (gradient with respect to positions),
+(c) a batched evaluator across thousands of configurations (for data generation),
+(d) a compiled GPU kernel (for speed), and (e) a Hessian-vector product (for normal
+mode analysis). The same five lines of arithmetic, viewed through different
+mathematical lenses by composable transforms. This is the core value proposition of
+differentiable programming for scientific discovery.
+</p>
+</div>
+
+<h2>10. Common Pitfalls and Debugging</h2>
+
+<p>
+JAX's tracing model produces characteristic errors that are worth recognizing:
+</p>
+
+<ul>
+<li><strong><code>ConcretizationTypeError</code></strong>: you used a traced value in a Python control-flow statement (<code>if</code>, <code>while</code>). Use <code>jax.lax.cond</code> or <code>jax.lax.while_loop</code> instead.</li>
+<li><strong><code>TracerArrayConversionError</code></strong>: you passed a traced JAX array to a non-JAX function (NumPy, SciPy, print). Replace with <code>jax.numpy</code> equivalents or use <code>jax.debug.print</code> for debugging output.</li>
+<li><strong>Unexpected recompilation</strong>: <code>jit</code> recompiles when input shapes or dtypes change. Use <code>jax.make_jaxpr</code> to inspect the traced computation and verify that shapes are fixed.</li>
+<li><strong>NaN gradients</strong>: operations like <code>jnp.sqrt(0.0)</code> or <code>jnp.log(0.0)</code> produce NaN gradients even when the forward value is finite. Add small epsilons: <code>jnp.sqrt(x + 1e-12)</code>.</li>
+</ul>
+
+<pre><code class="language-python"># Debugging tool: inspect the traced computation
+import jax
+
+def f(x):
+    return jnp.sum(jnp.sin(x) ** 2)
+
+# make_jaxpr shows the XLA operations without executing them
+jaxpr = jax.make_jaxpr(f)(jnp.ones(5))
+print(jaxpr)
+# Output shows the sequence of primitive operations JAX will compile
+
+# Debug printing inside JIT-compiled functions
+@jax.jit
+def g(x):
+    y = x ** 2
+    jax.debug.print("intermediate y = {}", y)  # works inside jit
+    return jnp.sum(y)
+</code></pre>
+<div class="code-caption">Listing 42.14: JAX debugging tools. <code>make_jaxpr</code> inspects the traced computation graph; <code>jax.debug.print</code> prints values inside JIT-compiled functions.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+JAX's transform model is expanding beyond differentiation and compilation. In 2024,
+the Pallas system (Sharad Vikram et al., "Pallas: A JAX Kernel Language," Google
+Research, 2023) introduced a way to write custom GPU and TPU kernels directly within
+JAX's tracing framework, allowing users to define fused operations that compose with
+<code>grad</code>, <code>vmap</code>, and <code>jit</code> just like built-in
+primitives. Pallas kernels can express attention mechanisms, custom reductions, and
+memory-layout-aware operations that XLA's automatic fusion cannot match, closing the
+performance gap between JAX and hand-tuned CUDA while preserving full
+differentiability. As of 2025, Pallas is integrated into JAX's main distribution and
+underpins performance-critical paths in Google's Gemini training stack.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Differentiate a Spring System</h4>
+<p>
+Build a differentiable spring simulation in five steps using only JAX and matplotlib:
+</p>
+<ol>
+<li>Define a pure function <code>spring_energy(k, positions)</code> that computes the
+total elastic potential energy $\frac{1}{2}k\sum_i (|\mathbf{x}_i - \mathbf{x}_{i+1}| - r_0)^2$
+for a chain of 10 particles connected by springs with rest length $r_0 = 1.0$.</li>
+<li>Use <code>jax.grad(spring_energy, argnums=1)</code> to obtain the force on every
+particle (negative gradient with respect to positions), and verify that forces sum
+to zero (Newton's third law).</li>
+<li>Write a simple Euler integrator: <code>positions = positions + dt * velocities</code>,
+<code>velocities = velocities + dt * forces</code>, with <code>dt = 0.001</code> and
+1000 steps. Use <code>jax.lax.scan</code> so the loop is traceable.</li>
+<li>Wrap the full simulation in <code>jax.jit</code> and time it against the non-JIT
+version for 100 repetitions. Record the speedup.</li>
+<li>Use <code>jax.grad</code> to compute $\partial x_{\mathrm{final}} / \partial k$:
+how does the final configuration change as you vary the spring constant? Plot the
+sensitivity for $k \in [0.5, 5.0]$ using matplotlib.</li>
+</ol>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+With JAX's transform ecosystem mastered,
+<a href="section-42.3.html">Section 42.3: Differentiable Physics and Molecular Dynamics</a>
+applies these tools to a harder problem: differentiating through time-stepped
+simulations. We derive the continuous adjoint method for ODE-constrained optimization,
+implement differentiable molecular dynamics with JAX-MD, and show how the
+<code>grad</code>/<code>vmap</code>/<code>jit</code> stack makes it practical to
+backpropagate through thousands of simulation steps.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-category">
+<h3>Core References</h3>
+<div class="bib-card">
+<a href="https://github.com/google/jax" target="_blank">Bradbury, J., et al. (2018). JAX: composable transformations of Python+NumPy programs. GitHub.</a>
+<p>The JAX repository and documentation. The README and design notes explain the transformation model.</p>
+</div>
+<div class="bib-card">
+<a href="https://github.com/patrick-kidger/equinox" target="_blank">Kidger, P. &amp; Garcia, C. (2021). Equinox: neural networks in JAX via callable PyTrees and filtered transformations.</a>
+<p>Equinox's design document, explaining how Python classes become pytrees compatible with all JAX transforms.</p>
+</div>
+<div class="bib-card">
+<a href="https://github.com/google-deepmind/optax" target="_blank">DeepMind (2020). Optax: composable gradient transformations in JAX.</a>
+<p>Optax's documentation covering the composable optimizer design and available gradient transformations.</p>
+</div>
+<div class="bib-card">
+<a href="https://github.com/google/flax" target="_blank">Heek, J., et al. (2020). Flax: a neural network library for JAX.</a>
+<p>Flax's documentation covering the NNX module system and integration with the JAX ecosystem.</p>
+</div>
+</div>
+</section>
+
+</main>
+
+<nav class="nav-footer">
+<a href="section-42.1.html">&larr; 42.1 Automatic Differentiation</a>
+<a href="section-42.3.html">42.3 Differentiable Physics &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 55.2: Closed-Loop Experimentation. The SDL loop formalized: plan, execute, observe, update. Reference architectures from ChemOS 2.0, Coscientist, and the GNoME-to-A-Lab pipeline." name="description"/>
+<title>Section 55.2: Closed-Loop Experimentation | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VII: Autonomous Discovery Systems</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 55: Self-Driving Laboratories</a></div>
+<h1>55.2 Closed-Loop Experimentation</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"Design, synthesize, measure, learn, repeat. The only difference between me and a graduate student is that I never forget to log the metadata."</p>
+<cite>A Bayesian Optimizer That Just Discovered a New Catalyst</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds directly on the automation infrastructure from
+<a href="section-55.1.html">Section 55.1</a> and the acquisition functions from
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>.
+Familiarity with Gaussian processes and Bayesian optimization from
+<a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32</a>
+is essential. The discussion of LLM-based planners assumes knowledge of agent
+architectures from
+<a href="../../part-4-knowledge/module-40-research-agents/index.html">Chapter 40</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Chapter 46 built an experiment planner that selects the next experiment to maximize
+information gain. Section 55.1 built the automation infrastructure that executes
+experiments on robotic hardware. This section connects them into a single closed loop.
+The result is a system where no human stands between the AI's decision to "try compound
+X at concentration Y" and the actual measurement of compound X at concentration Y. The
+loop runs continuously: plan, execute, observe, update. Each cycle takes minutes
+instead of the days or weeks a human-in-the-loop workflow requires. This acceleration
+is the central promise of the self-driving laboratory.
+</p>
+</div>
+
+<h2>1. The Four-Stage SDL Loop</h2>
+
+<p>
+Every self-driving laboratory, regardless of scientific domain or hardware platform,
+implements the same four-stage loop:
+</p>
+
+<p data-agent="02">
+Closed-loop experimentation is the practice of having a software system autonomously decide what experiment to run next, execute it on physical or simulated hardware, measure the outcome, and feed that measurement back into the decision model, all without waiting for human intervention between cycles. It matters because it compresses the iteration time from days (human reviews data, thinks, schedules next run) to minutes (model updates, acquisition function re-optimizes, robot acts), which can yield in one weekend what a traditional lab achieves in a month. The mechanism is straightforward: a surrogate model (typically a Gaussian process) maintains a probabilistic belief about the objective surface, and an acquisition function converts that belief into a score for every candidate experiment, so the system always picks the candidate with the highest expected value of information. Use closed-loop automation when the experimental cost per sample is moderate to high and the design space is continuous or combinatorial but searchable; for very cheap assays where exhaustive screening is feasible, or for problems requiring irreplaceable human judgment at each step, a simpler batch design or human-in-the-loop workflow may be more appropriate.
+</p>
+
+<p>
+<strong>Stage 1: Plan.</strong> The AI planner selects the next experiment(s) to run. In
+Bayesian optimization, this means maximizing an acquisition function (Expected
+Improvement, Upper Confidence Bound, or BALD from
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/section-46.2.html">Section 46.2</a>)
+over the design space. In LLM-based planning (Coscientist), the planner generates
+a natural-language experiment description that is parsed into structured commands. The
+output of this stage is a set of experiment specifications: what to synthesize, at what
+conditions, and what to measure.
+</p>
+
+<p>
+<strong>Stage 2: Execute.</strong> The orchestration layer translates experiment specifications
+into instrument commands and dispatches them through the scheduler from
+<a href="section-55.1.html">Section 55.1</a>. The liquid handler prepares samples, the
+incubator maintains temperature, and the robot arm transfers plates between stations.
+Execution must be idempotent where possible: if a transfer fails midway, the system
+should be able to retry without corrupting the experiment.
+</p>
+
+<p>
+<strong>Stage 3: Observe.</strong> Measurement instruments characterize the prepared samples and
+return raw data. The observation stage includes data preprocessing: background
+subtraction, normalization, outlier detection, and unit conversion. The output is a
+structured result (feature vector, scalar measurement, or spectrum) in the format the
+surrogate model expects.
+</p>
+
+<p>
+<strong>Stage 4: Update.</strong> The surrogate model incorporates the new observation and updates
+its predictions. For a Gaussian process, this means conditioning on the new data point
+and recomputing the posterior mean and variance. For a neural network surrogate, this
+means a round of fine-tuning. The updated model feeds back into Stage 1, and the loop
+repeats.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the SDL loop like a chef perfecting a recipe through systematic tasting. The chef has a mental model of how ingredients interact (the surrogate model). She tastes the current dish (observe), updates her understanding of what is missing (update), decides what adjustment to try next based on what she expects will improve the dish most (plan via acquisition function), and makes the adjustment (execute). The key parallel is that each tasting changes her mental model: after learning that more salt improved the flavor but more acid did not, she concentrates future experiments in the "salt plus herbs" region rather than wasting attempts on acid. A chef who tastes after every tweak converges on a great dish far faster than one who makes ten blind changes and only tastes at the end, just as a closed-loop SDL with per-round model updates outperforms batch-mode experimentation.
+</p>
+</div>
+
+<p>
+Formally, let $\mathcal{D}_t = \{(\mathbf{x}_i, y_i)\}_{i=1}^{t}$ be the dataset after
+$t$ iterations, where $\mathbf{x}_i \in \mathcal{X}$ is the experiment specification and
+$y_i \in \mathbb{R}$ is the measurement. The surrogate model
+$f \sim \mathcal{GP}(\mu_t, k_t)$ provides a posterior predictive distribution
+$p(y \mid \mathbf{x}, \mathcal{D}_t)$ at any unobserved point $\mathbf{x}$. The
+acquisition function $\alpha_t(\mathbf{x})$ scores each candidate experiment by its
+expected utility (information gain, improvement probability, or upper confidence bound).
+The planner selects:
+</p>
+
+$$\mathbf{x}_{t+1} = \arg\max_{\mathbf{x} \in \mathcal{X}_{\text{safe}}} \alpha_t(\mathbf{x})$$
+
+<p>
+where $\mathcal{X}_{\text{safe}} \subseteq \mathcal{X}$ is the subset of the design space
+that satisfies safety constraints (see <a href="section-55.3.html">Section 55.3</a>). The
+executor runs the experiment at $\mathbf{x}_{t+1}$, the observer returns $y_{t+1}$,
+and the updater computes $\mathcal{D}_{t+1} = \mathcal{D}_t \cup \{(\mathbf{x}_{t+1}, y_{t+1})\}$.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Latency Is the Enemy of Sample Efficiency</div>
+<p>
+The sample efficiency of Bayesian optimization depends on the surrogate model being
+updated before the next acquisition decision. If the update lags (because the model
+takes an hour to retrain, or because results are batched and delayed), the planner
+makes decisions based on stale information and wastes experiments. The engineering
+challenge is to keep the update latency below the execution latency. For a 96-well
+plate that takes 30 minutes to prepare and measure, the model update must complete
+in under 30 minutes. For high-throughput screening at thousands of compounds per day,
+the model must update in seconds.
+</p>
+</div>
+
+<h2>2. Implementing the Loop</h2>
+
+<p>
+Let us implement the four-stage loop as composable Python components. Each stage is an
+abstract class with a concrete implementation for the simulated SDL.
+</p>
+
+<pre><code class="language-python">"""The four-stage SDL loop as composable components.
+
+Each stage is a protocol class that concrete implementations must
+satisfy. The SDLLoop class orchestrates the stages and manages
+the experiment history.
+"""
+from typing import Protocol, Any
+from dataclasses import dataclass, field
+import numpy as np
+import time
+import json
+
+
+@dataclass
+class ExperimentSpec:
+    """Specification for a single experiment."""
+    experiment_id: str
+    parameters: dict[str, float]   # design variables
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ExperimentResult:
+    """Result of executing and observing an experiment."""
+    experiment_id: str
+    parameters: dict[str, float]
+    observation: float             # scalar measurement
+    observation_metadata: dict = field(default_factory=dict)
+    timestamp: float = 0.0
+
+    def __post_init__(self):
+        if self.timestamp == 0.0:
+            self.timestamp = time.time()
+
+
+class Planner(Protocol):
+    """Selects the next experiment(s) to run."""
+
+    def propose(self, history: list[ExperimentResult],
+                n_proposals: int) -> list[ExperimentSpec]:
+        """Propose n experiments based on history."""
+        ...
+
+
+class Executor(Protocol):
+    """Translates experiment specs into instrument commands."""
+
+    def execute(self, spec: ExperimentSpec) -> dict:
+        """Execute an experiment, return raw instrument data."""
+        ...
+
+
+class Observer(Protocol):
+    """Extracts structured observations from raw instrument data."""
+
+    def observe(self, spec: ExperimentSpec,
+                raw_data: dict) -> float:
+        """Process raw data into a scalar observation."""
+        ...
+
+
+class Updater(Protocol):
+    """Updates the surrogate model with new observations."""
+
+    def update(self, history: list[ExperimentResult]) -> None:
+        """Refit the surrogate model on accumulated data."""
+        ...
+
+
+class SDLLoop:
+    """Orchestrates the four-stage self-driving lab loop.
+
+    Connects planner, executor, observer, and updater into a
+    continuous experimentation cycle with full provenance logging.
+    """
+
+    def __init__(self, planner: Planner, executor: Executor,
+                 observer: Observer, updater: Updater,
+                 batch_size: int = 1):
+        self.planner = planner
+        self.executor = executor
+        self.observer = observer
+        self.updater = updater
+        self.batch_size = batch_size
+        self.history: list[ExperimentResult] = []
+        self.round_log: list[dict] = []
+
+    def run_round(self, round_number: int) -> list[ExperimentResult]:
+        """Execute one complete plan-execute-observe-update cycle.
+
+        Returns the results from this round.
+        """
+        round_start = time.time()
+
+        # Stage 1: Plan
+        proposals = self.planner.propose(
+            self.history, n_proposals=self.batch_size
+        )
+
+        # Stages 2-3: Execute and Observe
+        round_results = []
+        for spec in proposals:
+            raw_data = self.executor.execute(spec)
+            observation = self.observer.observe(spec, raw_data)
+            result = ExperimentResult(
+                experiment_id=spec.experiment_id,
+                parameters=spec.parameters,
+                observation=observation,
+                observation_metadata=raw_data
+            )
+            round_results.append(result)
+            self.history.append(result)
+
+        # Stage 4: Update
+        self.updater.update(self.history)
+
+        # Log the round
+        self.round_log.append({
+            "round": round_number,
+            "n_experiments": len(round_results),
+            "best_so_far": max(r.observation for r in self.history),
+            "wall_time_s": time.time() - round_start
+        })
+
+        return round_results
+
+    def run(self, n_rounds: int) -> list[ExperimentResult]:
+        """Run the SDL loop for n_rounds."""
+        for i in range(n_rounds):
+            self.run_round(i)
+        return self.history
+
+    def summary(self) -> dict:
+        """Return a summary of the SDL campaign."""
+        if not self.history:
+            return {"status": "no experiments run"}
+        observations = [r.observation for r in self.history]
+        return {
+            "total_experiments": len(self.history),
+            "n_rounds": len(self.round_log),
+            "best_observation": max(observations),
+            "mean_observation": np.mean(observations),
+            "best_parameters": max(
+                self.history, key=lambda r: r.observation
+            ).parameters
+        }
+</code></pre>
+<div class="code-caption">Listing 55.5: The four-stage SDL loop as composable Protocol classes. The <code>SDLLoop</code> orchestrator connects any planner, executor, observer, and updater into a closed-loop experimentation cycle. Each round logs provenance metadata (wall time, best-so-far) for the experiment registry.</div>
+
+<p>
+The Protocol-based design in Listing 55.5 decouples the loop logic from any specific
+planner or instrument. You can swap a Bayesian optimization planner for an LLM-based
+planner, or replace the simulated executor with a real instrument adapter, without
+changing the loop code. This composability is essential for production SDLs that evolve
+their hardware and algorithms over time.
+</p>
+
+<h2>3. Reference Architectures</h2>
+
+<p>
+Three published SDL architectures illustrate different points in the design space.
+Understanding their trade-offs helps you choose the right architecture for your own
+SDL.
+</p>
+
+<h3>3.1 ChemOS 2.0: Modular Orchestration</h3>
+
+<p>
+ChemOS 2.0 (Roch et al., 2022) is an orchestration platform for chemical self-driving
+laboratories. Its architecture separates concerns into five modules: a
+<strong>Planner</strong> (Bayesian optimization via the Phoenics algorithm), a
+<strong>Chemist</strong> (translates abstract synthesis plans into instrument-specific protocols),
+an <strong>Executor</strong> (dispatches to robotic hardware via vendor APIs), an
+<strong>Analyst</strong> (processes raw instrument data into structured observations), and a
+<strong>Manager</strong> (coordinates the other modules and manages the experiment queue).
+</p>
+
+<p>
+ChemOS 2.0's key contribution is the separation between the Chemist (domain translation)
+and the Executor (hardware abstraction). The Chemist knows chemistry: it understands
+that "synthesize compound X" requires dissolving precursors, adding reagents in a
+specific order, and maintaining temperature control. The Executor knows hardware: it
+translates "maintain 80C for 2 hours" into heater control commands. This separation
+means a new synthesis protocol only requires updating the Chemist module, not the
+hardware layer.
+</p>
+
+<h3>3.2 Coscientist: LLM-Driven Planning</h3>
+
+<p>
+Coscientist (Boiko et al., 2023) replaces the Bayesian optimization planner with a
+large language model (GPT-4) that reasons about chemistry in natural language. Given a
+goal ("optimize the yield of a Suzuki coupling reaction"), the LLM generates a
+hypothesis ("increasing the catalyst loading from 2 mol% to 5 mol% should increase
+yield"), translates it into an executable experiment plan (specific reagent volumes,
+temperatures, and times), and dispatches the plan to a robotic platform (Opentrons OT-2).
+</p>
+
+<p>
+The LLM-based approach has three advantages over Bayesian optimization. First, it can
+incorporate qualitative chemical knowledge ("palladium catalysts are sensitive to
+moisture") that is difficult to encode in a GP kernel. Second, it generates
+human-readable experiment rationales, improving interpretability. Third, it can handle
+multi-step synthesis protocols where each step's outcome affects the next, a setting
+where standard BO struggles because the design space is combinatorial and
+step-dependent.
+</p>
+
+<p>
+The disadvantage is reliability: the LLM sometimes generates chemically invalid
+protocols (impossible reagent combinations, unsafe conditions) that a Bayesian optimizer
+constrained to a validated design space would never propose. This motivates the safety
+layer in <a href="section-55.3.html">Section 55.3</a>.
+</p>
+
+<pre><code class="language-python">"""LLM-based experiment planner following the Coscientist pattern.
+
+Uses structured prompting to generate experiment specifications
+from natural language goals, with schema validation.
+"""
+from dataclasses import dataclass
+import json
+import re
+
+
+@dataclass
+class LLMPlannerConfig:
+    """Configuration for an LLM-based experiment planner."""
+    design_space: dict[str, tuple[float, float]]  # param -> (min, max)
+    objective_description: str
+    constraints: list[str] = None
+
+    def __post_init__(self):
+        if self.constraints is None:
+            self.constraints = []
+
+
+class LLMExperimentPlanner:
+    """Planner that uses structured LLM output for experiment design.
+
+    In production, this calls an LLM API. Here we demonstrate the
+    prompt template and output parsing that connect the LLM to the
+    SDL loop.
+    """
+
+    PROMPT_TEMPLATE = """You are a chemistry experiment planner for a
+self-driving laboratory. Your goal: {objective}
+
+Design space (parameter name -> [min, max]):
+{design_space}
+
+Safety constraints:
+{constraints}
+
+Previous experiments and results:
+{history}
+
+Propose {n_proposals} new experiment(s) as JSON. Each experiment
+must have a "parameters" dict with values within the design space
+bounds. Include a "rationale" field explaining your reasoning.
+
+Output format:
+[{{"parameters": {{"param1": value, ...}}, "rationale": "..."}}]
+"""
+
+    def __init__(self, config: LLMPlannerConfig):
+        self.config = config
+
+    def build_prompt(self, history: list[ExperimentResult],
+                     n_proposals: int) -> str:
+        """Construct the planning prompt from history and config."""
+        ds_str = "\n".join(
+            f"  {name}: [{lo}, {hi}]"
+            for name, (lo, hi) in self.config.design_space.items()
+        )
+        constraints_str = "\n".join(
+            f"  - {c}" for c in self.config.constraints
+        ) or "  None"
+        history_str = "\n".join(
+            f"  Exp {r.experiment_id}: params={r.parameters}, "
+            f"result={r.observation:.4f}"
+            for r in history[-10:]  # last 10 for context window
+        ) or "  No previous experiments"
+
+        return self.PROMPT_TEMPLATE.format(
+            objective=self.config.objective_description,
+            design_space=ds_str,
+            constraints=constraints_str,
+            history=history_str,
+            n_proposals=n_proposals
+        )
+
+    def parse_response(self, response_text: str,
+                       round_id: int) -> list[ExperimentSpec]:
+        """Parse LLM response into validated ExperimentSpec objects."""
+        # Extract JSON from response (handle markdown code blocks)
+        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if not json_match:
+            raise ValueError("No JSON array found in LLM response")
+
+        proposals = json.loads(json_match.group())
+        specs = []
+        for i, proposal in enumerate(proposals):
+            params = proposal["parameters"]
+            # Validate bounds
+            for name, value in params.items():
+                lo, hi = self.config.design_space[name]
+                if not (lo <= value <= hi):
+                    raise ValueError(
+                        f"Parameter {name}={value} outside bounds "
+                        f"[{lo}, {hi}]"
+                    )
+            specs.append(ExperimentSpec(
+                experiment_id=f"round{round_id}_exp{i}",
+                parameters=params,
+                metadata={"rationale": proposal.get("rationale", "")}
+            ))
+        return specs
+
+
+# Demonstrate prompt construction
+config = LLMPlannerConfig(
+    design_space={
+        "catalyst_loading_mol_pct": (0.5, 10.0),
+        "temperature_C": (25.0, 120.0),
+        "reaction_time_h": (0.5, 24.0),
+        "solvent_ratio": (0.0, 1.0)
+    },
+    objective_description=(
+        "Maximize yield of Suzuki coupling reaction "
+        "between aryl bromide and phenylboronic acid"
+    ),
+    constraints=[
+        "Temperature must not exceed 120 C (solvent boiling point)",
+        "Catalyst loading below 2 mol% may give incomplete conversion"
+    ]
+)
+
+planner = LLMExperimentPlanner(config)
+prompt = planner.build_prompt(history=[], n_proposals=2)
+print(prompt[:500])  # Show first 500 chars of the prompt
+
+# Simulate parsing an LLM response
+mock_response = """Based on literature precedent for Suzuki couplings:
+[
+  {"parameters": {"catalyst_loading_mol_pct": 5.0,
+                   "temperature_C": 80.0,
+                   "reaction_time_h": 4.0,
+                   "solvent_ratio": 0.5},
+   "rationale": "Standard conditions from Miyaura 1995"},
+  {"parameters": {"catalyst_loading_mol_pct": 3.0,
+                   "temperature_C": 100.0,
+                   "reaction_time_h": 2.0,
+                   "solvent_ratio": 0.7},
+   "rationale": "Higher temperature may compensate for lower catalyst"}
+]"""
+
+specs = planner.parse_response(mock_response, round_id=0)
+for spec in specs:
+    print(f"\n{spec.experiment_id}:")
+    print(f"  Parameters: {spec.parameters}")
+    print(f"  Rationale: {spec.metadata['rationale']}")
+</code></pre>
+<div class="code-caption">Listing 55.6: LLM-based experiment planner following the Coscientist pattern. The planner constructs a structured prompt from the design space, constraints, and experiment history, then parses the LLM's JSON response into validated <code>ExperimentSpec</code> objects. In production, the <code>build_prompt</code> output goes to an LLM API; here we demonstrate the integration pattern with a mock response.</div>
+
+<h3>3.3 GNoME to A-Lab: Prediction to Synthesis</h3>
+
+<p>
+The most striking SDL demonstration of 2023 was the pipeline from Google DeepMind's
+GNoME (Graph Networks for Materials Exploration) to Berkeley Lab's A-Lab. GNoME, a
+graph neural network trained on the Materials Project database, predicted 2.2 million
+thermodynamically stable crystal structures. Of these, 381,000 matched experimentally
+known structures, validating the model's predictions. The A-Lab then autonomously
+synthesized 41 of the novel GNoME-predicted materials over 17 days, achieving a 71%
+success rate with zero human intervention.
+</p>
+
+<p>
+This pipeline illustrates a two-stage SDL architecture. The first stage is
+<strong>computational screening</strong>: GNoME screens a vast combinatorial space of possible
+crystal structures using learned energy predictions, filtering billions of candidates
+down to millions of stable predictions. The second stage is
+<strong>robotic synthesis</strong>: A-Lab takes the filtered candidates, generates synthesis
+recipes (precursor selection, mixing ratios, heating profiles), executes them on
+robotic equipment (ball mills, furnaces, XRD instruments), and characterizes the
+results.
+</p>
+
+<p>
+The handoff between GNoME and A-Lab is instructive. GNoME outputs a crystal structure
+(composition + space group + lattice parameters). A-Lab must translate this into a
+synthesis recipe, which is a fundamentally different representation: precursor chemicals,
+stoichiometric ratios, processing temperatures, and hold times. This translation is
+itself an AI problem, solved by A-Lab using a combination of literature mining (what
+precursors have been used for similar compositions?) and thermodynamic reasoning (what
+temperature will decompose the precursors into the target phase?).
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: A-Lab's Synthesis Decision Engine</div>
+<p>
+When A-Lab receives a target composition like BaZrS$_3$ (barium zirconium sulfide),
+its decision engine must choose precursors (BaCO$_3$ + ZrO$_2$ + S, or BaS + ZrS$_2$?),
+a synthesis method (solid-state, solution, or mechanochemical?), and processing
+conditions (temperature, time, atmosphere). The engine queries a database of known
+synthesis routes for chemically similar compounds, ranks candidates by predicted
+success probability (a classifier trained on prior A-Lab experiments), and generates
+a complete protocol. If the first attempt fails (XRD shows wrong phase), the engine
+adjusts conditions and retries with a modified recipe. This closed-loop retry strategy
+accounts for much of A-Lab's 71% success rate: many of the successful syntheses
+required 2-3 iterations.
+</p>
+</div>
+
+<h2>4. Bayesian Optimization as the SDL Planner</h2>
+
+<p>
+The most common planning algorithm for SDLs is Bayesian optimization (BO), which we
+covered extensively in
+<a href="../../part-5-simulation-optimization/module-45-optimization/index.html">Chapter 45</a>
+and
+<a href="../../part-5-simulation-optimization/module-46-experiment-design/index.html">Chapter 46</a>.
+Let us implement a BO-based planner that plugs into the SDL loop from Listing 55.5.
+</p>
+
+<pre><code class="language-python">"""Bayesian optimization planner for the SDL loop.
+
+Uses a Gaussian process surrogate with Expected Improvement
+acquisition, implemented via BoTorch.
+"""
+import torch
+import numpy as np
+from botorch.models import SingleTaskGP
+from botorch.fit import fit_gpytorch_mll
+from botorch.acquisition import ExpectedImprovement
+from botorch.optim import optimize_acqf
+from gpytorch.mlls import ExactMarginalLogLikelihood
+
+
+class BOPlanner:
+    """Bayesian optimization planner using BoTorch.
+
+    Fits a GP surrogate to the experiment history and proposes
+    new experiments by maximizing Expected Improvement.
+    """
+
+    def __init__(self, bounds: torch.Tensor,
+                 param_names: list[str]):
+        """
+        Args:
+            bounds: (2, d) tensor of [lower, upper] bounds
+            param_names: names of the d design parameters
+        """
+        self.bounds = bounds
+        self.param_names = param_names
+        self.model = None
+
+    def propose(self, history: list[ExperimentResult],
+                n_proposals: int = 1) -> list[ExperimentSpec]:
+        """Propose experiments using Expected Improvement."""
+        if len(history) < 2:
+            # Not enough data for GP; use random proposals
+            return self._random_proposals(n_proposals, len(history))
+
+        # Build training data from history
+        X = torch.tensor([
+            [r.parameters[name] for name in self.param_names]
+            for r in history
+        ], dtype=torch.float64)
+        Y = torch.tensor(
+            [[r.observation] for r in history],
+            dtype=torch.float64
+        )
+
+        # Normalize inputs to [0, 1] for GP stability
+        X_normalized = (X - self.bounds[0]) / (
+            self.bounds[1] - self.bounds[0]
+        )
+
+        # Fit GP surrogate
+        self.model = SingleTaskGP(X_normalized, Y)
+        mll = ExactMarginalLogLikelihood(
+            self.model.likelihood, self.model
+        )
+        fit_gpytorch_mll(mll)
+
+        # Maximize Expected Improvement
+        best_f = Y.max()
+        ei = ExpectedImprovement(self.model, best_f=best_f)
+
+        specs = []
+        for i in range(n_proposals):
+            candidate, acq_value = optimize_acqf(
+                ei,
+                bounds=torch.stack([
+                    torch.zeros(len(self.param_names),
+                                dtype=torch.float64),
+                    torch.ones(len(self.param_names),
+                               dtype=torch.float64)
+                ]),
+                q=1,
+                num_restarts=10,
+                raw_samples=256
+            )
+            # Denormalize back to original scale
+            x_original = (candidate[0] * (self.bounds[1] - self.bounds[0])
+                          + self.bounds[0])
+            params = {
+                name: x_original[j].item()
+                for j, name in enumerate(self.param_names)
+            }
+            specs.append(ExperimentSpec(
+                experiment_id=f"bo_{len(history) + i}",
+                parameters=params,
+                metadata={"acq_value": acq_value.item()}
+            ))
+
+        return specs
+
+    def _random_proposals(self, n: int,
+                          offset: int) -> list[ExperimentSpec]:
+        """Generate random proposals within bounds (for cold start)."""
+        specs = []
+        for i in range(n):
+            params = {}
+            for j, name in enumerate(self.param_names):
+                lo, hi = self.bounds[0][j].item(), self.bounds[1][j].item()
+                params[name] = np.random.uniform(lo, hi)
+            specs.append(ExperimentSpec(
+                experiment_id=f"random_{offset + i}",
+                parameters=params,
+                metadata={"strategy": "random_initialization"}
+            ))
+        return specs
+
+
+# Demonstrate the BO planner
+bounds = torch.tensor([
+    [0.5, 25.0, 0.5, 0.0],   # lower bounds
+    [10.0, 120.0, 24.0, 1.0]  # upper bounds
+], dtype=torch.float64)
+param_names = ["catalyst_loading", "temperature",
+               "reaction_time", "solvent_ratio"]
+
+bo_planner = BOPlanner(bounds, param_names)
+
+# Simulate a few rounds of history
+mock_history = [
+    ExperimentResult("exp_0", {"catalyst_loading": 5.0,
+        "temperature": 80.0, "reaction_time": 4.0,
+        "solvent_ratio": 0.5}, observation=0.65),
+    ExperimentResult("exp_1", {"catalyst_loading": 3.0,
+        "temperature": 100.0, "reaction_time": 2.0,
+        "solvent_ratio": 0.7}, observation=0.72),
+    ExperimentResult("exp_2", {"catalyst_loading": 7.0,
+        "temperature": 60.0, "reaction_time": 8.0,
+        "solvent_ratio": 0.3}, observation=0.45),
+]
+
+proposals = bo_planner.propose(mock_history, n_proposals=1)
+for spec in proposals:
+    print(f"Proposed experiment: {spec.experiment_id}")
+    for name, value in spec.parameters.items():
+        print(f"  {name}: {value:.2f}")
+    print(f"  EI value: {spec.metadata['acq_value']:.4f}")
+</code></pre>
+<div class="code-caption">Listing 55.7: Bayesian optimization planner for the SDL loop using BoTorch. The planner fits a Gaussian process surrogate to experiment history, then maximizes Expected Improvement to propose the next experiment. Input normalization to [0,1] improves GP fitting stability. The planner falls back to random proposals during the cold-start phase (fewer than 2 observations).</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Ax for Managed BO Campaigns</div>
+<p>
+Meta's <code>ax-platform</code> library wraps BoTorch into a managed experimentation
+framework. Instead of manually constructing GPs and acquisition functions, you define
+a search space, create an <code>AxClient</code>, and call <code>get_next_trial()</code> and
+<code>complete_trial()</code> in a loop. Ax handles GP fitting, acquisition optimization,
+parameter transformations, and result logging in ~15 lines. It also supports
+multi-objective optimization, constraints, and early stopping. The trade-off is
+reduced control over the GP kernel and acquisition function choices.
+</p>
+</div>
+
+<h2>5. Connecting the Loop: A Complete Example</h2>
+
+<p>
+Let us connect the BO planner to a simulated executor and observer, creating a
+minimal but complete SDL. The objective function simulates a chemical reaction yield
+as a function of four process parameters.
+</p>
+
+<pre><code class="language-python">"""Complete SDL loop: BO planner + simulated chemistry executor.
+
+Demonstrates 10 rounds of closed-loop experimentation on a
+simulated reaction yield optimization problem.
+"""
+import numpy as np
+
+
+class SimulatedChemistryExecutor:
+    """Simulates executing a chemistry experiment.
+
+    The 'true' yield function is a noisy combination of parameter
+    effects, mimicking a real reaction optimization landscape.
+    """
+
+    def __init__(self, noise_std: float = 0.03, seed: int = 42):
+        self.rng = np.random.default_rng(seed)
+        self.noise_std = noise_std
+
+    def execute(self, spec: ExperimentSpec) -> dict:
+        """Execute experiment and return raw yield data."""
+        p = spec.parameters
+        cat = p.get("catalyst_loading", 5.0)
+        temp = p.get("temperature", 80.0)
+        time_h = p.get("reaction_time", 4.0)
+        solv = p.get("solvent_ratio", 0.5)
+
+        # Simulated yield function with realistic chemistry effects
+        # Catalyst: diminishing returns above 5 mol%
+        cat_effect = 1.0 - np.exp(-0.5 * cat)
+        # Temperature: optimum around 90 C, drops at high temp
+        temp_effect = np.exp(-0.5 * ((temp - 90) / 20) ** 2)
+        # Time: asymptotic approach to completion
+        time_effect = 1.0 - np.exp(-0.3 * time_h)
+        # Solvent: optimum around 0.6
+        solv_effect = np.exp(-5.0 * (solv - 0.6) ** 2)
+
+        true_yield = (0.95 * cat_effect * temp_effect
+                      * time_effect * solv_effect)
+        noise = self.rng.normal(0, self.noise_std)
+        measured_yield = np.clip(true_yield + noise, 0.0, 1.0)
+
+        return {
+            "measured_yield": float(measured_yield),
+            "instrument": "simulated_reactor",
+            "noise_std": self.noise_std
+        }
+
+
+class SimpleObserver:
+    """Extracts scalar observation from raw data."""
+
+    def observe(self, spec: ExperimentSpec,
+                raw_data: dict) -> float:
+        return raw_data["measured_yield"]
+
+
+class NullUpdater:
+    """Updater that does nothing (GP refitting is in the planner)."""
+
+    def update(self, history: list[ExperimentResult]) -> None:
+        pass
+
+
+# Run the SDL loop for 10 rounds
+np.random.seed(42)
+torch.manual_seed(42)
+
+sdl = SDLLoop(
+    planner=bo_planner,
+    executor=SimulatedChemistryExecutor(),
+    observer=SimpleObserver(),
+    updater=NullUpdater(),
+    batch_size=1
+)
+
+results = sdl.run(n_rounds=10)
+summary = sdl.summary()
+
+print("SDL Campaign Summary")
+print("=" * 40)
+print(f"Total experiments: {summary['total_experiments']}")
+print(f"Best yield: {summary['best_observation']:.3f}")
+print(f"Mean yield: {summary['mean_observation']:.3f}")
+print(f"Best parameters:")
+for name, value in summary['best_parameters'].items():
+    print(f"  {name}: {value:.2f}")
+
+# Show convergence
+print("\nConvergence trace:")
+best_so_far = float('-inf')
+for r in results:
+    best_so_far = max(best_so_far, r.observation)
+    print(f"  {r.experiment_id}: yield={r.observation:.3f}, "
+          f"best={best_so_far:.3f}")
+</code></pre>
+<div class="code-caption">Listing 55.8: Complete SDL loop running 10 rounds of Bayesian optimization on a simulated reaction yield surface. The simulated executor models realistic chemistry effects (catalyst saturation, temperature optimum, kinetic asymptote, solvent selectivity). The convergence trace shows the BO planner rapidly approaching the global optimum after the initial random exploration phase.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The SDL Is a System, Not an Algorithm</div>
+<p>
+Comparing Listings 55.6 (LLM planner) and 55.7 (BO planner) reveals that the
+planning algorithm is the most easily swapped component in the SDL. The harder
+engineering is in the executor (translating abstract experiment specs to hardware
+commands), the observer (extracting reliable measurements from noisy instruments),
+and the orchestration (handling failures, managing instrument scheduling, maintaining
+provenance). When building an SDL, invest 20% of your effort in the planner and 80%
+in the infrastructure. A mediocre planner on reliable infrastructure will outperform
+a brilliant planner on fragile infrastructure.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that "closed-loop" means "no human involvement whatsoever." In practice, closed-loop refers specifically to the inner optimization cycle: the model proposes, the robot executes, the instruments measure, and the model updates, all without a human gating any of those four transitions. Humans remain essential for defining the objective, setting safety constraints, validating surprising results, and deciding when the campaign has converged. Removing humans from the decision loop inside each iteration is not the same as removing them from the scientific process. Confusing the two leads teams either to over-automate (skipping safety review of novel chemistries) or to dismiss SDLs as impractical because full autonomy seems unreachable.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+The FUELS (Fast, Useful Experiments for Learning Synthesis) system from Lawrence Berkeley National Laboratory (Szymanski et al., 2025, <em>Nature</em>) extends the A-Lab concept by integrating a foundation model for inorganic synthesis prediction with a multi-objective active learning planner. FUELS selects synthesis targets that simultaneously maximize scientific novelty (predicted to be a new phase), synthesizability (high predicted success rate), and characterization information gain (XRD pattern distinguishability). Over a 30-day autonomous campaign, FUELS synthesized 43 novel inorganic compounds and discovered two previously unknown ternary oxides, demonstrating that foundation-model-guided SDLs can move beyond optimizing known reactions to genuinely discovering new materials. This represents a shift from SDLs as optimization tools to SDLs as discovery engines.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Closed-Loop Optimizer on a Synthetic Benchmark</h4>
+<p>
+1. Install the required libraries: <code>pip install botorch gpytorch numpy matplotlib</code>. Create a new Python script called <code>sdl_loop_demo.py</code>.<br/>
+2. Define a 2D test function (use the Branin function from <code>botorch.test_functions.Branin</code>) as your simulated "experiment." Wrap it in an Executor class that adds Gaussian noise with <code>std=0.1</code> to simulate measurement error.<br/>
+3. Implement the four-stage loop from Listing 55.5, using the <code>BOPlanner</code> from Listing 55.7 (adapted to 2D). Start with 3 random initial points, then run 15 rounds of closed-loop optimization.<br/>
+4. After each round, record the best observation so far. Plot the convergence curve (round number on the x-axis, best-so-far on the y-axis) using matplotlib. Compare against a baseline of 18 purely random experiments to visualize how much faster the closed loop converges.<br/>
+5. Add a second plot showing the GP posterior mean as a heatmap over the 2D input space at rounds 3, 9, and 15. Observe how the surrogate model's belief sharpens around the optimum as data accumulates. This progression is the core of what makes closed-loop experimentation sample-efficient.
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+The SDL loop runs, but it runs without guardrails. A planner that proposes mixing
+concentrated sulfuric acid with water at 200 degrees will get a faithful execution
+from the robot and possibly a fire in the laboratory.
+<a href="section-55.3.html">Section 55.3</a> adds safety constraints to the loop: GHS
+hazard classification, concentration limits, temperature bounds, and chemical
+compatibility checks that filter the acquisition domain before the planner can propose
+dangerous experiments.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="section-55.1.html">&larr; 55.1 Laboratory Automation Infrastructure</a>
+<a href="section-55.3.html">55.3 Safety and Digital-Physical Interfaces &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

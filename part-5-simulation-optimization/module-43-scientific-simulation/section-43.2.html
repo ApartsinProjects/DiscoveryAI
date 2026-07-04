@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 43.2: Stochastic Simulation and Molecular Dynamics. Gillespie algorithm, OpenMM, MDAnalysis, and synthetic data generation from simulators." name="description"/>
+<title>Section 43.2: Stochastic Simulation and Molecular Dynamics | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation &amp; Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 43: Scientific Simulation</a></div>
+<h1>43.2 Stochastic Simulation and Molecular Dynamics</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"I computed the exact probability of every possible next reaction. Then I rolled a die. People think stochastic simulation is random. It is the opposite: it is randomness done correctly."</p>
+<cite>A Propensity Function With Standards</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>When molecules number in the hundreds rather than the billions, the smooth curves of ordinary differential equations lie. A cell with 50 copies of a transcription factor does not experience continuous concentration changes; it experiences discrete, stochastic events: one molecule binds, another degrades, a burst of mRNA appears. The Gillespie algorithm simulates these events exactly, producing sample paths that honor the underlying probability theory. At a different scale, molecular dynamics tracks every atom in a protein as it vibrates, folds, and interacts with water, solving Newton's equations at femtosecond resolution. This section covers both regimes: chemical kinetics at the stochastic level and atomic physics at the molecular level.</p>
+</div>
+
+<h2>1. The Gillespie Algorithm</h2>
+
+<p>The Stochastic Simulation Algorithm (SSA), published by Daniel Gillespie in 1977, solves a problem that deterministic kinetics cannot: simulating the time evolution of a well-stirred chemical system when molecule counts are small enough that stochastic fluctuations matter.</p>
+
+<p><strong>What.</strong> The Gillespie algorithm produces exact sample paths of the Chemical Master Equation (CME), the probability distribution over all possible states of a reaction system. Each sample path is a sequence of discrete reaction events, with both the <em>time</em> of the next event and the <em>identity</em> of the next reaction determined by the current state.</p>
+
+<p><strong>Why.</strong> Deterministic rate equations (ODEs) describe the mean behavior of a system in the limit of infinite molecules. For systems with low copy numbers (gene regulatory networks, single-cell biology, early-stage viral infection), the mean is a poor summary. Stochastic fluctuations drive phenomena like bistability, noise-induced switching, and stochastic focusing that deterministic models miss entirely.</p>
+
+<p><strong>How.</strong> The algorithm maintains a state vector $\mathbf{x} = (x_1, x_2, \ldots, x_N)$ counting the molecules of each species. At each step:</p>
+
+<ol>
+<li>Compute the <em>propensity</em> $a_j(\mathbf{x})$ of each reaction $j$. For a unimolecular reaction $A \to B$ with rate constant $c_j$, the propensity is $a_j = c_j \cdot x_A$. For a bimolecular reaction $A + B \to C$, it is $a_j = c_j \cdot x_A \cdot x_B$.</li>
+<li>Compute the total propensity $a_0 = \sum_j a_j$.</li>
+<li>Draw the time to the next event from an exponential distribution: $\tau \sim \text{Exp}(a_0)$.</li>
+<li>Choose which reaction fires with probability proportional to its propensity: $P(\text{reaction } j) = a_j / a_0$.</li>
+<li>Update the state vector and the clock: $\mathbf{x} \leftarrow \mathbf{x} + \boldsymbol{\nu}_j$, $t \leftarrow t + \tau$, where $\boldsymbol{\nu}_j$ is the stoichiometry vector for reaction $j$.</li>
+</ol>
+
+<p>The beauty of the algorithm is that steps 3 and 4 are <em>exact</em>: no approximation, no discretization error. The sample path is a draw from the true probability distribution over trajectories.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of the Gillespie algorithm like a kitchen with several dishes cooking on different burners. Each dish (reaction) has its own timer, but the timers are not set to fixed intervals; instead, each timer rings sooner when the dish needs more frequent stirring (higher propensity). You always attend to whichever timer rings first, stir that dish, then all the timers reset based on the new state of the kitchen. If one pot boils down (reactant is consumed), its timer slows; if another pot starts bubbling over (product accumulates), its timer speeds up. You never need to check every burner at once; the timers tell you exactly when and where to act next. This is why the algorithm is both event-driven and exact: it lets the system's own dynamics schedule every intervention.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Propensity Is Not Rate</div>
+<p>The propensity $a_j(\mathbf{x})$ is the probability per unit time that reaction $j$ fires in state $\mathbf{x}$. It depends on both the rate constant $c_j$ and the current molecule counts. This state-dependence is what makes the Gillespie algorithm faithful to the underlying physics: as reactants are consumed, the propensity drops; as products accumulate and become reactants for downstream reactions, new propensities rise. The system's dynamics emerge from this interplay, not from a fixed set of rates.</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent mistake is believing that stochastic simulation produces "noisy" or "unreliable" results compared to deterministic ODE models, and that running enough replicates would converge to the ODE solution. This is wrong: the stochasticity is not numerical noise to be averaged away; it is a physical property of the system. When molecule counts are small, the probability distribution over states is broad and often multimodal (for example, a gene regulatory switch can be in an "on" or "off" state, with the ODE solution landing at an unphysical average between the two). The Gillespie algorithm samples from the true distribution; the ODE gives only the mean of that distribution, which may correspond to no physically realizable state at all.</p>
+</div>
+
+<h3>1.1 Implementing the Gillespie Algorithm</h3>
+
+<p>Let us implement the SSA for a concrete system: the Lotka-Volterra predator-prey model, which exhibits the oscillatory dynamics that make stochastic effects most visible.</p>
+
+$$
+\begin{align}
+R_1: &\quad \text{Prey} \xrightarrow{c_1} 2\,\text{Prey} \quad &\text{(prey reproduction)} \\
+R_2: &\quad \text{Prey} + \text{Predator} \xrightarrow{c_2} 2\,\text{Predator} \quad &\text{(predation)} \\
+R_3: &\quad \text{Predator} \xrightarrow{c_3} \emptyset \quad &\text{(predator death)}
+\end{align}
+$$
+
+<pre><code class="language-python">import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class Reaction:
+    """A chemical reaction with reactant indices, stoichiometry, and rate."""
+    name: str
+    reactants: list       # indices into species vector
+    stoichiometry: list   # change in each species when reaction fires
+    rate_constant: float
+
+
+def gillespie_ssa(species_init, reactions, t_max, seed=42):
+    """Exact stochastic simulation using the Gillespie algorithm.
+
+    Args:
+        species_init: initial molecule counts, shape (n_species,)
+        reactions: list of Reaction objects
+        t_max: simulation end time
+        seed: random seed for reproducibility
+
+    Returns:
+        times: array of event times
+        states: array of shape (n_events, n_species)
+    """
+    rng = np.random.default_rng(seed)
+    x = np.array(species_init, dtype=float)
+    t = 0.0
+
+    times = [t]
+    states = [x.copy()]
+
+    while t < t_max:
+        # Step 1: Compute propensities
+        propensities = np.zeros(len(reactions))
+        for j, rxn in enumerate(reactions):
+            prop = rxn.rate_constant
+            for idx in rxn.reactants:
+                prop *= x[idx]
+            propensities[j] = prop
+
+        a0 = propensities.sum()
+        if a0 == 0:
+            break  # no reactions possible (extinction)
+
+        # Step 2: Time to next event
+        tau = rng.exponential(1.0 / a0)
+        t += tau
+
+        if t > t_max:
+            break
+
+        # Step 3: Which reaction fires?
+        j = rng.choice(len(reactions), p=propensities / a0)
+
+        # Step 4: Update state
+        x += reactions[j].stoichiometry
+        x = np.maximum(x, 0)  # guard against numerical issues
+
+        times.append(t)
+        states.append(x.copy())
+
+    return np.array(times), np.array(states)
+
+
+# Define the Lotka-Volterra system
+reactions = [
+    Reaction("prey_birth",     [0],    [1, 0],    0.5),   # Prey -> 2 Prey
+    Reaction("predation",      [0, 1], [-1, 1],   0.005), # Prey + Pred -> 2 Pred
+    Reaction("predator_death", [1],    [0, -1],   0.3),   # Pred -> 0
+]
+
+times, states = gillespie_ssa(
+    species_init=[100, 50],
+    reactions=reactions,
+    t_max=50.0,
+    seed=42,
+)
+
+print(f"Simulation produced {len(times)} events over {times[-1]:.1f} time units")
+print(f"Final state: Prey={states[-1, 0]:.0f}, Predators={states[-1, 1]:.0f}")</code></pre>
+<div class="code-caption">Gillespie SSA for the Lotka-Volterra predator-prey system. Each event is a single reaction firing: a prey birth, a predation event, or a predator death. The stochastic trajectories show noisy oscillations that occasionally lead to extinction, a phenomenon invisible to the deterministic ODE model.</div>
+
+<p>Running multiple replications reveals the stochastic nature of the system. Some trajectories sustain oscillations indefinitely; others terminate in prey extinction (followed inevitably by predator extinction). The deterministic ODE model predicts perfect, eternal cycles. The stochastic model reveals that extinction is not only possible but probable over long time horizons, a qualitative difference that matters for conservation biology and epidemiology.</p>
+
+<h3>1.2 Tau-Leaping: Trading Exactness for Speed</h3>
+
+<p>The Gillespie algorithm is exact but slow: it processes one reaction at a time. For systems with thousands of molecules and fast reactions, the algorithm spends most of its time on events that barely change the state. <em>Tau-leaping</em> accelerates simulation by firing multiple reactions in a single time step.</p>
+
+<p data-agent="02">Tau-leaping is a controlled approximation of the exact Gillespie algorithm that groups many individual reaction events into a single time step, making it the workhorse for simulating chemical systems too large for event-by-event SSA but too small for deterministic ODEs. It matters because exact SSA becomes computationally intractable when systems contain thousands of molecules and hundreds of reaction channels, since each step processes only one event; tau-leaping can reduce the number of simulation steps by two to three orders of magnitude. The mechanism works by choosing a step size $\tau$ small enough that no propensity changes by more than a specified tolerance during the interval, then drawing the number of firings of each reaction from independent Poisson distributions with means $a_j(\mathbf{x}) \cdot \tau$. Use tau-leaping over exact SSA when molecule counts exceed roughly 100 and the system lacks extremely fast reactions that would require tiny $\tau$; fall back to exact SSA for very low copy numbers (under ~20 molecules) where the Poisson approximation breaks down, and switch to deterministic ODEs when counts exceed ~10,000 and stochastic effects become negligible.</p>
+
+<p>The idea is simple: choose a time step $\tau$ small enough that propensities do not change appreciably, then draw the number of times each reaction fires from a Poisson distribution:</p>
+
+$$k_j \sim \text{Poisson}(a_j(\mathbf{x}) \cdot \tau)$$
+
+<pre><code class="language-python">def tau_leaping(species_init, reactions, t_max, tau=0.01, seed=42):
+    """Approximate stochastic simulation using tau-leaping.
+
+    Fires multiple reactions per time step using Poisson-distributed
+    counts. Faster than exact SSA but introduces discretization error.
+    """
+    rng = np.random.default_rng(seed)
+    x = np.array(species_init, dtype=float)
+    t = 0.0
+
+    times = [t]
+    states = [x.copy()]
+
+    while t < t_max:
+        propensities = np.zeros(len(reactions))
+        for j, rxn in enumerate(reactions):
+            prop = rxn.rate_constant
+            for idx in rxn.reactants:
+                prop *= x[idx]
+            propensities[j] = max(prop, 0)
+
+        if propensities.sum() == 0:
+            break
+
+        # Fire multiple reactions in one step
+        for j, rxn in enumerate(reactions):
+            if propensities[j] > 0:
+                n_firings = rng.poisson(propensities[j] * tau)
+                x += n_firings * np.array(rxn.stoichiometry)
+
+        x = np.maximum(x, 0)
+        t += tau
+        times.append(t)
+        states.append(x.copy())
+
+    return np.array(times), np.array(states)
+
+
+times_tl, states_tl = tau_leaping(
+    species_init=[100, 50],
+    reactions=reactions,
+    t_max=50.0,
+    tau=0.01,
+    seed=42,
+)
+print(f"Tau-leaping: {len(times_tl)} steps (vs {len(times)} exact SSA events)")</code></pre>
+<div class="code-caption">Tau-leaping approximation for the Lotka-Volterra system. By firing Poisson-distributed numbers of reactions per fixed time step, tau-leaping reduces the number of simulation steps by orders of magnitude at the cost of small approximation error. The step size $\tau$ controls the speed-accuracy tradeoff.</div>
+
+<div class="callout warning">
+<div class="callout-title">Warning: Negative Populations in Tau-Leaping</div>
+<p>Tau-leaping can produce negative molecule counts when $\tau$ is too large relative to the current populations. The <code>np.maximum(x, 0)</code> guard in the code above is a crude fix. Production implementations use adaptive tau selection (Cao et al., 2006) or the binomial tau-leap variant, which bounds the number of firings by the available reactant molecules. For discovery-oriented work where qualitative behavior matters more than exact counts, the simple guard suffices; for quantitative calibration, use adaptive methods or fall back to exact SSA.</p>
+</div>
+
+<h2>2. Molecular Dynamics with OpenMM</h2>
+
+<p>Molecular dynamics (MD) operates at a different scale from stochastic chemical kinetics. Where the Gillespie algorithm tracks molecule <em>counts</em>, MD tracks every <em>atom</em>: its position, its velocity, and the forces acting on it from every other atom. The simulation integrates Newton's equations of motion at femtosecond ($10^{-15}$ s) resolution, producing trajectories that reveal how proteins fold, how drugs bind, and how materials deform.</p>
+
+<p><strong>What.</strong> Molecular dynamics numerically integrates $\mathbf{F} = m\mathbf{a}$ for every atom in the system, using force fields (parametric functions of atomic positions) to compute interatomic forces at each time step.</p>
+
+<p><strong>Why.</strong> MD provides atomistic resolution that no other experimental technique matches. X-ray crystallography gives you a static snapshot; MD gives you the movie. NMR gives you averaged dynamics; MD gives you individual trajectories. Cryo-EM gives you an ensemble average; MD gives you the ensemble members.</p>
+
+<p><strong>How.</strong> The simulation loop computes forces from the force field, integrates the equations of motion (typically with the Verlet or leapfrog integrator), applies thermostats and barostats to maintain desired temperature and pressure, and writes coordinates to a trajectory file at regular intervals.</p>
+
+<p><strong>When.</strong> Use MD when you need atomistic detail: drug-receptor binding, protein conformational changes, membrane dynamics, or materials properties like elastic moduli and diffusion coefficients. For coarser questions (will this reaction happen? what is the equilibrium constant?), methods like the Gillespie algorithm or free energy calculations are more appropriate.</p>
+
+<h3>2.1 Setting Up an OpenMM Simulation</h3>
+
+<p>OpenMM is a GPU-accelerated MD engine with a Python API that makes it possible to set up, customize, and run simulations entirely from Python. The following example simulates alanine dipeptide, a standard benchmark system for testing enhanced sampling methods.</p>
+
+<pre><code class="language-python">from openmm.app import (
+    PDBFile, ForceField, Simulation, PME, HBonds,
+    DCDReporter, StateDataReporter
+)
+from openmm import LangevinMiddleIntegrator, unit
+import sys
+
+
+def setup_alanine_dipeptide_simulation(
+    pdb_path="alanine_dipeptide.pdb",
+    temperature=300 * unit.kelvin,
+    timestep=2.0 * unit.femtoseconds,
+    friction=1.0 / unit.picosecond,
+    total_steps=500_000,
+    report_interval=1000,
+    trajectory_path="trajectory.dcd",
+):
+    """Set up and run an MD simulation of alanine dipeptide.
+
+    Args:
+        pdb_path: path to the initial structure in PDB format
+        temperature: simulation temperature with units
+        timestep: integration time step
+        friction: Langevin thermostat friction coefficient
+        total_steps: number of integration steps
+        report_interval: save coordinates every N steps
+        trajectory_path: output trajectory file path
+
+    Returns:
+        simulation: the configured OpenMM Simulation object
+    """
+    # Load structure and force field
+    pdb = PDBFile(pdb_path)
+    forcefield = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
+
+    # Create the system with PME electrostatics and rigid water
+    system = forcefield.createSystem(
+        pdb.topology,
+        nonbondedMethod=PME,
+        nonbondedCutoff=1.0 * unit.nanometers,
+        constraints=HBonds,
+    )
+
+    # Langevin integrator for NVT ensemble (constant T)
+    integrator = LangevinMiddleIntegrator(temperature, friction, timestep)
+
+    # Build the simulation object
+    simulation = Simulation(pdb.topology, system, integrator)
+    simulation.context.setPositions(pdb.positions)
+
+    # Energy minimization: remove bad contacts
+    print("Minimizing energy...")
+    simulation.minimizeEnergy()
+
+    # Add reporters for trajectory and energy logging
+    simulation.reporters.append(
+        DCDReporter(trajectory_path, report_interval)
+    )
+    simulation.reporters.append(
+        StateDataReporter(
+            sys.stdout,
+            report_interval * 10,
+            step=True,
+            potentialEnergy=True,
+            temperature=True,
+            speed=True,
+        )
+    )
+
+    # Run the simulation
+    print(f"Running {total_steps} steps...")
+    simulation.step(total_steps)
+    print("Simulation complete.")
+
+    return simulation</code></pre>
+<div class="code-caption">OpenMM simulation of alanine dipeptide with the AMBER14 force field. The Langevin integrator maintains constant temperature, PME handles long-range electrostatics, and the DCD reporter saves coordinates for later analysis with MDAnalysis. The entire setup, from PDB loading to production run, is fewer than 50 lines of Python.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Force Fields Are the Theory</div>
+<p>In molecular dynamics, the force field <em>is</em> the scientific model. It encodes how atoms interact: bond stretches, angle bends, torsional rotations, van der Waals attractions, electrostatic interactions. Choosing AMBER14 vs. CHARMM36 vs. OPLS-AA is choosing a different theory of atomic interactions, each calibrated against different experimental data. When an MD simulation disagrees with experiment, the force field is the first suspect. This parallels the simulator calibration theme of <a href="section-43.3.html">Section 43.3</a>: the force field's parameters are the model's parameters, and their values determine the simulation's fidelity.</p>
+</div>
+
+<h3>2.2 Trajectory Analysis with MDAnalysis</h3>
+
+<p>A raw MD trajectory is a sequence of coordinate snapshots. Science requires computing observables from those coordinates: distances, angles, hydrogen bonds, root-mean-square deviation (RMSD), radius of gyration, and secondary structure content. MDAnalysis provides a unified interface for reading trajectories from dozens of formats and computing these observables efficiently.</p>
+
+<pre><code class="language-python">import MDAnalysis as mda
+from MDAnalysis.analysis import rms, dihedrals
+import numpy as np
+
+
+def analyze_alanine_dipeptide(topology_path, trajectory_path):
+    """Compute key observables from an alanine dipeptide trajectory.
+
+    Args:
+        topology_path: PDB or PSF file with atom connectivity
+        trajectory_path: DCD or XTC trajectory file
+
+    Returns:
+        dict with RMSD, phi/psi angles, and summary statistics
+    """
+    # Load the universe (topology + trajectory)
+    u = mda.Universe(topology_path, trajectory_path)
+
+    # RMSD relative to the first frame
+    rmsd_analysis = rms.RMSD(
+        u,
+        u,  # reference is the first frame
+        select="protein and name CA",
+    )
+    rmsd_analysis.run()
+    rmsd_values = rmsd_analysis.results.rmsd[:, 2]  # column 2 is RMSD
+
+    # Ramachandran angles (phi, psi)
+    protein = u.select_atoms("protein")
+    rama = dihedrals.Ramachandran(protein)
+    rama.run()
+    phi_angles = rama.results.angles[:, :, 0].flatten()
+    psi_angles = rama.results.angles[:, :, 1].flatten()
+
+    results = {
+        "rmsd_mean": np.mean(rmsd_values),
+        "rmsd_std": np.std(rmsd_values),
+        "phi_mean": np.degrees(np.mean(phi_angles)),
+        "psi_mean": np.degrees(np.mean(psi_angles)),
+        "n_frames": len(u.trajectory),
+        "rmsd_timeseries": rmsd_values,
+        "phi_psi": np.column_stack([phi_angles, psi_angles]),
+    }
+
+    print(f"Trajectory: {results['n_frames']} frames")
+    print(f"RMSD: {results['rmsd_mean']:.3f} +/- {results['rmsd_std']:.3f} A")
+    return results
+
+
+def compute_free_energy_surface(phi, psi, n_bins=72, kT=0.596):
+    """Compute the 2D free energy surface from phi/psi samples.
+
+    Args:
+        phi, psi: dihedral angles in degrees
+        n_bins: number of bins per dimension
+        kT: thermal energy in kcal/mol (0.596 at 300K)
+
+    Returns:
+        phi_edges, psi_edges, free_energy (2D array in kcal/mol)
+    """
+    hist, phi_edges, psi_edges = np.histogram2d(
+        phi, psi, bins=n_bins, range=[[-180, 180], [-180, 180]]
+    )
+
+    # Normalize to probability and convert to free energy
+    prob = hist / hist.sum()
+    prob[prob == 0] = prob[prob > 0].min() * 0.01  # avoid log(0)
+    free_energy = -kT * np.log(prob)
+    free_energy -= free_energy.min()  # shift so minimum is zero
+
+    return phi_edges, psi_edges, free_energy</code></pre>
+<div class="code-caption">MDAnalysis pipeline for alanine dipeptide trajectory analysis. RMSD quantifies structural deviation from the starting state. Ramachandran angles (phi, psi) map the conformational landscape. The free energy surface computed from the angle histogram reveals the metastable states (basins) and barriers that govern the peptide's dynamics.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: MDAnalysis Replaces Hundreds of Lines</div>
+<p>Without MDAnalysis, computing RMSD from a DCD trajectory requires: parsing the binary DCD format (50+ lines), handling topology from a separate file (30+ lines), implementing optimal rotation alignment (40+ lines of Kabsch algorithm), and accumulating statistics (20+ lines). MDAnalysis collapses this to <code>rms.RMSD(u, u, select="protein").run()</code>: one line, three arguments. It supports over 30 trajectory formats, handles periodic boundary conditions automatically, and provides built-in analysis modules for RMSD, RMSF, hydrogen bonds, contacts, density, and more. The library handles the I/O and the geometry; you define what to measure.</p>
+</div>
+
+<h2>3. Connecting Scales: From Molecules to Populations</h2>
+
+<p>The Gillespie algorithm and molecular dynamics operate at different scales, but they are not isolated. In practice, multiscale simulation pipelines use MD to compute parameters (rate constants, binding free energies) that feed into stochastic simulations of larger systems. For example, MD can estimate the binding rate of a transcription factor to DNA, and that rate becomes the propensity constant in a Gillespie simulation of gene expression.</p>
+
+<pre><code class="language-python">def md_to_gillespie_rate(
+    binding_free_energy_kcal,
+    temperature_K=300.0,
+    attempt_frequency=1e9,
+):
+    """Convert an MD-computed binding free energy to a Gillespie rate constant.
+
+    Uses transition state theory: k = v * exp(-dG / kT)
+
+    Args:
+        binding_free_energy_kcal: binding free energy in kcal/mol
+        temperature_K: temperature in Kelvin
+        attempt_frequency: pre-exponential factor in 1/s
+
+    Returns:
+        rate_constant: in units compatible with Gillespie propensities
+    """
+    kT_kcal = 0.001987 * temperature_K  # Boltzmann constant in kcal/(mol*K)
+    rate = attempt_frequency * np.exp(
+        -binding_free_energy_kcal / kT_kcal
+    )
+    return rate
+
+
+# Example: MD estimates binding free energy of -8 kcal/mol
+k_bind = md_to_gillespie_rate(-8.0)
+print(f"Binding rate constant: {k_bind:.2e} /s")</code></pre>
+<div class="code-caption">Converting an MD-computed binding free energy into a rate constant for the Gillespie algorithm using transition state theory. This multiscale bridge lets atomistic simulations inform stochastic models of cellular processes.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Drug Resistance Through Multiscale Simulation</div>
+<p>Understanding how a single amino acid mutation confers drug resistance requires connecting atomic and cellular scales. At the MD level, you simulate the drug bound to the wild-type and mutant receptors, computing the change in binding free energy ($\Delta\Delta G$). At the Gillespie level, you translate this energy change into altered rate constants for drug binding and unbinding, then simulate the cellular signaling network to predict how the mutation affects downstream pathway activity. This multiscale approach has been used to predict resistance mutations in kinase inhibitors for cancer therapy (Shirts et al., 2017) and to design second-generation drugs that overcome the resistance mechanism.</p>
+</div>
+
+<h2>4. Generating Synthetic Data from Simulators</h2>
+
+<p>Both the Gillespie algorithm and MD serve as sources of synthetic data for machine learning. The key difference from the synthetic data discussion in <a href="section-43.1.html">Section 43.1</a> is that molecular-scale simulators produce <em>physically grounded</em> data: every sample path obeys conservation laws, thermodynamic constraints, and the statistical mechanics of the underlying system.</p>
+
+<h3>4.1 Stochastic Trajectories as Training Data</h3>
+
+<p>Gillespie trajectories can train surrogate models that predict system behavior without running the full simulation. This is particularly valuable when the simulator is embedded in an optimization loop (as in <a href="section-43.3.html">Section 43.3</a>) and must be called thousands of times.</p>
+
+<pre><code class="language-python">def generate_trajectory_dataset(
+    reactions, param_ranges, n_trajectories=1000,
+    species_init=None, t_max=50.0, n_timepoints=100,
+    seed=42,
+):
+    """Generate a dataset of Gillespie trajectories with varied parameters.
+
+    Args:
+        reactions: list of Reaction templates (rate constants will be overridden)
+        param_ranges: dict mapping parameter name to (low, high) range
+        n_trajectories: number of trajectories to generate
+        species_init: initial species counts
+        t_max: simulation duration
+        n_timepoints: number of evenly spaced time points for interpolation
+        seed: random seed
+
+    Returns:
+        params_array: shape (n_trajectories, n_params)
+        trajectories: shape (n_trajectories, n_timepoints, n_species)
+    """
+    rng = np.random.default_rng(seed)
+    t_eval = np.linspace(0, t_max, n_timepoints)
+
+    param_names = list(param_ranges.keys())
+    n_params = len(param_names)
+    n_species = len(species_init)
+
+    params_array = np.zeros((n_trajectories, n_params))
+    trajectories = np.zeros((n_trajectories, n_timepoints, n_species))
+
+    for i in range(n_trajectories):
+        # Sample parameters uniformly from ranges
+        params = {}
+        for j, name in enumerate(param_names):
+            lo, hi = param_ranges[name]
+            val = rng.uniform(lo, hi)
+            params[name] = val
+            params_array[i, j] = val
+
+        # Update reaction rate constants
+        rxns_copy = []
+        for rxn in reactions:
+            rc = Reaction(
+                rxn.name, rxn.reactants, rxn.stoichiometry,
+                params.get(rxn.name, rxn.rate_constant),
+            )
+            rxns_copy.append(rc)
+
+        # Run Gillespie
+        run_seed = rng.integers(0, 2**31)
+        times, states = gillespie_ssa(
+            species_init, rxns_copy, t_max, seed=run_seed
+        )
+
+        # Interpolate to fixed time grid
+        for s in range(n_species):
+            trajectories[i, :, s] = np.interp(t_eval, times, states[:, s])
+
+    return params_array, trajectories
+
+
+# Generate 500 Lotka-Volterra trajectories with varied parameters
+param_ranges = {
+    "prey_birth": (0.2, 1.0),
+    "predation": (0.002, 0.01),
+    "predator_death": (0.1, 0.5),
+}
+
+params, trajs = generate_trajectory_dataset(
+    reactions=reactions,
+    param_ranges=param_ranges,
+    n_trajectories=500,
+    species_init=[100, 50],
+    t_max=50.0,
+    seed=42,
+)
+print(f"Generated dataset: params {params.shape}, trajectories {trajs.shape}")</code></pre>
+<div class="code-caption">Generating a dataset of stochastic trajectories with varied parameters for training surrogate models. Each trajectory is interpolated to a fixed time grid for compatibility with standard neural network architectures. The parameter ranges define the prior distribution over plausible model configurations.</div>
+
+<h3>4.2 MD Snapshots as Training Data for ML Potentials</h3>
+
+<p>Molecular dynamics trajectories provide training data for machine-learned interatomic potentials, a rapidly growing field at the intersection of simulation and AI. The idea is to train a neural network to predict forces and energies from atomic coordinates, replacing the classical force field with a learned function that can achieve quantum-mechanical accuracy at a fraction of the computational cost.</p>
+
+<pre><code class="language-python">def extract_ml_training_data(topology_path, trajectory_path, stride=10):
+    """Extract atomic coordinates and properties from an MD trajectory
+    for training machine learning potentials.
+
+    Args:
+        topology_path: topology file (PDB, PSF)
+        trajectory_path: trajectory file (DCD, XTC)
+        stride: use every Nth frame to reduce correlation
+
+    Returns:
+        coordinates: shape (n_frames, n_atoms, 3)
+        atom_types: shape (n_atoms,) integer atom type indices
+        metadata: dict with species names and counts
+    """
+    u = mda.Universe(topology_path, trajectory_path)
+    atoms = u.select_atoms("all")
+
+    # Map element symbols to integer indices
+    elements = atoms.elements
+    unique_elements = sorted(set(elements))
+    element_to_idx = {e: i for i, e in enumerate(unique_elements)}
+    atom_types = np.array([element_to_idx[e] for e in elements])
+
+    # Extract coordinates from every stride-th frame
+    coords_list = []
+    for ts in u.trajectory[::stride]:
+        coords_list.append(atoms.positions.copy())
+
+    coordinates = np.array(coords_list)
+
+    metadata = {
+        "elements": unique_elements,
+        "n_atoms": len(atoms),
+        "n_frames": len(coords_list),
+        "stride": stride,
+    }
+
+    print(f"Extracted {metadata['n_frames']} frames, "
+          f"{metadata['n_atoms']} atoms, "
+          f"elements: {metadata['elements']}")
+
+    return coordinates, atom_types, metadata</code></pre>
+<div class="code-caption">Extracting atomic coordinates from an MD trajectory for training machine-learned interatomic potentials. The stride parameter reduces temporal correlation between frames. The output format (coordinates + atom types) is compatible with training frameworks like SchNet, NequIP, and MACE.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: ML Potentials for Materials Discovery</div>
+<p>Google DeepMind's GNoME project (2023) used MD trajectories from density functional theory (DFT) calculations to train graph neural network potentials that predict the stability of inorganic crystals. By running the trained potential on millions of candidate structures (far more than DFT could handle), they identified over 380,000 stable materials, expanding the known stable crystal database by an order of magnitude. The pipeline is: run expensive quantum simulations on a training set, train a neural network to reproduce those forces, then use the network as a fast surrogate for screening. This synthetic-data-from-simulation approach connects directly to the surrogate modeling ideas from <a href="../../part-3-data-models/module-33-scientific-ml/index.html">Chapter 33 (Scientific ML)</a>.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>The MACE-MP-0 universal foundation model for atomistic simulations (Batatia et al., 2023, arXiv:2401.00096) represents a shift from training per-system ML potentials to building a single pretrained model that generalizes across the periodic table. Trained on over 150,000 DFT calculations from the Materials Project, MACE-MP-0 achieves near-DFT accuracy for energy and force predictions on diverse inorganic materials without any fine-tuning, and can be specialized to new chemistries with only a few hundred additional data points. This "foundation model for force fields" paradigm parallels the pretrained language model approach: a large, expensive pretraining phase produces a general-purpose model, and cheap fine-tuning adapts it to specific domains. For practitioners, it means that running accurate atomistic simulations of novel materials no longer requires generating a custom quantum-mechanical training set from scratch.</p>
+</div>
+
+<h2>5. Choosing the Right Simulation Scale</h2>
+
+<p>The choice between stochastic simulation, molecular dynamics, and the agent-based/DES models from <a href="section-43.1.html">Section 43.1</a> depends on the scientific question, not the available software. The table below summarizes the tradeoffs.</p>
+
+<figure class="table-figure">
+<table>
+<thead>
+<tr>
+<th>Paradigm</th>
+<th>Scale</th>
+<th>State</th>
+<th>Time Step</th>
+<th>Best For</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Molecular Dynamics</td>
+<td>Atoms (10<sup>3</sup> to 10<sup>6</sup>)</td>
+<td>Positions, velocities</td>
+<td>1-2 fs</td>
+<td>Binding, folding, materials</td>
+</tr>
+<tr>
+<td>Gillespie SSA</td>
+<td>Molecules (10<sup>0</sup> to 10<sup>4</sup>)</td>
+<td>Counts</td>
+<td>Variable (exact)</td>
+<td>Gene networks, signaling</td>
+</tr>
+<tr>
+<td>Tau-leaping</td>
+<td>Molecules (10<sup>2</sup> to 10<sup>6</sup>)</td>
+<td>Counts</td>
+<td>Fixed (approximate)</td>
+<td>Faster kinetics, larger systems</td>
+</tr>
+<tr>
+<td>Agent-based</td>
+<td>Individuals (10<sup>1</sup> to 10<sup>7</sup>)</td>
+<td>Agent attributes</td>
+<td>Fixed tick</td>
+<td>Emergence, heterogeneity</td>
+</tr>
+<tr>
+<td>Discrete-event</td>
+<td>Processes</td>
+<td>Queues, resources</td>
+<td>Event-driven</td>
+<td>Throughput, capacity</td>
+</tr>
+</tbody>
+</table>
+<figcaption>Figure 43.1: Simulation paradigm selection guide. The choice depends on the spatial and temporal scale of the question, the nature of the state variables, and the type of insight sought.</figcaption>
+</figure>
+
+<h2>6. Summary</h2>
+
+<p>Stochastic simulation and molecular dynamics provide exact or near-exact models of chemical and physical systems at scales where deterministic approximations fail. The Gillespie algorithm produces faithful sample paths of chemical kinetics when molecule counts are low. Tau-leaping trades exactness for speed when populations are large enough. Molecular dynamics resolves atomic-level detail for protein folding, drug binding, and materials science. Both paradigms generate physically grounded synthetic data for training machine learning models. The multiscale bridge between MD-computed energies and Gillespie rate constants connects atomistic detail to cellular behavior. In the next section, we address the central challenge that all these simulators share: how do you choose the parameter values?</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Stochastic Gene Expression Toggle Switch</h4>
+<p>Build a Gillespie simulation of the genetic toggle switch (Gardner et al., 2000), a two-gene system where each gene represses the other, using only NumPy. This classic system exhibits bistability that is invisible to deterministic models.
+<strong>Step 1.</strong> Define two species (Protein A, Protein B) and four reactions: production of A (repressed by B, with propensity $c_1 / (1 + x_B^2)$), degradation of A (propensity $c_2 \cdot x_A$), production of B (repressed by A, with propensity $c_3 / (1 + x_A^2)$), and degradation of B (propensity $c_4 \cdot x_B$). Use $c_1 = c_3 = 50$, $c_2 = c_4 = 0.1$.
+<strong>Step 2.</strong> Adapt the <code>gillespie_ssa</code> function from this section to support non-mass-action propensities by passing a custom propensity function for each reaction instead of computing propensities from reactant counts alone.
+<strong>Step 3.</strong> Run 20 trajectories with identical initial conditions ($x_A = x_B = 10$) for $t_{\max} = 500$ and plot all trajectories of $x_A$ on one axis. You should see some trajectories settle into a high-A/low-B state and others into a low-A/high-B state.
+<strong>Step 4.</strong> Scatter-plot the final $(x_A, x_B)$ values across all 20 runs. The points should cluster around two distinct basins, confirming bistability.
+<strong>Step 5.</strong> Compare with the deterministic ODE solution (use <code>scipy.integrate.solve_ivp</code>) starting from the same initial conditions. The ODE settles to a single symmetric fixed point; the stochastic model reveals the two stable states that the ODE misses entirely.</p>
+</div>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p><a href="section-43.3.html">Section 43.3: Simulator Calibration</a> tackles the inverse problem: given observed data, what parameter values make your simulator reproduce reality? When the simulator has no tractable likelihood function (as is the case for all the simulators in this section), Approximate Bayesian Computation provides a principled, likelihood-free solution.</p>
+</section>
+
+</main>
+
+<footer>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="edition-note">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+</footer>
+</body>
+</html>

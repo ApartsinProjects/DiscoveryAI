@@ -1,0 +1,1415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 21.3: Building an Agent-Assisted Pipeline. End-to-end CI/CD pipeline with AI agents for build, test, deploy, and monitor stages, plus synthetic incident postmortem." name="description"/>
+<title>Section 21.3: Building an Agent-Assisted Pipeline | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 21: AI for DevOps and Platform Engineering</a></div>
+<h1>21.3 Building an Agent-Assisted Pipeline</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The pipeline does not sleep, does not take vacation, and does not forget the runbook. It also does not understand why the database is on fire. That part still requires a human, or at the very least, a very well-prompted agent."</p>
+<cite>A Kubernetes Pod in CrashLoopBackOff, Reflecting on Its Life Choices</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section synthesizes the CI/CD pipeline patterns from
+<a href="section-21.1.html">Section 21.1</a> and the observability and incident analysis
+techniques from <a href="section-21.2.html">Section 21.2</a> into an integrated system.
+You should also be familiar with the multi-agent orchestration patterns from
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17</a> and the MCP server
+architecture from <a href="../module-12-mcp-servers/index.html">Chapter 12</a>, as the
+agent-assisted pipeline uses both. The Discovery Workbench integration connects to the
+system architecture established in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The previous two sections built the components: CI/CD pipelines that transform code into
+deployments, and observability systems that detect and diagnose failures. This section
+connects them into a closed loop. An AI agent monitors the pipeline, interprets failures,
+suggests fixes, and feeds operational insights back into the development process. The
+result is not just automation (running predefined steps faster) but <em>intelligence</em>
+(adapting the pipeline based on what it learns). This closes the discovery loop that
+began in <a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>:
+the pipeline observes outcomes, updates its model of what works, and adjusts its strategy
+for the next iteration.
+</p>
+</div>
+
+<h2>1. Architecture of an Agent-Assisted Pipeline</h2>
+
+<p>
+An agent-assisted CI/CD pipeline wraps each pipeline stage with an AI layer that can
+observe, decide, and act. The agent does not replace the pipeline; it augments it. The
+pipeline still runs builds, tests, and deployments through deterministic tools (GitHub
+Actions, Docker, Terraform). The agent adds three capabilities: <strong>pre-stage
+analysis</strong> (should we skip or modify this stage based on the change?),
+<strong>failure interpretation</strong> (what does this error mean, and can we fix it
+automatically?), and <strong>cross-stage learning</strong> (how should we adjust future
+stages based on what happened in earlier ones?).
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that "agent-assisted" means the AI agent <em>decides</em>
+whether code reaches production. In this architecture the agent never holds unilateral
+authority over irreversible actions; it proposes, and a human (or a strict policy gate)
+approves. The agent's value is in interpreting ambiguous signals and filtering noise, not
+in replacing the approval chain.
+</p>
+</div>
+
+<p data-agent="02">
+An agent-assisted pipeline is a CI/CD system where a language model sits between
+pipeline stages, consuming structured events (build logs, test verdicts, deployment
+status codes) and emitting structured actions (skip, retry, escalate, roll back). It
+matters because traditional pipelines follow static "if red then stop" logic, while an
+agent can weigh ambiguous signals (a test that fails only on certain data, an error
+message that implies a transient network blip) and choose the response most likely to
+keep the release moving safely. The mechanism is straightforward: each stage publishes
+its result as a JSON object; the agent reads that object alongside accumulated context
+from earlier stages, queries an LLM with a constrained prompt, and maps the LLM's
+structured reply to a concrete pipeline action. Use an agent-assisted pipeline when your
+failure modes are diverse enough that hand-written conditional logic would become
+unmanageable; for pipelines with only one or two stages and deterministic outcomes, a
+simple "fail and alert" strategy is cheaper and easier to audit.
+</p>
+
+<p>
+The architecture follows the tool-use agent pattern from
+<a href="../module-12-mcp-servers/index.html">Chapter 12</a>. Each pipeline stage exposes
+its inputs and outputs through a structured interface. The agent receives events from
+the pipeline (stage started, stage completed, stage failed), queries the relevant tools
+for context (build logs, test results, deployment status, monitoring metrics), and takes
+actions (retry a stage, skip a stage, create an issue, trigger a rollback). The agent's
+decision-making is bounded by a policy that defines what it can do autonomously (retry a
+flaky test) and what requires human approval (deploy to production, roll back a release).
+</p>
+
+<pre><code class="language-python">"""
+Agent-assisted CI/CD pipeline orchestrator.
+Wraps pipeline stages with AI-driven decision making for
+failure interpretation, adaptive test selection, and
+automated remediation.
+"""
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime
+from typing import Callable
+from anthropic import Anthropic
+
+
+class StageStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    RETRIED = "retried"
+
+
+class ApprovalLevel(Enum):
+    AUTO = "auto"           # Agent can act without human approval
+    NOTIFY = "notify"       # Agent acts and notifies human
+    APPROVE = "approve"     # Agent proposes, human approves
+
+
+@dataclass
+class StageResult:
+    """Result of a pipeline stage execution."""
+    stage_name: str
+    status: StageStatus
+    duration_seconds: float
+    output: str                # Stdout/stderr from the stage
+    artifacts: dict = field(default_factory=dict)  # Produced files, images, etc.
+    error_message: str = ""
+    retry_count: int = 0
+
+
+@dataclass
+class PipelineStage:
+    """Definition of a pipeline stage with agent policies."""
+    name: str
+    execute: Callable              # Function that runs the stage
+    approval_level: ApprovalLevel  # What the agent can do autonomously
+    max_retries: int = 2           # Maximum automatic retries
+    skip_conditions: list[str] = field(default_factory=list)  # When to skip
+
+
+@dataclass
+class PipelineContext:
+    """Accumulated context across pipeline stages."""
+    commit_sha: str
+    changed_files: list[str]
+    commit_message: str
+    author: str
+    branch: str
+    stage_results: list[StageResult] = field(default_factory=list)
+    agent_decisions: list[dict] = field(default_factory=list)
+
+
+class AgentPipeline:
+    """AI-augmented CI/CD pipeline orchestrator.
+
+    Wraps each pipeline stage with an AI agent that can:
+    1. Decide whether to skip a stage based on the change
+    2. Interpret failures and suggest fixes
+    3. Retry stages with modified parameters
+    4. Escalate to humans when confidence is low
+    """
+
+    def __init__(self, stages: list[PipelineStage]):
+        self.stages = stages
+        self.client = Anthropic()
+
+    def should_skip_stage(
+        self, stage: PipelineStage, context: PipelineContext
+    ) -> tuple[bool, str]:
+        """Ask the agent whether a stage should be skipped.
+
+        Uses the commit diff and stage skip conditions to decide.
+        Returns (should_skip, reason).
+        """
+        if not stage.skip_conditions:
+            return False, ""
+
+        prompt = f"""Given this code change, should the "{stage.name}" stage be skipped?
+
+Changed files: {', '.join(context.changed_files)}
+Commit message: {context.commit_message}
+
+Skip conditions for this stage:
+{chr(10).join(f'- {c}' for c in stage.skip_conditions)}
+
+Previous stage results:
+{chr(10).join(f'- {r.stage_name}: {r.status.value}' for r in context.stage_results)}
+
+Respond with EXACTLY one line:
+SKIP: <reason>
+or
+RUN: <reason>"""
+
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        answer = response.content[0].text.strip()
+
+        if answer.startswith("SKIP:"):
+            return True, answer[5:].strip()
+        return False, answer.replace("RUN:", "").strip()
+
+    def interpret_failure(
+        self, stage: PipelineStage, result: StageResult, context: PipelineContext
+    ) -> dict:
+        """Analyze a stage failure and recommend next steps.
+
+        Returns a structured interpretation with:
+        - root_cause: What likely caused the failure
+        - is_transient: Whether retrying might fix it
+        - fix_suggestion: How to fix it (if possible)
+        - should_retry: Whether the agent recommends a retry
+        - should_block: Whether this failure should block the pipeline
+        """
+        prompt = f"""A CI/CD pipeline stage failed. Analyze the failure.
+
+Stage: {stage.name}
+Retry count: {result.retry_count} / {stage.max_retries}
+Error: {result.error_message}
+
+Stage output (last 2000 chars):
+{result.output[-2000:]}
+
+Changed files: {', '.join(context.changed_files)}
+
+Previous stages:
+{chr(10).join(f'- {r.stage_name}: {r.status.value}' for r in context.stage_results)}
+
+Analyze and respond in this exact format:
+ROOT_CAUSE: <one line explanation>
+IS_TRANSIENT: <yes/no>
+FIX_SUGGESTION: <concrete fix or "none">
+SHOULD_RETRY: <yes/no>
+SHOULD_BLOCK: <yes/no>
+CONFIDENCE: <high/medium/low>"""
+
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        # Parse structured response
+        lines = response.content[0].text.strip().split("\n")
+        interpretation = {}
+        for line in lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                interpretation[key.strip().lower()] = value.strip()
+
+        return {
+            "root_cause": interpretation.get("root_cause", "unknown"),
+            "is_transient": interpretation.get("is_transient", "").lower() == "yes",
+            "fix_suggestion": interpretation.get("fix_suggestion", "none"),
+            "should_retry": (
+                interpretation.get("should_retry", "").lower() == "yes"
+                and result.retry_count < stage.max_retries
+            ),
+            "should_block": interpretation.get("should_block", "").lower() != "no",
+            "confidence": interpretation.get("confidence", "low"),
+            "raw_analysis": response.content[0].text
+        }
+
+    def run(self, context: PipelineContext) -> dict:
+        """Execute the full pipeline with agent assistance.
+
+        Returns a summary of all stages, decisions, and outcomes.
+        """
+        pipeline_start = datetime.now()
+
+        for stage in self.stages:
+            # Pre-stage: check if we should skip
+            should_skip, skip_reason = self.should_skip_stage(stage, context)
+
+            if should_skip:
+                result = StageResult(
+                    stage_name=stage.name,
+                    status=StageStatus.SKIPPED,
+                    duration_seconds=0,
+                    output=f"Skipped by agent: {skip_reason}"
+                )
+                context.stage_results.append(result)
+                context.agent_decisions.append({
+                    "stage": stage.name,
+                    "decision": "skip",
+                    "reason": skip_reason,
+                    "timestamp": datetime.now().isoformat()
+                })
+                continue
+
+            # Execute the stage (with retry loop)
+            retry_count = 0
+            while True:
+                import time
+                start = time.time()
+                try:
+                    output = stage.execute(context)
+                    result = StageResult(
+                        stage_name=stage.name,
+                        status=StageStatus.PASSED,
+                        duration_seconds=time.time() - start,
+                        output=output,
+                        retry_count=retry_count
+                    )
+                    break
+                except Exception as e:
+                    result = StageResult(
+                        stage_name=stage.name,
+                        status=StageStatus.FAILED,
+                        duration_seconds=time.time() - start,
+                        output=str(e),
+                        error_message=str(e),
+                        retry_count=retry_count
+                    )
+
+                    # Agent interprets the failure
+                    interpretation = self.interpret_failure(
+                        stage, result, context
+                    )
+
+                    context.agent_decisions.append({
+                        "stage": stage.name,
+                        "decision": "interpret_failure",
+                        "interpretation": interpretation,
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+                    if interpretation["should_retry"] and retry_count < stage.max_retries:
+                        retry_count += 1
+                        result.status = StageStatus.RETRIED
+                        context.stage_results.append(result)
+                        continue
+                    else:
+                        # Failure is final
+                        if interpretation["should_block"]:
+                            context.stage_results.append(result)
+                            return self._build_summary(
+                                context, pipeline_start, blocked_by=stage.name
+                            )
+                        break
+
+            context.stage_results.append(result)
+
+        return self._build_summary(context, pipeline_start)
+
+    def _build_summary(
+        self,
+        context: PipelineContext,
+        start_time: datetime,
+        blocked_by: str = ""
+    ) -> dict:
+        """Build a structured pipeline execution summary."""
+        end_time = datetime.now()
+        total_duration = (end_time - start_time).total_seconds()
+
+        return {
+            "commit": context.commit_sha,
+            "branch": context.branch,
+            "status": "blocked" if blocked_by else "completed",
+            "blocked_by": blocked_by,
+            "total_duration_seconds": round(total_duration, 1),
+            "stages": [
+                {
+                    "name": r.stage_name,
+                    "status": r.status.value,
+                    "duration": round(r.duration_seconds, 1),
+                    "retries": r.retry_count
+                }
+                for r in context.stage_results
+            ],
+            "agent_decisions": context.agent_decisions,
+            "stages_skipped": sum(
+                1 for r in context.stage_results
+                if r.status == StageStatus.SKIPPED
+            ),
+            "stages_retried": sum(
+                1 for r in context.stage_results
+                if r.status == StageStatus.RETRIED
+            )
+        }</code></pre>
+<div class="code-caption">The core agent-assisted pipeline orchestrator that wraps each CI/CD stage with AI-driven skip decisions, failure interpretation, retry logic, and escalation policies, accumulating context across stages for informed decision-making.</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of cross-stage learning like a seasoned airport gate agent handling a delayed
+flight. The gate agent does not just look at the current boarding pass; she checks
+whether the inbound aircraft arrived late (earlier stage), whether connecting passengers
+need rebooking (downstream impact), and whether this route has a pattern of weather
+delays at this time of year (historical context). Each decision incorporates information
+from other stages of the journey, and the accumulation of that context is what separates
+a smooth recovery from a cascade of missed connections. In the pipeline, the
+<code>PipelineContext</code> object plays the same role as the gate agent's situational
+awareness: it carries forward every earlier stage's outcome so that later decisions
+(should we retry? should we skip?) account for what has already happened, not just what
+is happening right now.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Bounded Autonomy in Production Pipelines</div>
+<p>
+The <code>ApprovalLevel</code> enum encodes a critical design principle: not all pipeline
+actions should be fully autonomous. Retrying a flaky test is safe to automate (AUTO level).
+Skipping a security scan should notify the team (NOTIFY level). Deploying to production or
+rolling back a release should require human approval (APPROVE level). This graduated
+autonomy mirrors the trust calibration discussed in
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17</a>: start with narrow
+autonomy on low-risk actions, expand as the agent demonstrates reliability, and always
+maintain human oversight on irreversible operations.
+</p>
+</div>
+
+<h2>2. Defining Pipeline Stages</h2>
+
+<p>
+With the orchestrator in place, we define concrete pipeline stages. Each stage is a
+function that takes the pipeline context and returns output text (or raises an exception
+on failure). The stages below implement a realistic pipeline for a Python scientific
+computing service, combining the CI/CD patterns from
+<a href="section-21.1.html">Section 21.1</a> with the observability checks from
+<a href="section-21.2.html">Section 21.2</a>.
+</p>
+
+<pre><code class="language-python">"""
+Concrete pipeline stage implementations for a scientific
+computing service. Each stage performs a real build/test/deploy
+operation and returns structured output for the agent.
+"""
+import subprocess
+import json
+import os
+
+
+def stage_lint(context: PipelineContext) -> str:
+    """Run linting and type checking on changed Python files."""
+    python_files = [f for f in context.changed_files if f.endswith(".py")]
+    if not python_files:
+        return "No Python files changed, lint passed trivially."
+
+    # Run ruff for fast linting
+    result = subprocess.run(
+        ["ruff", "check"] + python_files,
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Lint failed:\n{result.stdout}\n{result.stderr}")
+
+    # Run mypy for type checking
+    result = subprocess.run(
+        ["mypy", "--strict"] + python_files,
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Type check failed:\n{result.stdout}")
+
+    return f"Lint passed: {len(python_files)} files checked."
+
+
+def stage_test(context: PipelineContext) -> str:
+    """Run tests with predictive selection for fast feedback."""
+    # Use predictive test selection from Section 21.1
+    result = subprocess.run(
+        ["pytest", "tests/", "-x",          # Stop on first failure
+         "--tb=short",                        # Short tracebacks
+         "--cov=src", "--cov-report=json",    # Coverage reporting
+         "-q"],                               # Quiet output
+        capture_output=True, text=True
+    )
+
+    output = result.stdout + result.stderr
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Tests failed:\n{output}")
+
+    # Parse coverage report
+    cov_file = "coverage.json"
+    if os.path.exists(cov_file):
+        with open(cov_file) as f:
+            cov_data = json.load(f)
+        total_cov = cov_data.get("totals", {}).get("percent_covered", 0)
+        output += f"\nCoverage: {total_cov:.1f}%"
+
+    return output
+
+
+def stage_security_scan(context: PipelineContext) -> str:
+    """Run dependency vulnerability scanning."""
+    result = subprocess.run(
+        ["pip-audit", "--format=json"],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        try:
+            vulnerabilities = json.loads(result.stdout)
+            high_severity = [
+                v for v in vulnerabilities
+                if v.get("severity", "").upper() in ("HIGH", "CRITICAL")
+            ]
+            if high_severity:
+                raise RuntimeError(
+                    f"Found {len(high_severity)} high/critical vulnerabilities:\n"
+                    + "\n".join(
+                        f"  {v['name']} {v['version']}: {v['description']}"
+                        for v in high_severity[:5]
+                    )
+                )
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Security scan error:\n{result.stderr}")
+
+    return "Security scan passed: no high/critical vulnerabilities."
+
+
+def stage_build_container(context: PipelineContext) -> str:
+    """Build and tag a Docker container image."""
+    tag = f"discovery-service:{context.commit_sha[:8]}"
+
+    result = subprocess.run(
+        ["docker", "build",
+         "--tag", tag,
+         "--label", f"commit={context.commit_sha}",
+         "--label", f"branch={context.branch}",
+         "."],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Docker build failed:\n{result.stderr}")
+
+    # Get image size
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", tag, "--format", "{{.Size}}"],
+        capture_output=True, text=True
+    )
+    size_mb = int(inspect.stdout.strip()) / (1024 * 1024) if inspect.returncode == 0 else 0
+
+    return f"Built image {tag} ({size_mb:.1f} MB)"
+
+
+def stage_deploy_staging(context: PipelineContext) -> str:
+    """Deploy to staging environment and run smoke tests."""
+    tag = f"discovery-service:{context.commit_sha[:8]}"
+
+    # Deploy using kubectl or similar
+    result = subprocess.run(
+        ["kubectl", "set", "image",
+         "deployment/discovery-service",
+         f"discovery-service={tag}",
+         "--namespace=staging"],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Staging deploy failed:\n{result.stderr}")
+
+    # Wait for rollout
+    result = subprocess.run(
+        ["kubectl", "rollout", "status",
+         "deployment/discovery-service",
+         "--namespace=staging",
+         "--timeout=120s"],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Staging rollout failed:\n{result.stderr}")
+
+    return f"Deployed {tag} to staging. Rollout complete."
+
+
+def stage_health_check(context: PipelineContext) -> str:
+    """Verify the deployed service is healthy using golden signals."""
+    import time
+
+    # Wait for metrics to accumulate
+    time.sleep(30)
+
+    # Check golden signals against SLOs
+    checks = {
+        "latency_p99_ms": {"threshold": 500, "actual": 0},
+        "error_rate_pct": {"threshold": 1.0, "actual": 0},
+        "health_endpoint": {"status": "unknown"}
+    }
+
+    # Query Prometheus/Grafana for golden signals
+    import urllib.request
+    try:
+        response = urllib.request.urlopen(
+            "http://staging.internal:8000/health",
+            timeout=10
+        )
+        checks["health_endpoint"]["status"] = "healthy"
+    except Exception as e:
+        raise RuntimeError(f"Health check failed: {e}")
+
+    return json.dumps(checks, indent=2)
+
+
+# Assemble the pipeline
+def create_discovery_pipeline() -> AgentPipeline:
+    """Create an agent-assisted pipeline for the Discovery service."""
+    stages = [
+        PipelineStage(
+            name="lint",
+            execute=stage_lint,
+            approval_level=ApprovalLevel.AUTO,
+            max_retries=0,
+            skip_conditions=[
+                "Only documentation files (.md, .rst, .txt) changed",
+                "Only CI configuration files changed"
+            ]
+        ),
+        PipelineStage(
+            name="test",
+            execute=stage_test,
+            approval_level=ApprovalLevel.AUTO,
+            max_retries=2,  # Retry for flaky tests
+            skip_conditions=[]
+        ),
+        PipelineStage(
+            name="security_scan",
+            execute=stage_security_scan,
+            approval_level=ApprovalLevel.NOTIFY,
+            max_retries=1,
+            skip_conditions=[
+                "No dependency files (pyproject.toml, requirements.txt) changed"
+            ]
+        ),
+        PipelineStage(
+            name="build_container",
+            execute=stage_build_container,
+            approval_level=ApprovalLevel.AUTO,
+            max_retries=1,
+            skip_conditions=[]
+        ),
+        PipelineStage(
+            name="deploy_staging",
+            execute=stage_deploy_staging,
+            approval_level=ApprovalLevel.APPROVE,  # Human approval required
+            max_retries=1,
+            skip_conditions=[]
+        ),
+        PipelineStage(
+            name="health_check",
+            execute=stage_health_check,
+            approval_level=ApprovalLevel.AUTO,
+            max_retries=3,  # Health checks may need retries
+            skip_conditions=[]
+        ),
+    ]
+
+    return AgentPipeline(stages)</code></pre>
+<div class="code-caption">Concrete pipeline stage implementations for a scientific computing service, assembled into an agent-assisted pipeline with per-stage approval levels, retry policies, and skip conditions that the AI agent evaluates at runtime.</div>
+
+<h2>3. Synthetic Incident Injection and Postmortem</h2>
+
+<p>
+The most effective way to improve incident response is to practice it. Chaos engineering
+tools like Netflix's Chaos Monkey inject real failures into production systems. For
+learning purposes, we take a safer approach: <em>synthetic incident injection</em> into a
+staging environment, followed by an AI-generated postmortem. This gives teams the learning
+benefits of real incidents without the production risk.
+</p>
+
+<p>
+A synthetic incident consists of three components: the <strong>fault</strong> (what breaks),
+the <strong>scenario</strong> (the sequence of observable symptoms), and the
+<strong>resolution</strong> (what fixes it). The AI agent generates realistic scenarios
+based on common failure modes and evaluates the team's (or another agent's) response.
+</p>
+
+<pre><code class="language-python">"""
+Synthetic incident generator and postmortem exercise.
+Creates realistic incident scenarios for training and evaluation,
+then generates AI-assisted postmortem reports.
+"""
+import random
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from anthropic import Anthropic
+
+
+@dataclass
+class SyntheticFault:
+    """A simulated fault injected into the system."""
+    fault_type: str           # "latency", "error", "resource_exhaustion", "data_corruption"
+    target_service: str
+    severity: str             # "P1", "P2", "P3"
+    description: str
+    observable_symptoms: list[str]
+    root_cause: str
+    resolution_steps: list[str]
+
+
+@dataclass
+class IncidentScenario:
+    """A complete incident scenario with timeline and telemetry."""
+    fault: SyntheticFault
+    timeline: list[dict]         # [{time_offset_min, event, source}]
+    metrics_snapshot: dict       # Golden signal values during incident
+    log_samples: list[str]       # Representative log lines
+    trace_anomalies: list[dict]  # Slow or errored spans
+
+
+# Common production failure modes for scenario generation
+FAULT_TEMPLATES = [
+    SyntheticFault(
+        fault_type="latency",
+        target_service="database",
+        severity="P2",
+        description="Database connection pool exhaustion due to leaked connections",
+        observable_symptoms=[
+            "P99 latency increases from 200ms to 5000ms over 15 minutes",
+            "Active database connections climb steadily toward the pool limit",
+            "Error rate increases as connection acquire timeouts begin",
+            "Upstream services show cascading latency increases"
+        ],
+        root_cause="A recent code change introduced a code path that acquires "
+                   "database connections but does not release them on exception, "
+                   "causing the connection pool to fill over time",
+        resolution_steps=[
+            "Identify the leaking code path using connection pool metrics",
+            "Restart affected service instances to release leaked connections",
+            "Deploy a hotfix wrapping the database call in a context manager",
+            "Add connection pool monitoring with alerts at 80% utilization"
+        ]
+    ),
+    SyntheticFault(
+        fault_type="error",
+        target_service="api_gateway",
+        severity="P1",
+        description="Certificate expiry causing TLS handshake failures",
+        observable_symptoms=[
+            "Error rate jumps from 0.1% to 100% at a specific timestamp",
+            "All errors are TLS handshake failures (SSL_ERROR_EXPIRED_CERT)",
+            "Health check endpoints return connection refused",
+            "No gradual degradation; failure is instantaneous"
+        ],
+        root_cause="The TLS certificate for the API gateway expired at the "
+                   "exact timestamp of the error spike. Certificate renewal "
+                   "automation failed silently 30 days ago",
+        resolution_steps=[
+            "Renew the TLS certificate manually or via ACME",
+            "Reload the API gateway configuration to pick up the new cert",
+            "Investigate why the automated renewal failed",
+            "Add certificate expiry monitoring with 30-day advance warning"
+        ]
+    ),
+    SyntheticFault(
+        fault_type="resource_exhaustion",
+        target_service="compute_worker",
+        severity="P2",
+        description="Memory leak in experiment processing workers",
+        observable_symptoms=[
+            "Worker memory usage increases linearly at 50MB per hour",
+            "Workers begin OOM-killing after approximately 8 hours",
+            "Job completion rate drops as workers restart",
+            "Job queue depth increases as processing capacity decreases"
+        ],
+        root_cause="A new feature caches intermediate computation results "
+                   "in memory without an eviction policy. Each experiment "
+                   "adds to the cache but nothing removes entries",
+        resolution_steps=[
+            "Add a maximum cache size with LRU eviction",
+            "Restart workers on a rolling schedule as an immediate fix",
+            "Add memory usage alerts at 80% of container limit",
+            "Implement periodic cache statistics logging for monitoring"
+        ]
+    ),
+    SyntheticFault(
+        fault_type="data_corruption",
+        target_service="storage",
+        severity="P1",
+        description="Schema migration applied without backward compatibility",
+        observable_symptoms=[
+            "Some API endpoints return 500 errors with serialization failures",
+            "Errors correlate with specific data records (old format vs new)",
+            "New records work correctly; old records fail",
+            "Error rate is proportional to the fraction of old records accessed"
+        ],
+        root_cause="A database migration renamed a column without a "
+                   "backward-compatible transition period. Records created "
+                   "before the migration reference the old column name",
+        resolution_steps=[
+            "Add the old column back as an alias or computed column",
+            "Deploy a data migration to backfill old records",
+            "Establish a migration policy requiring backward compatibility",
+            "Add integration tests that verify old and new record formats"
+        ]
+    ),
+]
+
+
+def generate_incident_scenario(
+    fault: SyntheticFault | None = None,
+    duration_minutes: int = 45
+) -> IncidentScenario:
+    """Generate a complete incident scenario with synthetic telemetry.
+
+    Creates a realistic timeline, metrics snapshot, log samples,
+    and trace anomalies for a given fault type.
+    """
+    if fault is None:
+        fault = random.choice(FAULT_TEMPLATES)
+
+    # Generate timeline
+    timeline = []
+    t = 0
+
+    # Pre-incident: normal operations
+    timeline.append({
+        "time_offset_min": t,
+        "event": "Deployment completed successfully",
+        "source": "ci_pipeline"
+    })
+
+    # Fault begins (typically 5-15 minutes after deployment)
+    onset = random.randint(5, 15)
+    t = onset
+    timeline.append({
+        "time_offset_min": t,
+        "event": f"First symptom: {fault.observable_symptoms[0]}",
+        "source": "monitoring"
+    })
+
+    # Detection (TTD: typically 2-10 minutes after onset)
+    ttd = random.randint(2, 10)
+    t += ttd
+    timeline.append({
+        "time_offset_min": t,
+        "event": "Alert fired: SLO violation detected",
+        "source": "alertmanager"
+    })
+    timeline.append({
+        "time_offset_min": t + 1,
+        "event": "On-call engineer paged",
+        "source": "pagerduty"
+    })
+
+    # Investigation
+    t += 3
+    timeline.append({
+        "time_offset_min": t,
+        "event": "On-call begins investigation, checks dashboards",
+        "source": "human"
+    })
+
+    # Additional symptoms surface
+    for i, symptom in enumerate(fault.observable_symptoms[1:], 1):
+        t += random.randint(2, 5)
+        timeline.append({
+            "time_offset_min": t,
+            "event": f"Observed: {symptom}",
+            "source": "monitoring" if i % 2 == 0 else "human"
+        })
+
+    # Mitigation
+    t += random.randint(5, 15)
+    timeline.append({
+        "time_offset_min": t,
+        "event": f"Mitigation applied: {fault.resolution_steps[0]}",
+        "source": "human"
+    })
+
+    # Resolution
+    t += random.randint(5, 10)
+    timeline.append({
+        "time_offset_min": t,
+        "event": "Service recovered, SLOs restored",
+        "source": "monitoring"
+    })
+
+    # Generate synthetic metrics
+    metrics_snapshot = {
+        "latency_p99_ms": {
+            "before": 200 + random.randint(0, 50),
+            "during": 200 + random.randint(300, 4800) if fault.fault_type == "latency" else 200 + random.randint(0, 100),
+            "after": 200 + random.randint(0, 50)
+        },
+        "error_rate_pct": {
+            "before": round(0.1 + random.random() * 0.2, 2),
+            "during": round(5.0 + random.random() * 90.0, 2) if fault.fault_type == "error" else round(0.5 + random.random() * 4.0, 2),
+            "after": round(0.1 + random.random() * 0.2, 2)
+        },
+        "traffic_rps": {
+            "before": 1000 + random.randint(0, 200),
+            "during": 1000 + random.randint(-200, 200),
+            "after": 1000 + random.randint(0, 200)
+        },
+        "cpu_pct": {
+            "before": 40 + random.randint(0, 20),
+            "during": 40 + random.randint(20, 50) if fault.fault_type == "resource_exhaustion" else 40 + random.randint(0, 20),
+            "after": 40 + random.randint(0, 20)
+        }
+    }
+
+    # Generate log samples
+    log_samples = [
+        f"[{fault.target_service}] INFO  Normal request processed in 45ms",
+        f"[{fault.target_service}] WARN  {fault.observable_symptoms[0]}",
+        f"[{fault.target_service}] ERROR {fault.description}",
+        f"[{fault.target_service}] ERROR Retry attempt 1/3 failed",
+        f"[{fault.target_service}] FATAL Service health check failed",
+    ]
+
+    # Generate trace anomalies
+    trace_anomalies = [
+        {
+            "trace_id": f"trace-{random.randint(1000, 9999)}",
+            "service": fault.target_service,
+            "operation": "process_request",
+            "duration_ms": random.randint(3000, 10000),
+            "status": "error",
+            "error": fault.description
+        }
+    ]
+
+    return IncidentScenario(
+        fault=fault,
+        timeline=timeline,
+        metrics_snapshot=metrics_snapshot,
+        log_samples=log_samples,
+        trace_anomalies=trace_anomalies
+    )</code></pre>
+<div class="code-caption">Synthetic incident generator with four realistic fault templates (connection pool exhaustion, certificate expiry, memory leak, schema migration failure), producing complete incident scenarios with timelines, metrics, logs, and traces for postmortem practice.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Tabletop Incident Exercise for a Research Platform</div>
+<p>
+A computational biology research platform used the synthetic incident generator to run
+monthly "game day" exercises. Each session picked a random fault template, injected it into
+the staging environment, and gave the on-call team 30 minutes to detect, diagnose, and
+mitigate the issue. The AI agent played two roles: it generated the incident scenario (so
+the exercise facilitator did not need to manually craft failures) and it generated a
+postmortem from the team's actions (so the retrospective started with a structured draft
+instead of a blank page). After six months, the team's mean time to detect (TTD) dropped
+from 12 minutes to 4 minutes, and their mean time to mitigate (TTM) dropped from 35 minutes
+to 15 minutes. The improvement came not from faster typing or better tooling, but from
+pattern recognition: after practicing twelve synthetic incidents, the team had seen enough
+failure modes to recognize real ones faster.
+</p>
+</div>
+
+<h2>4. Running the Postmortem Exercise</h2>
+
+<p>
+The postmortem exercise combines the incident scenario with the AI-driven root cause
+analysis from <a href="section-21.2.html">Section 21.2</a>. The flow is: generate a
+scenario, present the symptoms (without the root cause) to the participant, collect their
+investigation steps, then compare their diagnosis to the known root cause. Finally,
+the AI generates a complete postmortem document.
+</p>
+
+<pre><code class="language-python">"""
+Complete postmortem exercise runner.
+Generates a scenario, evaluates the response, and produces
+a structured postmortem with lessons learned.
+"""
+from anthropic import Anthropic
+from datetime import datetime, timedelta
+
+
+def run_postmortem_exercise(scenario: IncidentScenario | None = None) -> dict:
+    """Run a complete synthetic incident postmortem exercise.
+
+    Returns a structured report comparing the expected and actual
+    diagnosis, with a complete postmortem document.
+    """
+    if scenario is None:
+        scenario = generate_incident_scenario()
+
+    client = Anthropic()
+
+    # Phase 1: Present symptoms and get AI diagnosis
+    # (In a real exercise, a human would investigate here)
+    symptoms_prompt = f"""You are an SRE investigating a production incident.
+Here is what you can observe:
+
+ALERT: SLO violation on {scenario.fault.target_service}
+
+METRICS:
+{_format_metrics(scenario.metrics_snapshot)}
+
+RECENT LOGS:
+{chr(10).join(scenario.log_samples)}
+
+TRACE ANOMALIES:
+{chr(10).join(str(t) for t in scenario.trace_anomalies)}
+
+TIMELINE (so far):
+{chr(10).join(f"  T+{e['time_offset_min']}m [{e['source']}]: {e['event']}" for e in scenario.timeline[:5])}
+
+Based on these observations:
+1. What is your top hypothesis for the root cause?
+2. What additional information would you query?
+3. What is your recommended immediate mitigation?
+
+Be specific. Cite the evidence that supports your hypothesis."""
+
+    diagnosis = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": symptoms_prompt}]
+    ).content[0].text
+
+    # Phase 2: Generate the postmortem
+    now = datetime.now()
+    incident_start = now - timedelta(minutes=scenario.timeline[-1]["time_offset_min"])
+
+    postmortem_prompt = f"""Generate a complete blameless postmortem for this incident.
+
+INCIDENT SUMMARY:
+Service: {scenario.fault.target_service}
+Severity: {scenario.fault.severity}
+Description: {scenario.fault.description}
+
+ACTUAL ROOT CAUSE:
+{scenario.fault.root_cause}
+
+RESOLUTION:
+{chr(10).join(f"  {i+1}. {step}" for i, step in enumerate(scenario.fault.resolution_steps))}
+
+FULL TIMELINE:
+{chr(10).join(f"  T+{e['time_offset_min']}m [{e['source']}]: {e['event']}" for e in scenario.timeline)}
+
+METRICS DURING INCIDENT:
+{_format_metrics(scenario.metrics_snapshot)}
+
+AI DIAGNOSIS (for comparison):
+{diagnosis}
+
+Generate the postmortem with these sections:
+1. Executive Summary
+2. Impact Assessment (estimate affected users, failed requests)
+3. Timeline (table format)
+4. Root Cause Analysis (blameless, technical)
+5. What Went Well
+6. What Could Be Improved
+7. Action Items (with priority: P0/P1/P2, owner placeholder, due date)
+8. Detection Gap Analysis (how could we have caught this sooner?)
+9. Lessons Learned
+
+Make it realistic, specific, and actionable."""
+
+    postmortem = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": postmortem_prompt}]
+    ).content[0].text
+
+    return {
+        "scenario": {
+            "fault_type": scenario.fault.fault_type,
+            "target_service": scenario.fault.target_service,
+            "severity": scenario.fault.severity,
+            "actual_root_cause": scenario.fault.root_cause,
+        },
+        "ai_diagnosis": diagnosis,
+        "postmortem": postmortem,
+        "exercise_metadata": {
+            "generated_at": datetime.now().isoformat(),
+            "incident_duration_min": scenario.timeline[-1]["time_offset_min"],
+            "fault_template": scenario.fault.description
+        }
+    }
+
+
+def _format_metrics(metrics: dict) -> str:
+    """Format metrics snapshot for display."""
+    lines = []
+    for signal, values in metrics.items():
+        lines.append(
+            f"  {signal}: before={values['before']}, "
+            f"during={values['during']}, after={values['after']}"
+        )
+    return "\n".join(lines)</code></pre>
+<div class="code-caption">Complete postmortem exercise runner that generates a synthetic incident, solicits an AI diagnosis from observable symptoms alone, then produces a full blameless postmortem comparing the diagnosis to the known root cause.</div>
+
+<h2>5. Discovery Workbench Integration</h2>
+
+<p>
+The agent-assisted pipeline connects to the Discovery Workbench through an operational
+intelligence layer. Every pipeline run, every incident, and every postmortem becomes a
+data point in the Workbench's knowledge base. Over time, this data reveals patterns:
+which types of changes cause the most failures, which services are the most fragile,
+which team practices correlate with fewer incidents. This is operational discovery,
+using the same search and pattern-recognition principles from
+<a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>
+applied to the software delivery process itself.
+</p>
+
+<pre><code class="language-python">"""
+Discovery Workbench integration for operational intelligence.
+Stores pipeline runs, incidents, and postmortems as discoverable
+knowledge in the Workbench's structured data store.
+"""
+from dataclasses import dataclass, field
+from datetime import datetime
+import json
+
+
+@dataclass
+class OperationalInsight:
+    """A discoverable insight from pipeline or incident data."""
+    insight_type: str        # "pipeline_pattern", "incident_pattern", "reliability_trend"
+    title: str
+    description: str
+    evidence: dict
+    confidence: float        # 0.0 to 1.0
+    actionable: bool
+    suggested_actions: list[str] = field(default_factory=list)
+    related_chapters: list[str] = field(default_factory=list)
+
+
+class OperationalKnowledgeBase:
+    """Stores and queries operational knowledge for the Discovery Workbench.
+
+    Aggregates pipeline runs, incidents, and postmortems into
+    a searchable knowledge base that surfaces patterns and trends.
+    """
+
+    def __init__(self):
+        self.pipeline_runs: list[dict] = []
+        self.incidents: list[dict] = []
+        self.postmortems: list[dict] = []
+
+    def record_pipeline_run(self, summary: dict):
+        """Record a pipeline execution for trend analysis."""
+        summary["recorded_at"] = datetime.now().isoformat()
+        self.pipeline_runs.append(summary)
+
+    def record_incident(self, incident: dict):
+        """Record an incident for pattern analysis."""
+        incident["recorded_at"] = datetime.now().isoformat()
+        self.incidents.append(incident)
+
+    def record_postmortem(self, postmortem: dict):
+        """Record a postmortem for knowledge accumulation."""
+        postmortem["recorded_at"] = datetime.now().isoformat()
+        self.postmortems.append(postmortem)
+
+    def analyze_reliability_trends(self, days: int = 30) -> list[OperationalInsight]:
+        """Analyze recent operational data for reliability trends.
+
+        Identifies patterns in pipeline failures, incident frequency,
+        and recovery times that suggest systemic issues or improvements.
+        """
+        insights = []
+
+        # Analyze pipeline failure patterns
+        if len(self.pipeline_runs) >= 10:
+            recent_runs = self.pipeline_runs[-100:]
+            failure_rate = sum(
+                1 for r in recent_runs if r.get("status") == "blocked"
+            ) / len(recent_runs)
+
+            if failure_rate > 0.2:
+                # Find the most common blocking stage
+                blocking_stages = [
+                    r.get("blocked_by", "unknown")
+                    for r in recent_runs if r.get("status") == "blocked"
+                ]
+                if blocking_stages:
+                    from collections import Counter
+                    most_common = Counter(blocking_stages).most_common(1)[0]
+
+                    insights.append(OperationalInsight(
+                        insight_type="pipeline_pattern",
+                        title=f"High pipeline failure rate: {failure_rate:.0%}",
+                        description=(
+                            f"The '{most_common[0]}' stage is the most common "
+                            f"blocker, causing {most_common[1]} of "
+                            f"{len(blocking_stages)} pipeline failures."
+                        ),
+                        evidence={
+                            "failure_rate": failure_rate,
+                            "most_common_blocker": most_common[0],
+                            "blocker_count": most_common[1],
+                            "sample_size": len(recent_runs)
+                        },
+                        confidence=min(len(recent_runs) / 50, 1.0),
+                        actionable=True,
+                        suggested_actions=[
+                            f"Investigate recurring failures in '{most_common[0]}'",
+                            "Review test stability and flakiness metrics",
+                            "Consider adding retry logic or splitting the stage"
+                        ],
+                        related_chapters=[
+                            "Chapter 18: AI-Assisted Testing",
+                            "Chapter 22: MLOps and LLMOps"
+                        ]
+                    ))
+
+        # Analyze incident recurrence
+        if len(self.incidents) >= 5:
+            service_incidents = {}
+            for inc in self.incidents:
+                svc = inc.get("target_service", "unknown")
+                service_incidents.setdefault(svc, []).append(inc)
+
+            for service, incs in service_incidents.items():
+                if len(incs) >= 3:
+                    insights.append(OperationalInsight(
+                        insight_type="incident_pattern",
+                        title=f"Recurring incidents in {service}",
+                        description=(
+                            f"Service '{service}' has had {len(incs)} incidents "
+                            f"in the analysis period. This suggests a systemic "
+                            f"reliability issue rather than isolated failures."
+                        ),
+                        evidence={
+                            "service": service,
+                            "incident_count": len(incs),
+                            "severities": [i.get("severity") for i in incs]
+                        },
+                        confidence=0.8,
+                        actionable=True,
+                        suggested_actions=[
+                            f"Conduct a reliability review of '{service}'",
+                            "Review and address all open action items from postmortems",
+                            "Consider architectural changes to improve resilience"
+                        ],
+                        related_chapters=[
+                            "Chapter 6: Discovery System Architecture",
+                            "Chapter 14: Discovery of Architectures"
+                        ]
+                    ))
+
+        return insights
+
+    def export_for_workbench(self) -> dict:
+        """Export operational knowledge in Discovery Workbench format.
+
+        Returns a structured dictionary suitable for ingestion into
+        the Workbench's knowledge graph (Chapter 38) or experiment
+        registry (Chapter 47).
+        """
+        return {
+            "source": "devops_pipeline",
+            "version": "1.0",
+            "exported_at": datetime.now().isoformat(),
+            "summary": {
+                "total_pipeline_runs": len(self.pipeline_runs),
+                "total_incidents": len(self.incidents),
+                "total_postmortems": len(self.postmortems),
+            },
+            "pipeline_runs": self.pipeline_runs,
+            "incidents": self.incidents,
+            "postmortems": self.postmortems,
+            "insights": [
+                {
+                    "type": i.insight_type,
+                    "title": i.title,
+                    "description": i.description,
+                    "confidence": i.confidence,
+                    "actions": i.suggested_actions
+                }
+                for i in self.analyze_reliability_trends()
+            ]
+        }</code></pre>
+<div class="code-caption">Discovery Workbench integration that accumulates pipeline runs, incidents, and postmortems into an operational knowledge base, then analyzes trends to surface actionable reliability insights with cross-references to relevant book chapters.</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+The logical endpoint of agent-assisted pipelines is <em>self-healing infrastructure</em>:
+systems that detect, diagnose, and remediate failures without human intervention. A
+concrete step in this direction is Microsoft's <strong>RCACopilot</strong> (2024), an
+LLM-based on-call system that ingests alerts, retrieves similar past incidents, and
+produces root-cause diagnoses for cloud service outages. Evaluated on over 200 real
+incidents in Microsoft Azure and Microsoft 365, RCACopilot achieved a top-1 diagnostic
+accuracy above 80% for well-represented fault categories, substantially outperforming
+retrieval-only baselines. The key challenge remains composability: individual
+self-healing behaviors are well-understood, but their interactions can create feedback
+loops (auto-scaler fights rate-limiter) or cascading remediation (one service's rollback
+triggers another's health check failure, which triggers a third's rollback). The
+multi-agent coordination patterns from
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17</a> and the causal
+reasoning from
+<a href="../../part-3-data-models/module-31-causal-discovery/index.html">Chapter 31</a>
+are both essential for building self-healing systems that compose safely.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Incident That Wrote Its Own Postmortem</div>
+<p>
+During testing of the postmortem generator, a team inadvertently created a recursive
+situation: the postmortem generation service itself experienced a timeout incident (the LLM
+API was rate-limited during a load test). The monitoring system detected the anomaly, the
+incident analysis pipeline diagnosed the root cause ("API rate limit exceeded for
+postmortem generation service"), and the postmortem generator produced a postmortem about
+its own failure. The action item: "Add rate limiting and retry logic to the postmortem
+generation service." The team framed the self-referential postmortem and hung it in the
+break room.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Failure-Interpreting Pipeline Stub</h4>
+<p>
+You can build a minimal agent-assisted pipeline on your laptop using only the Python
+standard library and the Anthropic SDK. Follow these steps:
+</p>
+<p>
+1. Create three shell commands that act as pipeline stages: a "lint" stage that always
+succeeds (<code>echo "lint OK"</code>), a "test" stage that fails 50% of the time
+(use <code>random.random()</code> to raise an exception on half the runs), and a
+"build" stage that always succeeds.<br/>
+2. Wire each command into a <code>PipelineStage</code> with
+<code>ApprovalLevel.AUTO</code>, giving the test stage
+<code>max_retries=2</code>.<br/>
+3. Instantiate <code>AgentPipeline</code> with the three stages and a
+<code>PipelineContext</code> populated with a dummy commit SHA and a list of two
+Python file names.<br/>
+4. Run <code>pipeline.run(context)</code> five times, collecting the returned
+summaries. Print each summary's <code>status</code>, the number of stages skipped,
+and the number of retries.<br/>
+5. Inspect the <code>agent_decisions</code> list in the summary. For every
+<code>interpret_failure</code> decision, print the <code>root_cause</code> and
+<code>confidence</code> fields and compare them to the exception message your test
+stage raised.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.3.1: Pipeline Policy Design (Conceptual)</div>
+<p>
+Design an approval policy for an agent-assisted pipeline serving a medical imaging
+analysis platform. For each of these actions, decide whether the approval level should be
+AUTO, NOTIFY, or APPROVE, and justify your choice: (a) retrying a failed unit test,
+(b) skipping a performance benchmark on a documentation-only change, (c) deploying a
+model update to staging, (d) deploying a model update to production, (e) rolling back a
+production deployment after detecting elevated error rates. Consider the regulatory
+requirements (FDA guidelines for medical software) and the consequences of each action.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.3.2: Incident Scenario Authoring (Coding)</div>
+<p>
+Add two new fault templates to the <code>FAULT_TEMPLATES</code> list: one for a DNS
+resolution failure (a common cause of intermittent connectivity issues) and one for a
+configuration deployment that introduces an incompatible feature flag. For each template,
+specify the fault type, target service, severity, observable symptoms, root cause, and
+resolution steps. Run the postmortem exercise with your new templates and evaluate whether
+the AI diagnosis correctly identifies the root cause from the observable symptoms alone.
+</p>
+</div>
+
+<div class="callout exercise">
+<div class="callout-title">Exercise 21.3.3: Workbench Analytics Dashboard (Analysis)</div>
+<p>
+Using the <code>OperationalKnowledgeBase</code>, generate 50 synthetic pipeline runs with
+varying failure rates and 10 synthetic incidents across three services. Run the
+<code>analyze_reliability_trends</code> method and evaluate the quality of the generated
+insights. Which patterns does the analyzer detect correctly? Which does it miss? Propose
+two additional analysis methods (for example, detecting correlation between deployment
+frequency and incident rate, or identifying the time-of-day pattern in failures) and
+implement them.
+</p>
+</div>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-21.2.html">&larr; 21.2 Observability and Incident Analysis</a>
+<a href="index.html">Chapter 21 Index</a>
+<a href="../module-22-mlops-llmops/index.html">Chapter 22: MLOps, LLMOps, and AgentOps &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

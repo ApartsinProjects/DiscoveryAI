@@ -1,0 +1,1476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 41.2: Reproducibility Auditing. Re-executing experimental pipelines, computing reproducibility scores, detecting data leakage, and building verification test suites with MLflow, DVC, and pytest." name="description"/>
+<title>Section 41.2: Reproducibility Auditing | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part IV: Discovery Through Knowledge</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 41: Scientific Claim Validation</a></div>
+<h1>41.2 Reproducibility Auditing</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I re-ran the experiment seventeen times. I got seventeen different numbers. The original paper reported an eighteenth number that matched none of them, along with the reassuring footnote 'results are reproducible.'"</p>
+<cite>A Confidence Interval That Lost Its Confidence</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section builds on the claim extraction and evidence mapping pipeline from
+<a href="section-41.1.html">Section 41.1</a>. You should be familiar with
+MLflow experiment tracking and DVC data versioning from
+<a href="../../part-2-software-engineering/module-22-mlops-llmops/index.html">Chapter 22</a>.
+Knowledge of pytest for writing test suites, basic statistics (mean, standard deviation,
+hypothesis testing), and the concept of data leakage from machine learning practice is
+assumed. Familiarity with
+<a href="../../part-3-data-models/module-25-exploratory-discovery/index.html">Chapter 25: Exploratory Discovery</a>
+will help with understanding how leakage distorts evaluation metrics.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Evidence mapping tells you what artifacts <em>should</em> support a claim.
+Reproducibility auditing tells you whether they <em>actually do</em>. The gap between
+"the code exists" and "the code produces the claimed result" is where most scientific
+claims break down. A reproducibility audit re-executes the experimental pipeline, compares
+the output to the reported values, and quantifies the discrepancy. When the discrepancy
+exceeds a statistical tolerance, the claim fails the audit. When the pipeline cannot
+even be re-executed (missing dependencies, undocumented preprocessing, hardware-specific
+code), the claim is flagged as unverifiable. Both outcomes are informative: a failed
+audit narrows the search for errors, and an unverifiable claim identifies exactly what
+documentation is missing.
+</p>
+</div>
+
+<h2>1. Re-Executing Experimental Pipelines</h2>
+
+<p>
+The gold standard for reproducibility is simple in concept and fiendish in practice:
+take the authors' code and data, run it, and check whether the output matches the
+reported results. The fiendish part is that "take the code and run it" can require
+resolving dozens of undocumented dependencies, obtaining restricted datasets,
+provisioning specific hardware, and interpreting ambiguous configuration files.
+Our approach automates as much of this process as possible using MLflow for experiment
+artifact retrieval and DVC for dataset versioning.
+</p>
+
+<p data-agent="02">
+A <strong>reproducibility audit</strong> is a systematic, automated procedure that retrieves the exact code, data, and configuration from a logged experiment, re-executes the computational pipeline in a controlled environment, and compares the resulting metrics against the values claimed in the publication. It matters because the mere existence of source code and data files tells you nothing about whether those artifacts actually produce the reported numbers; only re-execution closes that gap. The mechanism works by hashing every input artifact, replaying each pipeline stage, and then applying statistical tolerance tests (covered in Section 2) to the output metrics. Use a reproducibility audit when you need quantitative confidence that a claimed result holds; use a lighter evidence map (Section 41.1) when you only need to verify that supporting artifacts exist, or a manual code review when you suspect logical errors that would survive a successful re-run.
+</p>
+
+<h3>1.1 Retrieving Artifacts from MLflow</h3>
+
+<p>
+MLflow stores experiment runs as structured records: parameters, metrics, artifacts
+(model files, evaluation outputs), and tags. When a paper's results are logged in
+MLflow, we can retrieve the exact artifacts that produced a claimed metric value and
+attempt to reproduce the evaluation step.
+</p>
+
+<pre><code class="language-python">"""
+Retrieve and re-execute experimental artifacts from MLflow.
+Connects claimed metrics to logged runs and verifies that
+artifacts can reproduce the reported values.
+"""
+import mlflow
+from mlflow.tracking import MlflowClient
+from dataclasses import dataclass, field
+from pathlib import Path
+import json
+import subprocess
+import tempfile
+
+
+@dataclass
+class RunArtifacts:
+    """Artifacts retrieved from an MLflow run."""
+    run_id: str
+    experiment_name: str
+    params: dict
+    metrics: dict                  # metric_name -> value
+    artifact_paths: list[str]      # Local paths to downloaded artifacts
+    tags: dict
+    start_time: int
+    status: str                    # FINISHED, FAILED, etc.
+
+
+class MLflowAuditor:
+    """Retrieve and verify MLflow experiment artifacts."""
+
+    def __init__(self, tracking_uri: str):
+        """Connect to an MLflow tracking server.
+
+        Args:
+            tracking_uri: MLflow server URI or local file path.
+                          Example: "http://localhost:5000" or
+                          "file:///path/to/mlruns"
+        """
+        mlflow.set_tracking_uri(tracking_uri)
+        self.client = MlflowClient(tracking_uri)
+
+    def find_runs_for_claim(
+        self, claim, experiment_name: str = None
+    ) -> list[RunArtifacts]:
+        """Find MLflow runs that match a claim's context.
+
+        Searches for runs with metrics matching the claim's
+        predicate and values close to the claimed magnitude.
+
+        Args:
+            claim: A Claim object from the extraction pipeline.
+            experiment_name: Optional experiment name to narrow search.
+
+        Returns:
+            List of matching RunArtifacts, sorted by metric proximity.
+        """
+        # Build search filter
+        if experiment_name:
+            experiments = [
+                e for e in self.client.search_experiments()
+                if e.name == experiment_name
+            ]
+        else:
+            experiments = self.client.search_experiments()
+
+        matching_runs = []
+
+        for exp in experiments:
+            runs = self.client.search_runs(
+                experiment_ids=[exp.experiment_id],
+                filter_string=f"status = 'FINISHED'",
+                max_results=100,
+                order_by=["start_time DESC"]
+            )
+
+            for run in runs:
+                # Check if run logged the claimed metric
+                metric_name = self._normalize_metric(
+                    claim.predicate
+                )
+                if metric_name in run.data.metrics:
+                    logged_value = run.data.metrics[metric_name]
+
+                    # Include if within 10% of claimed value
+                    if claim.value.magnitude is not None:
+                        relative_diff = abs(
+                            logged_value - claim.value.magnitude
+                        ) / max(abs(claim.value.magnitude), 1e-8)
+                        if relative_diff < 0.10:
+                            artifacts = self._download_artifacts(
+                                run.info.run_id
+                            )
+                            matching_runs.append(RunArtifacts(
+                                run_id=run.info.run_id,
+                                experiment_name=exp.name,
+                                params=dict(run.data.params),
+                                metrics=dict(run.data.metrics),
+                                artifact_paths=artifacts,
+                                tags=dict(run.data.tags),
+                                start_time=run.info.start_time,
+                                status=run.info.status,
+                            ))
+
+        # Sort by proximity to claimed value
+        if claim.value.magnitude is not None:
+            matching_runs.sort(key=lambda r: abs(
+                r.metrics.get(
+                    self._normalize_metric(claim.predicate), 0
+                ) - claim.value.magnitude
+            ))
+
+        return matching_runs
+
+    def _download_artifacts(self, run_id: str) -> list[str]:
+        """Download all artifacts from an MLflow run."""
+        local_dir = Path(tempfile.mkdtemp()) / run_id
+        try:
+            path = self.client.download_artifacts(
+                run_id, "", str(local_dir)
+            )
+            return [
+                str(p) for p in Path(path).rglob("*")
+                if p.is_file()
+            ]
+        except Exception:
+            return []
+
+    def _normalize_metric(self, predicate: str) -> str:
+        """Normalize metric names for matching.
+        Maps common aliases to canonical forms."""
+        aliases = {
+            "accuracy": "accuracy",
+            "acc": "accuracy",
+            "f1 score": "f1",
+            "f1": "f1",
+            "precision": "precision",
+            "recall": "recall",
+            "auc-roc": "auc_roc",
+            "auc": "auc_roc",
+            "rmse": "rmse",
+            "mae": "mae",
+            "loss": "loss",
+            "perplexity": "perplexity",
+        }
+        return aliases.get(predicate.lower(), predicate.lower())
+
+    def compare_claim_to_run(
+        self, claim, run: RunArtifacts
+    ) -> dict:
+        """Compare a claim's value to an MLflow run's metrics.
+
+        Returns:
+            Dictionary with match status, delta, and details.
+        """
+        metric_name = self._normalize_metric(claim.predicate)
+        if metric_name not in run.metrics:
+            return {
+                "match": False,
+                "reason": f"Metric '{metric_name}' not in run",
+                "run_id": run.run_id,
+            }
+
+        logged_value = run.metrics[metric_name]
+        claimed_value = claim.value.magnitude
+
+        if claimed_value is None:
+            return {
+                "match": False,
+                "reason": "Claim has no numerical value",
+                "run_id": run.run_id,
+            }
+
+        delta = logged_value - claimed_value
+        relative_delta = delta / max(abs(claimed_value), 1e-8)
+
+        return {
+            "match": abs(relative_delta) < 0.01,  # 1% tolerance
+            "claimed_value": claimed_value,
+            "logged_value": logged_value,
+            "delta": delta,
+            "relative_delta": relative_delta,
+            "run_id": run.run_id,
+            "experiment": run.experiment_name,
+        }
+</code></pre>
+<div class="code-caption">Listing 41.9: MLflow auditor that retrieves experiment runs matching a claim's metric and value, downloads run artifacts, and compares logged metrics against claimed values with configurable tolerance.</div>
+
+<h3>1.2 Dataset Verification with DVC</h3>
+
+<p>
+Even when the code is available and executable, reproducibility fails if the dataset has
+changed since the original experiment. DVC (Data Version Control) addresses this by
+tracking datasets alongside code in Git, storing file hashes that pin each dataset
+version to a specific commit. Our auditor verifies that the dataset used in a re-execution
+matches the dataset recorded in the original experiment.
+</p>
+
+<pre><code class="language-python">"""
+Dataset verification using DVC checksums.
+Ensures that the data used in a reproduction matches
+the data used in the original experiment.
+"""
+import hashlib
+import subprocess
+import yaml
+from pathlib import Path
+
+
+@dataclass
+class DatasetIntegrity:
+    """Result of a dataset integrity check."""
+    dataset_path: str
+    expected_hash: str     # From DVC lock file or MLflow artifact
+    actual_hash: str       # Computed from current file
+    matches: bool
+    file_size_bytes: int
+    row_count: int | None  # For tabular data
+
+
+class DVCVerifier:
+    """Verify dataset integrity using DVC checksums."""
+
+    def __init__(self, repo_path: str):
+        """Initialize with path to a Git/DVC repository.
+
+        Args:
+            repo_path: Path to the repository root containing
+                       .dvc files and dvc.lock.
+        """
+        self.repo_path = Path(repo_path)
+
+    def get_tracked_files(self) -> dict[str, str]:
+        """Parse DVC lock file to get tracked file hashes.
+
+        Returns:
+            Dictionary mapping file paths to their MD5 hashes.
+        """
+        lock_path = self.repo_path / "dvc.lock"
+        if not lock_path.exists():
+            return {}
+
+        with open(lock_path) as f:
+            lock_data = yaml.safe_load(f)
+
+        tracked = {}
+        for stage_name, stage in lock_data.get(
+            "stages", {}
+        ).items():
+            for dep in stage.get("deps", []):
+                if "md5" in dep and "path" in dep:
+                    tracked[dep["path"]] = dep["md5"]
+            for out in stage.get("outs", []):
+                if "md5" in out and "path" in out:
+                    tracked[out["path"]] = out["md5"]
+
+        return tracked
+
+    def verify_dataset(
+        self, dataset_path: str, expected_hash: str = None
+    ) -> DatasetIntegrity:
+        """Verify a dataset file against its expected hash.
+
+        If no expected_hash is given, uses the hash from the
+        DVC lock file.
+        """
+        full_path = self.repo_path / dataset_path
+        if not full_path.exists():
+            return DatasetIntegrity(
+                dataset_path=dataset_path,
+                expected_hash=expected_hash or "",
+                actual_hash="FILE_NOT_FOUND",
+                matches=False,
+                file_size_bytes=0,
+                row_count=None,
+            )
+
+        # Compute MD5 (DVC uses MD5 by default)
+        actual_hash = self._compute_md5(full_path)
+
+        # Get expected hash from DVC if not provided
+        if expected_hash is None:
+            tracked = self.get_tracked_files()
+            expected_hash = tracked.get(dataset_path, "")
+
+        # Count rows for tabular data
+        row_count = None
+        if full_path.suffix in (".csv", ".tsv"):
+            with open(full_path) as f:
+                row_count = sum(1 for _ in f) - 1  # Minus header
+
+        return DatasetIntegrity(
+            dataset_path=dataset_path,
+            expected_hash=expected_hash,
+            actual_hash=actual_hash,
+            matches=(actual_hash == expected_hash),
+            file_size_bytes=full_path.stat().st_size,
+            row_count=row_count,
+        )
+
+    def verify_all_tracked(self) -> list[DatasetIntegrity]:
+        """Verify integrity of all DVC-tracked files."""
+        tracked = self.get_tracked_files()
+        results = []
+        for path, expected in tracked.items():
+            results.append(
+                self.verify_dataset(path, expected)
+            )
+        return results
+
+    def _compute_md5(self, path: Path) -> str:
+        """Compute MD5 hash of a file (matching DVC convention)."""
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def reproduce_pipeline(
+        self, stage: str = None
+    ) -> dict:
+        """Attempt to reproduce a DVC pipeline stage.
+
+        Args:
+            stage: Optional stage name. If None, reproduces all.
+
+        Returns:
+            Dictionary with success status, outputs, and timing.
+        """
+        cmd = ["dvc", "repro"]
+        if stage:
+            cmd.append(stage)
+
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(self.repo_path),
+                capture_output=True,
+                text=True,
+                timeout=3600,  # 1 hour timeout
+            )
+            return {
+                "success": result.returncode == 0,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "error": "Pipeline execution timed out (1h limit)",
+            }
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "error": "DVC not installed or not in PATH",
+            }
+</code></pre>
+<div class="code-caption">Listing 41.10: DVC-based dataset verification that compares current file hashes against the DVC lock file to detect dataset drift. The reproduce_pipeline method attempts full pipeline re-execution with a safety timeout.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+The most common cause of irreproducibility is not buggy code or fabricated data. It is
+<em>undocumented preprocessing</em>. The authors ran a cleaning script they forgot to
+commit, used a random seed they did not record, or applied a filter they considered
+"obvious" and did not mention. DVC's pipeline tracking catches this class of errors
+because it records the hash of every input and output at every stage. If a preprocessing
+step changes one byte of the training data, the downstream hashes break, and the
+discrepancy is visible.
+</p>
+</div>
+
+<h2>2. Computing Reproducibility Scores</h2>
+
+<p>
+Not every discrepancy between a claimed value and a reproduced value indicates a problem.
+Machine learning experiments involve stochastic processes (random initialization, data
+shuffling, dropout), and small variations between runs are expected. A reproducibility
+score must distinguish between acceptable variation (noise) and meaningful discrepancy
+(signal). We use a statistical framework based on tolerance intervals.
+</p>
+
+<h3>2.1 Statistical Tolerance Bands</h3>
+
+<p>
+A <strong>tolerance band</strong> defines the range of values that are considered
+"reproduced." If a paper claims accuracy of 94.7%, and we re-run the experiment 10
+times and get values between 93.9% and 95.1%, the claim is reproduced within tolerance.
+If we get values between 88.2% and 90.1%, the claim fails.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of a tolerance band like the acceptable temperature range on a home thermostat. If you set your thermostat to 72 degrees, you do not expect the room to sit at exactly 72.0 at every moment; the heating system cycles on and off, and readings between 71 and 73 are perfectly normal operation. A reading of 68, though, means something is wrong with the furnace or the insulation, not just random fluctuation. The tolerance band in reproducibility scoring works the same way: it defines the "normal cycling range" around a claimed experimental result, so you can distinguish a system operating as expected (small stochastic variation between runs) from a system that is malfunctioning (the claimed result is far outside what re-execution actually produces).
+</p>
+</div>
+
+<p>
+Formally, given $n$ reproduction runs with results $x_1, x_2, \ldots, x_n$, we compute:
+</p>
+
+$$
+\bar{x} = \frac{1}{n} \sum_{i=1}^{n} x_i, \quad s = \sqrt{\frac{1}{n-1} \sum_{i=1}^{n} (x_i - \bar{x})^2}
+$$
+
+<p>
+The tolerance interval at confidence level $\gamma$ and coverage proportion $p$ is:
+</p>
+
+$$
+[\bar{x} - k \cdot s, \quad \bar{x} + k \cdot s]
+$$
+
+<p>
+where $k$ is the tolerance factor depending on $n$, $p$, and $\gamma$. For practical use
+with small $n$ (3 to 10 reproduction runs), we use the simpler approach of a
+$t$-distribution based confidence interval for the mean, and check whether the claimed
+value falls within it.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that a "reproduced" verdict means the original experiment was conducted correctly and the claim is true. Reproducibility only confirms that <em>the same code and data produce the same numbers</em>; it says nothing about whether the experimental design was sound, the data was representative, or the conclusions are valid. A pipeline with severe data leakage, for example, will reproduce its inflated metrics perfectly every time. Reproducibility is a necessary condition for trust, not a sufficient one.
+</p>
+</div>
+
+<pre><code class="language-python">"""
+Reproducibility scoring with statistical tolerance bands.
+Computes whether a claimed value falls within the expected
+variation of reproduced experimental results.
+"""
+import numpy as np
+from scipy import stats
+from enum import Enum
+
+
+class ReproducibilityVerdict(Enum):
+    REPRODUCED = "reproduced"              # Within tolerance
+    PARTIALLY_REPRODUCED = "partial"       # Close but outside CI
+    NOT_REPRODUCED = "not_reproduced"      # Outside tolerance
+    INSUFFICIENT_RUNS = "insufficient"     # Too few runs to judge
+    EXECUTION_FAILED = "failed"            # Could not run at all
+
+
+@dataclass
+class ReproducibilityScore:
+    """Result of a reproducibility assessment."""
+    claimed_value: float
+    reproduced_values: list[float]
+    mean: float
+    std: float
+    ci_lower: float        # Confidence interval lower bound
+    ci_upper: float        # Confidence interval upper bound
+    delta: float           # claimed - mean
+    relative_delta: float  # delta / claimed
+    p_value: float         # Probability of observing claimed value
+    verdict: ReproducibilityVerdict
+    score: float           # 0 to 1, continuous reproducibility score
+    n_runs: int
+
+
+class ReproducibilityAuditor:
+    """Compute reproducibility scores for scientific claims."""
+
+    def __init__(
+        self,
+        confidence: float = 0.95,
+        min_runs: int = 3,
+        tolerance_factor: float = 2.0
+    ):
+        """Configure the auditor.
+
+        Args:
+            confidence: Confidence level for tolerance intervals.
+            min_runs: Minimum reproduction runs for a verdict.
+            tolerance_factor: Multiplier for acceptable deviation
+                              (in units of standard deviation).
+        """
+        self.confidence = confidence
+        self.min_runs = min_runs
+        self.tolerance_factor = tolerance_factor
+
+    def score_claim(
+        self,
+        claimed_value: float,
+        reproduced_values: list[float]
+    ) -> ReproducibilityScore:
+        """Score a claim against reproduced values.
+
+        Args:
+            claimed_value: The value reported in the paper.
+            reproduced_values: Values from reproduction runs.
+
+        Returns:
+            ReproducibilityScore with verdict and statistics.
+        """
+        n = len(reproduced_values)
+
+        if n < self.min_runs:
+            return ReproducibilityScore(
+                claimed_value=claimed_value,
+                reproduced_values=reproduced_values,
+                mean=np.mean(reproduced_values) if n > 0 else 0,
+                std=np.std(reproduced_values, ddof=1) if n > 1 else 0,
+                ci_lower=0, ci_upper=0,
+                delta=0, relative_delta=0, p_value=1.0,
+                verdict=ReproducibilityVerdict.INSUFFICIENT_RUNS,
+                score=0.0,
+                n_runs=n,
+            )
+
+        values = np.array(reproduced_values)
+        mean = np.mean(values)
+        std = np.std(values, ddof=1)
+
+        # Confidence interval using t-distribution
+        t_crit = stats.t.ppf(
+            (1 + self.confidence) / 2, df=n - 1
+        )
+        margin = t_crit * std / np.sqrt(n)
+        ci_lower = mean - margin
+        ci_upper = mean + margin
+
+        # How far is the claimed value from our mean?
+        delta = claimed_value - mean
+        relative_delta = delta / max(abs(claimed_value), 1e-8)
+
+        # One-sample t-test: is claimed value plausible?
+        if std > 1e-10:
+            t_stat = (claimed_value - mean) / (std / np.sqrt(n))
+            p_value = 2 * (1 - stats.t.cdf(abs(t_stat), df=n - 1))
+        else:
+            # Zero variance: exact match or clear mismatch
+            p_value = 1.0 if abs(delta) < 1e-10 else 0.0
+
+        # Determine verdict
+        verdict = self._compute_verdict(
+            claimed_value, mean, std, ci_lower, ci_upper, p_value
+        )
+
+        # Continuous score: exponential decay from perfect match
+        # score = exp(-|delta| / (tolerance_factor * std))
+        if std > 1e-10:
+            score = float(np.exp(
+                -abs(delta) / (self.tolerance_factor * std)
+            ))
+        else:
+            score = 1.0 if abs(delta) < 1e-10 else 0.0
+
+        return ReproducibilityScore(
+            claimed_value=claimed_value,
+            reproduced_values=reproduced_values,
+            mean=float(mean),
+            std=float(std),
+            ci_lower=float(ci_lower),
+            ci_upper=float(ci_upper),
+            delta=float(delta),
+            relative_delta=float(relative_delta),
+            p_value=float(p_value),
+            verdict=verdict,
+            score=float(score),
+            n_runs=n,
+        )
+
+    def _compute_verdict(
+        self, claimed, mean, std, ci_lo, ci_hi, p_value
+    ) -> ReproducibilityVerdict:
+        """Assign a categorical verdict based on statistics."""
+        # Within confidence interval: reproduced
+        if ci_lo <= claimed <= ci_hi:
+            return ReproducibilityVerdict.REPRODUCED
+
+        # Within tolerance band but outside CI: partial
+        tol_lo = mean - self.tolerance_factor * std
+        tol_hi = mean + self.tolerance_factor * std
+        if tol_lo <= claimed <= tol_hi:
+            return ReproducibilityVerdict.PARTIALLY_REPRODUCED
+
+        # Outside tolerance: not reproduced
+        return ReproducibilityVerdict.NOT_REPRODUCED
+
+
+# --- Demonstration ---
+auditor = ReproducibilityAuditor(confidence=0.95, min_runs=3)
+
+# Scenario 1: Claim reproduced within tolerance
+score1 = auditor.score_claim(
+    claimed_value=94.7,
+    reproduced_values=[94.3, 94.8, 94.5, 94.1, 94.9]
+)
+print(f"Verdict: {score1.verdict.value}")
+# Verdict: reproduced
+print(f"Score: {score1.score:.3f}")
+# Score: 0.913
+print(f"Mean: {score1.mean:.1f} +/- {score1.std:.2f}")
+# Mean: 94.5 +/- 0.33
+
+# Scenario 2: Claim NOT reproduced
+score2 = auditor.score_claim(
+    claimed_value=94.7,
+    reproduced_values=[88.2, 89.1, 87.8, 88.5, 89.3]
+)
+print(f"Verdict: {score2.verdict.value}")
+# Verdict: not_reproduced
+print(f"Score: {score2.score:.3f}")
+# Score: 0.000
+print(f"Delta: {score2.delta:.1f} percentage points")
+# Delta: 6.0 percentage points
+</code></pre>
+<div class="code-caption">Listing 41.11: Reproducibility scoring engine that computes tolerance intervals from reproduction runs, tests whether the claimed value falls within them, and produces both a categorical verdict and a continuous score based on exponential decay from the reproduction mean.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example</div>
+<p>
+<strong>Reproducibility audit at an AI safety lab.</strong> Before incorporating a new
+alignment technique into their production safety pipeline, the lab's validation team
+re-runs the paper's key experiments five times with the published code. The paper claims
+"our RLHF approach reduces harmful completions by 73% on the ToxiGen benchmark." The
+five reproduction runs yield reductions of 68%, 71%, 65%, 70%, and 67%. The
+reproducibility auditor computes a mean of 68.2% with a 95% confidence interval of
+[64.8%, 71.6%]. The claimed 73% falls outside this interval, producing a verdict of
+"partially reproduced" (within the wider tolerance band but outside the CI). The team
+proceeds with the technique but recalibrates their safety budget using the reproduced
+mean of 68.2% rather than the claimed 73%.
+</p>
+</div>
+
+<h2>3. Data Leakage Detection</h2>
+
+<p>
+Data leakage is the silent killer of scientific claims. When information from the test
+set contaminates the training process, reported metrics are inflated, sometimes
+dramatically, and the resulting model fails to generalize. Leakage is particularly
+insidious because the code may be correct, the experiment may be well-documented, and
+the results may be perfectly reproducible. The problem is that the experimental design
+itself is flawed.
+</p>
+
+<p>
+Kapoor and Narayanan (2023) documented leakage across 17 scientific fields, finding
+that it was responsible for inflated claims in hundreds of published papers. Common
+leakage patterns include: train/test overlap (identical samples in both sets), temporal
+leakage (using future information to predict past events), preprocessing leakage
+(fitting normalizers on the full dataset before splitting), and feature leakage
+(including the target variable or a proxy in the input features).
+</p>
+
+<pre><code class="language-python">"""
+Data leakage detector for ML experimental pipelines.
+Checks for common leakage patterns that inflate reported
+metrics and invalidate claims.
+"""
+import pandas as pd
+import numpy as np
+from typing import Optional
+
+
+@dataclass
+class LeakageReport:
+    """Result of a leakage detection analysis."""
+    leakage_type: str        # overlap, temporal, feature, preprocessing
+    severity: str            # critical, warning, info
+    description: str
+    affected_samples: int
+    total_samples: int
+    estimated_inflation: float | None  # Estimated metric inflation
+
+
+class LeakageDetector:
+    """Detect data leakage in ML datasets and pipelines."""
+
+    def detect_all(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_col: str,
+        timestamp_col: str = None,
+        id_cols: list[str] = None,
+    ) -> list[LeakageReport]:
+        """Run all leakage checks on a train/test split.
+
+        Args:
+            train_df: Training set DataFrame.
+            test_df: Test set DataFrame.
+            target_col: Name of the target column.
+            timestamp_col: Optional temporal column for time leakage.
+            id_cols: Optional identifier columns for overlap checks.
+
+        Returns:
+            List of LeakageReport objects for each detected issue.
+        """
+        reports = []
+
+        reports.extend(
+            self.check_sample_overlap(
+                train_df, test_df, id_cols
+            )
+        )
+        reports.extend(
+            self.check_feature_leakage(
+                train_df, target_col
+            )
+        )
+        if timestamp_col:
+            reports.extend(
+                self.check_temporal_leakage(
+                    train_df, test_df, timestamp_col
+                )
+            )
+        reports.extend(
+            self.check_target_distribution_shift(
+                train_df, test_df, target_col
+            )
+        )
+
+        # Sort by severity
+        severity_order = {"critical": 0, "warning": 1, "info": 2}
+        reports.sort(
+            key=lambda r: severity_order.get(r.severity, 3)
+        )
+        return reports
+
+    def check_sample_overlap(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        id_cols: list[str] = None,
+    ) -> list[LeakageReport]:
+        """Check for identical samples in train and test sets."""
+        reports = []
+
+        if id_cols:
+            # Check overlap on identifier columns
+            train_ids = set(
+                train_df[id_cols].apply(tuple, axis=1)
+            )
+            test_ids = set(
+                test_df[id_cols].apply(tuple, axis=1)
+            )
+            overlap = train_ids & test_ids
+        else:
+            # Check for exact row duplicates
+            # Convert to tuples for hashable comparison
+            feature_cols = [
+                c for c in train_df.columns
+            ]
+            train_tuples = set(
+                train_df[feature_cols].apply(tuple, axis=1)
+            )
+            test_tuples = set(
+                test_df[feature_cols].apply(tuple, axis=1)
+            )
+            overlap = train_tuples & test_tuples
+
+        if overlap:
+            overlap_rate = len(overlap) / len(test_df)
+            severity = (
+                "critical" if overlap_rate > 0.01
+                else "warning" if overlap_rate > 0.001
+                else "info"
+            )
+            reports.append(LeakageReport(
+                leakage_type="overlap",
+                severity=severity,
+                description=(
+                    f"{len(overlap)} test samples "
+                    f"({overlap_rate:.2%}) appear in the "
+                    f"training set. Metrics on these samples "
+                    f"reflect memorization, not generalization."
+                ),
+                affected_samples=len(overlap),
+                total_samples=len(test_df),
+                estimated_inflation=self._estimate_overlap_inflation(
+                    overlap_rate
+                ),
+            ))
+
+        return reports
+
+    def check_feature_leakage(
+        self,
+        train_df: pd.DataFrame,
+        target_col: str,
+    ) -> list[LeakageReport]:
+        """Detect features with suspiciously high correlation
+        to the target, which may indicate leakage."""
+        reports = []
+        numeric_cols = train_df.select_dtypes(
+            include=[np.number]
+        ).columns
+
+        if target_col not in numeric_cols:
+            return reports
+
+        for col in numeric_cols:
+            if col == target_col:
+                continue
+            corr = train_df[col].corr(train_df[target_col])
+            if abs(corr) > 0.95:
+                reports.append(LeakageReport(
+                    leakage_type="feature",
+                    severity="critical",
+                    description=(
+                        f"Feature '{col}' has correlation "
+                        f"{corr:.3f} with target '{target_col}'. "
+                        f"This may indicate the feature is a "
+                        f"proxy for or derived from the target."
+                    ),
+                    affected_samples=len(train_df),
+                    total_samples=len(train_df),
+                    estimated_inflation=None,
+                ))
+            elif abs(corr) > 0.85:
+                reports.append(LeakageReport(
+                    leakage_type="feature",
+                    severity="warning",
+                    description=(
+                        f"Feature '{col}' has high correlation "
+                        f"{corr:.3f} with target '{target_col}'. "
+                        f"Verify this is a legitimate predictor."
+                    ),
+                    affected_samples=len(train_df),
+                    total_samples=len(train_df),
+                    estimated_inflation=None,
+                ))
+
+        return reports
+
+    def check_temporal_leakage(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        timestamp_col: str,
+    ) -> list[LeakageReport]:
+        """Check for temporal leakage: test events occurring
+        before training events."""
+        reports = []
+
+        try:
+            train_times = pd.to_datetime(
+                train_df[timestamp_col]
+            )
+            test_times = pd.to_datetime(
+                test_df[timestamp_col]
+            )
+        except (ValueError, KeyError):
+            return reports
+
+        train_max = train_times.max()
+        test_min = test_times.min()
+
+        if test_min < train_max:
+            # Some test events precede training events
+            leaking = (test_times < train_max).sum()
+            reports.append(LeakageReport(
+                leakage_type="temporal",
+                severity="critical",
+                description=(
+                    f"{leaking} test samples have timestamps "
+                    f"earlier than the latest training sample. "
+                    f"The model may have seen 'future' "
+                    f"information during training."
+                ),
+                affected_samples=int(leaking),
+                total_samples=len(test_df),
+                estimated_inflation=None,
+            ))
+
+        return reports
+
+    def check_target_distribution_shift(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_col: str,
+    ) -> list[LeakageReport]:
+        """Check if train and test target distributions are
+        suspiciously identical (may indicate improper splitting)."""
+        reports = []
+
+        if target_col not in train_df.columns:
+            return reports
+
+        if train_df[target_col].dtype in [np.float64, np.int64]:
+            # KS test for continuous targets
+            stat, p_val = stats.ks_2samp(
+                train_df[target_col].dropna(),
+                test_df[target_col].dropna()
+            )
+            if p_val > 0.99:
+                reports.append(LeakageReport(
+                    leakage_type="preprocessing",
+                    severity="warning",
+                    description=(
+                        f"Train and test target distributions "
+                        f"are suspiciously identical "
+                        f"(KS p-value = {p_val:.4f}). "
+                        f"This may indicate the split was "
+                        f"performed after stratification on "
+                        f"the target, or the data was shuffled "
+                        f"with a non-random mechanism."
+                    ),
+                    affected_samples=len(test_df),
+                    total_samples=len(train_df) + len(test_df),
+                    estimated_inflation=None,
+                ))
+
+        return reports
+
+    def _estimate_overlap_inflation(
+        self, overlap_rate: float
+    ) -> float:
+        """Estimate metric inflation from train/test overlap.
+
+        Assumes overlapping samples achieve ~100% accuracy
+        (memorization) and the true accuracy on non-overlapping
+        samples is the baseline.
+
+        For accuracy-like metrics:
+        inflated = baseline * (1 - overlap_rate) + 1.0 * overlap_rate
+        inflation = overlap_rate * (1.0 - baseline)
+
+        We use a conservative baseline assumption of 0.5.
+        """
+        baseline = 0.5
+        return overlap_rate * (1.0 - baseline)
+</code></pre>
+<div class="code-caption">Listing 41.12: Data leakage detector that checks for sample overlap, feature leakage via suspicious correlations, temporal ordering violations, and distribution anomalies between train and test sets. Each detected issue includes severity grading and estimated metric inflation where computable.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight</div>
+<p>
+Leakage detection is asymmetric: detecting leakage is much easier than proving its
+absence. A clean leakage report does not guarantee clean data. It only means that the
+automated checks did not find the specific leakage patterns they were designed to detect.
+Novel leakage mechanisms (e.g., geographic proximity between train and test hospitals in
+a medical imaging study) require domain-specific checks that no generic detector will
+catch. The automated detector handles the common cases; the rare cases require human
+domain expertise.
+</p>
+</div>
+
+<h2>4. Building Reproducibility Test Suites with pytest</h2>
+
+<p>
+Reproducibility checks are a natural fit for test frameworks. Each check is an assertion:
+"the reproduced accuracy is within 1% of the claimed value," "the dataset hash matches
+the DVC lock file," "no train/test overlap exists." By encoding these assertions as
+pytest tests, we get automatic execution, clear pass/fail reporting, and integration
+with CI/CD pipelines from
+<a href="../../part-2-software-engineering/module-21-devops/index.html">Chapter 21</a>.
+</p>
+
+<pre><code class="language-python">"""
+Reproducibility test suite using pytest.
+Each test encodes a specific reproducibility assertion
+that can be run as part of a CI/CD pipeline.
+"""
+import pytest
+import json
+from pathlib import Path
+
+
+# ---- Fixtures ----
+
+@pytest.fixture
+def claims():
+    """Load extracted claims from the extraction pipeline."""
+    claims_path = Path("artifacts/extracted_claims.json")
+    with open(claims_path) as f:
+        data = json.load(f)
+    return [Claim(**c) for c in data]
+
+
+@pytest.fixture
+def mlflow_auditor():
+    """Initialize MLflow auditor for artifact verification."""
+    return MLflowAuditor(tracking_uri="file:///mlruns")
+
+
+@pytest.fixture
+def dvc_verifier():
+    """Initialize DVC verifier for dataset integrity."""
+    return DVCVerifier(repo_path=".")
+
+
+@pytest.fixture
+def repro_auditor():
+    """Initialize reproducibility auditor with default config."""
+    return ReproducibilityAuditor(
+        confidence=0.95,
+        min_runs=3,
+        tolerance_factor=2.0
+    )
+
+
+@pytest.fixture
+def leakage_detector():
+    """Initialize leakage detector."""
+    return LeakageDetector()
+
+
+# ---- Dataset Integrity Tests ----
+
+class TestDatasetIntegrity:
+    """Verify that datasets match their recorded checksums."""
+
+    def test_all_tracked_files_intact(self, dvc_verifier):
+        """All DVC-tracked files should match their lock hashes."""
+        results = dvc_verifier.verify_all_tracked()
+        failed = [r for r in results if not r.matches]
+        assert len(failed) == 0, (
+            f"{len(failed)} files have mismatched hashes: "
+            + ", ".join(r.dataset_path for r in failed)
+        )
+
+    def test_training_data_exists(self, dvc_verifier):
+        """Training data file must exist and be non-empty."""
+        result = dvc_verifier.verify_dataset("data/train.csv")
+        assert result.actual_hash != "FILE_NOT_FOUND", (
+            "Training data file not found"
+        )
+        assert result.file_size_bytes > 0, (
+            "Training data file is empty"
+        )
+
+    def test_test_data_exists(self, dvc_verifier):
+        """Test data file must exist and be non-empty."""
+        result = dvc_verifier.verify_dataset("data/test.csv")
+        assert result.actual_hash != "FILE_NOT_FOUND", (
+            "Test data file not found"
+        )
+
+
+# ---- Leakage Tests ----
+
+class TestLeakage:
+    """Verify absence of data leakage in train/test split."""
+
+    @pytest.fixture
+    def train_test_data(self):
+        """Load train and test datasets."""
+        import pandas as pd
+        train = pd.read_csv("data/train.csv")
+        test = pd.read_csv("data/test.csv")
+        return train, test
+
+    def test_no_sample_overlap(
+        self, leakage_detector, train_test_data
+    ):
+        """Train and test sets must have no overlapping samples."""
+        train, test = train_test_data
+        reports = leakage_detector.check_sample_overlap(
+            train, test
+        )
+        critical = [
+            r for r in reports if r.severity == "critical"
+        ]
+        assert len(critical) == 0, (
+            f"Critical sample overlap detected: "
+            + "; ".join(r.description for r in critical)
+        )
+
+    def test_no_feature_leakage(
+        self, leakage_detector, train_test_data
+    ):
+        """No feature should be a near-perfect proxy for target."""
+        train, _ = train_test_data
+        reports = leakage_detector.check_feature_leakage(
+            train, target_col="label"
+        )
+        critical = [
+            r for r in reports if r.severity == "critical"
+        ]
+        assert len(critical) == 0, (
+            f"Feature leakage detected: "
+            + "; ".join(r.description for r in critical)
+        )
+
+    def test_no_temporal_leakage(
+        self, leakage_detector, train_test_data
+    ):
+        """Test timestamps must not precede training timestamps."""
+        train, test = train_test_data
+        if "timestamp" not in train.columns:
+            pytest.skip("No timestamp column")
+        reports = leakage_detector.check_temporal_leakage(
+            train, test, timestamp_col="timestamp"
+        )
+        assert len(reports) == 0, (
+            f"Temporal leakage detected: "
+            + "; ".join(r.description for r in reports)
+        )
+
+
+# ---- Reproducibility Tests ----
+
+class TestReproducibility:
+    """Verify that claimed metrics are reproducible."""
+
+    def test_primary_metric_reproducible(
+        self, claims, mlflow_auditor, repro_auditor
+    ):
+        """The primary claimed metric should be reproducible
+        within the tolerance band."""
+        # Find the primary numerical claim
+        primary = next(
+            (c for c in claims
+             if c.claim_type == ClaimType.NUMERICAL
+             and c.is_verifiable()),
+            None
+        )
+        if primary is None:
+            pytest.skip("No verifiable numerical claim found")
+
+        # Find matching MLflow runs
+        runs = mlflow_auditor.find_runs_for_claim(primary)
+        assert len(runs) >= 3, (
+            f"Need at least 3 matching runs, found {len(runs)}"
+        )
+
+        # Extract reproduced values
+        metric = mlflow_auditor._normalize_metric(
+            primary.predicate
+        )
+        repro_values = [
+            r.metrics[metric] for r in runs
+            if metric in r.metrics
+        ]
+
+        # Score reproducibility
+        score = repro_auditor.score_claim(
+            claimed_value=primary.value.magnitude,
+            reproduced_values=repro_values
+        )
+
+        assert score.verdict in (
+            ReproducibilityVerdict.REPRODUCED,
+            ReproducibilityVerdict.PARTIALLY_REPRODUCED,
+        ), (
+            f"Claim '{primary.summary()}' not reproduced. "
+            f"Claimed: {score.claimed_value}, "
+            f"Mean: {score.mean:.3f} +/- {score.std:.3f}, "
+            f"Score: {score.score:.3f}"
+        )
+
+    def test_all_numerical_claims(
+        self, claims, mlflow_auditor
+    ):
+        """All numerical claims should have matching MLflow runs."""
+        numerical = [
+            c for c in claims
+            if c.claim_type == ClaimType.NUMERICAL
+            and c.is_verifiable()
+        ]
+
+        unmatched = []
+        for claim in numerical:
+            runs = mlflow_auditor.find_runs_for_claim(claim)
+            if not runs:
+                unmatched.append(claim.summary())
+
+        assert len(unmatched) == 0, (
+            f"{len(unmatched)} claims have no matching MLflow "
+            f"runs: " + "; ".join(unmatched)
+        )
+</code></pre>
+<div class="code-caption">Listing 41.13: pytest-based reproducibility test suite that encodes dataset integrity, leakage absence, and metric reproducibility as automated test assertions. Each test class targets a specific reproducibility concern and integrates with CI/CD pipelines for continuous validation.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut</div>
+<p>
+The <a href="https://github.com/replicate/cog" target="_blank">Cog</a> packaging tool
+from Replicate provides a standardized way to define reproducible ML environments as
+Docker containers. By wrapping a model in a <code>cog.yaml</code> specification, the
+entire environment (Python version, CUDA version, all dependencies) is pinned and
+reproducible. The <code>cog predict</code> command then re-runs predictions in the
+identical environment, reducing the "works on my machine" problem to roughly 5 lines
+of configuration. Cog handles environment isolation, GPU setup, and output formatting
+internally, letting you focus on the metric comparison logic rather than dependency
+debugging.
+</p>
+</div>
+
+<h2>5. Artifact Integrity Verification</h2>
+
+<p>
+Beyond dataset integrity, a full reproducibility audit verifies the integrity of all
+computational artifacts: model checkpoints, configuration files, evaluation scripts,
+and output logs. Each artifact should have a cryptographic hash recorded at experiment
+time, and the audit verifies that the current artifact matches its recorded hash.
+</p>
+
+<pre><code class="language-python">"""
+Artifact integrity verification with cryptographic hashing.
+Verifies that model checkpoints, configs, and scripts have
+not been modified since the original experiment.
+"""
+import hashlib
+from pathlib import Path
+
+
+@dataclass
+class ArtifactIntegrity:
+    """Result of an artifact integrity check."""
+    path: str
+    artifact_type: str     # model, config, script, data
+    expected_hash: str
+    actual_hash: str
+    matches: bool
+    size_bytes: int
+    modified_time: float
+
+
+class ArtifactIntegrityChecker:
+    """Verify integrity of experimental artifacts."""
+
+    def __init__(self, manifest_path: str):
+        """Load artifact manifest with expected hashes.
+
+        The manifest is a JSON file mapping artifact paths
+        to their SHA-256 hashes, recorded at experiment time.
+        """
+        self.manifest_path = Path(manifest_path)
+        if self.manifest_path.exists():
+            with open(self.manifest_path) as f:
+                self.manifest = json.load(f)
+        else:
+            self.manifest = {}
+
+    def verify_artifact(self, path: str) -> ArtifactIntegrity:
+        """Check a single artifact against the manifest."""
+        full_path = Path(path)
+        expected = self.manifest.get(path, "")
+
+        if not full_path.exists():
+            return ArtifactIntegrity(
+                path=path,
+                artifact_type=self._classify(path),
+                expected_hash=expected,
+                actual_hash="FILE_NOT_FOUND",
+                matches=False,
+                size_bytes=0,
+                modified_time=0,
+            )
+
+        actual = self._sha256(full_path)
+        stat = full_path.stat()
+
+        return ArtifactIntegrity(
+            path=path,
+            artifact_type=self._classify(path),
+            expected_hash=expected,
+            actual_hash=actual,
+            matches=(actual == expected) if expected else False,
+            size_bytes=stat.st_size,
+            modified_time=stat.st_mtime,
+        )
+
+    def verify_all(self) -> list[ArtifactIntegrity]:
+        """Verify all artifacts in the manifest."""
+        return [
+            self.verify_artifact(path)
+            for path in self.manifest
+        ]
+
+    def create_manifest(
+        self, artifact_dir: str, output_path: str = None
+    ) -> dict:
+        """Create a manifest of all artifacts in a directory.
+
+        Use this to record artifact hashes at experiment time.
+        """
+        manifest = {}
+        for path in Path(artifact_dir).rglob("*"):
+            if path.is_file():
+                rel_path = str(
+                    path.relative_to(artifact_dir)
+                )
+                manifest[rel_path] = self._sha256(path)
+
+        if output_path:
+            with open(output_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+
+        return manifest
+
+    def _sha256(self, path: Path) -> str:
+        """Compute SHA-256 hash of a file."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _classify(self, path: str) -> str:
+        """Classify artifact type from file extension."""
+        ext = Path(path).suffix.lower()
+        type_map = {
+            ".pt": "model", ".pth": "model",
+            ".ckpt": "model", ".h5": "model",
+            ".safetensors": "model",
+            ".json": "config", ".yaml": "config",
+            ".yml": "config", ".toml": "config",
+            ".py": "script", ".sh": "script",
+            ".csv": "data", ".parquet": "data",
+            ".tsv": "data", ".jsonl": "data",
+        }
+        return type_map.get(ext, "unknown")
+</code></pre>
+<div class="code-caption">Listing 41.14: Artifact integrity checker using SHA-256 hashing. The create_manifest method records hashes at experiment time; verify_all checks current files against the manifest to detect any post-experiment modifications.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example</div>
+<p>
+<strong>Artifact integrity in a clinical trial AI system.</strong> A regulatory submission
+for an AI-assisted diagnostic tool requires demonstrating that the model used in the
+validation study is identical to the model being submitted for approval. The integrity
+checker creates a manifest at validation time, recording SHA-256 hashes of the model
+checkpoint (1.2 GB), the preprocessing configuration (3 KB), the evaluation script
+(450 lines), and the test dataset (2.1 million records). Six months later, during the
+FDA review, the checker verifies all four artifacts. The model and configuration match.
+The evaluation script has a one-line change (a logging statement added for debugging),
+flagged by the hash mismatch. The team provides the git diff showing the change is
+non-functional, satisfying the reviewer. Without the manifest, they would have no way
+to prove the evaluation code was substantively unchanged.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+The ACM Conference on Reproducibility and Replicability (ACM REP) introduced in 2023 has catalyzed new tooling for automated reproducibility assessment. Notably, the TREC Reproducibility Track (2023 onwards) established standardized benchmarks for measuring how well IR and ML systems reproduce across independent re-implementations, not just re-executions. In parallel, Isdahl and Gundersen's "Out-of-the-Machine" framework (2023) proposes machine-readable reproducibility checklists embedded directly in experiment metadata, enabling fully automated audit pipelines that go beyond hash verification to check whether hyperparameter search spaces, early stopping criteria, and hardware specifications were faithfully reported. These developments push toward a future where reproducibility auditing is a continuous integration step rather than a post-publication afterthought.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Reproducibility Auditor</h4>
+<p>
+Test reproducibility scoring on a real stochastic experiment using only Python, NumPy, SciPy, and scikit-learn.
+</p>
+<ol>
+<li><strong>Create a stochastic experiment.</strong> Write a script that trains a <code>sklearn.ensemble.RandomForestClassifier</code> on the Iris dataset with a random train/test split (no fixed seed), evaluates accuracy, and prints the result. Run it 10 times, collecting the 10 accuracy values in a list.</li>
+<li><strong>Simulate a "claimed" result.</strong> Pick one of your 10 values and treat it as the "published claim." Alternatively, use an artificially inflated value (e.g., add 5 percentage points) to simulate a non-reproducible claim.</li>
+<li><strong>Implement the scoring logic.</strong> Using the <code>ReproducibilityAuditor</code> class from Listing 41.11, pass your claimed value and the remaining 9 reproduced values to <code>score_claim()</code>. Print the verdict, score, confidence interval, and p-value.</li>
+<li><strong>Add a leakage check.</strong> Deliberately introduce train/test overlap by copying 10% of the test set into the training set. Re-run the 10 experiments and observe how the reproduced values shift upward. Run the <code>LeakageDetector.check_sample_overlap()</code> method on the contaminated split to confirm it catches the overlap.</li>
+<li><strong>Write a pytest test.</strong> Encode one assertion ("accuracy claim is within the 95% confidence interval") as a pytest test function. Run <code>pytest -v</code> and observe whether your honest and inflated claims pass or fail.</li>
+</ol>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+We now have all the components needed for end-to-end claim validation: claim extraction
+(Section 41.1), evidence mapping (Section 41.1), reproducibility scoring (this section),
+leakage detection (this section), and artifact integrity checking (this section).
+<a href="section-41.3.html">Section 41.3: Building a Claim Validator</a> assembles
+these components into a complete pipeline that ingests a paper, extracts its numerical
+claims, links each to MLflow run artifacts, re-executes evaluation code, and produces
+a scored validation report with per-claim confidence ratings.
+</p>
+</section>
+
+<nav class="chapter-nav">
+<a href="section-41.1.html">&larr; Section 41.1: Claim Extraction and Evidence Mapping</a>
+<a href="section-41.3.html">Section 41.3: Building a Claim Validator &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

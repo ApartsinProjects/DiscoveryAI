@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 33.2: Neural Operators. DeepONet branch-trunk architecture, Fourier Neural Operator spectral convolutions, and resolution-invariant learning for PDE families." name="description"/>
+<title>Section 33.2: Neural Operators | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 33: Scientific Machine Learning</a></div>
+<h1>Section 33.2: Neural Operators</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"A PINN solves one PDE instance. I solve entire families. Tell me the initial condition, and I will tell you the future."</p>
+<cite>A Fourier Neural Operator, Feeling Superior</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+In <a href="section-33.1.html">Section 33.1</a>, we trained a PINN to solve a single
+instance of the heat equation with a specific initial condition. If the initial condition
+changes, we must retrain from scratch. Neural operators solve this fundamental limitation
+by learning the mapping from input functions (initial conditions, boundary conditions,
+forcing terms, PDE coefficients) to output functions (solutions). Once trained, a neural
+operator produces the solution for any new input function in a single forward pass, with
+inference times typically three to four orders of magnitude faster than traditional
+solvers. This section covers the two dominant neural operator architectures: DeepONet
+(which factorizes the operator into branch and trunk networks) and the Fourier Neural
+Operator (which performs convolutions in the spectral domain for resolution invariance).
+</p>
+</div>
+
+<h2>1. From Functions to Operators</h2>
+
+<p>
+A classical neural network learns a mapping between finite-dimensional vectors:
+$f: \mathbb{R}^n \to \mathbb{R}^m$. A neural operator learns a mapping between
+function spaces: $\mathcal{G}: \mathcal{U} \to \mathcal{V}$, where $\mathcal{U}$ and
+$\mathcal{V}$ are (typically infinite-dimensional) spaces of functions. For a PDE, the
+operator might map an initial condition $u_0(x) \in \mathcal{U}$ to the solution at time
+$T$, $u(x, T) \in \mathcal{V}$.
+</p>
+
+<p>
+The theoretical foundation is the universal approximation theorem for operators (Chen &
+Chen, 1995): a neural network with a specific architecture can approximate any continuous
+nonlinear operator to arbitrary accuracy. DeepONet and FNO are two different architectures
+that realize this theorem, each with distinct strengths.
+</p>
+
+<p data-agent="02">
+A neural operator is a parametric map between infinite-dimensional function spaces,
+trained on paired examples of input and output functions so that, after training, it
+can predict the output function for any new input in a single forward pass. This matters
+because traditional PDE solvers must re-solve from scratch whenever the input (initial
+condition, boundary, or coefficient field) changes, while a neural operator amortizes
+that cost across all future queries. The mechanism is to encode the input function into
+a finite-dimensional latent representation, transform it through learnable layers that
+respect the function-space structure, and decode it back to a function. Choose a neural
+operator over a PINN when you need to evaluate the same PDE family for hundreds or
+thousands of different inputs; choose a traditional solver when you need guaranteed
+error bounds or have only a single instance to solve.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Amortized Cost</div>
+<p>
+The critical advantage of neural operators is <strong>amortized computation</strong>.
+Training is expensive (hours to days on GPU), but inference is cheap (milliseconds).
+For applications that require solving the same PDE thousands of times with different
+parameters, such as uncertainty quantification (Chapter 32), design optimization
+(<a href="../../part-5-simulation-optimization/module-45-optimization/index.html">Chapter 45</a>),
+or real-time control, a single trained neural operator replaces an entire fleet of
+traditional solver runs. The break-even point is typically around 100 to 1000 forward
+evaluations, after which the neural operator is faster in total wall-clock time.
+</p>
+</div>
+
+<h2>2. DeepONet: Branch and Trunk</h2>
+
+<p>
+DeepONet (Deep Operator Network) factorizes the operator into two sub-networks:
+</p>
+
+<ul>
+<li>The <strong>branch network</strong> encodes the input function $u(x)$, evaluated at
+a fixed set of sensor locations $\{x_1, \ldots, x_m\}$, into a latent representation
+$\mathbf{b} = [b_1, \ldots, b_p] \in \mathbb{R}^p$.</li>
+
+<li>The <strong>trunk network</strong> takes the query location $y$ (where we want to
+evaluate the output) and produces a basis representation
+$\boldsymbol{\tau} = [\tau_1(y), \ldots, \tau_p(y)] \in \mathbb{R}^p$.</li>
+</ul>
+
+<p>
+The output is their inner product:
+</p>
+
+$$\mathcal{G}_\theta(u)(y) = \sum_{k=1}^{p} b_k \cdot \tau_k(y) + b_0$$
+
+<p>
+This factorization has elegant properties: the branch network learns a data-dependent
+representation of the input function, while the trunk network learns a set of basis
+functions for the output space. The inner product combines them, analogous to how a
+traditional Galerkin method projects onto a finite basis.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+class DeepONet(nn.Module):
+    """DeepONet: branch encodes input function, trunk encodes query location."""
+
+    def __init__(self, branch_input_dim, trunk_input_dim, hidden_dim=128,
+                 num_basis=64):
+        super().__init__()
+        # Branch network: input function values at sensor locations -> latent
+        self.branch = nn.Sequential(
+            nn.Linear(branch_input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, num_basis),
+        )
+        # Trunk network: query location -> basis functions
+        self.trunk = nn.Sequential(
+            nn.Linear(trunk_input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, num_basis),
+        )
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, u_sensors, y_query):
+        """
+        u_sensors: (batch, m) - input function at m sensor locations
+        y_query: (batch, d) - query locations in output domain
+        Returns: (batch,) - operator output at query locations
+        """
+        b = self.branch(u_sensors)          # (batch, num_basis)
+        tau = self.trunk(y_query)            # (batch, num_basis)
+        return torch.sum(b * tau, dim=-1) + self.bias
+
+# Example: map initial condition u0(x) to solution u(x, T=0.5)
+# m=100 sensor locations, 1D query points
+model = DeepONet(branch_input_dim=100, trunk_input_dim=1)
+</code></pre>
+<div class="code-caption">DeepONet in PyTorch: the branch network processes 100 sensor readings of the input function, the trunk network processes a query coordinate, and their dot product gives the operator output. This architecture can learn any continuous operator between function spaces.</div>
+
+<h2>3. Fourier Neural Operator: Spectral Convolutions</h2>
+
+<p>
+The Fourier Neural Operator (FNO) takes a fundamentally different approach. Instead of
+factorizing the operator, it processes the input function through a sequence of layers,
+each of which applies a linear transformation in Fourier space followed by a nonlinear
+activation in physical space:
+</p>
+
+$$v^{(l+1)}(x) = \sigma\Big(W^{(l)} v^{(l)}(x) + \mathcal{F}^{-1}\big(R^{(l)} \cdot \mathcal{F}[v^{(l)}]\big)(x)\Big)$$
+
+<p>
+where $\mathcal{F}$ denotes the Fourier transform, $R^{(l)}$ is a learnable weight matrix
+in Fourier space (applied to the first $k_{\max}$ modes), $W^{(l)}$ is a local linear
+transformation, and $\sigma$ is a pointwise nonlinearity (typically GELU).
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the FNO's spectral convolution like an audio equalizer on a mixing board.
+A sound wave (your PDE solution) is a sum of frequencies. The equalizer decomposes
+the signal into its frequency bands, lets you boost or cut each band independently
+with a slider, and then recombines them into a modified signal. The FNO does the same
+thing: the Fourier transform decomposes the spatial field into frequency modes, the
+learnable weight matrix $R^{(l)}$ acts as the set of sliders (adjusting each mode's
+amplitude and phase), and the inverse transform reassembles the result. Because the
+equalizer operates on frequencies rather than individual audio samples, it works
+identically whether the song is recorded at 44.1 kHz or 96 kHz. That is exactly why
+the FNO generalizes across spatial resolutions.
+</p>
+</div>
+
+<p>
+The key properties of the spectral convolution are:
+</p>
+
+<ul>
+<li><strong>Resolution invariance</strong>: since convolutions in physical space become
+pointwise multiplications in Fourier space, and the Fourier transform is defined for any
+discretization, an FNO trained at one resolution can be evaluated at a different resolution
+without retraining. This is impossible for standard convolutional networks.</li>
+
+<li><strong>Global receptive field</strong>: each Fourier layer captures long-range
+dependencies across the entire domain, unlike local convolutional filters that require
+stacking many layers for global context.</li>
+
+<li><strong>Efficient parameterization</strong>: by truncating to $k_{\max}$ Fourier modes,
+the model captures the dominant spectral components of the solution while keeping the
+parameter count manageable.</li>
+</ul>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.fft
+
+class SpectralConv1d(nn.Module):
+    """1D Fourier layer: learnable filter in spectral domain."""
+
+    def __init__(self, in_channels, out_channels, modes):
+        super().__init__()
+        self.modes = modes  # number of Fourier modes to keep
+        scale = 1.0 / (in_channels * out_channels)
+        # Complex-valued weights for Fourier modes
+        self.weights = nn.Parameter(
+            scale * torch.randn(in_channels, out_channels, modes,
+                                dtype=torch.cfloat)
+        )
+
+    def forward(self, x):
+        """x: (batch, channels, spatial_points)."""
+        # Transform to Fourier space
+        x_ft = torch.fft.rfft(x)
+
+        # Multiply relevant modes by learnable weights
+        out_ft = torch.zeros_like(x_ft[:, :1, :].repeat(1, self.weights.shape[1], 1))
+        out_ft[:, :, :self.modes] = torch.einsum(
+            "bim,iom->bom", x_ft[:, :, :self.modes], self.weights
+        )
+
+        # Transform back to physical space
+        return torch.fft.irfft(out_ft, n=x.size(-1))
+
+
+class FNO1d(nn.Module):
+    """1D Fourier Neural Operator with 4 Fourier layers."""
+
+    def __init__(self, modes=16, width=64):
+        super().__init__()
+        self.fc0 = nn.Linear(2, width)  # lift: (x, u) -> high-dim
+
+        # Four Fourier layers
+        self.convs = nn.ModuleList([
+            SpectralConv1d(width, width, modes) for _ in range(4)
+        ])
+        self.ws = nn.ModuleList([
+            nn.Conv1d(width, width, 1) for _ in range(4)
+        ])
+
+        # Project back to output
+        self.fc1 = nn.Linear(width, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        """x: (batch, spatial_points, 2) where channels are [coord, u0]."""
+        x = self.fc0(x)                     # (batch, S, width)
+        x = x.permute(0, 2, 1)              # (batch, width, S)
+
+        for conv, w in zip(self.convs, self.ws):
+            x1 = conv(x)                     # spectral pathway
+            x2 = w(x)                        # local pathway
+            x = torch.nn.functional.gelu(x1 + x2)
+
+        x = x.permute(0, 2, 1)              # (batch, S, width)
+        x = torch.nn.functional.gelu(self.fc1(x))
+        return self.fc2(x)                   # (batch, S, 1)
+</code></pre>
+<div class="code-caption">A 1D Fourier Neural Operator: each layer applies a learnable filter in Fourier space (capturing global structure) combined with a local 1x1 convolution (capturing pointwise features). The spectral truncation to the first 16 modes acts as an implicit regularizer and keeps the parameter count low.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Weather Forecasting with FourCastNet</div>
+<p>
+NVIDIA's FourCastNet applies the FNO architecture to global weather prediction on the
+0.25-degree ERA5 grid (721 x 1440 spatial points, 20 atmospheric variables). Trained
+on 40 years of reanalysis data, FourCastNet generates 7-day forecasts in under 2 seconds
+on a single GPU, compared to hours on a supercomputer for the traditional Integrated
+Forecasting System (IFS). The model achieves competitive accuracy with IFS for lead
+times up to 5 days. This application, discussed further in
+<a href="../../part-6-scientific-domains/module-51-climate-earth/index.html">Chapter 51</a>,
+demonstrates that neural operators can scale to real-world scientific problems with
+operational speed requirements.
+</p>
+</div>
+
+<h2>4. DeepONet vs. FNO: When to Use Which</h2>
+
+<p>
+The two architectures have complementary strengths:
+</p>
+
+<table>
+<thead>
+<tr><th>Property</th><th>DeepONet</th><th>FNO</th></tr>
+</thead>
+<tbody>
+<tr><td>Input representation</td><td>Fixed sensor locations</td><td>Regular grid</td></tr>
+<tr><td>Output evaluation</td><td>Any point (continuous)</td><td>Grid points</td></tr>
+<tr><td>Resolution invariance</td><td>No (fixed sensors)</td><td>Yes (Fourier modes)</td></tr>
+<tr><td>Irregular geometry</td><td>Handles well</td><td>Requires domain mapping</td></tr>
+<tr><td>Multi-scale problems</td><td>Moderate</td><td>Strong (spectral)</td></tr>
+<tr><td>Data efficiency</td><td>Moderate</td><td>Needs more data</td></tr>
+<tr><td>Theoretical basis</td><td>Universal approximation</td><td>Spectral methods</td></tr>
+</tbody>
+</table>
+
+<p>
+As a rule of thumb: use DeepONet when your data comes from irregular sensor networks
+or you need continuous output evaluation, and use FNO when your data lives on a regular
+grid and the problem has periodic or smooth boundary conditions. For problems that need
+both irregular inputs and resolution invariance, hybrid architectures (e.g., geo-FNO)
+bridge the gap.
+</p>
+
+<h2>5. The NeuralOperator Library</h2>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: NeuralOperator</div>
+<p>
+The <a href="https://github.com/neuraloperator/neuraloperator">NeuralOperator</a> library
+provides production-ready implementations of FNO, TFNO (tensor-factorized FNO for
+3D problems), SFNO (spherical FNO for data on spheres), and UNO (U-shaped neural
+operator). It includes built-in data loaders for standard benchmarks (Darcy flow,
+Navier-Stokes, shallow water equations), training utilities, and resolution-transfer
+evaluation. What takes approximately 120 lines of custom PyTorch above can be configured
+in 15 lines:
+</p>
+</div>
+
+<pre><code class="language-python">from neuralop.models import FNO
+from neuralop.datasets import load_darcy_flow_small
+from neuralop.training import Trainer
+from neuralop.losses import LpLoss
+
+# Load the Darcy flow benchmark dataset
+train_loader, test_loaders, output_encoder = load_darcy_flow_small(
+    n_train=1000, batch_size=32,
+    test_resolutions=[16, 32],  # test at multiple resolutions
+    test_batch_sizes=[32, 32],
+)
+
+# Create FNO model
+model = FNO(
+    n_modes=(16, 16),           # Fourier modes in each dimension
+    in_channels=1,              # input: permeability field
+    out_channels=1,             # output: pressure field
+    hidden_channels=32,
+    n_layers=4,
+)
+
+# Train with relative L2 loss
+trainer = Trainer(model=model, n_epochs=50)
+trainer.train(
+    train_loader=train_loader,
+    test_loaders=test_loaders,
+    output_encoder=output_encoder,
+)
+</code></pre>
+<div class="code-caption">The NeuralOperator library reduces FNO training to configuration: specify modes, channels, and layers, then train. The library handles Fourier layer implementation, resolution transfer testing, and standard scientific benchmarks.</div>
+
+<h2>6. Training Neural Operators: Data Generation and Best Practices</h2>
+
+<p>
+Neural operators are supervised: they need pairs of (input function, output function)
+for training. Unlike PINNs, which are self-supervised through PDE residuals, neural
+operators require pre-computed solutions from traditional solvers. This creates a
+chicken-and-egg situation: you need a solver to generate training data for the model
+that is supposed to replace the solver.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often believe that neural operators eliminate the need for traditional PDE
+solvers entirely. In reality, neural operators depend on traditional solvers to generate
+their training data: you must first solve the PDE many times (with varied inputs) using
+a classical method, then train the neural operator on those input/output pairs. The
+speed advantage comes at inference time, when the trained operator handles new inputs
+without re-running the solver, but the solver remains essential during the data
+generation phase.
+</p>
+</div>
+
+<p>
+The resolution is that training data generation is a one-time cost. Best practices include:
+</p>
+
+<ul>
+<li><strong>Diverse training distribution</strong>: sample input functions from a rich
+distribution (e.g., Gaussian random fields with varying correlation lengths) to ensure
+the operator generalizes across the expected range of inputs.</li>
+
+<li><strong>Multi-resolution training</strong>: generate training data at coarse resolution
+(cheap) and validate at fine resolution, leveraging the FNO's resolution invariance.</li>
+
+<li><strong>Physics-informed neural operators</strong> (PINO): combine the data-driven
+loss with a PDE residual loss, reducing the amount of training data needed. This hybrid
+marries the strengths of PINNs (no labeled data needed) and neural operators (fast
+inference for new inputs).</li>
+</ul>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Foundation Models for PDEs (2024-2025)</div>
+<p>
+The latest direction in neural operators is building foundation models that generalize
+across PDE families, not just across initial conditions for a single PDE. <strong>Poseidon</strong>
+(Herde et al., 2024) pre-trains a neural operator on 15 PDE families and fine-tunes on
+unseen equations with as few as 32 examples. <strong>Multiple Physics Pretraining</strong>
+(MPP, McCabe et al., 2024) demonstrates that pre-training on diverse physics (fluids,
+electromagnetics, diffusion) improves transfer to new domains. More recently,
+<strong>DPOT</strong> (Hao et al., 2025) introduces a pre-trained transformer backbone
+for operator learning that scales to over 500 million parameters, achieving
+state-of-the-art results on 10 benchmark PDEs from the PDEBench suite with a single
+pre-trained model, and demonstrating that scaling laws observed in language models
+extend to scientific operator learning. These models are to PDE solving what GPT is
+to natural language: general-purpose function-space transformers that can be adapted
+to specific scientific domains with minimal task-specific data.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note</div>
+<p>
+The Fourier Neural Operator was originally trained on 2D Navier-Stokes turbulence
+at a resolution of 64 x 64. When researchers evaluated it at 256 x 256 (a resolution
+never seen during training), it produced accurate results. This "zero-shot
+super-resolution" property, unique to the spectral parameterization, prompted a
+flurry of interest from the computational physics community, which had spent decades
+fighting the curse of mesh refinement.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Train an FNO on Burgers' Equation in 30 Minutes</h4>
+<p>
+Build and evaluate a 1D Fourier Neural Operator on the viscous Burgers' equation using
+only PyTorch and NumPy.
+</p>
+<ol>
+<li><strong>Generate training data.</strong> Write a finite-difference solver for the 1D
+viscous Burgers' equation ($u_t + u u_x = \nu u_{xx}$, $\nu = 0.01$) on the domain
+$[0, 1]$ with periodic boundary conditions. Use 256 spatial points and integrate to
+$t = 1.0$. Sample 1000 random initial conditions from a truncated Fourier series
+(sum of 5 to 10 random sine and cosine terms with random amplitudes).</li>
+<li><strong>Build the FNO.</strong> Implement the <code>SpectralConv1d</code> and
+<code>FNO1d</code> classes from this section (copy the code above). Set
+<code>modes=16</code> and <code>width=64</code>. The input is
+<code>[x_coordinate, u0(x)]</code> stacked along the channel dimension; the output is
+<code>u(x, T=1.0)</code>.</li>
+<li><strong>Train for 50 epochs.</strong> Use the Adam optimizer with learning rate
+$10^{-3}$, batch size 32, and relative $L^2$ loss. Split your 1000 samples into 800
+training and 200 test pairs.</li>
+<li><strong>Test resolution transfer.</strong> Interpolate your test inputs to 512 spatial
+points using <code>scipy.interpolate.interp1d</code>. Run the trained FNO (without
+retraining) on the upsampled inputs and compare with the ground truth at 512 points.
+Verify that the relative error stays within 2x of the original-resolution error.</li>
+<li><strong>Benchmark speed.</strong> Time 200 forward passes through the FNO versus 200
+runs of your finite-difference solver. Compute the speedup factor and estimate the
+break-even point (number of evaluations at which the FNO's training cost plus
+inference cost equals the solver's total cost).</li>
+</ol>
+</div>
+
+<h2>Exercises</h2>
+
+<ol>
+<li><strong>Conceptual:</strong> Explain why a standard CNN cannot generalize across
+resolutions while an FNO can. What property of the Fourier transform makes this possible?
+How does the choice of $k_{\max}$ (number of retained modes) affect accuracy and
+generalization?</li>
+
+<li><strong>Coding:</strong> Using the NeuralOperator library, train an FNO on the Darcy
+flow dataset at resolution 16 x 16 and evaluate it at 32 x 32. Report the relative $L^2$
+error at both resolutions. Then retrain at 32 x 32 and compare. How much does training
+resolution matter?</li>
+
+<li><strong>Analysis:</strong> Implement a simple DeepONet for the 1D heat equation
+(input: initial condition sampled from $\sin(k\pi x)$ for $k = 1, \ldots, 5$; output:
+solution at $t = 0.5$). Compare its accuracy and inference speed against: (a) the PINN
+from <a href="section-33.1.html">Section 33.1</a> (retrained for each initial condition),
+and (b) a traditional finite-difference solver. At what number of evaluations does the
+DeepONet break even in total wall-clock time?</li>
+</ol>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-33.1.html">&larr; Section 33.1</a>
+<a href="index.html">Chapter 33</a>
+<a href="section-33.3.html">Section 33.3 &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

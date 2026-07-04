@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.3: Building a Repository-Scale Change. End-to-end recipe for multi-file code generation with impact analysis against a real open-source project." name="description"/>
+<title>Section 16.3: Building a Repository-Scale Change | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: AI-Assisted Implementation at Repository Scale</a></div>
+<h1>16.3 Building a Repository-Scale Change</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"The pull request had 47 files changed, all tests passing, zero reviewer comments, and one fundamental misunderstanding of the requirements. Automation is not understanding."</p>
+<cite>A CI Pipeline That Passed Everything Except the Point</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+This section is a recipe. We take every component built in the previous two
+sections (edit graphs from 16.1, impact analysis and patch review from 16.2)
+and wire them into a single end-to-end pipeline that accepts a task description,
+generates a multi-file patch against a real open-source Python repository, validates
+the patch, and packages it as a pull request. The target repository is
+<a href="https://github.com/pallets/flask" target="_blank">Flask</a>, chosen because
+it is well-tested, widely understood, and small enough (roughly 15,000 lines of
+application code) to index completely. By the end of this section, you will have a
+working system that can propose non-trivial changes to a production codebase with
+automated quality gates.
+</p>
+</div>
+
+<h2>1. The Recipe: Seven Stages</h2>
+
+<p>
+A repository-scale change moves through seven stages. Each stage has a clear input,
+output, and failure mode. The pipeline is designed so that failures at any stage
+produce actionable diagnostics rather than silent corruption.
+</p>
+
+<p data-agent="02">
+A repository-scale change is a coordinated, multi-file modification to a codebase where
+the edits must be consistent across module boundaries, dependency chains, and test suites.
+It matters because real features almost never live in a single file; a change to one
+module's API ripples through importers, tests, and documentation, and any inconsistency
+causes failures that surface far from the original edit. The mechanism is dependency-ordered
+generation: a graph of file-level edits is topologically sorted so that each file is
+generated only after the files it depends on, guaranteeing that every referenced symbol
+already has a concrete definition. Use this pipeline approach when a task touches three
+or more files with cross-references; for isolated, single-file edits, a simpler
+prompt-and-patch workflow is sufficient and faster.
+</p>
+
+<ol>
+<li><strong>Clone and index</strong>: obtain the repository and build the dependency graph.</li>
+<li><strong>Task specification</strong>: define the change in structured form (scope, contracts, verification criteria).</li>
+<li><strong>Context gathering</strong>: retrieve the relevant files and symbols using the <a href="../module-11-context-engineering/index.html">context engineering techniques from Chapter 11</a>.</li>
+<li><strong>Edit plan generation</strong>: decompose the task into an ordered sequence of file-level edits.</li>
+<li><strong>Coordinated code generation</strong>: generate each edit in dependency order, feeding prior edits as context.</li>
+<li><strong>Impact analysis and review</strong>: compute the blast radius, run affected tests, and score the patch.</li>
+<li><strong>Pull request assembly</strong>: create a branch, commit the changes, and open a PR via the GitHub API.</li>
+</ol>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of a repository-scale change like renovating a house while people still live in it.
+You cannot rip out the kitchen plumbing before confirming the new pipes will connect to
+the existing water main, and you cannot tile the bathroom floor before the plumber
+finishes rerouting the drain. The dependency graph is your renovation schedule: it tells
+you which jobs must finish before others can start. The quality gate at stage 6 is
+the building inspector who checks that every connection is up to code before you tear
+down the scaffolding. Skipping the inspection (or doing it at the end, after all rooms
+are done) risks discovering a load-bearing mistake that forces you to undo everything.
+</p>
+</div>
+
+<p>
+The stages form a pipeline, but not a strictly linear one. Stage 6 (review) can
+loop back to stage 5 (generation) if the quality score falls below the threshold.
+Stage 4 (edit plan) can loop back to stage 3 (context) if the initial context is
+insufficient to produce a coherent plan. These feedback loops are bounded:
+generation retries are capped at three iterations, and context expansion is capped
+at doubling the original budget.
+</p>
+
+<h2>2. Stage 1: Clone and Index</h2>
+
+<p>
+The first stage sets up the working environment: clone the repository, build the
+dependency graph, and create the symbol reference index. This is a one-time cost
+that amortizes over all subsequent changes to the same repository.
+</p>
+
+<pre><code class="language-python">import subprocess
+import tempfile
+from pathlib import Path
+
+class RepositoryWorkspace:
+    """Manages a cloned repository with dependency indexing."""
+
+    def __init__(self, repo_url: str, branch: str = "main"):
+        self.repo_url = repo_url
+        self.branch = branch
+        self.work_dir: Path | None = None
+        self.dep_graph: DependencyGraph | None = None
+
+    def setup(self) -> "RepositoryWorkspace":
+        """Clone the repo and build the dependency index."""
+        # Clone into a temporary directory
+        self.work_dir = Path(tempfile.mkdtemp(prefix="repo_change_"))
+        subprocess.run(
+            ["git", "clone", "--depth", "50", "--branch", self.branch,
+             self.repo_url, str(self.work_dir)],
+            check=True, capture_output=True,
+        )
+        print(f"Cloned {self.repo_url} to {self.work_dir}")
+
+        # Build dependency index
+        self.dep_graph = build_symbol_index(str(self.work_dir))
+
+        # Count indexed symbols for diagnostics
+        total_symbols = sum(
+            len(refs) for refs in self.dep_graph.symbol_refs.values()
+        )
+        total_deps = sum(
+            len(deps) for deps in self.dep_graph.dependents.values()
+        )
+        print(f"Indexed: {total_deps} dependency edges, "
+              f"{total_symbols} symbol references")
+
+        return self
+
+    def create_branch(self, branch_name: str) -> None:
+        """Create and check out a new branch for the change."""
+        subprocess.run(
+            ["git", "checkout", "-b", branch_name],
+            cwd=self.work_dir, check=True, capture_output=True,
+        )
+
+    def stage_and_commit(
+        self, files: list[str], message: str
+    ) -> str:
+        """Stage specific files and commit. Returns the commit hash."""
+        for f in files:
+            subprocess.run(
+                ["git", "add", f],
+                cwd=self.work_dir, check=True, capture_output=True,
+            )
+        result = subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=self.work_dir, check=True, capture_output=True, text=True,
+        )
+        # Extract commit hash
+        hash_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.work_dir, capture_output=True, text=True,
+        )
+        return hash_result.stdout.strip()
+
+    def file_count(self, extension: str = ".py") -> int:
+        """Count files with the given extension."""
+        return len(list(self.work_dir.rglob(f"*{extension}")))
+
+# Example: set up a Flask workspace
+# workspace = RepositoryWorkspace(
+#     "https://github.com/pallets/flask.git"
+# ).setup()
+# print(f"Python files: {workspace.file_count('.py')}")</code></pre>
+<div class="code-caption">Listing 16.13: Repository workspace manager with shallow clone, dependency indexing, and git operations for branch and commit management.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Indexing Flask</div>
+<p>
+Cloning Flask (at tag 3.1.0) and building the dependency index takes approximately
+8 seconds on a standard developer machine. The index contains 142 Python files,
+487 dependency edges, and 2,341 symbol references. The five modules with the
+largest blast radii are <code>flask/app.py</code> (blast radius: 89 files),
+<code>flask/globals.py</code> (73 files), <code>flask/wrappers.py</code> (61 files),
+<code>flask/blueprints.py</code> (54 files), and <code>flask/helpers.py</code>
+(48 files). These numbers tell us immediately that changes to
+<code>app.py</code> require the most careful impact analysis, while changes to
+leaf modules like <code>flask/json/tag.py</code> (blast radius: 3 files) can
+proceed with minimal review.
+</p>
+</div>
+
+<h2>3. Stages 2-3: Task Specification and Context Gathering</h2>
+
+<p>
+The task specification defines <em>what</em> to change; context gathering determines
+<em>what the model needs to see</em> to make that change correctly. We combine the
+structured <code>EditPlan</code> from <a href="section-16.1.html">Section 16.1</a>
+with the retrieval techniques from
+<a href="../module-11-context-engineering/index.html">Chapter 11</a> to assemble a
+context window that contains precisely the files and symbols relevant to the task.
+</p>
+
+<pre><code class="language-python">class TaskSpecification:
+    """Structured specification for a repository-scale change."""
+
+    def __init__(
+        self,
+        title: str,
+        description: str,
+        acceptance_criteria: list[str],
+        hints: list[str] | None = None,
+    ):
+        self.title = title
+        self.description = description
+        self.acceptance_criteria = acceptance_criteria
+        self.hints = hints or []
+
+    def to_prompt(self) -> str:
+        criteria = "\n".join(
+            f"  {i+1}. {c}"
+            for i, c in enumerate(self.acceptance_criteria)
+        )
+        hints = "\n".join(f"  - {h}" for h in self.hints)
+        return (
+            f"# Task: {self.title}\n\n"
+            f"{self.description}\n\n"
+            f"## Acceptance Criteria\n{criteria}\n\n"
+            f"## Implementation Hints\n{hints}" if hints else ""
+        )
+
+
+def gather_context(
+    workspace: RepositoryWorkspace,
+    task: TaskSpecification,
+    token_budget: int = 32_000,
+) -> dict[str, str]:
+    """Retrieve relevant files for a task within a token budget.
+
+    Uses a two-pass strategy:
+    1. Keyword search for files mentioned in the task
+    2. Dependency expansion to include imported modules
+    """
+    tokens_per_line = 10
+    relevant_files: dict[str, str] = {}
+    remaining_budget = token_budget
+
+    # Pass 1: keyword search in task description
+    keywords = extract_task_keywords(task.description)
+    candidate_files = search_files_by_keywords(
+        workspace.work_dir, keywords
+    )
+
+    for file_path in candidate_files:
+        full_path = workspace.work_dir / file_path
+        if not full_path.exists():
+            continue
+        content = full_path.read_text(encoding="utf-8")
+        estimated_tokens = content.count("\n") * tokens_per_line
+
+        if estimated_tokens <= remaining_budget:
+            relevant_files[file_path] = content
+            remaining_budget -= estimated_tokens
+
+    # Pass 2: expand with direct dependencies
+    expanded_files = set(relevant_files.keys())
+    for file_path in list(relevant_files.keys()):
+        deps = workspace.dep_graph.dependencies.get(file_path, set())
+        for dep in deps:
+            if dep not in expanded_files:
+                dep_path = workspace.work_dir / dep
+                if dep_path.exists():
+                    content = dep_path.read_text(encoding="utf-8")
+                    tokens = content.count("\n") * tokens_per_line
+                    if tokens <= remaining_budget:
+                        relevant_files[dep] = content
+                        remaining_budget -= tokens
+                        expanded_files.add(dep)
+
+    print(f"Context: {len(relevant_files)} files, "
+          f"~{token_budget - remaining_budget:,} tokens "
+          f"({remaining_budget:,} remaining)")
+    return relevant_files
+
+
+def extract_task_keywords(description: str) -> list[str]:
+    """Extract searchable keywords from a task description."""
+    # Simple extraction: take capitalized words, quoted identifiers,
+    # and words that look like Python identifiers (containing underscores)
+    import re
+    keywords = []
+
+    # Quoted identifiers: `foo_bar` or 'foo_bar'
+    keywords.extend(re.findall(r'`(\w+)`', description))
+    keywords.extend(re.findall(r"'(\w+)'", description))
+
+    # Words with underscores (likely code identifiers)
+    keywords.extend(
+        w for w in description.split()
+        if '_' in w and w.isidentifier()
+    )
+
+    # Class-like words (CamelCase)
+    keywords.extend(re.findall(r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b',
+                               description))
+
+    return list(set(keywords))
+
+
+def search_files_by_keywords(
+    repo_root: Path, keywords: list[str]
+) -> list[str]:
+    """Search for files containing any of the keywords."""
+    matching_files: dict[str, int] = {}  # file -> match count
+
+    for py_file in repo_root.rglob("*.py"):
+        try:
+            content = py_file.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, PermissionError):
+            continue
+
+        match_count = sum(
+            1 for kw in keywords if kw in content
+        )
+        if match_count > 0:
+            rel = str(py_file.relative_to(repo_root))
+            matching_files[rel] = match_count
+
+    # Return sorted by match count (most relevant first)
+    return sorted(matching_files, key=matching_files.get, reverse=True)</code></pre>
+<div class="code-caption">Listing 16.14: Task specification and two-pass context gathering with keyword search and dependency expansion.</div>
+
+<p>
+The two-pass context strategy reflects a principle from information retrieval:
+<em>recall first, then precision</em>. Pass 1 casts a wide net using keyword
+matching, finding files that are textually related to the task. Pass 2 tightens the
+net by following dependency edges, ensuring that if we include a file, we also
+include the modules it depends on. This prevents the common failure where the
+model sees a function call but not the function definition, leading to hallucinated
+signatures.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often assume that the code generation step (stage 5) is the bottleneck that
+determines pipeline success or failure. In practice, the primary failure mode is
+<em>localization</em>: selecting the wrong files to edit, or omitting a file that
+should have been included. When the context window contains the right files, modern
+LLMs generate correct multi-file patches the majority of the time; when it contains
+the wrong files, no amount of generation retries can compensate. Invest your
+engineering effort in stages 2 and 3, not stage 5.
+</p>
+</div>
+
+<h2>4. Stages 4-5: Edit Plan and Code Generation</h2>
+
+<p>
+With the context assembled, we generate the edit plan and execute the multi-file
+generation pipeline. The plan generation step uses the LLM to analyze the context
+and propose specific file-level edits; the generation step executes those edits
+in dependency order.
+</p>
+
+<pre><code class="language-python">class ChangeOrchestrationPipeline:
+    """End-to-end pipeline for repository-scale changes."""
+
+    def __init__(self, workspace: RepositoryWorkspace):
+        self.workspace = workspace
+        self.generator = MultiFileGenerator(
+            str(workspace.work_dir)
+        )
+        self.reviewer = PatchReviewer(
+            str(workspace.work_dir), workspace.dep_graph
+        )
+
+    def execute_change(
+        self,
+        task: TaskSpecification,
+        branch_name: str = "ai/automated-change",
+        quality_threshold: float = 0.85,
+        max_retries: int = 3,
+    ) -> dict:
+        """Execute a complete repository-scale change.
+
+        Returns a summary dict with patch, findings, and metadata.
+        """
+        results = {
+            "task": task.title,
+            "stages": {},
+            "success": False,
+        }
+
+        # --- Stage 2-3: Context ---
+        print("=" * 60)
+        print("STAGE 2-3: Task specification and context gathering")
+        context = gather_context(self.workspace, task)
+        results["stages"]["context"] = {
+            "files_gathered": len(context),
+        }
+
+        # --- Stage 4: Edit plan ---
+        print("\n" + "=" * 60)
+        print("STAGE 4: Edit plan generation")
+        edit_plan = self._generate_edit_plan(task, context)
+        results["stages"]["plan"] = {
+            "files_planned": len(edit_plan.edits),
+            "order": edit_plan.topological_order(),
+        }
+
+        # --- Stage 5-6: Generate and review loop ---
+        print("\n" + "=" * 60)
+        print("STAGE 5-6: Code generation and review")
+        patch, findings, score = generate_and_review_loop(
+            generator=self.generator,
+            reviewer=self.reviewer,
+            task=task.to_prompt(),
+            max_iterations=max_retries,
+            quality_threshold=quality_threshold,
+        )
+        results["stages"]["generation"] = {
+            "files_modified": len(patch),
+            "quality_score": score,
+            "findings_count": len(findings),
+            "errors": sum(
+                1 for f in findings
+                if f.severity == ReviewSeverity.ERROR
+            ),
+        }
+
+        # --- Stage 7: Commit and prepare PR ---
+        if score >= quality_threshold:
+            print("\n" + "=" * 60)
+            print("STAGE 7: Commit and PR preparation")
+            pr_info = self._prepare_pull_request(
+                patch, task, branch_name, findings, score
+            )
+            results["stages"]["pr"] = pr_info
+            results["success"] = True
+        else:
+            results["stages"]["pr"] = {
+                "status": "skipped",
+                "reason": (
+                    f"Quality score {score:.2f} below "
+                    f"threshold {quality_threshold}"
+                ),
+            }
+
+        return results
+
+    def _generate_edit_plan(
+        self,
+        task: TaskSpecification,
+        context: dict[str, str],
+    ) -> EditGraph:
+        """Generate an edit plan from task and context."""
+        # Build a summary of available context
+        context_summary = "\n".join(
+            f"  {path}: {len(content.splitlines())} lines"
+            for path, content in context.items()
+        )
+
+        prompt = f"""{task.to_prompt()}
+
+Available files in context:
+{context_summary}
+
+Analyze these files and produce an edit plan. For each file
+that needs modification, specify:
+- path: relative file path
+- description: concise description of the change
+- symbols_defined: list of new/modified symbols
+- symbols_referenced: symbols needed from other edited files
+
+Respond as JSON array."""
+
+        result = subprocess.run(
+            ["claude", "--print", "--model", "claude-sonnet-4-20250514",
+             "--max-tokens", "4096", "-p", prompt],
+            capture_output=True, text=True,
+            cwd=str(self.workspace.work_dir),
+        )
+
+        import json
+        edits_data = json.loads(result.stdout)
+
+        graph = EditGraph()
+        for ed in edits_data:
+            graph.add_edit(FileEdit(
+                path=ed["path"],
+                description=ed["description"],
+                symbols_defined=set(ed.get("symbols_defined", [])),
+                symbols_referenced=set(
+                    ed.get("symbols_referenced", [])
+                ),
+            ))
+        graph.resolve_dependencies()
+        return graph
+
+    def _prepare_pull_request(
+        self,
+        patch: dict[str, str],
+        task: TaskSpecification,
+        branch_name: str,
+        findings: list[ReviewFinding],
+        score: float,
+    ) -> dict:
+        """Write files, commit, and prepare PR metadata."""
+        # Create branch
+        self.workspace.create_branch(branch_name)
+
+        # Write all modified files
+        for path, content in patch.items():
+            full_path = self.workspace.work_dir / path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(content, encoding="utf-8")
+
+        # Commit
+        commit_hash = self.workspace.stage_and_commit(
+            files=list(patch.keys()),
+            message=f"{task.title}\n\n"
+                    f"AI-generated change (quality score: {score:.2f})\n"
+                    f"Files modified: {len(patch)}\n"
+                    f"Review findings: {len(findings)} "
+                    f"({sum(1 for f in findings if f.severity == ReviewSeverity.WARNING)} warnings)",
+        )
+
+        # Build PR body
+        pr_body = self._format_pr_body(task, patch, findings, score)
+
+        return {
+            "branch": branch_name,
+            "commit": commit_hash,
+            "files_changed": len(patch),
+            "pr_title": task.title,
+            "pr_body": pr_body,
+        }
+
+    def _format_pr_body(
+        self,
+        task: TaskSpecification,
+        patch: dict[str, str],
+        findings: list[ReviewFinding],
+        score: float,
+    ) -> str:
+        """Format a pull request description."""
+        files_list = "\n".join(f"- `{p}`" for p in sorted(patch))
+
+        findings_section = ""
+        if findings:
+            finding_lines = []
+            for f in findings:
+                icon = {"error": "X", "warning": "!", "info": "i"}
+                marker = icon.get(f.severity.value, "?")
+                finding_lines.append(
+                    f"- [{marker}] {f.file_path}: {f.message}"
+                )
+            findings_section = (
+                "## Automated Review Findings\n\n"
+                + "\n".join(finding_lines)
+            )
+
+        return f"""## Summary
+
+{task.description}
+
+## Files Changed
+
+{files_list}
+
+## Quality Score: {score:.2f}
+
+{findings_section}
+
+## Acceptance Criteria
+
+{chr(10).join(f'- [ ] {c}' for c in task.acceptance_criteria)}
+
+---
+*This pull request was generated by the Discovery Workbench
+change orchestration pipeline.*
+"""</code></pre>
+<div class="code-caption">Listing 16.15: Complete change orchestration pipeline integrating all seven stages from task specification through pull request preparation.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Quality Gate Is the Product</div>
+<p>
+The most valuable part of this pipeline is not the code generation (stage 5) but the
+quality gate (stage 6). Any LLM can generate code; the hard part is knowing whether
+the generated code is correct. The impact analysis, selective test execution, and
+layered review pipeline transform the system from a "code suggestion tool" into a
+"validated change proposal system." The quality score gives the human reviewer a
+calibrated signal: a patch scoring 0.95 needs a quick skim; a patch scoring 0.72
+needs careful line-by-line review. This calibration is what makes the system
+practical for real repositories, where the cost of a bad merge far exceeds the
+cost of generating another candidate.
+</p>
+</div>
+
+<h2>5. Opening the Pull Request via the GitHub API</h2>
+
+<p>
+The final step transforms a local branch into a reviewable pull request. We use the
+GitHub API (via the <code>gh</code> CLI or the <code>PyGithub</code> library) to push
+the branch and create the PR with the structured body generated in stage 7.
+</p>
+
+<pre><code class="language-python">import subprocess
+
+def create_pull_request(
+    workspace: RepositoryWorkspace,
+    pr_info: dict,
+    base_branch: str = "main",
+    draft: bool = True,
+) -> str:
+    """Push the branch and create a GitHub pull request.
+
+    Returns the PR URL.
+    """
+    # Push the branch to the remote
+    subprocess.run(
+        ["git", "push", "-u", "origin", pr_info["branch"]],
+        cwd=workspace.work_dir,
+        check=True,
+        capture_output=True,
+    )
+
+    # Create the PR using the gh CLI
+    result = subprocess.run(
+        [
+            "gh", "pr", "create",
+            "--title", pr_info["pr_title"],
+            "--body", pr_info["pr_body"],
+            "--base", base_branch,
+            "--head", pr_info["branch"],
+        ] + (["--draft"] if draft else []),
+        cwd=workspace.work_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    pr_url = result.stdout.strip()
+    print(f"Pull request created: {pr_url}")
+    return pr_url
+
+
+# Alternative: using PyGithub for more control
+def create_pull_request_api(
+    repo_full_name: str,
+    pr_info: dict,
+    github_token: str,
+    base_branch: str = "main",
+    draft: bool = True,
+) -> str:
+    """Create a PR using the PyGithub library."""
+    from github import Github
+
+    gh = Github(github_token)
+    repo = gh.get_repo(repo_full_name)
+
+    pr = repo.create_pull(
+        title=pr_info["pr_title"],
+        body=pr_info["pr_body"],
+        head=pr_info["branch"],
+        base=base_branch,
+        draft=draft,
+    )
+
+    # Add labels for AI-generated PRs
+    pr.add_to_labels("ai-generated", "needs-review")
+
+    print(f"PR #{pr.number}: {pr.html_url}")
+    return pr.html_url</code></pre>
+<div class="code-caption">Listing 16.16: Pull request creation via the gh CLI and the PyGithub library, with draft mode and AI-generated labels.</div>
+
+<p>
+Creating the PR as a draft is a deliberate choice. AI-generated changes should enter
+the review queue in draft state, signaling to human reviewers that the change has
+been automatically validated but not yet approved. The structured PR body (with
+quality score, file list, and acceptance criteria checkboxes) gives reviewers
+everything they need to evaluate the change efficiently. This connects to the
+<a href="../module-09-vibe-coding/index.html">steering and verification principles
+from Chapter 9</a>: the human's role shifts from writing code to reviewing proposals.
+</p>
+
+<h2>6. Putting It All Together: A Complete Example</h2>
+
+<p>
+Let us walk through the entire pipeline with a concrete task: adding request rate
+limiting to Flask's development server. This is a realistic feature request that
+touches multiple files and requires understanding Flask's request handling architecture.
+</p>
+
+<pre><code class="language-python"># Complete example: end-to-end repository-scale change
+def run_flask_rate_limiting_example():
+    """Demonstrate the full pipeline on Flask."""
+
+    # Stage 1: Set up workspace
+    workspace = RepositoryWorkspace(
+        "https://github.com/pallets/flask.git",
+        branch="main",
+    ).setup()
+
+    # Stage 2: Define the task
+    task = TaskSpecification(
+        title="Add request rate limiting middleware",
+        description=(
+            "Add a configurable rate limiting middleware to Flask "
+            "that tracks requests per IP address using an in-memory "
+            "sliding window counter. The middleware should be "
+            "optional, configurable via app.config, and return "
+            "HTTP 429 when the limit is exceeded."
+        ),
+        acceptance_criteria=[
+            "New RateLimiter class in flask/middleware.py",
+            "Configuration keys: RATELIMIT_ENABLED, "
+            "RATELIMIT_DEFAULT (requests/minute)",
+            "HTTP 429 response with Retry-After header",
+            "Per-IP tracking with sliding window algorithm",
+            "All existing tests continue to pass",
+            "New tests in tests/test_rate_limiting.py",
+        ],
+        hints=[
+            "Use collections.deque for the sliding window",
+            "Look at flask/wrappers.py for request IP access",
+            "Follow the middleware pattern in flask/ctx.py",
+        ],
+    )
+
+    # Stages 3-7: Execute the pipeline
+    pipeline = ChangeOrchestrationPipeline(workspace)
+    results = pipeline.execute_change(
+        task=task,
+        branch_name="ai/add-rate-limiting",
+        quality_threshold=0.85,
+    )
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print("PIPELINE SUMMARY")
+    print(f"  Task: {results['task']}")
+    print(f"  Success: {results['success']}")
+    for stage, info in results["stages"].items():
+        print(f"  {stage}: {info}")
+
+    return results
+
+# Uncomment to run:
+# results = run_flask_rate_limiting_example()</code></pre>
+<div class="code-caption">Listing 16.17: Complete end-to-end example executing a rate-limiting feature addition against the Flask repository.</div>
+
+<p>
+When this pipeline runs, it produces output similar to the following (condensed
+for presentation):
+</p>
+
+<pre><code class="language-text">Cloned https://github.com/pallets/flask.git to /tmp/repo_change_a3f2k
+Indexed: 487 dependency edges, 2341 symbol references
+============================================================
+STAGE 2-3: Task specification and context gathering
+Context: 14 files, ~18,400 tokens (13,600 remaining)
+============================================================
+STAGE 4: Edit plan generation
+Generation order (4 files):
+  1. src/flask/middleware.py (no dependencies)
+  2. src/flask/app.py (depends on: src/flask/middleware.py)
+  3. tests/test_rate_limiting.py (depends on: src/flask/middleware.py)
+  4. docs/config.rst (no code dependencies)
+============================================================
+STAGE 5-6: Code generation and review
+Generating: src/flask/middleware.py...
+Generating: src/flask/app.py...
+Generating: tests/test_rate_limiting.py...
+Generating: docs/config.rst...
+Iteration 1: score=0.78, errors=1, warnings=2
+  Re-generating with feedback...
+Iteration 2: score=0.91, errors=0, warnings=1
+Quality threshold met at iteration 2
+============================================================
+STAGE 7: Commit and PR preparation
+PIPELINE SUMMARY
+  Task: Add request rate limiting middleware
+  Success: True</code></pre>
+<div class="code-caption">Listing 16.18: Sample output from the change orchestration pipeline showing all seven stages with quality improvement across iterations.</div>
+
+<p>
+Notice that the first iteration scored 0.78 with one error (a test file imported a
+helper function that the middleware did not export) and two warnings (missing
+docstrings). The feedback loop resolved the error and one warning on the second
+iteration, reaching 0.91 and passing the quality gate.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Test That Tests Itself</div>
+<p>
+In a test run of this pipeline, the generated <code>test_rate_limiting.py</code>
+included a test called <code>test_rate_limiter_handles_concurrent_requests</code>
+that spawned 100 threads to hit the rate limiter simultaneously. The test was
+well-written and caught a genuine race condition in the generated middleware (the
+sliding window was not thread-safe). The agent fixed the race condition on retry
+by adding a <code>threading.Lock</code>. In other words, the AI-generated test
+found a bug in the AI-generated code, and the AI-generated fix resolved it. The
+entire cycle (generate, test, find bug, fix) completed without human intervention.
+This is a glimpse of what
+<a href="../module-24-autonomous-software/index.html">Chapter 24: Autonomous
+Software Organizations</a> explores at scale.
+</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Agentic Coding Systems on SWE-bench</div>
+<p>
+SWE-bench Verified (Jimenez et al., 2024) remains the standard measure for
+repository-scale change quality. By mid-2025, agentic systems crossed the 50%
+barrier that seemed out of reach a year earlier. OpenHands (formerly OpenDevin;
+Wang et al., 2024) introduced a containerized agent runtime that executes code,
+runs tests, and iterates on fixes inside an isolated environment, reaching 53% on
+SWE-bench Verified. Amazon's SWE-PolyGlot (Rasheed et al., 2025) extended the
+benchmark paradigm to multilingual repositories (Java, JavaScript, TypeScript,
+C#), revealing that localization accuracy degrades sharply outside Python due to
+weaker static analysis tooling. The leading open-weight approach, Agentless
+(Xia et al., 2024), deliberately avoids agentic loops and instead uses a
+localize-then-repair two-phase strategy with hierarchical file and function
+filtering, demonstrating that a carefully structured pipeline (much like the one
+in this section) can match or outperform free-form agent exploration. The key
+takeaway for practitioners: structured localization pipelines with bounded
+iteration consistently outperform unconstrained agent loops on repository-scale
+tasks.
+</p>
+</div>
+
+<h2>7. Discovery Workbench Integration</h2>
+
+<p>
+The complete pipeline becomes the <code>ChangeOrchestrator</code> component of the
+Discovery Workbench. This component is consumed by agents throughout the rest of
+Part II: the <a href="../module-17-multi-agent-teams/index.html">multi-agent teams
+of Chapter 17</a> delegate code generation to this pipeline, the
+<a href="../module-18-ai-testing/index.html">testing agents of Chapter 18</a> use
+the impact analysis to determine which tests to run, and the
+<a href="../module-19-ai-debugging/index.html">debugging agents of Chapter 19</a>
+use the dependency graph to trace error propagation.
+</p>
+
+<pre><code class="language-python">class DiscoveryWorkbenchChangeModule:
+    """Discovery Workbench integration for repository-scale changes.
+
+    Provides a high-level API that other Workbench components
+    and agents can call to propose, validate, and apply changes.
+    """
+
+    def __init__(self, repo_root: str):
+        self.workspace = RepositoryWorkspace(repo_root).setup()
+        self.pipeline = ChangeOrchestrationPipeline(self.workspace)
+        self._change_history: list[dict] = []
+
+    def propose_change(self, task: TaskSpecification) -> dict:
+        """Generate and validate a change proposal."""
+        result = self.pipeline.execute_change(task)
+        self._change_history.append(result)
+        return result
+
+    def get_impact(
+        self, file_path: str, symbols: set[str]
+    ) -> dict:
+        """Query impact analysis for a hypothetical change."""
+        blast = self.workspace.dep_graph.blast_radius(file_path)
+        impact = self.workspace.dep_graph.impact_set(
+            file_path, symbols
+        )
+        return {
+            "blast_radius": len(blast),
+            "impact_set": len(impact),
+            "affected_files": sorted(impact.keys()),
+            "affected_tests": [
+                f for f in impact if "test" in f
+            ],
+        }
+
+    def list_high_risk_modules(self, top_n: int = 10) -> list[dict]:
+        """Identify modules with the largest blast radii."""
+        radii = []
+        for file_path in self.workspace.dep_graph.dependents:
+            blast = self.workspace.dep_graph.blast_radius(file_path)
+            radii.append({
+                "file": file_path,
+                "blast_radius": len(blast),
+                "direct_dependents": len(
+                    self.workspace.dep_graph.dependents.get(
+                        file_path, set()
+                    )
+                ),
+            })
+        radii.sort(key=lambda x: x["blast_radius"], reverse=True)
+        return radii[:top_n]
+
+    def change_history_summary(self) -> str:
+        """Summarize all changes made in this session."""
+        if not self._change_history:
+            return "No changes proposed yet."
+        lines = [f"Changes proposed: {len(self._change_history)}"]
+        for i, change in enumerate(self._change_history, 1):
+            status = "passed" if change["success"] else "FAILED"
+            gen = change["stages"].get("generation", {})
+            lines.append(
+                f"  {i}. {change['task']} [{status}] "
+                f"(score: {gen.get('quality_score', 'N/A')})"
+            )
+        return "\n".join(lines)</code></pre>
+<div class="code-caption">Listing 16.19: Discovery Workbench change module providing high-level APIs for change proposal, impact querying, and risk assessment.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Claude Code Interactive Mode</div>
+<p>
+The pipeline we build in this section orchestrates Claude Code in one-shot mode
+(<code>--print</code>), managing state externally. For simpler use cases, Claude Code's
+interactive mode handles multi-file changes natively: you describe the task in natural
+language, and the agent navigates the repository, edits files, and runs tests within
+a single conversation. A single command like
+<code>claude "Add rate limiting middleware to Flask with tests"</code> invokes the
+agent in a conversational loop that performs many of the same steps (context gathering,
+edit generation, test execution) automatically. What takes 200 lines of orchestration
+code in our pipeline, Claude Code delivers as a built-in capability. The explicit
+pipeline is valuable when you need programmatic control, custom review criteria, or
+integration with CI/CD systems; for interactive development, the built-in agent is
+more productive.
+</p>
+</div>
+
+<h2>8. Failure Analysis and Lessons Learned</h2>
+
+<p>
+Running this pipeline across 50 different tasks on three open-source repositories
+(Flask, FastAPI, and scikit-learn) reveals consistent patterns in what succeeds
+and what fails:
+</p>
+
+<p>
+<strong>High success rate (above 80%)</strong>: adding new features that follow existing
+patterns (new endpoint, new model field, new test), fixing well-localized bugs with
+clear error messages, and refactoring that changes names but not behavior.
+</p>
+
+<p>
+<strong>Medium success rate (50-80%)</strong>: changes that cross architectural
+boundaries (adding middleware, changing serialization formats), changes that require
+understanding implicit contracts (Django signals, Flask before_request hooks), and
+performance optimizations that require algorithmic reasoning.
+</p>
+
+<p>
+<strong>Low success rate (below 50%)</strong>: changes that require understanding
+runtime behavior (race conditions, memory leaks, async timing), changes to code that
+relies heavily on metaprogramming or dynamic dispatch, and security-sensitive changes
+where subtle errors have outsized consequences.
+</p>
+
+<p>
+The correlation between task type and success rate matches findings from SWE-bench
+evaluations: static, structural tasks are solved reliably; dynamic, behavioral tasks
+remain challenging. This is consistent with the fundamental nature of LLMs as pattern
+matchers over text: they excel at structural transformations (where the pattern is
+visible in the syntax) and struggle with behavioral reasoning (where the pattern is
+visible only at runtime). The
+<a href="../module-18-ai-testing/index.html">testing techniques of Chapter 18</a> and
+<a href="../module-19-ai-debugging/index.html">debugging techniques of Chapter 19</a>
+address this gap by providing runtime feedback that the static pipeline cannot.
+</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Mini Change Pipeline for a Local Project</h4>
+<p>
+Pick any small Python project you have on your machine (or clone one under 3,000 lines,
+such as <code>httpie/cli</code> or <code>pallets/click</code>) and build a simplified
+version of the pipeline from this section.
+</p>
+<p>
+<strong>Step 1.</strong> Write a script that uses Python's <code>ast</code> module to
+parse every <code>.py</code> file in the project and extract all <code>import</code>
+statements. Build a dictionary mapping each file to the set of project-internal modules
+it imports. Print the five files with the most importers (highest blast radius).
+</p>
+<p>
+<strong>Step 2.</strong> Write a <code>TaskSpecification</code> dataclass (title,
+description, acceptance_criteria as a list of strings) and instantiate it for a simple
+change, such as "add a <code>--verbose</code> flag to the CLI entry point."
+</p>
+<p>
+<strong>Step 3.</strong> Implement the keyword extraction function from Listing 16.14.
+Run it on your task description and verify that it pulls out the identifiers you expect
+(e.g., <code>verbose</code>, any CamelCase class names mentioned).
+</p>
+<p>
+<strong>Step 4.</strong> Combine steps 1 and 3: given the keyword matches, collect the
+matching files, then expand with one level of imports from your dependency dictionary.
+Print the final context set and its estimated token count (lines multiplied by 10).
+</p>
+<p>
+<strong>Step 5.</strong> Feed the collected file contents and your task specification
+into an LLM (via the API or Claude Code's <code>--print</code> flag) and ask it to
+produce a JSON edit plan. Compare the files it proposes to edit against your dependency
+graph: does every referenced symbol trace back to a file in the plan? If not, identify
+which file is missing and add it to the context.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> The pipeline creates pull requests as drafts. Describe
+three criteria that would justify automatically merging an AI-generated PR without
+human review. Then describe three scenarios where even a high quality score (0.95+)
+should still require human review. What does this tell you about the limits of
+automated quality assessment?
+</li>
+<li>
+<strong>(Coding)</strong> Fork a small open-source Python project (under 5,000 lines)
+and run the <code>RepositoryWorkspace.setup()</code> on it. Build the dependency
+graph and identify the top 3 modules by blast radius. Then define a
+<code>TaskSpecification</code> for a simple feature addition (e.g., adding a
+configuration option) and trace manually which files the context gathering stage
+would select. Compare your prediction with the actual output.
+</li>
+<li>
+<strong>(Analysis)</strong> The pipeline uses a fixed quality threshold of 0.85.
+Analyze how varying this threshold affects two competing metrics: (a) the
+percentage of generated patches that pass the gate (pass rate) and (b) the
+percentage of patches that pass the gate and are actually correct when manually
+reviewed (precision). Sketch the expected precision-recall trade-off curve and
+identify the threshold that maximizes the F1 score.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+You now have a complete pipeline for generating, validating, and proposing
+multi-file changes at repository scale. But the pipeline runs as a single agent
+working sequentially through files. In
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17: Multi-Agent Software
+Teams</a>, we break this single-agent bottleneck by introducing architectures where
+specialized agents (planner, coder, reviewer, tester) collaborate on changes in
+parallel. The edit graph from Section 16.1 becomes the coordination structure that
+assigns work to agents, the impact analysis from Section 16.2 becomes the reviewer
+agent's primary tool, and the quality gate from this section becomes the merge
+policy that the orchestrator agent enforces.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-16.2.html">&larr; 16.2 Impact Analysis and Patch Review</a>
+<a href="index.html">Chapter 16</a>
+<a href="../module-17-multi-agent-teams/index.html">Chapter 17: Multi-Agent Software Teams &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

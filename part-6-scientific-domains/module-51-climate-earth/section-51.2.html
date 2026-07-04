@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 51.2: Climate Emulation and Downscaling. Climate emulators, statistical and learned downscaling, earth observation foundation models, and carbon accounting." name="description"/>
+<title>Section 51.2: Climate Emulation and Downscaling | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part VI: Discovery in Scientific Domains</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 51: Discovery AI for Climate and Earth Science</a></div>
+<h1>51.2 Climate Emulation and Downscaling</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"The general circulation model ran for three months on a supercomputer. I reproduced its century-long simulation in forty seconds. We agreed on the global mean. We disagreed on whether this was progress or an insult."</p>
+<cite>A Climate Emulator With an Efficiency Complex</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Weather prediction asks "what will happen next week?" Climate science asks "how will the statistical distribution of weather change over decades?" These are fundamentally different questions. A weather model must track individual atmospheric states; a climate model must reproduce the long-term statistics (mean temperature, precipitation patterns, variability, extremes) under different forcing scenarios. General circulation models (GCMs) answer climate questions by running physics-based simulations for centuries, but this costs millions of CPU hours per scenario. Climate emulators learn to approximate GCM outputs from forcing inputs, producing century-long projections in seconds. Downscaling then translates coarse global projections to the fine regional detail that adaptation planning requires.</p>
+</div>
+
+<h2>1. Climate Emulation</h2>
+
+<p><strong>What.</strong> A climate emulator is a statistical or neural model that maps forcing scenarios (greenhouse gas concentrations, aerosol emissions, land-use changes) to climate response fields (spatial patterns of temperature, precipitation, sea level pressure) without running a physics-based GCM. The emulator learns the input-output relationship of the GCM from a training set of completed simulations.</p>
+
+<p><strong>Why.</strong> The Coupled Model Intercomparison Project (CMIP) produces climate projections by running dozens of GCMs under multiple Shared Socioeconomic Pathways (SSPs). Each combination of model and scenario costs weeks to months of supercomputer time. Policy analysis, uncertainty quantification, and rapid scenario exploration all benefit from emulators that can produce comparable projections in seconds.</p>
+
+<p><strong>How.</strong> The simplest emulators use pattern scaling: assume that the spatial pattern of warming is constant and only the global mean temperature changes with forcing. More sophisticated approaches use Gaussian processes, random forests, or neural networks to learn non-linear relationships between forcing and spatial response patterns.</p>
+
+<p data-agent="02">Pattern scaling works by first running a GCM to produce a spatial warming map for one reference scenario, then normalizing that map by the global mean temperature change to obtain a dimensionless "fingerprint." For any new forcing scenario, the method multiplies this fingerprint by the predicted global mean temperature (often from a simple energy balance model), producing an approximate spatial field without re-running the GCM. This matters because it reduces century-long spatial projections to a single scalar prediction problem, making it computationally trivial. Pattern scaling is the right choice when the forcing change is moderate and the spatial response is roughly linear with global temperature; for scenarios involving strong aerosol forcing, abrupt ice-sheet changes, or precipitation extremes, the linearity assumption breaks down and learned emulators or full GCM runs are necessary.</p>
+
+<p><strong>When.</strong> Use emulators for scenario screening (which SSPs produce dangerous warming in which regions?), uncertainty quantification (how much does the response vary across GCMs?), and impact assessment (feeding climate projections into agricultural, hydrological, or economic models that need thousands of scenarios).</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent misconception is that a faster emulator is a better climate model. Speed is an engineering advantage, not a scientific one: the emulator inherits all of the biases, structural assumptions, and domain limitations of the GCM it was trained on. If the training GCM underestimates Arctic amplification or misrepresents monsoon dynamics, the emulator will faithfully reproduce those same errors at a thousand times the speed.</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Emulation vs. Simulation</div>
+<p>A climate emulator is not a climate model. It does not solve the Navier-Stokes equations or represent cloud microphysics. It learns the mapping that a GCM implements, bypassing the physics entirely. This makes it fast but also means it cannot extrapolate beyond the forcing scenarios it was trained on. If the real climate enters a regime that no GCM has simulated (a sudden ice-sheet collapse, a methane feedback loop), the emulator has no mechanism to capture the new physics. This is why emulators complement rather than replace GCMs: emulators accelerate exploration within the GCM's domain of validity, while GCMs push the boundaries of physical understanding. The same principle applies to the scientific ML surrogates we built in <a href="../../part-3-data-models/module-33-scientific-ml/index.html">Chapter 33</a>.</p>
+</div>
+
+<pre><code class="language-python">"""
+Climate emulator: predict spatial temperature response from
+forcing scenarios using a neural network trained on CMIP6 output.
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+import xarray as xr
+from pathlib import Path
+
+
+class ClimateEmulator(nn.Module):
+    """Neural climate emulator mapping forcing to spatial response.
+
+    Input: time series of global forcings (CO2, CH4, SO2, etc.)
+    Output: spatial temperature anomaly field (lat x lon)
+
+    Architecture: encode the forcing time series with a 1D CNN,
+    then decode to spatial patterns with a learned basis.
+    """
+
+    def __init__(self, n_forcings: int = 4, n_years: int = 86,
+                 n_lat: int = 64, n_lon: int = 128,
+                 n_basis: int = 32, hidden_dim: int = 256):
+        super().__init__()
+        self.n_lat = n_lat
+        self.n_lon = n_lon
+        self.n_basis = n_basis
+
+        # Temporal encoder: process forcing time series
+        self.forcing_encoder = nn.Sequential(
+            nn.Conv1d(n_forcings, hidden_dim, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),  # global average over time
+            nn.Flatten(),
+        )
+
+        # Map encoded forcing to basis coefficients
+        self.basis_predictor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_basis),
+        )
+
+        # Learnable spatial basis patterns
+        # Each basis pattern is a (lat, lon) field
+        self.spatial_basis = nn.Parameter(
+            torch.randn(n_basis, n_lat, n_lon) * 0.01
+        )
+
+        # Predict per-year scaling from forcing time series
+        self.year_predictor = nn.Sequential(
+            nn.Conv1d(n_forcings, hidden_dim, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(hidden_dim, n_basis, kernel_size=1),
+        )
+
+    def forward(self, forcings: torch.Tensor) -> torch.Tensor:
+        """Predict spatial temperature response from forcing scenario.
+
+        Args:
+            forcings: (batch, n_forcings, n_years)
+                Time series of greenhouse gas concentrations,
+                aerosol emissions, etc.
+        Returns:
+            temperature_anomaly: (batch, n_years, n_lat, n_lon)
+                Predicted temperature change relative to baseline
+        """
+        # Global basis coefficients from forcing summary
+        encoded = self.forcing_encoder(forcings)   # (B, hidden)
+        global_coeff = self.basis_predictor(encoded)  # (B, n_basis)
+
+        # Per-year modulation of basis coefficients
+        year_coeff = self.year_predictor(forcings)  # (B, n_basis, n_years)
+
+        # Combine: global pattern x yearly modulation
+        coeff = global_coeff.unsqueeze(-1) * year_coeff  # (B, n_basis, years)
+
+        # Reconstruct spatial field from basis
+        # spatial_basis: (n_basis, lat, lon) -> (1, n_basis, lat*lon)
+        basis_flat = self.spatial_basis.reshape(self.n_basis, -1).unsqueeze(0)
+
+        # coeff: (B, n_basis, years) @ basis: (1, n_basis, lat*lon)
+        # -> (B, years, lat*lon)
+        response = torch.einsum("bkt,bkp->btp", coeff.transpose(1, 2),
+                                basis_flat.expand(coeff.shape[0], -1, -1))
+
+        return response.reshape(-1, coeff.shape[-1],
+                                self.n_lat, self.n_lon)
+
+
+def train_emulator(model: ClimateEmulator,
+                   forcing_data: torch.Tensor,
+                   target_data: torch.Tensor,
+                   n_epochs: int = 200,
+                   lr: float = 1e-3) -> list[float]:
+    """Train the climate emulator on CMIP6 model output.
+
+    The training set consists of multiple GCM simulations
+    under different SSP scenarios. Each sample is a
+    (forcing_timeseries, temperature_response) pair.
+
+    Args:
+        model: ClimateEmulator instance
+        forcing_data: (n_scenarios, n_forcings, n_years)
+        target_data: (n_scenarios, n_years, n_lat, n_lon)
+        n_epochs: Training epochs
+        lr: Learning rate
+    Returns:
+        List of training losses
+    """
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
+                                  weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs
+    )
+    losses = []
+
+    for epoch in range(n_epochs):
+        model.train()
+        pred = model(forcing_data)
+        loss = nn.functional.mse_loss(pred, target_data)
+
+        # Add spatial smoothness regularization
+        # Penalize high-frequency spatial noise
+        dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+        dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+        smooth_loss = 0.01 * (dx.pow(2).mean() + dy.pow(2).mean())
+
+        total_loss = loss + smooth_loss
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        losses.append(total_loss.item())
+        if (epoch + 1) % 50 == 0:
+            print(f"Epoch {epoch+1}/{n_epochs}, "
+                  f"MSE: {loss.item():.6f}, "
+                  f"Smooth: {smooth_loss.item():.6f}")
+
+    return losses</code></pre>
+<div class="code-caption">Figure 51.7: A neural climate emulator that maps forcing time series (CO2, CH4, aerosol concentrations) to spatial temperature response fields. The architecture uses a temporal encoder to process forcing scenarios and a learned spatial basis to reconstruct gridded temperature anomalies, trained on CMIP6 GCM output.</div>
+
+<h2>2. Statistical Downscaling</h2>
+
+<p>GCMs and climate emulators produce projections on coarse grids (typically 1 to 2 degrees, or 100 to 200 km). Adaptation planning needs local detail: how will rainfall change in a specific river catchment? Will a particular city face more extreme heat days? <strong>Downscaling</strong> bridges this resolution gap.</p>
+
+<p>Statistical downscaling learns relationships between large-scale atmospheric patterns and local weather variables from historical observations. The assumption is that these relationships, calibrated on the recent past, will hold under future climate conditions. This is the "stationarity assumption," and it is the primary limitation of statistical downscaling: if climate change alters the local processes themselves (for example, by shifting the jet stream or changing land surface properties), the learned relationships may break down.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of statistical downscaling like a local weather forecaster who has spent decades learning that "when the barometric pressure drops and the wind shifts southwest, our valley gets heavy rain." She does not simulate the physics of the atmosphere; she recognizes recurring large-scale patterns and translates them into local consequences based on years of observed correlation. If the climate shifts so that entirely new wind patterns appear (ones she has never seen before), her local translation rules stop working. That is exactly the stationarity assumption: the forecaster's learned dictionary of "large pattern maps to local outcome" remains valid only as long as the large-scale regimes stay within the range she trained on.</p>
+</div>
+
+<p>Three families of methods dominate.</p>
+
+<p><strong>Perfect prognosis (PP)</strong> methods train a regression model from observed large-scale predictors (reanalysis data) to observed local-scale predictands (station observations). At prediction time, the GCM's large-scale output replaces the reanalysis data. This assumes that the GCM represents large-scale patterns well enough to substitute for reanalysis.</p>
+
+<p><strong>Model output statistics (MOS)</strong> methods train directly on GCM output paired with observations, learning to correct the GCM's biases. MOS is simpler but couples the downscaling model to a specific GCM.</p>
+
+<p><strong>Learned downscaling</strong> uses convolutional neural networks or diffusion models to super-resolve coarse climate fields, treating the problem as analogous to image super-resolution. This approach has the advantage of producing spatially coherent high-resolution fields rather than point predictions.</p>
+
+<pre><code class="language-python">"""
+Statistical downscaling: from coarse GCM output to fine-resolution
+local climate using both classical and neural approaches.
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+import xarray as xr
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+
+
+class PerfectPrognosisDownscaler:
+    """Classical statistical downscaling via perfect prognosis.
+
+    Trains a Ridge regression from large-scale reanalysis
+    predictors to local station observations. At inference time,
+    GCM output replaces reanalysis as input.
+    """
+
+    def __init__(self, alpha: float = 1.0):
+        self.scaler_X = StandardScaler()
+        self.scaler_y = StandardScaler()
+        self.model = Ridge(alpha=alpha)
+
+    def fit(self, predictors: np.ndarray,
+            targets: np.ndarray) -> "PerfectPrognosisDownscaler":
+        """Train on reanalysis predictors and station observations.
+
+        Args:
+            predictors: (n_samples, n_features) large-scale fields
+                (e.g., 500hPa geopotential, 850hPa temperature,
+                sea level pressure) extracted from ERA5
+            targets: (n_samples,) local variable
+                (e.g., daily max temperature at a station)
+        Returns:
+            self
+        """
+        X = self.scaler_X.fit_transform(predictors)
+        y = self.scaler_y.fit_transform(targets.reshape(-1, 1)).ravel()
+        self.model.fit(X, y)
+        return self
+
+    def predict(self, gcm_predictors: np.ndarray) -> np.ndarray:
+        """Downscale GCM output to local predictions.
+
+        Args:
+            gcm_predictors: (n_samples, n_features) large-scale
+                fields from a GCM simulation
+        Returns:
+            Local-scale predictions
+        """
+        X = self.scaler_X.transform(gcm_predictors)
+        y_scaled = self.model.predict(X)
+        return self.scaler_y.inverse_transform(
+            y_scaled.reshape(-1, 1)
+        ).ravel()
+
+
+class ConvDownscaler(nn.Module):
+    """Neural downscaling via learned super-resolution.
+
+    Treats climate downscaling as a super-resolution problem:
+    upscale coarse (e.g., 1-degree) fields to fine resolution
+    (e.g., 0.1-degree) using residual convolutional blocks and
+    pixel shuffle upsampling.
+
+    This produces spatially coherent high-resolution fields
+    rather than independent point predictions.
+    """
+
+    def __init__(self, in_channels: int = 5, scale_factor: int = 10,
+                 hidden_channels: int = 64, n_res_blocks: int = 8):
+        super().__init__()
+        self.scale_factor = scale_factor
+
+        # Initial feature extraction
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
+            nn.ReLU(),
+        )
+
+        # Residual blocks for deep feature extraction
+        self.body = nn.Sequential(*[
+            ResidualBlock(hidden_channels) for _ in range(n_res_blocks)
+        ])
+
+        # Upsampling via sub-pixel convolution (pixel shuffle)
+        upsample_layers = []
+        remaining = scale_factor
+        while remaining > 1:
+            if remaining >= 5:
+                factor = 5
+            elif remaining >= 2:
+                factor = 2
+            else:
+                factor = remaining
+            upsample_layers.extend([
+                nn.Conv2d(hidden_channels,
+                          hidden_channels * factor ** 2, 3, padding=1),
+                nn.PixelShuffle(factor),
+                nn.ReLU(),
+            ])
+            remaining //= factor
+
+        self.upsample = nn.Sequential(*upsample_layers)
+
+        # Final output layer
+        self.tail = nn.Conv2d(hidden_channels, 1, 3, padding=1)
+
+    def forward(self, coarse: torch.Tensor,
+                topography: torch.Tensor = None) -> torch.Tensor:
+        """Downscale coarse climate field to fine resolution.
+
+        Args:
+            coarse: (batch, in_channels, lat_coarse, lon_coarse)
+                Coarse-resolution fields (temperature, pressure,
+                humidity, wind components)
+            topography: Optional (batch, 1, lat_fine, lon_fine)
+                High-resolution topography for conditioning
+        Returns:
+            fine: (batch, 1, lat_fine, lon_fine) downscaled field
+        """
+        x = self.head(coarse)
+        x = x + self.body(x)  # global skip connection
+        x = self.upsample(x)
+        x = self.tail(x)
+
+        # Add topographic correction if available
+        if topography is not None:
+            # Lapse rate correction: temperature decreases with altitude
+            lapse_rate = -6.5e-3  # K/m, standard atmosphere
+            x = x + lapse_rate * topography
+
+        return x
+
+
+class ResidualBlock(nn.Module):
+    """Residual convolutional block with batch normalization."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)</code></pre>
+<div class="code-caption">Figure 51.8: Two approaches to statistical downscaling. The PerfectPrognosisDownscaler uses classical Ridge regression to map large-scale atmospheric patterns to local station observations. The ConvDownscaler treats downscaling as a super-resolution problem, using residual convolutions and pixel shuffle upsampling to produce spatially coherent high-resolution fields with optional topographic correction.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Downscaling Precipitation for Flood Risk</div>
+<p>A European climate adaptation project needed 0.1-degree precipitation projections for flood risk modeling across Alpine river catchments. Coarse CMIP6 models at 1-degree resolution could not resolve the orographic enhancement (mountains forcing air upward, causing intense local rainfall) that drives Alpine flood risk. The project trained a ConvDownscaler on ERA5 reanalysis paired with high-resolution E-OBS station observations, incorporating a 90-meter digital elevation model as a conditioning input. The downscaled projections captured orographic precipitation patterns that the coarse models missed entirely, enabling the first catchment-scale flood risk assessments under SSP2-4.5 and SSP5-8.5 scenarios. The key lesson: topographic conditioning is essential for precipitation downscaling in mountainous terrain.</p>
+</div>
+
+<h2>3. Foundation Models for Earth Observation</h2>
+
+<p>Earth observation satellites generate petabytes of multispectral imagery annually. Sentinel-2 alone produces 1.6 TB per day. Traditional analysis pipelines require hand-engineered features and task-specific models for each application (land cover classification, crop monitoring, wildfire detection, urban growth tracking). Foundation models for earth observation learn general-purpose representations from unlabeled satellite imagery, then adapt to specific tasks with minimal labeled data.</p>
+
+<p>The approach mirrors the foundation model paradigm from <a href="../../part-3-data-models/module-27-foundation-models/index.html">Chapter 27</a>: pretrain a large model on self-supervised objectives (masked image modeling, temporal prediction), then fine-tune on downstream tasks. Three models define the current landscape.</p>
+
+<p><strong>Prithvi</strong> (IBM/NASA, 2023) is a vision Transformer pretrained on Harmonized Landsat Sentinel-2 (HLS) data. It processes multi-temporal, multi-spectral inputs and has been fine-tuned for flood mapping, wildfire scar detection, and multi-temporal crop segmentation.</p>
+
+<p><strong>Clay</strong> (Clay Foundation, 2024) trains on diverse satellite modalities (optical, SAR, DEM) with a masked autoencoder objective, producing embeddings that transfer across sensors and geographies.</p>
+
+<p><strong>SatMAE</strong> (Cong et al., 2023) adapts the Masked Autoencoder framework to multispectral satellite imagery, learning to reconstruct masked patches across spectral bands and time steps.</p>
+
+<pre><code class="language-python">"""
+Using Google Earth Engine for large-scale earth observation
+data access and preprocessing, feeding into foundation models.
+"""
+import ee
+import numpy as np
+import xarray as xr
+
+# Initialize Earth Engine (requires authentication)
+# ee.Authenticate()
+# ee.Initialize(project='your-project-id')
+
+
+def get_ndvi_timeseries(
+    geometry: ee.Geometry,
+    start_date: str,
+    end_date: str,
+    cloud_threshold: float = 20.0,
+) -> ee.ImageCollection:
+    """Extract cloud-filtered NDVI time series from Sentinel-2.
+
+    Normalized Difference Vegetation Index (NDVI) tracks
+    vegetation health and phenology from space:
+    NDVI = (NIR - Red) / (NIR + Red)
+
+    Args:
+        geometry: Region of interest as an Earth Engine geometry
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        cloud_threshold: Maximum cloud cover percentage
+    Returns:
+        ImageCollection of NDVI images
+    """
+    s2 = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(geometry)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE",
+                             cloud_threshold))
+    )
+
+    def add_ndvi(image):
+        ndvi = image.normalizedDifference(["B8", "B4"]).rename("NDVI")
+        return image.addBands(ndvi)
+
+    return s2.map(add_ndvi).select("NDVI")
+
+
+def compute_land_surface_temperature(
+    geometry: ee.Geometry,
+    start_date: str,
+    end_date: str,
+) -> ee.Image:
+    """Compute mean land surface temperature from MODIS.
+
+    Land surface temperature (LST) from the MODIS satellite
+    provides a direct measure of surface energy balance,
+    critical for urban heat island studies and agriculture.
+
+    Args:
+        geometry: Region of interest
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+    Returns:
+        Mean LST image in Celsius
+    """
+    lst = (
+        ee.ImageCollection("MODIS/061/MOD11A2")
+        .filterBounds(geometry)
+        .filterDate(start_date, end_date)
+        .select("LST_Day_1km")
+    )
+
+    # Convert from scaled integer to Celsius
+    mean_lst = lst.mean().multiply(0.02).subtract(273.15)
+    return mean_lst.clip(geometry)
+
+
+def carbon_stock_estimation(
+    geometry: ee.Geometry,
+    year: int = 2023,
+) -> dict:
+    """Estimate above-ground carbon stocks using satellite data.
+
+    Combines Global Forest Canopy Height (GEDI/Landsat),
+    land cover classification, and allometric models to
+    estimate carbon stored in vegetation.
+
+    Args:
+        geometry: Region of interest
+        year: Target year
+    Returns:
+        Dictionary with area and carbon estimates
+    """
+    # Global forest canopy height from GEDI/Landsat
+    canopy_height = ee.Image(
+        "users/nlang/ETH_GlobalCanopyHeight_2020_10m_v1"
+    ).clip(geometry)
+
+    # Simple allometric model: biomass ~ height^2.5
+    # (Real applications use species-specific allometrics)
+    biomass_density = canopy_height.pow(2.5).multiply(0.5)
+
+    # Carbon is approximately 50% of dry biomass
+    carbon_density = biomass_density.multiply(0.5)  # tonnes C / ha
+
+    # Compute zonal statistics
+    stats = carbon_density.reduceRegion(
+        reducer=ee.Reducer.mean().combine(
+            ee.Reducer.sum(), sharedInputs=True
+        ),
+        geometry=geometry,
+        scale=30,
+        maxPixels=1e9,
+    )
+
+    return {
+        "mean_carbon_density_tC_per_ha": stats.get("b1_mean"),
+        "total_carbon_tC": stats.get("b1_sum"),
+        "area_ha": geometry.area().divide(10000),
+    }</code></pre>
+<div class="code-caption">Figure 51.9: Google Earth Engine workflows for earth observation. The NDVI time series tracks vegetation health from Sentinel-2 imagery; MODIS provides land surface temperature; and canopy height from GEDI/Landsat feeds into allometric carbon stock estimation. These data streams serve as inputs to foundation models and downstream climate applications.</div>
+
+<h2>4. Carbon Accounting with Satellite Data</h2>
+
+<p>Carbon accounting quantifies greenhouse gas sources, sinks, and stocks across landscapes. Satellite observations provide three complementary measurements. First, <strong>atmospheric CO2 concentrations</strong> from OCO-2/OCO-3 reveal spatial patterns of carbon sources and sinks at regional scale. Second, <strong>land cover change</strong> from Landsat/Sentinel-2 tracks deforestation, reforestation, and land-use transitions. Third, <strong>biomass estimation</strong> from GEDI lidar and SAR (Sentinel-1) quantifies the carbon stored in vegetation.</p>
+
+<p>AI enters carbon accounting in two ways. Machine learning models fuse these heterogeneous data sources into consistent carbon flux estimates (how much CO2 is entering or leaving each grid cell). And foundation models pretrained on satellite imagery can classify land cover, detect disturbances, and estimate biomass with far less labeled training data than traditional approaches.</p>
+
+<pre><code class="language-python">"""
+Zarr-based climate data pipeline with the Pangeo stack.
+Demonstrates cloud-native access to analysis-ready climate data.
+"""
+import xarray as xr
+import numpy as np
+import dask
+
+
+def load_era5_from_zarr(
+    variable: str = "2m_temperature",
+    time_range: tuple[str, str] = ("2020-01-01", "2020-12-31"),
+    region: dict = None,
+) -> xr.DataArray:
+    """Load ERA5 reanalysis data from cloud-hosted Zarr store.
+
+    The Pangeo ecosystem hosts ERA5 data in Zarr format on
+    Google Cloud Storage, enabling lazy loading of multi-terabyte
+    datasets without downloading anything to local disk.
+
+    Args:
+        variable: ERA5 variable name
+        time_range: (start, end) date strings
+        region: Optional dict with lat/lon bounds
+            e.g., {"lat": slice(60, 30), "lon": slice(-10, 40)}
+    Returns:
+        Lazy-loaded xarray DataArray backed by Dask
+    """
+    # Cloud-hosted ERA5 in Zarr format (Pangeo)
+    store = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
+
+    ds = xr.open_zarr(store, chunks="auto")
+    da = ds[variable].sel(time=slice(*time_range))
+
+    if region:
+        da = da.sel(**region)
+
+    return da
+
+
+def compute_climatology(da: xr.DataArray,
+                        baseline: tuple[str, str] = ("1991", "2020")
+                        ) -> xr.DataArray:
+    """Compute day-of-year climatology over a baseline period.
+
+    The climatology is the expected value for each calendar day,
+    used as the reference for anomaly calculations and as a
+    baseline forecast in WeatherBench2 evaluations.
+
+    Args:
+        da: Input DataArray with a time dimension
+        baseline: (start_year, end_year) for the baseline period
+    Returns:
+        Climatology indexed by day-of-year (1 to 366)
+    """
+    baseline_data = da.sel(
+        time=slice(baseline[0], baseline[1])
+    )
+    climatology = baseline_data.groupby("time.dayofyear").mean("time")
+    return climatology
+
+
+def compute_anomaly(da: xr.DataArray,
+                    climatology: xr.DataArray) -> xr.DataArray:
+    """Compute anomaly relative to day-of-year climatology.
+
+    Anomalies are departures from the expected seasonal cycle.
+    They isolate the weather signal from the climatological
+    background, making it easier to detect trends, extreme
+    events, and teleconnection patterns.
+
+    Args:
+        da: Input DataArray
+        climatology: Day-of-year climatology from compute_climatology
+    Returns:
+        Anomaly DataArray
+    """
+    return da.groupby("time.dayofyear") - climatology
+
+
+def spatial_average(da: xr.DataArray,
+                    weights: xr.DataArray = None) -> xr.DataArray:
+    """Area-weighted spatial average.
+
+    Without area weighting, a naive average over a regular
+    lat-lon grid overweights polar regions where grid cells
+    have less physical area.
+
+    Args:
+        da: Input DataArray with lat/lon dimensions
+        weights: Optional weights; defaults to cos(lat)
+    Returns:
+        Spatially averaged time series
+    """
+    if weights is None:
+        weights = np.cos(np.deg2rad(da.lat))
+        weights = weights / weights.sum()
+
+    weighted = da.weighted(weights)
+    return weighted.mean(["lat", "lon"])</code></pre>
+<div class="code-caption">Figure 51.10: Pangeo-based climate data pipeline. Cloud-hosted ERA5 data in Zarr format enables lazy loading of multi-terabyte datasets. The climatology and anomaly functions provide the baseline calculations that underpin both weather evaluation (WeatherBench2) and extreme event detection (Section 51.3).</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: The Pangeo Ecosystem</div>
+<p>The code above builds climate analysis primitives from scratch, but the Pangeo ecosystem provides production-ready alternatives. <code>xarray</code> handles labeled multidimensional arrays with built-in groupby, resampling, and weighted operations. <code>zarr</code> enables chunked, compressed, cloud-native storage. <code>dask</code> parallelizes computations transparently across cores or clusters. <code>intake-esm</code> provides a catalog interface for discovering CMIP6 and other climate datasets. <code>xesmf</code> wraps the ESMF regridding library for conservative interpolation between grids. <code>climpred</code> provides forecast verification metrics. Together, these libraries reduce the pipeline above from dozens of lines to a few configuration calls, while handling edge cases (calendar types, missing data, grid singularities) that production code must address. What took 80 lines here is about 10 lines with the full Pangeo stack.</p>
+</div>
+
+<h2>5. ClimateBench: Evaluating Emulators</h2>
+
+<p>ClimateBench (Watson-Parris et al., 2024) provides a standardized evaluation framework for climate emulators, analogous to WeatherBench2 for weather models. The benchmark defines four forcing scenarios (historical + SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5) and evaluates emulators on their ability to reproduce the spatial patterns of temperature and precipitation response from NorESM2 GCM simulations.</p>
+
+<p>The primary metrics are the normalized global RMSE (NRMSE) for spatial pattern fidelity and the global mean bias for overall calibration. A good emulator captures both the large-scale pattern (warming amplification over land, Arctic amplification, wet-get-wetter/dry-get-drier precipitation) and the regional detail (the North Atlantic warming hole, the Southern Ocean delay).</p>
+
+<pre><code class="language-python">"""
+ClimateBench-style evaluation for climate emulators.
+"""
+import numpy as np
+import xarray as xr
+
+
+def normalized_global_rmse(
+    predicted: xr.DataArray,
+    target: xr.DataArray,
+    lat: xr.DataArray = None,
+) -> float:
+    """Normalized global RMSE for spatial pattern evaluation.
+
+    Normalizes by the spatial standard deviation of the target
+    field, so NRMSE = 1.0 means the emulator's error is as
+    large as the signal's spatial variability.
+
+    Args:
+        predicted: Emulated spatial field
+        target: GCM target spatial field
+        lat: Latitude array for area weighting
+    Returns:
+        NRMSE score (lower is better, 0 = perfect)
+    """
+    if lat is None:
+        lat = predicted.lat
+
+    weights = np.cos(np.deg2rad(lat))
+    weights = weights / weights.sum()
+    weights_da = xr.DataArray(weights, dims=["lat"],
+                              coords={"lat": lat})
+
+    # Weighted RMSE
+    sq_error = (predicted - target) ** 2
+    wmse = float((sq_error * weights_da).sum(["lat", "lon"])
+                 / weights_da.sum())
+    rmse = np.sqrt(wmse)
+
+    # Normalize by target spatial standard deviation
+    target_var = float(
+        ((target - (target * weights_da).sum(["lat", "lon"])) ** 2
+         * weights_da).sum(["lat", "lon"])
+    )
+    target_std = np.sqrt(target_var)
+
+    return rmse / (target_std + 1e-10)
+
+
+def pattern_correlation(
+    predicted: xr.DataArray,
+    target: xr.DataArray,
+) -> float:
+    """Spatial pattern correlation coefficient.
+
+    Measures whether the emulator reproduces the spatial
+    structure of the climate response, regardless of amplitude.
+
+    Args:
+        predicted: Emulated spatial field
+        target: GCM target spatial field
+    Returns:
+        Correlation coefficient (-1 to 1, higher is better)
+    """
+    weights = np.cos(np.deg2rad(predicted.lat))
+
+    p_anom = predicted - float((predicted * weights).sum()
+                               / weights.sum())
+    t_anom = target - float((target * weights).sum()
+                            / weights.sum())
+
+    numerator = float((p_anom * t_anom * weights).sum())
+    denom = np.sqrt(
+        float((p_anom ** 2 * weights).sum())
+        * float((t_anom ** 2 * weights).sum())
+    )
+    return numerator / (denom + 1e-10)</code></pre>
+<div class="code-caption">Figure 51.11: ClimateBench-style evaluation metrics. The normalized global RMSE measures spatial pattern fidelity relative to the target's spatial variability, while the pattern correlation coefficient captures structural agreement independently of amplitude errors.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Rapid Scenario Screening for IPCC</div>
+<p>The IPCC's Working Group I evaluates climate projections across dozens of models and scenarios. Running all combinations with full GCMs is computationally prohibitive. Climate emulators trained on the CMIP6 multi-model ensemble enable rapid screening: given a new emissions pathway, the emulator produces spatial temperature and precipitation projections in seconds, along with inter-model uncertainty ranges. This allows policy-relevant questions ("What is the probability that warming exceeds 2C over South Asia under this pathway?") to be answered in real time during negotiations, rather than requiring months of supercomputer allocation.</p>
+</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>ACE2 (Watt-Meyer et al., 2024, "ACE2: Accurately Learning the Earth's Climatic Variables in a Fully Coupled Global AI Framework") demonstrated the first fully coupled global AI climate model capable of producing stable, physically consistent multi-decade simulations. Unlike emulators that learn a single GCM's input-output mapping, ACE2 autoregressively steps the full atmospheric state forward in time, coupled to a slab ocean model. Trained on ERA5 reanalysis and AMIP-style runs, ACE2 reproduces realistic climatology, interannual variability, and the spatial structure of warming under increased CO2, all while running roughly 100 times faster than a comparable GCM. This pushes beyond the emulation paradigm covered in this section: rather than approximating a GCM's outputs, ACE2 replaces the GCM's dynamical core entirely with a learned model, raising questions about whether future climate projections can be produced without traditional numerical solvers.</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Pattern-Scaling Emulator from CMIP6 Data</h4>
+<p>
+1. Install the required libraries (<code>pip install xarray zarr intake-esm matplotlib numpy</code>) and use <code>intake-esm</code> to load a CMIP6 dataset: search the Pangeo CMIP6 catalog for the NorESM2-LM model, historical experiment, surface air temperature variable (<code>tas</code>), and one ensemble member. Load the data lazily with <code>xr.open_zarr</code>.<br/>
+2. Compute a baseline climatology (1981 to 2010 mean) and subtract it from the full time series to get annual-mean temperature anomalies on the model's native grid. Also load the corresponding SSP2-4.5 run for the same model.<br/>
+3. For each year in the historical and SSP2-4.5 records, compute the global-mean temperature anomaly (area-weighted using <code>cos(latitude)</code>) and the corresponding spatial anomaly field. Divide each spatial field by its global mean to obtain dimensionless "fingerprint" patterns.<br/>
+4. Average all fingerprint patterns across years to get a single mean fingerprint. Multiply this fingerprint by an arbitrary global-mean trajectory (for example, a linear ramp from 0 to 4 K) to produce a synthetic spatial projection. Plot the result on a map using <code>matplotlib</code> with a diverging colormap.<br/>
+5. Evaluate your pattern-scaling emulator against the actual SSP2-4.5 spatial field: compute the NRMSE and pattern correlation using the functions from Figure 51.11. Observe where pattern scaling succeeds (land/ocean contrast, Arctic amplification) and where it fails (precipitation, regional aerosol effects).
+</p>
+</div>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+Climate emulation provides the statistical backbone for understanding long-term trends.
+<a href="section-51.3.html">Section 51.3</a> focuses on the tails of those distributions:
+extreme weather events. We examine how AI detects rare events in high-dimensional climate data
+and how attribution science quantifies the contribution of human activities to their changing
+probability.
+</p>
+</section>
+
+<nav class="section-nav">
+<a href="section-51.1.html">&larr; 51.1 AI Weather Prediction</a>
+<a href="section-51.3.html">51.3 Extreme Events and Attribution &rarr;</a>
+</nav>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

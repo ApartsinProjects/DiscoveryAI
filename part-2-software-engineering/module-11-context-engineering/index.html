@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Chapter 11: Context Engineering at Repository Scale. How coding agents gather, chunk, embed, and retrieve code context to overcome LLM token limits." name="description"/>
+<title>Chapter 11: Context Engineering at Repository Scale | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 11: Context Engineering at Repository Scale</a></div>
+<h1>Context Engineering at Repository Scale</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I have 200,000 tokens of context window and 2,000,000 lines of code. Something has to give, and it will not be my confidence."</p>
+<cite>A Coding Agent With a Context Budget</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="chapter-overview">
+<h2>Overview</h2>
+<p>
+A coding agent is only as effective as the context it carries into the conversation.
+Feed it the wrong files and it hallucinates APIs that do not exist. Feed it too many
+files and critical details drown in noise. Feed it too few and it reinvents logic
+that already lives three directories away. This chapter treats context engineering as
+a first-class engineering discipline: the systematic construction, compression, and
+retrieval of the information a language model needs to act correctly on a large codebase.
+</p>
+<p>
+We begin by quantifying why context is the bottleneck for coding agents (Section 11.1),
+then build the chunking and summarization machinery that compresses code into
+context-friendly units (Section 11.2). Section 11.3 introduces retrieval-augmented
+code generation, combining embedding search, BM25, and hybrid ranking to surface the
+right code at the right time. Finally, Section 11.4 assembles these pieces into a
+working repository intelligence layer that scales to codebases of 50,000 lines and beyond.
+</p>
+<p>
+The ideas here connect backward to the
+<a href="../module-10-prompting-to-programming/index.html">prompt construction techniques of Chapter 10</a>
+and forward to the <a href="../module-12-mcp-servers/index.html">MCP server architecture of Chapter 12</a>,
+where the intelligence layer becomes a tool that agents call through the Model Context Protocol.
+The Discovery Workbench, introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>,
+gains a repository intelligence module in Section 11.4 that every subsequent chapter builds upon.
+</p>
+</section>
+
+<section class="prerequisites">
+<h2>Prerequisites</h2>
+<p>
+This chapter assumes you have read
+<a href="../module-08-ai-software-foundations/index.html">Chapter 8: Foundations of AI-Assisted Software Engineering</a>
+(for the mental model of how LLMs process code) and
+<a href="../module-10-prompting-to-programming/index.html">Chapter 10: Prompting to Programming</a>
+(for prompt construction patterns). Familiarity with Python, basic linear algebra
+(dot products, cosine similarity), and introductory information retrieval concepts
+(TF-IDF, inverted indexes) will be helpful. If you need a refresher on embeddings and
+vector spaces, see <a href="../../part-3-data-models/module-26-representation-learning/index.html">Chapter 26</a>.
+</p>
+</section>
+
+<section class="learning-outcomes">
+<h2>Learning Outcomes</h2>
+<ul>
+<li>Quantify the context bottleneck: why token limits, attention decay, and information density make naive "dump everything" strategies fail.</li>
+<li>Parse source code into meaningful chunks using tree-sitter, and summarize those chunks with docstring extraction and LLM-generated summaries.</li>
+<li>Build a hybrid retrieval system combining dense embeddings (sentence-transformers), sparse retrieval (BM25), and structural signals (import graphs).</li>
+<li>Formulate context selection as a knapsack optimization problem and solve it with greedy and dynamic-programming approaches.</li>
+<li>Construct a complete repository intelligence layer using tree-sitter, ripgrep, sentence-transformers, and pgvector.</li>
+<li>Integrate the intelligence layer into the Discovery Workbench as a reusable service for downstream coding agents.</li>
+</ul>
+</section>
+
+<section class="chapter-sections">
+<h2>Sections</h2>
+<div class="section-cards">
+
+<div class="section-card">
+<h3><a href="section-11.1.html">11.1 Why Context Is the Bottleneck</a></h3>
+<p>Token limits versus codebase size. Attention decay and the lost-in-the-middle problem. Information density of code versus prose. Repo structure signals: file trees, import graphs, symbol tables. The context budget as a scarce resource.</p>
+</div>
+
+<div class="section-card">
+<h3><a href="section-11.2.html">11.2 Chunking and Summarization</a></h3>
+<p>Syntactic chunking with tree-sitter. Semantic chunking by logical units. Hierarchical chunking for nested structures. Summarization via docstring extraction, signature condensation, and LLM-generated overviews. Building a chunk store.</p>
+</div>
+
+<div class="section-card">
+<h3><a href="section-11.3.html">11.3 Retrieval-Augmented Code Generation</a></h3>
+<p>Dense retrieval with code embeddings. Sparse retrieval with BM25. Hybrid search and reciprocal rank fusion. Structural re-ranking with import graphs. Context budget as a knapsack problem. Evaluation metrics for code retrieval.</p>
+</div>
+
+<div class="section-card">
+<h3><a href="section-11.4.html">11.4 Building a Repository Intelligence Layer</a></h3>
+<p>Recipe: assembling tree-sitter, ripgrep, sentence-transformers, and pgvector into a repository intelligence service. Indexing pipeline, query interface, and integration with the Discovery Workbench. Performance benchmarks on a 50k-LOC codebase.</p>
+</div>
+
+</div>
+</section>
+
+<section class="whats-next-section">
+<h2>What's Next</h2>
+<p>
+The repository intelligence layer you build in this chapter provides the context
+backbone that coding agents need. In
+<a href="../module-12-mcp-servers/index.html">Chapter 12: Building MCP Servers for Scientific Workflows</a>,
+we wrap this intelligence layer (and many other tools) in the Model Context Protocol,
+giving agents a standardized way to query repository structure, retrieve relevant code,
+and invoke development tools. The context engineering techniques from this chapter
+become the foundation for every agent interaction in the rest of Part II.
+</p>
+</section>
+
+<section class="bibliography">
+<h2>Bibliography</h2>
+
+<div class="bib-category">
+<h3>Foundational Papers</h3>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2307.03172" target="_blank">Liu, N. F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., &amp; Liang, P. (2024). Lost in the middle: How language models use long contexts. <em>Transactions of the ACL</em>, 12, 157-173.</a>
+<p>The landmark study showing that LLMs attend most strongly to the beginning and end of their context window, with significant degradation for information placed in the middle.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2401.14196" target="_blank">Jimenez, C. E., Yang, J., Wettig, A., Yao, S., Pei, K., Press, O., &amp; Narasimhan, K. (2024). SWE-bench: Can language models resolve real-world GitHub issues? <em>ICLR 2024</em>.</a>
+<p>The benchmark that revealed how critically context retrieval quality affects coding agent success rates on real repository issues.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2009.08366" target="_blank">Guo, D., Ren, S., Lu, S., Feng, Z., Tang, D., Liu, S., Zhou, L., Duan, N., Svyatkovskiy, A., Fu, S., Tufano, M., Deng, S. K., Clement, C., Drain, D., Sundaresan, N., Yin, J., Jiang, D., &amp; Zhou, M. (2021). GraphCodeBERT: Pre-training code representations with data flow. <em>ICLR 2021</em>.</a>
+<p>Introduced data-flow-aware pre-training for code representations, showing that structural information dramatically improves code understanding.</p>
+</div>
+</div>
+
+<div class="bib-category">
+<h3>Books</h3>
+<div class="bib-card">
+<a href="https://nlp.stanford.edu/IR-book/" target="_blank">Manning, C. D., Raghavan, P., &amp; Schutze, H. (2008). <em>Introduction to Information Retrieval</em>. Cambridge University Press.</a>
+<p>The classic information retrieval textbook covering TF-IDF, BM25, and inverted indexes; essential background for code search systems.</p>
+</div>
+</div>
+
+<div class="bib-category">
+<h3>Tools &amp; Libraries</h3>
+<div class="bib-card">
+<a href="https://tree-sitter.github.io/tree-sitter/" target="_blank">Tree-sitter</a>
+<p>An incremental parsing library that builds concrete syntax trees for source code in dozens of languages, used throughout this chapter for syntactic chunking.</p>
+</div>
+<div class="bib-card">
+<a href="https://github.com/BurntSushi/ripgrep" target="_blank">ripgrep (rg)</a>
+<p>A blazing-fast line-oriented search tool that respects .gitignore rules, used as the text search backbone in the repository intelligence layer.</p>
+</div>
+<div class="bib-card">
+<a href="https://www.sbert.net/" target="_blank">sentence-transformers</a>
+<p>The Python library for computing dense vector embeddings with pre-trained transformer models, used for semantic code search in Section 11.3.</p>
+</div>
+<div class="bib-card">
+<a href="https://github.com/pgvector/pgvector" target="_blank">pgvector</a>
+<p>A PostgreSQL extension for vector similarity search, providing the persistent embedding store in the repository intelligence layer.</p>
+</div>
+<div class="bib-card">
+<a href="https://github.com/dorianbrown/rank_bm25" target="_blank">rank_bm25</a>
+<p>A Python implementation of the BM25 ranking algorithm, used for sparse keyword-based code retrieval.</p>
+</div>
+</div>
+
+<div class="bib-category">
+<h3>Tutorials &amp; Surveys</h3>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2310.06839" target="_blank">Zhang, F., Chen, B., Zhang, Y., Keung, J., Liu, J., Zan, D., Mao, Y., Lou, J.-G., &amp; Chen, W. (2023). RepoCoder: Repository-level code completion through iterative retrieval and generation. <em>EMNLP 2023</em>.</a>
+<p>Demonstrates iterative retrieval-and-generation for repository-level code completion, a key pattern for context engineering.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2306.02264" target="_blank">Shrivastava, D., Larochelle, H., &amp; Tarlow, D. (2023). Repository-level prompt generation for large language models of code. <em>ICML 2023</em>.</a>
+<p>Proposes Repo-Level Prompt Generator (RLPG), which learns to compose prompts from repository context for code completion.</p>
+</div>
+<div class="bib-card">
+<a href="https://arxiv.org/abs/2403.12171" target="_blank">Ding, Y., et al. (2024). CrossCodeEval: A diverse and multilingual benchmark for cross-file code completion. <em>NeurIPS 2023</em>.</a>
+<p>A benchmark specifically designed to evaluate cross-file code understanding, directly testing the retrieval quality that context engineering aims to optimize.</p>
+</div>
+</div>
+</section>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

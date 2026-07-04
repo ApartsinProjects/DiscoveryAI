@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 16.1: Multi-File Code Generation. Task decomposition, dependency-ordered generation, edit graphs, and maintaining consistency across files." name="description"/>
+<title>Section 16.1: Multi-File Code Generation | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 16: AI-Assisted Implementation at Repository Scale</a></div>
+<h1>16.1 Multi-File Code Generation</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I rewrote the data model, updated the serializer, fixed the migration, and adjusted twelve tests. I forgot to update the import in <code>__init__.py</code>. Everything exploded."</p>
+<cite>A Coding Agent Learning About Transitive Dependencies</cite>
+</blockquote>
+
+<main class="content">
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Generating code for a single file is a solved problem in the sense that modern LLMs
+do it reliably. The hard problem is generating a <em>coordinated set of edits</em>
+across multiple files that collectively implement a feature, fix a bug, or refactor
+an interface. This coordination requires understanding the dependency structure of
+the repository, ordering edits so that each file sees a consistent view of the
+symbols it references, and detecting when a change in one file silently invalidates
+assumptions in another. This section formalizes the problem, introduces the edit
+graph abstraction for reasoning about multi-file changes, and builds a generation
+pipeline that produces consistent patches.
+</p>
+</div>
+
+<h2>1. Why Single-File Generation Is Not Enough</h2>
+
+<p>
+Consider a seemingly simple task: "Add a <code>created_at</code> timestamp field to the
+<code>Experiment</code> model." In a well-structured repository, this single requirement
+touches at minimum five files:
+</p>
+
+<ol>
+<li>The model definition (<code>models/experiment.py</code>): add the field.</li>
+<li>The database migration (<code>migrations/add_created_at.py</code>): generate the ALTER TABLE statement.</li>
+<li>The serializer (<code>api/serializers.py</code>): include the new field in API responses.</li>
+<li>The test fixtures (<code>tests/conftest.py</code>): update factory functions to supply the field.</li>
+<li>The API documentation (<code>docs/api.md</code> or an OpenAPI spec): reflect the new response shape.</li>
+</ol>
+
+<p>
+A coding agent that edits only the model file produces a change that fails on the
+next database query, returns incomplete API responses, and breaks the test suite.
+The SWE-bench benchmark (Jimenez et al., 2024) found that 67% of real GitHub issues
+require edits to two or more files, and 31% require edits to four or more. Multi-file
+consistency is not an edge case; it is the common case.
+</p>
+
+<p data-agent="02">
+Multi-file code generation is the process of producing a coordinated set of source code changes across multiple files in a repository such that all cross-file references (imports, function calls, type annotations, configuration keys) remain valid after every edit is applied. It matters because real software changes almost never live in a single file; a field added to a data model ripples into serializers, migrations, tests, and documentation, and any mismatch between these files produces runtime errors or silent data corruption. The mechanism works by building a dependency graph of the planned edits, topologically sorting that graph so that each file is generated only after the files it references are already finalized, and then feeding each generation step the actual content of its dependencies as prompt context. Use this approach whenever a change touches two or more files with cross-references; for isolated, single-file edits (a local bug fix, a docstring update), standard single-file generation is simpler and sufficient.
+</p>
+
+<p>
+We can quantify the coordination challenge. Let $F = \{f_1, f_2, \ldots, f_n\}$ be the
+set of files affected by a change, and let $E = \{e_1, e_2, \ldots, e_n\}$ be the
+corresponding edits. A change is <em>consistent</em> if every symbol referenced in
+$e_i$ is either defined in $f_i$ itself or defined (with a compatible signature) in
+some $f_j$ where $e_j$ has already been applied. Formally, let $\text{refs}(e_i)$ be
+the set of external symbols referenced by edit $e_i$, and let $\text{defs}(e_j)$ be
+the symbols defined by edit $e_j$. The consistency condition is:
+</p>
+
+$$
+\forall\, e_i \in E,\; \forall\, s \in \text{refs}(e_i): \exists\, e_j \in E \text{ such that } s \in \text{defs}(e_j) \land \text{sig}(s, e_j) \text{ is compatible with } \text{usage}(s, e_i)
+$$
+
+<p>
+where $\text{sig}(s, e_j)$ is the signature of symbol $s$ as defined in edit $e_j$,
+and $\text{usage}(s, e_i)$ is how edit $e_i$ calls or references $s$. This condition
+is trivially satisfied in single-file edits (where all references resolve internally)
+but becomes a genuine constraint when edits span the module boundary.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of multi-file code generation like renovating a kitchen where the plumber, electrician, and tile installer must coordinate. The plumber runs pipes first because the electrician needs to know where the water lines are before routing wires around them, and the tile installer cannot lay tile until both pipes and wires are in the walls. If the electrician starts before the plumber finishes, she has to guess where the pipes will go, and a wrong guess means ripping out finished work. The edit graph is the renovation schedule: it sequences the trades (file edits) so each worker (generation step) sees the actual work of the trades before it, not a prediction. The consistency condition is the building inspector's checklist: every wire must connect to a real outlet, every pipe must reach a real fixture, and every tile must cover a real wall surface.
+</p>
+</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Edit Order Determines Consistency</div>
+<p>
+The order in which a coding agent generates edits matters enormously. If the agent
+generates the serializer edit before the model edit, it must <em>predict</em> the
+exact field name, type annotation, and default value that the model edit will introduce.
+Any mismatch creates an inconsistency. Generating edits in dependency order (model
+first, then serializer) lets each subsequent edit reference the actual definitions
+produced by earlier edits, eliminating prediction errors. This is the same principle
+behind topological sorting in build systems: define before reference.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that multi-file generation fails primarily because LLMs produce bad code in individual files. In practice, each file in isolation is usually correct; the failures arise from <em>inconsistencies between files</em>, such as one file calling a function with three arguments while another file defines that function with four. Improving the quality of single-file generation does not fix this problem. The solution is structural: ensuring that when a file is generated, it has access to the actual definitions from the files it depends on, not a hallucinated version of those definitions.
+</p>
+</div>
+
+<h2>2. The Edit Graph Abstraction</h2>
+
+<p>
+To reason about multi-file changes, we introduce the <em>edit graph</em>: a directed
+acyclic graph (DAG) where nodes represent file-level edits and edges represent
+dependencies between them. An edge from $e_i$ to $e_j$ means "edit $e_j$ references
+symbols that $e_i$ defines or modifies." The topological order of this DAG gives us
+a safe generation sequence.
+</p>
+
+<p>
+Building the edit graph requires two pieces of information: the existing dependency
+structure of the repository (which files import from which other files) and the
+planned change (which files will be affected and what symbols each edit will
+introduce or modify). We extract the first from the codebase using tree-sitter;
+the second comes from the task decomposition step.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+from collections import defaultdict
+
+@dataclass
+class FileEdit:
+    """A planned edit to a single file."""
+    path: str
+    description: str
+    symbols_defined: set[str] = field(default_factory=set)
+    symbols_referenced: set[str] = field(default_factory=set)
+    depends_on: list[str] = field(default_factory=list)
+
+@dataclass
+class EditGraph:
+    """DAG of file edits with dependency edges."""
+    edits: dict[str, FileEdit] = field(default_factory=dict)
+
+    def add_edit(self, edit: FileEdit) -> None:
+        self.edits[edit.path] = edit
+
+    def resolve_dependencies(self) -> None:
+        """Compute dependency edges from symbol references."""
+        # Build a map: symbol -> file that defines it
+        symbol_sources: dict[str, str] = {}
+        for path, edit in self.edits.items():
+            for sym in edit.symbols_defined:
+                symbol_sources[sym] = path
+
+        # Resolve each edit's references to dependencies
+        for path, edit in self.edits.items():
+            for sym in edit.symbols_referenced:
+                source = symbol_sources.get(sym)
+                if source and source != path:
+                    if source not in edit.depends_on:
+                        edit.depends_on.append(source)
+
+    def topological_order(self) -> list[str]:
+        """Return file paths in dependency-safe generation order."""
+        in_degree: dict[str, int] = {p: 0 for p in self.edits}
+        for edit in self.edits.values():
+            for dep in edit.depends_on:
+                if dep in in_degree:
+                    in_degree[edit.path] = in_degree.get(edit.path, 0)
+                    # dep must come before edit.path
+                    pass
+
+        # Kahn's algorithm
+        adj: dict[str, list[str]] = defaultdict(list)
+        in_deg: dict[str, int] = {p: 0 for p in self.edits}
+        for path, edit in self.edits.items():
+            for dep in edit.depends_on:
+                if dep in self.edits:
+                    adj[dep].append(path)
+                    in_deg[path] += 1
+
+        queue = [p for p, d in in_deg.items() if d == 0]
+        order = []
+        while queue:
+            node = queue.pop(0)
+            order.append(node)
+            for neighbor in adj[node]:
+                in_deg[neighbor] -= 1
+                if in_deg[neighbor] == 0:
+                    queue.append(neighbor)
+
+        if len(order) != len(self.edits):
+            cycle_nodes = set(self.edits) - set(order)
+            raise ValueError(f"Circular dependency among: {cycle_nodes}")
+
+        return order</code></pre>
+<div class="code-caption">Listing 16.1: The EditGraph data structure for representing multi-file changes as a dependency DAG with topological ordering via Kahn's algorithm.</div>
+
+<p>
+The <code>EditGraph</code> captures the essential structure of a multi-file change.
+Each <code>FileEdit</code> declares what symbols it will define and what symbols it
+needs from other files. The <code>resolve_dependencies</code> method computes the
+edges, and <code>topological_order</code> produces a safe generation sequence. If the
+graph contains a cycle (file A depends on file B which depends on file A), the method
+raises an error, signaling that the change plan needs restructuring; see Section 16.1.5
+for strategies to break such cycles.
+</p>
+
+<h2>3. Extracting Dependencies with Tree-Sitter</h2>
+
+<p>
+The edit graph needs to know which symbols each file imports and exports. We extract
+this information from the abstract syntax tree (AST) using tree-sitter, the same
+incremental parser we used for
+<a href="../module-11-context-engineering/index.html">chunking in Chapter 11</a>.
+Tree-sitter parses source code into a concrete syntax tree (CST) that preserves
+every token, making it possible to extract import statements, function signatures,
+and class definitions with byte-level precision.
+</p>
+
+<pre><code class="language-python">import tree_sitter_python as tspython
+from tree_sitter import Language, Parser
+
+PY_LANGUAGE = Language(tspython.language())
+parser = Parser(PY_LANGUAGE)
+
+def extract_imports(source: str) -> list[dict]:
+    """Extract all import statements from Python source code."""
+    tree = parser.parse(source.encode("utf-8"))
+    imports = []
+
+    # Query for import statements
+    import_query = PY_LANGUAGE.query("""
+        (import_statement
+            name: (dotted_name) @module)
+        (import_from_statement
+            module_name: (dotted_name) @module
+            name: (dotted_name) @name)
+    """)
+
+    captures = import_query.captures(tree.root_node)
+    for node, name in captures:
+        imports.append({
+            "type": name,
+            "text": node.text.decode("utf-8"),
+            "line": node.start_point[0] + 1,
+        })
+    return imports
+
+def extract_definitions(source: str) -> list[dict]:
+    """Extract top-level function and class definitions."""
+    tree = parser.parse(source.encode("utf-8"))
+    defs = []
+
+    def_query = PY_LANGUAGE.query("""
+        (function_definition
+            name: (identifier) @func_name
+            parameters: (parameters) @params)
+        (class_definition
+            name: (identifier) @class_name)
+    """)
+
+    captures = def_query.captures(tree.root_node)
+    for node, name in captures:
+        # Only top-level definitions (depth 1 from module)
+        if node.parent and node.parent.parent == tree.root_node:
+            defs.append({
+                "type": "function" if name == "func_name" else "class",
+                "name": node.text.decode("utf-8"),
+                "line": node.start_point[0] + 1,
+            })
+    return defs
+
+# Example: analyze a source file
+source = '''
+from models.base import BaseModel
+from utils.timestamps import now
+
+class Experiment(BaseModel):
+    def __init__(self, name: str):
+        self.name = name
+        self.created_at = now()
+'''
+
+print("Imports:", extract_imports(source))
+print("Definitions:", extract_definitions(source))</code></pre>
+<div class="code-caption">Listing 16.2: Extracting import statements and top-level definitions from Python source using tree-sitter queries.</div>
+
+<p>
+With these extraction functions, we can scan every file in the repository and build a
+complete dependency graph. The graph tells us, for any proposed edit, which files might
+be affected: if we change the signature of <code>BaseModel.__init__</code>, every file
+that imports from <code>models.base</code> is a candidate for a cascading edit. This
+is the foundation of the impact analysis we build in
+<a href="section-16.2.html">Section 16.2</a>.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Adding Authentication to a Flask API</div>
+<p>
+Suppose you need to add JWT authentication to a Flask application with 40 endpoint
+files. The edit graph for this change has three layers. Layer 1: create
+<code>auth/jwt_handler.py</code> (defines <code>verify_token</code>,
+<code>create_token</code>). Layer 2: create <code>auth/decorators.py</code> (defines
+<code>@require_auth</code>, imports from <code>jwt_handler</code>). Layer 3: modify
+all 40 endpoint files (each imports <code>@require_auth</code> and wraps its route
+functions). Generating layer 3 before layers 1 and 2 would force the agent to guess
+the decorator's exact name, parameter signature, and error behavior. Generating in
+topological order means layer 3 edits can reference the actual <code>@require_auth</code>
+implementation, eliminating guesswork. The edit graph has 42 nodes and 81 edges
+(each endpoint depends on the decorator, which depends on the handler).
+</p>
+</div>
+
+<h2>4. The Multi-File Generation Pipeline</h2>
+
+<p>
+With the edit graph in place, we can define a generation pipeline that produces
+consistent multi-file changes. The pipeline has four stages: (1) task decomposition,
+where a high-level request is broken into file-level edit descriptions;
+(2) dependency resolution, where the edit graph is constructed and topologically
+sorted; (3) sequential generation, where each edit is generated in dependency order
+with preceding edits included in the context; and (4) consistency validation, where
+the combined patch is checked for import coherence and type compatibility.
+</p>
+
+<pre><code class="language-python">import subprocess
+import json
+from pathlib import Path
+
+class MultiFileGenerator:
+    """Orchestrates multi-file code generation in dependency order."""
+
+    def __init__(self, repo_root: str, model: str = "claude-sonnet-4-20250514"):
+        self.repo_root = Path(repo_root)
+        self.model = model
+        self.generated_edits: dict[str, str] = {}  # path -> new content
+
+    def decompose_task(self, task: str) -> EditGraph:
+        """Use an LLM to decompose a task into file-level edits."""
+        prompt = f"""Analyze this repository and decompose the following task
+into file-level edits. For each file, specify:
+- path: the file to edit
+- description: what changes to make
+- symbols_defined: new symbols this edit introduces
+- symbols_referenced: symbols from other edited files this edit needs
+
+Task: {task}
+
+Respond in JSON: [{{"path": "...", "description": "...",
+"symbols_defined": [...], "symbols_referenced": [...]}}]"""
+
+        result = subprocess.run(
+            ["claude", "--print", "--model", self.model,
+             "--max-tokens", "4096", "-p", prompt],
+            capture_output=True, text=True, cwd=self.repo_root
+        )
+        edits_data = json.loads(result.stdout)
+
+        graph = EditGraph()
+        for ed in edits_data:
+            graph.add_edit(FileEdit(
+                path=ed["path"],
+                description=ed["description"],
+                symbols_defined=set(ed.get("symbols_defined", [])),
+                symbols_referenced=set(ed.get("symbols_referenced", [])),
+            ))
+        graph.resolve_dependencies()
+        return graph
+
+    def generate_edit(self, edit: FileEdit) -> str:
+        """Generate code for a single file edit with context from prior edits."""
+        # Build context from already-generated edits this one depends on
+        context_parts = []
+        for dep_path in edit.depends_on:
+            if dep_path in self.generated_edits:
+                context_parts.append(
+                    f"--- {dep_path} (already modified) ---\n"
+                    f"{self.generated_edits[dep_path]}"
+                )
+
+        # Read the current file content if it exists
+        file_path = self.repo_root / edit.path
+        current_content = ""
+        if file_path.exists():
+            current_content = file_path.read_text(encoding="utf-8")
+
+        prompt = f"""Apply this edit to the file.
+
+File: {edit.path}
+Current content:
+{current_content}
+
+Edit description: {edit.description}
+
+Context from related files already modified:
+{chr(10).join(context_parts) if context_parts else "(none)"}
+
+Output ONLY the complete new file content, no explanation."""
+
+        result = subprocess.run(
+            ["claude", "--print", "--model", self.model,
+             "--max-tokens", "8192", "-p", prompt],
+            capture_output=True, text=True, cwd=self.repo_root
+        )
+        return result.stdout.strip()
+
+    def execute(self, task: str) -> dict[str, str]:
+        """Run the full multi-file generation pipeline."""
+        # Stage 1: Decompose
+        graph = self.decompose_task(task)
+
+        # Stage 2: Topological order
+        order = graph.topological_order()
+        print(f"Generation order ({len(order)} files):")
+        for i, path in enumerate(order, 1):
+            deps = graph.edits[path].depends_on
+            dep_str = f" (depends on: {', '.join(deps)})" if deps else ""
+            print(f"  {i}. {path}{dep_str}")
+
+        # Stage 3: Sequential generation
+        for path in order:
+            edit = graph.edits[path]
+            print(f"\nGenerating: {path}...")
+            content = self.generate_edit(edit)
+            self.generated_edits[path] = content
+
+        # Stage 4: Consistency check (see Section 16.2 for full version)
+        issues = self._check_import_consistency()
+        if issues:
+            print(f"\nWarning: {len(issues)} consistency issues found")
+            for issue in issues:
+                print(f"  - {issue}")
+
+        return self.generated_edits
+
+    def _check_import_consistency(self) -> list[str]:
+        """Basic check: do all imports resolve to defined symbols?"""
+        issues = []
+        all_defs: dict[str, set[str]] = {}
+
+        for path, content in self.generated_edits.items():
+            defs = extract_definitions(content)
+            all_defs[path] = {d["name"] for d in defs}
+
+        for path, content in self.generated_edits.items():
+            imports = extract_imports(content)
+            for imp in imports:
+                # Check if imported module is one of our edited files
+                module_path = imp["text"].replace(".", "/") + ".py"
+                if module_path in all_defs:
+                    # Imported name should exist in that module's definitions
+                    if imp.get("type") == "name":
+                        if imp["text"] not in all_defs[module_path]:
+                            issues.append(
+                                f"{path} imports '{imp['text']}' from "
+                                f"{module_path}, but it is not defined there"
+                            )
+        return issues</code></pre>
+<div class="code-caption">Listing 16.3: Multi-file generation pipeline using the Claude Code SDK, generating edits in topological order with context from previously generated files.</div>
+
+<p>
+The key insight in this pipeline is stage 3: each file is generated with the
+<em>actual content</em> of its dependencies in the prompt context. When the agent
+generates the serializer, it sees the exact field definition from the model file,
+not a predicted version. This eliminates the most common source of multi-file
+inconsistency: signature mismatch between the definition site and the usage site.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Speculative and Agentic Multi-File Generation</div>
+<p>
+The sequential pipeline above is safe but slow: each file waits for its dependencies
+to finish generating. Recent work pushes toward parallelism and richer agentic
+orchestration. CodeR (Chen et al., 2024) introduces a multi-agent framework where
+a "manager" agent decomposes the task, "analyst" agents locate relevant code, and
+"developer" agents generate patches in parallel, achieving a 17.6% resolve rate on
+the full SWE-bench dataset. SWE-agent with the "Moatless Tools" integration (Orwall,
+2024) uses a search/identify/plan/edit pipeline that performs code search and context
+gathering as separate tool-use stages before generation, reducing hallucinated
+references. OpenHands CodeAct (Wang et al., 2024) unifies code generation with code
+execution in a single action space, letting the agent run tests between file edits
+and self-correct inconsistencies before completing the patch. The trade-off remains
+latency versus consistency: parallel generation is faster but requires robust
+validation to catch mismatches, while agentic loop approaches are slower but
+self-healing. For repository-scale changes touching more than 20 files, hybrid
+strategies that generate independent subtrees in parallel while serializing
+cross-cutting dependencies represent the current engineering frontier.
+</p>
+</div>
+
+<h2>5. Failure Modes of Multi-File Generation</h2>
+
+<p>
+Understanding how multi-file generation fails is as important as understanding how
+it succeeds. Through analysis of SWE-bench submissions and production coding agent
+logs, we can identify five recurring failure patterns. Each pattern has a structural
+signature that makes it detectable before the code ever runs.
+</p>
+
+<h3>5.1 Hallucinated Imports</h3>
+
+<p>
+The agent imports a symbol that does not exist in the target module. This happens
+when the model "remembers" an API from its training data that differs from the
+actual codebase. For example, importing <code>from utils import retry_with_backoff</code>
+when the repository's utils module only exports <code>retry</code>.
+Detection: parse all import statements with tree-sitter and verify that each
+imported name exists in the target module's definition list.
+</p>
+
+<h3>5.2 Signature Drift</h3>
+
+<p>
+The agent calls a function with arguments that do not match its definition.
+This occurs when edits to the definition site and the call site are generated
+independently (without dependency ordering). For example, the model edit adds
+<code>created_at: datetime</code> as a required parameter, but the test fixture
+calls <code>Experiment(name="test")</code> without supplying it.
+Detection: extract function signatures and call sites with tree-sitter, then
+verify argument compatibility.
+</p>
+
+<h3>5.3 Orphaned References</h3>
+
+<p>
+The agent removes or renames a symbol in one file but fails to update all
+references in other files. This is the inverse of the hallucinated import: the
+symbol existed before the change but no longer does after. Renaming
+<code>process_data</code> to <code>transform_data</code> in the utility module
+while leaving 15 call sites unchanged produces 15 <code>NameError</code>s.
+Detection: compute the set difference between pre-change and post-change
+definitions, then search for references to removed symbols.
+</p>
+
+<h3>5.4 Circular Dependencies</h3>
+
+<p>
+The planned edits create a circular import chain that did not exist before.
+File A imports from file B, and the new edit to file B adds an import from file A.
+Python handles some circular imports gracefully (if the imported name is accessed
+only at call time, not at import time), but many cases produce
+<code>ImportError</code> at module load.
+Detection: build the post-change import graph and check for cycles.
+</p>
+
+<h3>5.5 Missing Transitive Edits</h3>
+
+<p>
+The agent edits the direct dependents of a changed file but misses the
+<em>transitive</em> dependents. Changing a base class method signature
+requires updating not just the immediate subclasses but also any code that
+calls the method through a reference to the subclass. The
+<a href="section-16.2.html">impact analysis of Section 16.2</a> addresses this
+by computing the full transitive closure of the dependency graph.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass
+from enum import Enum
+
+class FailureType(Enum):
+    HALLUCINATED_IMPORT = "hallucinated_import"
+    SIGNATURE_DRIFT = "signature_drift"
+    ORPHANED_REFERENCE = "orphaned_reference"
+    CIRCULAR_DEPENDENCY = "circular_dependency"
+    MISSING_TRANSITIVE = "missing_transitive_edit"
+
+@dataclass
+class PatchFailure:
+    failure_type: FailureType
+    file_path: str
+    line: int
+    message: str
+    severity: str  # "error" or "warning"
+
+def detect_hallucinated_imports(
+    edits: dict[str, str],
+    repo_definitions: dict[str, set[str]]
+) -> list[PatchFailure]:
+    """Detect imports that reference non-existent symbols."""
+    failures = []
+
+    for path, content in edits.items():
+        imports = extract_imports(content)
+        for imp in imports:
+            module = imp["text"]
+            # Check against both edited files and existing repo
+            target_path = module.replace(".", "/") + ".py"
+            available_defs = set()
+
+            if target_path in edits:
+                available_defs = {
+                    d["name"] for d in extract_definitions(edits[target_path])
+                }
+            elif target_path in repo_definitions:
+                available_defs = repo_definitions[target_path]
+
+            if imp.get("type") == "name" and available_defs:
+                if imp["text"] not in available_defs:
+                    failures.append(PatchFailure(
+                        failure_type=FailureType.HALLUCINATED_IMPORT,
+                        file_path=path,
+                        line=imp["line"],
+                        message=(
+                            f"Imports '{imp['text']}' from {module}, "
+                            f"but available symbols are: "
+                            f"{', '.join(sorted(available_defs))}"
+                        ),
+                        severity="error",
+                    ))
+    return failures</code></pre>
+<div class="code-caption">Listing 16.4: Failure type taxonomy and detection for hallucinated imports in multi-file patches.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Ghost Import</div>
+<p>
+In one memorable SWE-bench submission, an agent imported
+<code>from django.utils.functional import cached_classproperty</code>. This symbol
+does not exist in Django. It does exist in a popular blog post about Django internals
+that the model likely encountered during training. The agent generated a working
+implementation of <code>cached_classproperty</code> inline, then imported it from
+Django anyway. The inline version worked; the import did not. This pattern, where
+the model simultaneously knows how to build something and hallucinates that it
+already exists elsewhere, reveals a fundamental tension between generation
+capability and factual grounding.
+</p>
+</div>
+
+<h2>6. Orchestrating Generation with the Claude Code SDK</h2>
+
+<p>
+The Claude Code SDK provides a programmatic interface for invoking Claude Code as a
+subprocess, enabling integration into automated pipelines. For multi-file generation,
+the SDK's key advantage is that each invocation can carry a different context window,
+allowing us to feed dependency-specific context to each generation step. The SDK
+supports both one-shot mode (<code>--print</code>, used above) and interactive
+conversation mode, where the agent maintains state across multiple tool calls.
+</p>
+
+<pre><code class="language-python">import subprocess
+import json
+
+def claude_code_generate(
+    prompt: str,
+    repo_root: str,
+    model: str = "claude-sonnet-4-20250514",
+    max_tokens: int = 8192,
+    allowed_tools: list[str] | None = None,
+) -> dict:
+    """Invoke Claude Code SDK for a single generation step.
+
+    Returns the parsed JSON output with conversation and result fields.
+    """
+    cmd = [
+        "claude",
+        "--print",           # one-shot mode: no interactive session
+        "--model", model,
+        "--max-tokens", str(max_tokens),
+        "--output-format", "json",
+    ]
+
+    if allowed_tools:
+        for tool in allowed_tools:
+            cmd.extend(["--allowedTools", tool])
+
+    cmd.extend(["-p", prompt])
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=repo_root,
+        timeout=120,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Claude Code failed (exit {result.returncode}): "
+            f"{result.stderr[:500]}"
+        )
+
+    return json.loads(result.stdout)
+
+
+def generate_with_retry(
+    prompt: str,
+    repo_root: str,
+    validation_fn: callable,
+    max_attempts: int = 3,
+) -> str:
+    """Generate code with validation and retry on failure."""
+    for attempt in range(max_attempts):
+        response = claude_code_generate(prompt, repo_root)
+        content = response.get("result", "")
+
+        issues = validation_fn(content)
+        if not issues:
+            return content
+
+        # Augment prompt with failure feedback for retry
+        feedback = "\n".join(f"- {issue}" for issue in issues)
+        prompt = (
+            f"{prompt}\n\n"
+            f"Previous attempt had these issues:\n{feedback}\n"
+            f"Please fix these issues in your response."
+        )
+
+    raise RuntimeError(
+        f"Failed to generate valid code after {max_attempts} attempts"
+    )</code></pre>
+<div class="code-caption">Listing 16.5: Claude Code SDK wrapper with JSON output parsing and retry-on-validation-failure loop.</div>
+
+<p>
+The <code>generate_with_retry</code> function implements a critical pattern for
+production-grade code generation: generate, validate, and retry. The validation
+function can check for any of the failure modes from Section 16.1.5, and the retry
+loop augments the prompt with specific failure feedback, giving the model a chance
+to correct its mistakes. In practice, most hallucinated import errors are resolved
+on the first retry when the prompt explicitly lists the available symbols.
+</p>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Aider's Multi-File Editing</div>
+<p>
+<a href="https://aider.chat" target="_blank">Aider</a> implements multi-file editing
+with its "architect" and "editor" modes. The architect mode uses a planning model to
+identify which files need changes and what changes to make, then the editor mode
+applies the changes using a diff-based format. In roughly 500 lines of Python, Aider
+handles file selection, diff generation, and automatic git commits. What we build in
+this section from first principles (edit graphs, dependency ordering, consistency
+checking), Aider ships as a turnkey feature. The trade-off: Aider's approach works
+well for codebases it can map within the context window, but the explicit dependency
+reasoning we develop here scales better to very large repositories where the map
+itself exceeds the token budget. For codebases under 50,000 lines,
+<code>pip install aider-chat</code> and <code>aider --model claude-sonnet-4-20250514</code>
+is the pragmatic choice.
+</p>
+</div>
+
+<h2>7. Building the Edit Plan from a Task Specification</h2>
+
+<p>
+The quality of multi-file generation depends critically on the quality of the
+initial decomposition. A vague task like "improve performance" produces a vague
+edit plan; a specific task like "replace the O(n^2) duplicate detection in
+<code>pipeline/dedup.py</code> with a hash-based approach and update the
+corresponding tests" produces a precise one. This connects directly to the
+<a href="../module-13-requirements-discovery/index.html">requirements discovery
+techniques of Chapter 13</a>: the better the specification, the better the
+implementation.
+</p>
+
+<p>
+A well-structured edit plan has four components:
+</p>
+
+<ol>
+<li><strong>Scope</strong>: which files are in scope and which are explicitly out of scope.</li>
+<li><strong>Ordering</strong>: which edits must precede which others.</li>
+<li><strong>Contracts</strong>: what each edited file promises to its dependents (function signatures, class interfaces, configuration keys).</li>
+<li><strong>Verification</strong>: how to test that the change works (which test files to run, what behavior to check).</li>
+</ol>
+
+<pre><code class="language-python">@dataclass
+class EditPlan:
+    """A structured plan for a multi-file change."""
+    task_description: str
+    scope: list[str]           # files to edit
+    out_of_scope: list[str]    # files explicitly not edited
+    contracts: dict[str, list[str]]  # file -> list of interface promises
+    verification: list[str]    # test commands to run
+
+    def to_prompt(self) -> str:
+        """Convert the plan to a prompt for the generation pipeline."""
+        lines = [
+            f"Task: {self.task_description}",
+            f"\nFiles to edit ({len(self.scope)}):",
+        ]
+        for f in self.scope:
+            contracts = self.contracts.get(f, [])
+            contract_str = "; ".join(contracts) if contracts else "no new interfaces"
+            lines.append(f"  - {f} ({contract_str})")
+
+        lines.append(f"\nFiles NOT to edit: {', '.join(self.out_of_scope)}")
+        lines.append(f"\nVerification: {'; '.join(self.verification)}")
+        return "\n".join(lines)
+
+# Example: plan for adding a caching layer
+plan = EditPlan(
+    task_description="Add Redis caching to the experiment lookup endpoint",
+    scope=[
+        "cache/redis_client.py",
+        "cache/__init__.py",
+        "api/endpoints/experiments.py",
+        "tests/test_experiments.py",
+        "config/settings.py",
+    ],
+    out_of_scope=[
+        "api/endpoints/users.py",   # different endpoint, not affected
+        "models/experiment.py",      # model unchanged, only read path cached
+    ],
+    contracts={
+        "cache/redis_client.py": [
+            "def get_cached(key: str) -> dict | None",
+            "def set_cached(key: str, value: dict, ttl: int = 300) -> None",
+        ],
+        "config/settings.py": [
+            "REDIS_URL: str",
+            "CACHE_TTL: int = 300",
+        ],
+    },
+    verification=[
+        "pytest tests/test_experiments.py -v",
+        "pytest tests/test_cache.py -v",
+    ],
+)
+print(plan.to_prompt())</code></pre>
+<div class="code-caption">Listing 16.6: Structured edit plan with scope, contracts, and verification commands for a Redis caching feature.</div>
+
+<p>
+The contract specification is particularly powerful. By declaring upfront that
+<code>cache/redis_client.py</code> will export <code>get_cached</code> and
+<code>set_cached</code> with specific signatures, we give the agent generating the
+endpoint file a concrete interface to code against, even before the cache module is
+generated. This is the software engineering principle of
+<em>programming to interfaces</em>, applied to AI-assisted code generation.
+</p>
+
+<div class="callout research-frontier">
+<div class="callout-title">Research Frontier: LLM-Generated Edit Plans</div>
+<p>
+AutoCodeRover (Zhang et al., 2024) and SWE-agent (Yang et al., 2024) both
+demonstrate that LLMs can generate reasonable edit plans from natural-language issue
+descriptions, particularly when given access to code search tools. The quality of
+these plans varies: on SWE-bench, agent-generated plans correctly identify the
+affected files about 70% of the time but miss transitive dependencies in roughly
+30% of cases. Active research focuses on combining LLM planning with static
+analysis, using the dependency graph to expand agent-proposed scopes to include
+files the agent overlooks. The MAGIS framework (Tao et al., 2024) introduces a
+dedicated "manager" agent whose sole job is plan quality, separate from the agents
+that execute the plan.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build and Validate a Multi-File Edit Graph</h4>
+<p>
+This mini-project walks you through constructing an edit graph for an existing Python project, detecting dependency violations, and verifying consistency. You need Python 3.10+, <code>pip install tree-sitter tree-sitter-python</code>, and any multi-file Python project (your own, or clone a small open-source one).
+</p>
+<p>
+1. <strong>Map the import graph.</strong> Write a script that uses the <code>extract_imports</code> and <code>extract_definitions</code> functions from Listing 16.2 to scan every <code>.py</code> file in your project. Store the results in a dictionary mapping each file path to its list of imports and definitions. Print the file with the highest in-degree (most imported by other files).
+</p>
+<p>
+2. <strong>Simulate a breaking change.</strong> Pick a function that at least three other files import. Rename it in your dictionary (do not edit the real files). Run a consistency check: for each file that imports the old name, flag it as having a broken reference. Print the list of affected files.
+</p>
+<p>
+3. <strong>Build the edit graph.</strong> Using the <code>EditGraph</code> class from Listing 16.1, create <code>FileEdit</code> nodes for the definition file (which defines the new name) and each file that references it. Call <code>resolve_dependencies()</code> and <code>topological_order()</code>. Verify that the definition file appears first in the ordering.
+</p>
+<p>
+4. <strong>Introduce a cycle.</strong> Add a synthetic dependency where one of the consumer files also exports a symbol that the definition file imports. Confirm that <code>topological_order()</code> raises a <code>ValueError</code> identifying the cycle.
+</p>
+<p>
+5. <strong>Break the cycle.</strong> Create a new <code>FileEdit</code> for a <code>shared.py</code> file that holds the mutual dependency. Update the edit graph so both the original files depend on <code>shared.py</code> instead of each other. Verify that <code>topological_order()</code> now succeeds and <code>shared.py</code> appears before both files.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> A repository has a module hierarchy where
+<code>models/</code> depends on <code>utils/</code>, <code>api/</code> depends on
+both <code>models/</code> and <code>utils/</code>, and <code>tests/</code> depends
+on all three. Draw the edit graph for a change that modifies a utility function
+signature, requiring updates to models, API endpoints, and tests. What is the
+topological order? How many files could be generated in parallel at each stage?
+</li>
+<li>
+<strong>(Coding)</strong> Extend the <code>EditGraph</code> from Listing 16.1 to
+detect cycles and report the specific files involved. Test it by constructing a
+graph where <code>auth/tokens.py</code> imports from <code>auth/users.py</code> and
+vice versa. Then implement a cycle-breaking strategy that introduces a third file
+(<code>auth/shared.py</code>) to hold the shared definitions.
+</li>
+<li>
+<strong>(Analysis)</strong> Run the <code>extract_imports</code> function from
+Listing 16.2 on a Python project you work with. Compute the import graph and find
+the module with the highest in-degree (most files import from it). Explain why
+changes to this module require the most careful edit planning and the largest blast
+radius analysis.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+We now have machinery to decompose a task into file-level edits, order them by
+dependency, and generate consistent multi-file patches. But generating code is only
+half the problem. In <a href="section-16.2.html">Section 16.2: Impact Analysis and
+Patch Review</a>, we build tools to analyze <em>what a change breaks</em>: tracing
+change propagation through the dependency graph, computing blast radii, and
+automating the review process that catches regressions before they reach production.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="index.html">&larr; Chapter 16 Index</a>
+<a href="index.html">Chapter 16</a>
+<a href="section-16.2.html">16.2 Impact Analysis and Patch Review &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

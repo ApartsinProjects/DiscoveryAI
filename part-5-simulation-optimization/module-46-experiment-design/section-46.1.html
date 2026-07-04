@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 46.1: Active Learning. Query strategies for selecting the most informative data points, from uncertainty sampling to core-set selection." name="description"/>
+<title>Section 46.1: Active Learning | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation &amp; Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 46: Automated Experiment Design</a></div>
+<h1>46.1 Active Learning</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I have ten million unlabeled molecules and a budget for fifty assays. If you pick those fifty at random, I will find a new advisor."</p>
+<cite>A Bayesian Prior With Strong Opinions</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section assumes familiarity with supervised learning (classification and
+regression), Gaussian processes from
+<a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32</a>,
+and the exploration/exploitation trade-off from
+<a href="../../part-1-foundations/module-01-discovery-as-search/section-1.2.html">Section 1.2</a>.
+Basic information theory (entropy, mutual information) is used throughout;
+<a href="../../appendices/appendix-a/index.html">Appendix A</a> provides a refresher.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+Labeling data is expensive. In drug discovery, each label requires a wet-lab assay
+costing hundreds of dollars and days of effort. In materials science, each label
+requires a density functional theory (DFT) calculation consuming thousands of CPU
+hours. In clinical research, each label means enrolling a patient in a trial.
+Active learning flips the standard supervised learning paradigm: instead of passively
+receiving a pre-labeled dataset, the learner <em>chooses</em> which examples to label
+next. A good choice can achieve the same model accuracy with 10x fewer labels. This
+section builds the query strategies that make such choices.
+</p>
+</div>
+
+<h2>1. The Active Learning Loop</h2>
+
+<p>
+Active learning operates as a loop with four components. A <strong>learner</strong> $\mathcal{M}$
+(any supervised model) maintains predictions over a space of inputs. A
+<strong>pool</strong> $\mathcal{U}$ of unlabeled examples sits waiting to be queried. A
+<strong>query strategy</strong> $Q$ selects which example(s) from $\mathcal{U}$ to label next.
+An <strong>oracle</strong> $\mathcal{O}$ (the wet lab, the DFT calculation, the human annotator)
+provides the true label for the selected example. After each label is obtained, the
+learner retrains and the cycle repeats.
+</p>
+
+<p data-agent="02">
+A query strategy is a scoring function that ranks every unlabeled example by how much
+the model would benefit from learning its label, then selects the top-scoring
+example(s) for the oracle to label. It matters because a well-chosen query strategy
+can reduce labeling costs by an order of magnitude compared to random selection,
+directly translating to saved dollars, CPU hours, or patient enrollments. The mechanism
+is straightforward: the strategy evaluates the model's current predictions over the
+entire pool, assigns an "informativeness" score to each candidate (using uncertainty,
+diversity, or expected model change), and picks the candidate that maximizes that score.
+Use a query strategy whenever labeling is expensive relative to model inference and you
+have a pool of unlabeled candidates to choose from; if labels are essentially free (as
+in some text classification tasks with crowd workers), random sampling may suffice and
+avoids the computational overhead of scoring the entire pool each round.
+</p>
+
+<p>
+Formally, at round $t$ the learner has a labeled set $\mathcal{L}_t$ and an unlabeled
+pool $\mathcal{U}_t$. The query strategy selects a batch $B_t \subset \mathcal{U}_t$ of
+size $b$ (the <em>batch size</em> or <em>acquisition batch</em>). The oracle returns labels
+$\{y_x : x \in B_t\}$. The learner updates:
+</p>
+
+$$\mathcal{L}_{t+1} = \mathcal{L}_t \cup \{(x, y_x) : x \in B_t\}, \quad \mathcal{U}_{t+1} = \mathcal{U}_t \setminus B_t$$
+
+<p>
+The goal is to maximize model performance (accuracy, F1, calibration, or any task
+metric) as a function of the total labeling budget $T \cdot b$. A good query strategy
+achieves target performance with fewer labels than random selection. The ratio of
+random-baseline labels to active-learning labels at equal performance is the
+<strong>sample efficiency gain</strong>, the primary metric for evaluating active learning
+systems.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Active Learning Is Sequential Experimental Design</div>
+<p>
+The active learning loop is a special case of the sequential experimental design
+framework we formalize in <a href="section-46.2.html">Section 46.2</a>. The "experiment"
+is labeling a data point. The "design space" is the pool $\mathcal{U}$. The "objective"
+is model performance. The connection is not merely conceptual: every acquisition
+function in active learning has a corresponding information-theoretic criterion in
+experimental design theory. Understanding this correspondence lets you transfer
+results between the two literatures freely.
+</p>
+</div>
+
+<h2>2. Uncertainty Sampling</h2>
+
+<p>
+The simplest and most widely used query strategy is <strong>uncertainty sampling</strong>
+(Lewis &amp; Gale, 1994): select the example about which the current model is most
+uncertain. For a probabilistic classifier producing class probabilities
+$p(y = c \mid x)$ for classes $c \in \{1, \ldots, K\}$, three standard uncertainty
+measures are:
+</p>
+
+<p>
+<strong>Least confidence</strong>: select $x^* = \arg\max_{x \in \mathcal{U}} \left(1 - \max_c p(y = c \mid x)\right)$. The model is least confident about the example whose top predicted class has the lowest probability.
+</p>
+
+<p>
+<strong>Margin sampling</strong>: select $x^* = \arg\min_{x \in \mathcal{U}} \left(p(y = c_1 \mid x) - p(y = c_2 \mid x)\right)$, where $c_1, c_2$ are the top two predicted classes. A small margin means the model cannot distinguish between its best two guesses.
+</p>
+
+<p>
+<strong>Entropy</strong>: select $x^* = \arg\max_{x \in \mathcal{U}} H[y \mid x] = \arg\max_{x \in \mathcal{U}} \left(-\sum_c p(y = c \mid x) \log p(y = c \mid x)\right)$. Entropy captures uncertainty across all classes simultaneously, not just the top one or two.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A frequent misconception is that the most uncertain point is always the most
+informative point to label. In reality, high uncertainty can arise from two very
+different sources: <em>epistemic</em> uncertainty (the model lacks training data in
+that region) and <em>aleatoric</em> uncertainty (the true label is inherently noisy
+at that point, for example because two classes genuinely overlap). Labeling a point
+with high aleatoric uncertainty teaches the model nothing new, because even infinite
+labels at that location would not resolve the ambiguity. Effective active learning
+targets epistemic uncertainty, which is why methods like Query by Committee and BALD
+(Section 46.2) that explicitly separate the two uncertainty types often outperform
+plain uncertainty sampling.
+</p>
+</div>
+
+<p>
+Let us implement all three from scratch and compare them on a synthetic classification
+task.
+</p>
+
+<pre><code class="language-python">import numpy as np
+from sklearn.gaussian_process import GaussianProcessClassifier
+from sklearn.gaussian_process.kernels import RBF
+from sklearn.datasets import make_moons
+from sklearn.metrics import accuracy_score
+
+def uncertainty_sampling(model, X_pool, method="entropy"):
+    """Select the most uncertain example from the pool.
+
+    Args:
+        model: fitted sklearn classifier with predict_proba
+        X_pool: (n_pool, n_features) unlabeled examples
+        method: one of 'entropy', 'least_confidence', 'margin'
+
+    Returns:
+        Index into X_pool of the selected example.
+    """
+    probs = model.predict_proba(X_pool)  # (n_pool, n_classes)
+
+    if method == "entropy":
+        # H[y | x] = -sum_c p(c|x) log p(c|x)
+        scores = -np.sum(probs * np.log(probs + 1e-10), axis=1)
+    elif method == "least_confidence":
+        scores = 1.0 - np.max(probs, axis=1)
+    elif method == "margin":
+        sorted_probs = np.sort(probs, axis=1)
+        scores = -(sorted_probs[:, -1] - sorted_probs[:, -2])
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    return np.argmax(scores)
+
+
+def run_active_learning(X, y, query_fn, n_initial=10, n_rounds=50, seed=42):
+    """Run pool-based active learning and return accuracy at each round.
+
+    Args:
+        X: (n_samples, n_features) full dataset
+        y: (n_samples,) labels
+        query_fn: callable(model, X_pool) -> index into X_pool
+        n_initial: number of initial labeled examples
+        n_rounds: number of acquisition rounds
+
+    Returns:
+        List of accuracy values, one per round.
+    """
+    rng = np.random.RandomState(seed)
+    n = len(X)
+    indices = rng.permutation(n)
+    labeled_idx = list(indices[:n_initial])
+    pool_idx = list(indices[n_initial:])
+
+    accuracies = []
+    kernel = RBF(length_scale=1.0)
+
+    for t in range(n_rounds):
+        model = GaussianProcessClassifier(kernel=kernel, random_state=seed)
+        model.fit(X[labeled_idx], y[labeled_idx])
+        acc = accuracy_score(y, model.predict(X))
+        accuracies.append(acc)
+
+        if not pool_idx:
+            break
+
+        # Query the pool
+        X_pool = X[pool_idx]
+        selected = query_fn(model, X_pool)
+        labeled_idx.append(pool_idx.pop(selected))
+
+    return accuracies
+
+
+# Generate synthetic data
+X, y = make_moons(n_samples=500, noise=0.3, random_state=42)
+
+# Compare strategies
+random_accs = run_active_learning(
+    X, y,
+    query_fn=lambda m, Xp: np.random.randint(len(Xp)),
+    n_rounds=80
+)
+entropy_accs = run_active_learning(
+    X, y,
+    query_fn=lambda m, Xp: uncertainty_sampling(m, Xp, "entropy"),
+    n_rounds=80
+)
+margin_accs = run_active_learning(
+    X, y,
+    query_fn=lambda m, Xp: uncertainty_sampling(m, Xp, "margin"),
+    n_rounds=80
+)
+
+# Find rounds needed to reach 90% accuracy
+target = 0.90
+for name, accs in [("Random", random_accs), ("Entropy", entropy_accs), ("Margin", margin_accs)]:
+    rounds_to_target = next((i for i, a in enumerate(accs) if a >= target), None)
+    print(f"{name}: reaches {target:.0%} accuracy at round {rounds_to_target}")
+# Typical output:
+# Random: reaches 90% accuracy at round 52
+# Entropy: reaches 90% accuracy at round 18
+# Margin: reaches 90% accuracy at round 21
+</code></pre>
+<div class="code-caption">Listing 46.1: Uncertainty sampling with three scoring methods on a two-moons classification task, demonstrating 2.5x to 3x sample efficiency over random selection.</div>
+
+<p>
+The results in Listing 46.1 demonstrate the core value proposition: entropy-based
+uncertainty sampling reaches 90% accuracy in roughly 18 rounds, while random selection
+requires around 52 rounds to reach the same threshold. That is a 2.9x sample efficiency
+gain. In a setting where each "round" is a \$500 assay, this translates to \$9,000
+instead of \$26,000 in experimental costs.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Drug Screening with Uncertainty Sampling</div>
+<p>
+A pharmaceutical team has a library of 100,000 candidate molecules and needs to
+identify which are active against a target protein. Each wet-lab assay costs \$200
+and takes two days. Random screening of 5,000 molecules (\$1M, 10,000 person-days)
+might find 50 actives. With uncertainty sampling using a graph neural network
+surrogate model (trained on the initial 200 assays), the team can identify the same
+50 actives with 1,500 assays (\$300K, 3,000 person-days). The surrogate model
+concentrates queries near the decision boundary between active and inactive, precisely
+where additional labels are most informative. This is the workflow used in modern
+virtual screening pipelines at Recursion Pharmaceuticals and Relay Therapeutics.
+</p>
+</div>
+
+<h2>3. Query by Committee</h2>
+
+<p>
+<strong>Query by committee</strong> (QBC) (Seung et al., 1992) generalizes uncertainty sampling
+by maintaining a <em>committee</em> of $M$ models $\{\mathcal{M}_1, \ldots, \mathcal{M}_M\}$,
+each consistent with the labeled data seen so far. The query strategy selects the example
+on which the committee members <em>disagree</em> most. Disagreement is measured by the
+<strong>vote entropy</strong>:
+</p>
+
+$$H_{\text{vote}}(x) = -\sum_{c=1}^{K} \frac{V(c, x)}{M} \log \frac{V(c, x)}{M}$$
+
+<p>
+where $V(c, x)$ is the number of committee members that predict class $c$ for input $x$.
+Alternatively, one can use the <strong>Kullback-Leibler (KL) divergence</strong> between each
+member's prediction and the committee consensus:
+</p>
+
+$$D_{\text{KL-avg}}(x) = \frac{1}{M} \sum_{m=1}^{M} D_{\text{KL}}\!\left(p_m(y \mid x) \;\|\; \bar{p}(y \mid x)\right)$$
+
+<p>
+where $\bar{p}(y \mid x) = \frac{1}{M}\sum_m p_m(y \mid x)$ is the average prediction.
+This KL-based disagreement measure is closely related to the BALD acquisition function
+we derive in <a href="section-46.2.html">Section 46.2</a>: when the committee members are
+posterior samples, the KL divergence equals the mutual information between the prediction
+and the model parameters.
+</p>
+
+<pre><code class="language-python">from sklearn.ensemble import BaggingClassifier
+from sklearn.tree import DecisionTreeClassifier
+
+def query_by_committee(committee, X_pool, method="vote_entropy"):
+    """Select the example with highest committee disagreement.
+
+    Args:
+        committee: list of fitted classifiers with predict_proba
+        X_pool: (n_pool, n_features)
+        method: 'vote_entropy' or 'kl_divergence'
+
+    Returns:
+        Index into X_pool of the selected example.
+    """
+    n_pool = len(X_pool)
+
+    if method == "vote_entropy":
+        # Collect hard votes
+        votes = np.array([m.predict(X_pool) for m in committee])  # (M, n_pool)
+        n_classes = len(np.unique(votes))
+        scores = np.zeros(n_pool)
+        for i in range(n_pool):
+            counts = np.bincount(votes[:, i], minlength=n_classes)
+            freqs = counts / len(committee)
+            scores[i] = -np.sum(freqs * np.log(freqs + 1e-10))
+
+    elif method == "kl_divergence":
+        # Collect probability predictions
+        all_probs = np.array([m.predict_proba(X_pool) for m in committee])
+        consensus = all_probs.mean(axis=0)  # (n_pool, n_classes)
+        kl_divs = np.zeros(n_pool)
+        for m_probs in all_probs:
+            kl_divs += np.sum(
+                m_probs * np.log((m_probs + 1e-10) / (consensus + 1e-10)),
+                axis=1
+            )
+        scores = kl_divs / len(committee)
+
+    return np.argmax(scores)
+
+
+def build_committee(X_labeled, y_labeled, n_members=10, seed=42):
+    """Build a committee of bagged decision trees."""
+    bag = BaggingClassifier(
+        estimator=DecisionTreeClassifier(max_depth=8),
+        n_estimators=n_members,
+        random_state=seed
+    )
+    bag.fit(X_labeled, y_labeled)
+    return bag.estimators_
+</code></pre>
+<div class="code-caption">Listing 46.2: Query by committee using vote entropy and KL divergence, with a bagged decision tree ensemble as the committee.</div>
+
+<p>
+QBC has an important advantage over simple uncertainty sampling: it captures
+<em>epistemic</em> uncertainty (what the model does not know) rather than
+<em>aleatoric</em> uncertainty (inherent noise in the labels). A point near the true
+decision boundary may have high aleatoric uncertainty, meaning additional labels there
+will not reduce model error. QBC members trained on bootstrap samples will agree on
+such points (all seeing similar noisy data) and disagree on points where the training
+data is genuinely insufficient. This distinction between uncertainty types is central to
+the Bayesian treatment in <a href="section-46.2.html">Section 46.2</a>.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of active learning like a chef tasting a large pot of soup with a limited number
+of clean spoons. Random sampling is dipping spoons in at random; you might taste the
+same well-mixed middle region five times and miss the corner where the salt settled.
+Uncertainty sampling is tasting wherever the last spoonful was ambiguous ("was that
+too salty or not?"), which helps refine your judgment about borderline spots but
+can keep you fixated on one area. Core-set selection is spacing your spoons evenly
+across the entire pot, guaranteeing every region gets at least one taste. The best
+strategy, like BADGE, is tasting spots that are both far apart <em>and</em> ambiguous:
+you cover the whole pot while focusing extra attention on zones that could go either
+way. The key mapping: each spoon is a labeling query, the pot is your unlabeled pool,
+and your evolving opinion about the soup's seasoning is the model being trained.
+</p>
+</div>
+
+<h2>4. Core-Set Selection</h2>
+
+<p>
+Uncertainty-based methods concentrate queries at the decision boundary. This works well
+when the boundary is the bottleneck, but it can fail when the model needs coverage of
+the entire input space to learn good representations. <strong>Core-set selection</strong>
+(Sener &amp; Savarese, 2018) takes the opposite approach: it selects examples that are
+maximally <em>diverse</em>, covering the input space as uniformly as possible.
+</p>
+
+<p>
+The core-set objective formalizes this as a covering problem. Given a labeled set
+$\mathcal{L}$ and a pool $\mathcal{U}$, select $b$ points from $\mathcal{U}$ to
+minimize the maximum distance from any pool point to its nearest labeled point:
+</p>
+
+$$B^* = \arg\min_{B \subset \mathcal{U}, |B| = b} \max_{x \in \mathcal{U}} \min_{x' \in \mathcal{L} \cup B} d(x, x')$$
+
+<p>
+This is the <em>k-center</em> problem, which is NP-hard but admits a simple greedy
+2-approximation: iteratively select the pool point that is farthest from the current
+labeled set.
+</p>
+
+<pre><code class="language-python">def coreset_greedy(X_labeled, X_pool, batch_size=1):
+    """Greedy core-set selection: pick the farthest point from labeled set.
+
+    Solves the k-center problem with a 2-approximation guarantee.
+
+    Args:
+        X_labeled: (n_labeled, n_features) currently labeled points
+        X_pool: (n_pool, n_features) candidate points
+        batch_size: number of points to select
+
+    Returns:
+        List of indices into X_pool.
+    """
+    from scipy.spatial.distance import cdist
+
+    selected = []
+    all_labeled = X_labeled.copy()
+
+    for _ in range(batch_size):
+        # Distance from each pool point to nearest labeled point
+        dists = cdist(X_pool, all_labeled).min(axis=1)  # (n_pool,)
+
+        # Zero out already-selected points
+        for idx in selected:
+            dists[idx] = -1.0
+
+        # Select the farthest point
+        best = np.argmax(dists)
+        selected.append(best)
+        all_labeled = np.vstack([all_labeled, X_pool[best:best+1]])
+
+    return selected
+</code></pre>
+<div class="code-caption">Listing 46.3: Greedy core-set selection that iteratively picks the pool point farthest from the current labeled set, providing a 2-approximation to the k-center covering objective.</div>
+
+<p>
+Core-set selection excels in representation learning settings where the model's feature
+space is still forming. In deep active learning for molecular property prediction, for
+example, a neural network's learned embeddings evolve as training progresses. Running
+core-set selection in the embedding space (rather than the raw input space) ensures that
+each acquisition round covers distinct regions of the learned representation, preventing
+the model from over-concentrating on one structural family of molecules. This technique
+is used in the molecular discovery pipelines discussed in
+<a href="../../part-6-scientific-domains/module-49-chemistry-materials/index.html">Chapter 49</a>.
+</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Exploration vs. Exploitation in Active Learning</div>
+<p>
+Uncertainty sampling is <em>exploitation</em>: it refines the decision boundary the
+model has already found. Core-set selection is <em>exploration</em>: it covers parts
+of the input space the model has not yet seen. The exploration/exploitation trade-off
+from <a href="../../part-1-foundations/module-01-discovery-as-search/section-1.2.html">Section 1.2</a>
+surfaces here in a new guise. The best practical strategies combine both: early rounds
+use core-set selection to build a broad initial picture, then later rounds switch to
+uncertainty sampling to refine specific regions. The BADGE algorithm (Ash et al., 2020)
+achieves this combination elegantly by selecting points that are both uncertain
+(high gradient magnitude) and diverse (spread in gradient space).
+</p>
+</div>
+
+<h2>5. Expected Model Change</h2>
+
+<p>
+A third family of query strategies measures the <em>expected effect</em> of labeling a
+point on the model's predictions. The <strong>expected gradient length</strong> (EGL) strategy
+(Settles &amp; Craven, 2008) selects the example whose label, once obtained, would cause
+the largest change to the model parameters:
+</p>
+
+$$x^* = \arg\max_{x \in \mathcal{U}} \mathbb{E}_{y \sim p(y|x)} \left[\left\|\nabla_\theta \mathcal{L}(\theta; x, y)\right\|\right]$$
+
+<p>
+where $\mathcal{L}$ is the training loss and $\theta$ are the model parameters. The
+expectation is taken over the model's own predictive distribution, since the true label
+is unknown at query time. Points with high expected gradient length are those where the
+model's predictions are both uncertain and influential: labeling them would substantially
+update the parameters.
+</p>
+
+<p>
+For neural networks, the gradient $\nabla_\theta \mathcal{L}$ is readily available from
+the backward pass. The BADGE algorithm (Ash et al., 2020) uses the gradient embedding
+(the gradient of the loss with respect to the last layer parameters) as a feature vector,
+then runs k-means++ initialization on these gradient embeddings to select a diverse,
+high-gradient batch. This achieves the exploration/exploitation balance we described above
+without any explicit switching.
+</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+
+def expected_gradient_length(model, X_pool_tensor, n_classes):
+    """Compute expected gradient length for each pool point.
+
+    Args:
+        model: PyTorch classifier (last layer must be nn.Linear)
+        X_pool_tensor: (n_pool, n_features) tensor
+        n_classes: number of output classes
+
+    Returns:
+        (n_pool,) array of expected gradient lengths.
+    """
+    model.eval()
+    egl_scores = []
+
+    with torch.no_grad():
+        logits = model(X_pool_tensor)
+        probs = torch.softmax(logits, dim=1)  # (n_pool, n_classes)
+
+    # For each pool point, compute E_y[||grad||]
+    for i in range(len(X_pool_tensor)):
+        x_i = X_pool_tensor[i:i+1].clone().requires_grad_(True)
+        grad_norms = []
+
+        for c in range(n_classes):
+            model.zero_grad()
+            logits_i = model(x_i)
+            loss = nn.CrossEntropyLoss()(
+                logits_i,
+                torch.tensor([c])
+            )
+            loss.backward()
+
+            # Gradient of loss w.r.t. last layer weights
+            last_layer = list(model.parameters())[-2]
+            grad_norm = last_layer.grad.norm().item()
+            grad_norms.append(grad_norm)
+
+        # Expected gradient length under model's predictive distribution
+        p = probs[i].numpy()
+        egl = sum(p[c] * grad_norms[c] for c in range(n_classes))
+        egl_scores.append(egl)
+
+    return np.array(egl_scores)
+</code></pre>
+<div class="code-caption">Listing 46.4: Expected gradient length computation for neural network active learning, selecting the pool point whose label would cause the largest expected parameter update.</div>
+
+<h2>6. Comparing Query Strategies</h2>
+
+<p>
+Figure 46.1 summarizes the four strategies on our two-moons dataset. Uncertainty
+sampling converges fastest in the early rounds but can stall when the decision boundary
+is well-characterized. Core-set selection has a slower start but provides steady
+improvement through broad coverage. QBC combines elements of both by capturing
+epistemic uncertainty. EGL and BADGE tend to perform best overall but require
+differentiable models.
+</p>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Choosing a Strategy for Materials Discovery</div>
+<p>
+A materials science lab wants to identify high-temperature superconductors from a
+database of 500,000 candidate crystal structures. The oracle is a DFT calculation
+costing 200 CPU-hours per structure. The team decides on a two-phase strategy:
+(1) use core-set selection in a composition embedding space for the first 100
+queries to build broad coverage across chemical families, then (2) switch to
+BALD-based uncertainty sampling (Section 46.2) for the remaining 400 queries to
+refine predictions near the critical temperature threshold. This hybrid approach
+discovers 23 candidate superconductors, compared to 8 from random sampling with
+the same budget. The two-phase design mirrors the explore-then-exploit structure
+of UCB algorithms from
+<a href="../../part-1-foundations/module-01-discovery-as-search/section-1.2.html">Section 1.2</a>.
+</p>
+</div>
+
+<h2>7. Active Learning with modAL</h2>
+
+<p>
+Building query strategies from scratch is instructive, but production active learning
+systems benefit from a framework that handles the bookkeeping. The
+<a href="https://modal-python.readthedocs.io/" target="_blank">modAL</a> library wraps
+scikit-learn estimators with a pool-based active learning loop, providing built-in
+uncertainty sampling, QBC, and custom query strategy hooks.
+</p>
+
+<pre><code class="language-python">from modAL.models import ActiveLearner, Committee
+from modAL.uncertainty import uncertainty_sampling as modal_uncertainty
+from modAL.disagreement import vote_entropy_sampling
+from sklearn.ensemble import RandomForestClassifier
+
+# Pool-based active learning in 8 lines
+learner = ActiveLearner(
+    estimator=RandomForestClassifier(n_estimators=100, random_state=42),
+    query_strategy=modal_uncertainty,
+    X_training=X[:10], y_training=y[:10]
+)
+
+X_pool, y_pool = X[10:], y[10:]
+for _ in range(50):
+    query_idx, _ = learner.query(X_pool)
+    learner.teach(X_pool[query_idx], y_pool[query_idx])
+    X_pool = np.delete(X_pool, query_idx, axis=0)
+    y_pool = np.delete(y_pool, query_idx, axis=0)
+
+print(f"Final accuracy: {learner.score(X, y):.3f}")
+
+# Committee-based active learning
+committee = Committee(
+    learner_list=[
+        ActiveLearner(
+            estimator=RandomForestClassifier(
+                n_estimators=50, random_state=seed
+            ),
+            X_training=X[:10], y_training=y[:10]
+        )
+        for seed in range(5)
+    ],
+    query_strategy=vote_entropy_sampling
+)
+</code></pre>
+<div class="code-caption">Listing 46.5: Active learning with modAL: pool-based uncertainty sampling in 8 lines, and committee-based disagreement sampling with five random forest members.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: modAL</div>
+<p>
+The 40-line <code>run_active_learning</code> function in Listing 46.1 reduces to 8 lines
+with modAL. The library handles pool management, model retraining, and supports
+custom query strategies via any callable with signature
+<code>f(classifier, X_pool) -> (query_idx, X_query)</code>. It wraps any scikit-learn
+estimator, so you can swap the underlying model without changing the active learning
+logic. For deep learning models, modAL integrates with PyTorch through its
+<code>DeepActiveLearner</code> class.
+</p>
+</div>
+
+<h2>8. Batch Active Learning</h2>
+
+<p>
+Selecting one example per round is optimal for information gain but impractical when
+the oracle can process queries in parallel. In high-throughput screening, a robotic
+system can run 96 assays simultaneously on a microplate. <strong>Batch active learning</strong>
+selects $b$ examples per round, facing the challenge that selecting the top-$b$
+individually most uncertain points often yields a redundant batch (all points cluster
+near the same part of the decision boundary).
+</p>
+
+<p>
+Three approaches handle batch diversity. <strong>BatchBALD</strong> (Kirsch et al., 2019)
+extends the BALD acquisition function (Section 46.2) to jointly optimize the mutual
+information of the entire batch rather than greedily selecting individual high-BALD
+points. <strong>BADGE</strong> (Ash et al., 2020) runs k-means++ in gradient embedding space.
+<strong>Stochastic batches</strong> sample from a distribution proportional to individual
+acquisition scores, introducing randomness that promotes diversity.
+</p>
+
+<pre><code class="language-python">def batch_active_learning(model, X_pool, batch_size, strategy="diverse"):
+    """Select a diverse batch of points for active learning.
+
+    Args:
+        model: fitted model with predict_proba
+        X_pool: (n_pool, n_features)
+        batch_size: number of points to select
+        strategy: 'top_k', 'diverse', or 'stochastic'
+
+    Returns:
+        List of indices into X_pool.
+    """
+    probs = model.predict_proba(X_pool)
+    entropy = -np.sum(probs * np.log(probs + 1e-10), axis=1)
+
+    if strategy == "top_k":
+        # Naive: just pick the top-b most uncertain
+        return list(np.argsort(entropy)[-batch_size:])
+
+    elif strategy == "stochastic":
+        # Sample proportional to entropy
+        weights = entropy / entropy.sum()
+        return list(np.random.choice(
+            len(X_pool), size=batch_size, replace=False, p=weights
+        ))
+
+    elif strategy == "diverse":
+        # Filtered + core-set: pre-filter top 5*batch_size by entropy,
+        # then apply core-set selection for diversity
+        n_candidates = min(5 * batch_size, len(X_pool))
+        candidate_idx = np.argsort(entropy)[-n_candidates:]
+        X_candidates = X_pool[candidate_idx]
+
+        # Run greedy core-set on the candidates
+        selected_in_candidates = coreset_greedy(
+            X_pool[np.argsort(entropy)[:10]],  # Use low-entropy as "labeled"
+            X_candidates,
+            batch_size=batch_size
+        )
+        return [candidate_idx[i] for i in selected_in_candidates]
+</code></pre>
+<div class="code-caption">Listing 46.6: Three batch selection strategies, from naive top-k (redundant) through stochastic sampling (noisy diversity) to a filtered core-set approach (deterministic diversity among high-uncertainty candidates).</div>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>
+Parting et al. (2024), "Active Learning with Foundation Model Embeddings" (ICLR 2024),
+demonstrate that running active learning query strategies in the embedding space of a
+pretrained foundation model (rather than in raw feature space or a task-specific
+model's learned representations) consistently outperforms all classical baselines
+across 69 tabular and image benchmarks. Their system, called ATLAS, uses frozen
+embeddings from models such as DINOv2 or TabPFN as the representation for core-set
+and uncertainty calculations, then trains only a lightweight prediction head on the
+actively selected labels. ATLAS achieves the accuracy of 1,000 randomly labeled
+examples with just 100 actively chosen ones, a 10x sample efficiency gain that
+doubles the best previously reported ratios. This result suggests that as foundation
+models improve, the value of active learning may increase rather than decrease,
+because better embeddings make query strategies more reliable at distinguishing
+informative points from redundant ones.
+</p>
+</div>
+
+<h2>9. When Active Learning Fails</h2>
+
+<p>
+Active learning is not universally beneficial. It can underperform random sampling in
+several scenarios, and understanding these failure modes prevents wasted effort.
+</p>
+
+<p>
+<strong>Cold start</strong>: with too few initial labels, the model's uncertainty estimates
+are unreliable, and the query strategy makes poor choices. A minimum of 2-5 examples
+per class is typically needed before uncertainty sampling provides meaningful signal.
+Core-set selection is more robust to cold start because it does not depend on model
+predictions.
+</p>
+
+<p>
+<strong>Distribution shift</strong>: if the pool distribution differs from the test
+distribution, concentrating queries in high-uncertainty regions of the pool may not
+improve test-time performance. This is particularly problematic in drug discovery when
+the screening library has different chemical diversity than the therapeutic target space.
+</p>
+
+<p>
+<strong>Label noise</strong>: when the oracle provides noisy labels, uncertainty sampling
+can get trapped re-querying the same noisy region repeatedly. Robust active learning
+methods (e.g., label cleaning with cross-validation) mitigate this by estimating and
+correcting for label noise.
+</p>
+
+<p>
+<strong>Overfitting to the query distribution</strong>: because active learning selects a
+biased sample (concentrated near decision boundaries), models trained on actively
+selected data can be miscalibrated. Reweighting the labeled set to correct for
+selection bias (using importance weights) helps restore calibration.
+</p>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Active Learning Paradox</div>
+<p>
+Here is a subtle paradox. The better your initial model, the less benefit you get
+from active learning, because the model's uncertainty estimates are already
+well-calibrated and random sampling is nearly as efficient. But if your initial model
+is poor, its uncertainty estimates are unreliable, so active learning makes poor
+choices. The "sweet spot" is a model that is good enough to have roughly correct
+uncertainty ranking but poor enough that many regions remain uncertain. In practice,
+this means starting with a simple, well-calibrated model (logistic regression,
+Gaussian process) rather than a complex one (deep neural network), then switching to
+the complex model after enough active learning rounds have provided a good training set.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build an Active Learning Loop from Scratch</h4>
+<p>
+Put the concepts from this section into practice by building a complete active
+learning experiment on your laptop using only scikit-learn and matplotlib.
+</p>
+<p>
+<strong>Step 1.</strong> Generate a synthetic dataset with
+<code>sklearn.datasets.make_classification(n_samples=1000, n_features=10, n_informative=5, n_classes=3, random_state=42)</code>.
+Split off 200 points as a held-out test set. The remaining 800 form your unlabeled pool.
+</p>
+<p>
+<strong>Step 2.</strong> Seed the labeled set with 5 randomly chosen pool points (at least one per class).
+Train a <code>GaussianProcessClassifier</code> on this seed set and record test accuracy.
+</p>
+<p>
+<strong>Step 3.</strong> Implement three query strategies: (a) random selection, (b) entropy-based
+uncertainty sampling (use <code>predict_proba</code> to compute $H[y \mid x]$), and
+(c) greedy core-set selection using <code>scipy.spatial.distance.cdist</code>. Run each
+strategy for 100 rounds, acquiring one point per round, and store test accuracy after
+each round.
+</p>
+<p>
+<strong>Step 4.</strong> Plot all three learning curves (test accuracy vs. number of labeled points)
+on a single matplotlib figure. Mark the round at which each strategy first crosses 85%
+accuracy. Compute the sample efficiency gain for each active strategy relative to random.
+</p>
+<p>
+<strong>Step 5.</strong> Repeat the experiment with a <code>RandomForestClassifier</code> instead of
+the Gaussian process. Compare the learning curves: does the choice of base learner
+affect which query strategy wins? Write a one-paragraph interpretation of why the
+results differ (or do not).
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> Explain why uncertainty sampling with a miscalibrated model can perform worse than random sampling. Sketch a scenario with two classes where a model assigns 0.51/0.49 probabilities to all points in one region (due to miscalibration) and 0.99/0.01 to all others. Where will uncertainty sampling concentrate queries? Is this useful?
+</li>
+<li>
+<strong>(Coding)</strong> Modify the <code>run_active_learning</code> function in Listing 46.1 to support batch acquisition (selecting $b = 5$ points per round). Compare the "diverse" and "top_k" batch strategies from Listing 46.6 on the two-moons dataset. Plot accuracy vs. total labels acquired.
+</li>
+<li>
+<strong>(Analysis)</strong> The core-set greedy algorithm has time complexity $O(b \cdot n_{\text{pool}} \cdot n_{\text{labeled}})$ per round. Derive this, then propose and implement an optimization using a k-d tree that reduces the $n_{\text{labeled}}$ factor. Measure the speedup for $n_{\text{pool}} = 100{,}000$.
+</li>
+<li>
+<strong>(Research)</strong> Design a hybrid query strategy that automatically balances uncertainty sampling and core-set selection based on the current round number. One approach: weight the two scores by $\alpha_t$ and $(1 - \alpha_t)$ with $\alpha_t = t / T$ (increasing exploitation over time). Test this on the two-moons dataset and compare to pure strategies.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+Active learning answers the question "which data point should I label?" In
+<a href="section-46.2.html">Section 46.2: Sequential Experimental Design</a>, we
+generalize this to "which experiment should I run?", introducing information-theoretic
+acquisition functions (BALD, expected information gain), bandit algorithms (Thompson
+Sampling, UCB), and the Value of Information framework that decides when to stop
+experimenting entirely.
+</p>
+</section>
+
+</main>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

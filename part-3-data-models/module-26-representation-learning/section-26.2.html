@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 26.2: Contrastive Objectives. NT-Xent loss derivation, mutual information maximization, alignment and uniformity, temperature scaling, and architectural comparisons." name="description"/>
+<title>Section 26.2: Contrastive Objectives | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part III: Discovery Through Data and Models</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 26: Representation Learning</a></div>
+<h1>26.2 Contrastive Objectives</h1>
+</header>
+
+<main class="content">
+
+<blockquote class="epigraph">
+<p>"My entire worldview is a similarity matrix. Everything I know about the universe, I learned by asking: is this pair more alike than that pair?"</p>
+<cite>A Cosine Similarity With Philosophical Depth</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>In <a href="section-26.1.html">Section 26.1</a>, we introduced contrastive learning as one of three SSL paradigms and implemented SimCLR and MoCo at the systems level. Now we go deeper into the mathematics. We derive the NT-Xent loss from first principles via InfoNCE and mutual information maximization, decompose it into the dual desiderata of alignment and uniformity, analyze the role of temperature scaling and hard negatives, explain why projection heads improve downstream performance, and compare the architectural choices of SimCLR, MoCo, and CLIP. By the end of this section, you will understand not just <em>how</em> contrastive objectives work, but <em>why</em> they work and <em>when</em> they fail.</p>
+</div>
+
+<h2>1. From Mutual Information to InfoNCE</h2>
+
+<p>The theoretical foundation of contrastive learning is <em>mutual information</em> (MI) maximization. Given two random variables $X$ and $Y$ (for example, two augmented views of the same image), mutual information measures how much knowing one tells you about the other:</p>
+
+$$I(X; Y) = \mathbb{E}_{p(x, y)}\left[\log \frac{p(x, y)}{p(x) p(y)}\right]$$
+
+<p>If $X$ and $Y$ are independent, $p(x, y) = p(x)p(y)$ and $I(X; Y) = 0$. If $X$ fully determines $Y$, $I(X; Y)$ equals the entropy of $Y$. The goal of contrastive representation learning is to find encoder functions $f$ such that $I(f(X); f(Y))$ is maximized: the representations should preserve as much information as possible about the relationship between paired views.</p>
+
+<p><strong>What.</strong> Mutual information is a measure of statistical dependence between two variables, quantifying the information shared between them in bits (or nats, depending on the log base).</p>
+
+<p><strong>Why.</strong> Maximizing MI between representations of paired views forces the encoder to capture the features that are shared across views (semantic content) while discarding features that vary across views (augmentation noise). This is precisely the inductive bias we want.</p>
+
+<p><strong>How.</strong> Direct MI estimation is intractable in high dimensions. InfoNCE provides a tractable lower bound that can be optimized with standard gradient descent.</p>
+
+<p><strong>When.</strong> The MI maximization framework applies whenever you can define meaningful positive pairs. It is most natural when the pairing captures a notion of semantic equivalence: two views of the same object, an image and its caption, a molecule and its textual description.</p>
+
+<p>Direct computation of MI requires knowing the joint and marginal densities, which is intractable for high-dimensional neural network representations. The InfoNCE bound (van den Oord et al., 2018) solves this by converting MI estimation into a classification problem. Given a positive pair $(x, y^+)$ drawn from the joint distribution $p(x, y)$ and $K$ negative samples $\{y^-_1, \ldots, y^-_K\}$ drawn from the marginal $p(y)$, define a scoring function $s(x, y)$ (typically cosine similarity of encoded representations). InfoNCE asks: can you identify which of the $K+1$ candidates is the true positive?</p>
+
+$$\mathcal{L}_{\text{InfoNCE}} = -\mathbb{E}\left[\log \frac{\exp(s(x, y^+))}{\exp(s(x, y^+)) + \sum_{k=1}^{K} \exp(s(x, y^-_k))}\right]$$
+
+<p>This is a $(K+1)$-way softmax classification where the correct class is the positive pair. The critical theoretical result is that minimizing $\mathcal{L}_{\text{InfoNCE}}$ maximizes a lower bound on mutual information:</p>
+
+$$I(X; Y) \geq \log(K + 1) - \mathcal{L}_{\text{InfoNCE}}$$
+
+<p>As $K \to \infty$, the bound tightens: more negatives yield a better estimate of MI. This explains the empirical finding that contrastive learning benefits from large numbers of negatives, whether through large batch sizes (SimCLR) or a momentum queue (MoCo).</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: Why More Negatives Help</div>
+<p>The InfoNCE bound $I(X;Y) \geq \log(K+1) - \mathcal{L}_{\text{InfoNCE}}$ reveals that the number of negatives $K$ directly limits the amount of MI the loss can capture. With $K=1$, the bound caps at $\log 2 \approx 0.69$ nats regardless of the true MI. With $K=65535$ (MoCo's queue), the cap is $\log 65536 \approx 11.1$ nats. For domains with complex structure (such as protein sequences with rich evolutionary relationships), the true MI between views can be very high, and insufficient negatives create a bottleneck where the model has no gradient signal to learn finer distinctions. This is why SimCLR needed batch sizes of 4096+ and why MoCo's queue was a practical breakthrough.</p>
+</div>
+
+<h2>2. The NT-Xent Loss: InfoNCE in Practice</h2>
+
+<p>NT-Xent (Normalized Temperature-scaled Cross-Entropy) is the specific instantiation of InfoNCE used by SimCLR. Given a batch of $N$ samples, each producing two views, the scoring function is temperature-scaled cosine similarity:</p>
+
+<p data-agent="02">NT-Xent is a contrastive loss function that trains an encoder by treating each sample's augmented partner as the single correct answer in a $(2N-1)$-way classification problem, where every other sample in the batch serves as a distractor. It matters because it turns the abstract goal of mutual information maximization into a concrete, GPU-friendly softmax cross-entropy computation that scales linearly with batch size. The mechanism works by normalizing embeddings onto the unit hypersphere, computing all pairwise cosine similarities scaled by a temperature parameter, and then applying a standard log-softmax so that the gradient pulls positive pairs together while pushing all other pairs apart. Use NT-Xent (or its close variants) when you have access to large batches of unlabeled data with a natural pairing structure; for smaller batch regimes where you cannot afford thousands of in-batch negatives, prefer a queue-based variant such as MoCo, or a non-contrastive method such as VICReg that avoids the need for explicit negatives altogether.</p>
+
+$$s(z_i, z_j) = \frac{z_i \cdot z_j}{\|z_i\| \|z_j\| \cdot \tau}$$
+
+<p>where $\tau$ is the temperature parameter. For a positive pair $(z_i, z_j)$ in a batch with $2N$ total views, the loss for anchor $z_i$ is:</p>
+
+$$\ell_i = -\log \frac{\exp(\text{sim}(z_i, z_j) / \tau)}{\sum_{k=1}^{2N} \mathbf{1}_{[k \neq i]} \exp(\text{sim}(z_i, z_k) / \tau)}$$
+
+<p>where $\text{sim}(u, v) = u^\top v / (\|u\| \|v\|)$ is cosine similarity and $j$ is the index of the positive partner of anchor $i$. The full NT-Xent loss averages over all $2N$ anchors:</p>
+
+$$\mathcal{L}_{\text{NT-Xent}} = \frac{1}{2N} \sum_{i=1}^{2N} \ell_i$$
+
+<p>Let us implement this loss with careful attention to numerical stability and inspect its behavior.</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor,
+                 temperature: float = 0.07) -> torch.Tensor:
+    """Compute NT-Xent loss for two sets of L2-normalized embeddings.
+
+    Args:
+        z1: (N, D) normalized embeddings from view 1
+        z2: (N, D) normalized embeddings from view 2
+        temperature: scaling parameter (default 0.07)
+    Returns:
+        Scalar loss value
+    """
+    N = z1.size(0)
+    z = torch.cat([z1, z2], dim=0)  # (2N, D)
+
+    # Full 2N x 2N cosine similarity matrix
+    sim = torch.mm(z, z.t()) / temperature  # (2N, 2N)
+
+    # Remove self-similarity from the denominator
+    mask = ~torch.eye(2 * N, dtype=torch.bool, device=z.device)
+
+    # For numerical stability, subtract the max before exp
+    sim_max, _ = sim.masked_fill(~mask, float('-inf')).max(
+        dim=1, keepdim=True
+    )
+    sim = sim - sim_max.detach()
+
+    # Denominator: sum of exp(sim) over all non-self entries
+    exp_sim = torch.exp(sim) * mask.float()
+    log_denom = torch.log(exp_sim.sum(dim=1))
+
+    # Numerator: positive pair similarity
+    # Positives: (i, i+N) for i in [0,N) and (i+N, i) for i in [0,N)
+    pos_indices = torch.cat([
+        torch.arange(N, 2 * N, device=z.device),
+        torch.arange(0, N, device=z.device)
+    ])
+    log_num = sim[torch.arange(2 * N, device=z.device), pos_indices]
+
+    loss = -(log_num - log_denom).mean()
+    return loss
+
+# Demonstrate how temperature affects the loss landscape
+z1 = F.normalize(torch.randn(256, 64), dim=1)
+z2 = F.normalize(torch.randn(256, 64), dim=1)
+
+for tau in [0.01, 0.07, 0.1, 0.5, 1.0]:
+    loss = nt_xent_loss(z1, z2, temperature=tau)
+    print(f"  tau={tau:.2f}  loss={loss.item():.4f}")</code></pre>
+<div class="code-caption">Listing 26.5: Numerically stable NT-Xent loss implementation. The max-subtraction trick prevents overflow in the exponentiation. The loop at the bottom demonstrates how temperature affects the loss magnitude: lower temperatures sharpen the similarity distribution, increasing the loss for random embeddings and creating stronger gradients.</div>
+
+<h2>3. Temperature: The Sharpness Dial</h2>
+
+<p>Temperature $\tau$ is the most underrated hyperparameter in contrastive learning. It controls the sharpness of the softmax distribution over similarity scores. To understand its effect, consider what happens at the extremes.</p>
+
+<p><strong>Low temperature ($\tau \to 0$).</strong> The softmax becomes a hard argmax. Only the most similar negative matters; the loss is dominated by the hardest negative in the batch. This focuses learning on fine-grained discrimination but can be unstable and sensitive to outliers.</p>
+
+<p><strong>High temperature ($\tau \to \infty$).</strong> The softmax becomes uniform. All negatives contribute equally regardless of similarity. The loss degenerates toward a constant, providing weak gradients. The model barely distinguishes between hard and easy negatives.</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>A frequent mistake is believing that lower temperature always produces better representations because it forces the model to focus on the hardest negatives. In practice, very low temperature amplifies noise: a single outlier negative (or a false negative that is actually semantically similar to the anchor) can dominate the entire gradient, causing unstable training and representations that overfit to batch-specific artifacts rather than genuine semantic structure. The optimal temperature balances discrimination sharpness against robustness to noise, and it depends on the data distribution, embedding dimension, and how clean your negative sampling is.</p>
+</div>
+
+<p>The optimal temperature depends on the data distribution and the encoder capacity. Empirically, $\tau = 0.07$ works well for visual representations with normalized embeddings, while text and scientific data often benefit from $\tau = 0.05$ to $\tau = 0.1$. The temperature interacts with the embedding dimension and normalization: on the unit hypersphere in $d$ dimensions, random unit vectors have expected cosine similarity $0$ with standard deviation $1/\sqrt{d}$. Lower-dimensional embeddings have higher variance in random similarity, requiring higher temperature to avoid collapse.</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+import math
+
+def analyze_temperature_effects(dim: int = 128, n_samples: int = 1000):
+    """Show how temperature interacts with embedding dimension."""
+    z = F.normalize(torch.randn(n_samples, dim), dim=1)
+    sims = torch.mm(z, z.t())
+
+    # Remove diagonal
+    mask = ~torch.eye(n_samples, dtype=torch.bool)
+    off_diag = sims[mask]
+
+    # Expected statistics of random cosine similarities
+    empirical_std = off_diag.std().item()
+    theoretical_std = 1 / math.sqrt(dim)
+
+    print(f"Dimension: {dim}")
+    print(f"  Empirical std of cosine sims: {empirical_std:.4f}")
+    print(f"  Theoretical std (1/sqrt(d)):  {theoretical_std:.4f}")
+
+    # Show softmax concentration at different temperatures
+    anchor_sims = sims[0, 1:]  # sims of sample 0 to all others
+    for tau in [0.01, 0.07, 0.5]:
+        probs = F.softmax(anchor_sims / tau, dim=0)
+        entropy = -(probs * probs.log()).sum().item()
+        max_prob = probs.max().item()
+        print(f"  tau={tau:.2f}: max_prob={max_prob:.6f}, "
+              f"entropy={entropy:.2f} "
+              f"(uniform={math.log(n_samples - 1):.2f})")
+
+for d in [32, 128, 512]:
+    analyze_temperature_effects(dim=d)
+    print()</code></pre>
+<div class="code-caption">Listing 26.6: Analyzing how temperature interacts with embedding dimensionality. In higher dimensions, random vectors are more orthogonal (lower variance in cosine similarity), so the softmax is naturally less peaked, and lower temperatures are needed to create useful gradients. The entropy of the softmax distribution quantifies how concentrated the attention is on the hardest negatives.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Temperature Tuning for Protein Embeddings</div>
+<p>When training contrastive embeddings for protein sequences, the optimal temperature depends on the evolutionary diversity of your training set. A dataset drawn from a single protein family (high pairwise similarity) needs lower temperature ($\tau \approx 0.05$) to learn the fine-grained distinctions between close homologs. A dataset spanning all of UniProt (low average pairwise similarity) can use higher temperature ($\tau \approx 0.1$) because the negatives are naturally well-separated. A practical diagnostic: compute the cosine similarity distribution of random pairs in your dataset. If the distribution has a long right tail (many moderately similar pairs), lower the temperature; if pairs are well-separated, raise it. The goal is a softmax distribution where the hardest negatives receive significant probability mass but do not completely dominate.</p>
+</div>
+
+<h2>4. Alignment and Uniformity</h2>
+
+<p>Wang and Isola (2020) provided an elegant decomposition of what makes contrastive representations good. They identified two independent properties, <em>alignment</em> and <em>uniformity</em>, that together explain the success of contrastive objectives.</p>
+
+<p><strong>Alignment</strong> measures how close the representations of positive pairs are. For a distribution of positive pairs $(x, x^+) \sim p_{\text{pos}}$:</p>
+
+$$\mathcal{L}_{\text{align}} = \mathbb{E}_{(x, x^+) \sim p_{\text{pos}}} \left[\|f(x) - f(x^+)\|^2\right]$$
+
+<p>Good representations have low alignment loss: positive pairs should map to nearby points. This is the "pull" force in contrastive learning.</p>
+
+<p><strong>Uniformity</strong> measures how evenly the representations are spread over the unit hypersphere. For a distribution of samples $x \sim p_{\text{data}}$:</p>
+
+$$\mathcal{L}_{\text{uniform}} = \log \mathbb{E}_{(x, y) \stackrel{i.i.d.}{\sim} p_{\text{data}}} \left[e^{-2\|f(x) - f(y)\|^2}\right]$$
+
+<p>Good representations have low (very negative) uniformity loss: features should be spread uniformly over the sphere, not collapsed into a few clusters. This is the "push" force.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of alignment and uniformity as the two forces governing how guests arrange themselves at a large cocktail party. Alignment is like name tags: people wearing matching tags (positive pairs) should find each other and stand close together. Uniformity is like the host's goal of filling the entire venue evenly, so that guests spread across the whole room rather than everyone crowding into one corner. A party where matched guests cluster together but the crowd fills the room wall to wall is a success. A party where everyone stands in the same spot (collapse) satisfies name-tag matching trivially but wastes the venue. A party where guests scatter randomly fills the room but matched pairs never meet. The contrastive loss is the invisible social pressure that simultaneously nudges tagged pairs closer and keeps the overall crowd dispersed.</p>
+</div>
+
+<p>The NT-Xent loss implicitly optimizes both objectives. The numerator (positive pair similarity) corresponds to alignment. The denominator (sum over all pairs including negatives) corresponds to uniformity. Decomposing these components during training provides a powerful diagnostic: if alignment is good but uniformity is poor, the model may be collapsing (mapping many distinct inputs to the same representation). If uniformity is good but alignment is poor, the model may not be learning the semantic relationship between positive pairs.</p>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def alignment_loss(z1: torch.Tensor, z2: torch.Tensor,
+                   alpha: float = 2.0) -> torch.Tensor:
+    """Alignment: expected distance between positive pairs.
+
+    Args:
+        z1, z2: (N, D) L2-normalized embeddings of positive pairs
+        alpha: exponent (default 2 for squared distance)
+    """
+    return (z1 - z2).norm(dim=1).pow(alpha).mean()
+
+def uniformity_loss(z: torch.Tensor, t: float = 2.0) -> torch.Tensor:
+    """Uniformity: log of expected Gaussian kernel over all pairs.
+
+    Args:
+        z: (N, D) L2-normalized embeddings
+        t: kernel bandwidth (default 2)
+    """
+    sq_pdist = torch.pdist(z, p=2).pow(2)
+    return sq_pdist.mul(-t).exp().mean().log()
+
+def monitor_contrastive_quality(encoder, data_pairs, device='cpu'):
+    """Track alignment and uniformity during training."""
+    encoder.eval()
+    with torch.no_grad():
+        x1, x2 = data_pairs
+        z1 = F.normalize(encoder(x1.to(device)), dim=1)
+        z2 = F.normalize(encoder(x2.to(device)), dim=1)
+
+        align = alignment_loss(z1, z2).item()
+        z_all = torch.cat([z1, z2], dim=0)
+        uniform = uniformity_loss(z_all).item()
+
+    encoder.train()
+    return {
+        'alignment': align,      # lower is better
+        'uniformity': uniform,   # lower (more negative) is better
+    }
+
+# Demonstrate: random vs collapsed vs good encoder
+dim = 64
+N = 500
+
+# Random encoder: decent uniformity, poor alignment
+z_rand_1 = F.normalize(torch.randn(N, dim), dim=1)
+z_rand_2 = F.normalize(torch.randn(N, dim), dim=1)
+print("Random encoder:")
+print(f"  Alignment:  {alignment_loss(z_rand_1, z_rand_2):.4f}")
+print(f"  Uniformity: {uniformity_loss(z_rand_1):.4f}")
+
+# Collapsed encoder: perfect alignment, terrible uniformity
+z_collapse = F.normalize(torch.ones(N, dim), dim=1)
+z_collapse_noisy = F.normalize(
+    z_collapse + 1e-6 * torch.randn(N, dim), dim=1
+)
+print("\nCollapsed encoder:")
+print(f"  Alignment:  {alignment_loss(z_collapse, z_collapse):.4f}")
+print(f"  Uniformity: {uniformity_loss(z_collapse_noisy):.4f}")
+
+# Good encoder: both metrics small
+z_good_1 = F.normalize(torch.randn(N, dim), dim=1)
+z_good_2 = F.normalize(z_good_1 + 0.1 * torch.randn(N, dim), dim=1)
+print("\nGood encoder:")
+print(f"  Alignment:  {alignment_loss(z_good_1, z_good_2):.4f}")
+print(f"  Uniformity: {uniformity_loss(z_good_1):.4f}")</code></pre>
+<div class="code-caption">Listing 26.7: Alignment and uniformity metrics for diagnosing representation quality. A random encoder has good uniformity but poor alignment. A collapsed encoder has perfect alignment but catastrophic uniformity. A well-trained contrastive encoder achieves both: positive pairs cluster while the overall distribution stays spread across the hypersphere.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Collapse Problem</div>
+<p>Without the uniformity pressure from negative samples, a contrastive encoder can "solve" the alignment objective trivially by mapping every input to the same point (or a small set of points). This is called <em>representation collapse</em>, and it is the fundamental failure mode of contrastive learning. Every architectural innovation in the field addresses collapse in some way. SimCLR prevents collapse through large numbers of in-batch negatives. MoCo prevents it through the momentum queue. BYOL and DINO prevent it without negatives at all, using asymmetric architectures and stop-gradient operations that implicitly maintain uniformity. Understanding collapse is essential: when your contrastive training loss drops to near-zero suspiciously fast, collapse is the most likely explanation.</p>
+</div>
+
+<h2>5. Hard Negatives and Mining Strategies</h2>
+
+<p>Not all negatives are equally informative. An easy negative (a protein from a completely different family compared to your anchor) provides almost no gradient signal because the encoder can trivially distinguish them. A hard negative (a protein from the same superfamily that performs a different function) forces the encoder to learn subtle discriminative features.</p>
+
+<p>The gradient of the NT-Xent loss with respect to the anchor representation $z_i$ is dominated by the negatives that have the highest similarity to the anchor. Formally, the contribution of negative $k$ to the gradient is proportional to:</p>
+
+$$w_k = \frac{\exp(\text{sim}(z_i, z_k) / \tau)}{\sum_j \exp(\text{sim}(z_i, z_j) / \tau)}$$
+
+<p>This is exactly the softmax weight of negative $k$. At low temperature, the gradient is dominated by the single hardest negative. At high temperature, all negatives contribute equally. This means temperature implicitly controls hard negative mining: lower temperature is equivalent to harder mining.</p>
+
+<p>Explicit hard negative mining strategies include:</p>
+
+<ul>
+<li><strong>In-batch hard negatives:</strong> Within a batch, identify the most similar negatives and up-weight their contribution. This is free but limited by batch diversity.</li>
+<li><strong>Cross-batch negatives (MoCo):</strong> The momentum queue accumulates negatives from recent batches, increasing the chance of encountering hard negatives.</li>
+<li><strong>Curriculum negatives:</strong> Start training with easy negatives and progressively introduce harder ones as the model improves.</li>
+<li><strong>Mined negatives:</strong> Use a separate retrieval index to find the hardest negatives offline, then construct batches that pair each anchor with its hardest negatives from the full dataset.</li>
+</ul>
+
+<pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def mine_hard_negatives(query_embs: torch.Tensor,
+                        corpus_embs: torch.Tensor,
+                        labels: torch.Tensor,
+                        k: int = 5) -> torch.Tensor:
+    """Mine the k hardest negatives for each query.
+
+    A hard negative has high similarity but a different label.
+
+    Args:
+        query_embs: (N, D) normalized query embeddings
+        corpus_embs: (M, D) normalized corpus embeddings
+        labels: (N,) query labels for filtering true positives
+        k: number of hard negatives per query
+
+    Returns:
+        (N, k) indices into corpus_embs of hardest negatives
+    """
+    # Compute all pairwise similarities
+    sims = torch.mm(query_embs, corpus_embs.t())  # (N, M)
+
+    # Mask out same-label pairs (true positives should not be negatives)
+    label_match = labels.unsqueeze(1) == labels.unsqueeze(0)
+    sims[label_match[:, :corpus_embs.size(0)]] = -float('inf')
+
+    # Top-k most similar among different-label samples
+    _, hard_neg_indices = sims.topk(k, dim=1)
+    return hard_neg_indices
+
+# Example: mine hard negatives for scientific abstract embeddings
+N = 200
+dim = 64
+embeddings = F.normalize(torch.randn(N, dim), dim=1)
+topic_labels = torch.randint(0, 10, (N,))  # 10 topics
+
+hard_negs = mine_hard_negatives(
+    embeddings, embeddings, topic_labels, k=3
+)
+print(f"Hard negative indices shape: {hard_negs.shape}")  # (200, 3)
+
+# Verify: hard negatives have different labels than the query
+for i in range(5):
+    neg_labels = topic_labels[hard_negs[i]]
+    neg_sims = embeddings[i] @ embeddings[hard_negs[i]].t()
+    print(f"  Query {i} (label={topic_labels[i].item()}): "
+          f"neg labels={neg_labels.tolist()}, "
+          f"sims={[f'{s:.3f}' for s in neg_sims.tolist()]}")</code></pre>
+<div class="code-caption">Listing 26.8: Hard negative mining for contrastive training. For each query, we find corpus samples with high embedding similarity but different labels. These hard negatives provide the most informative training signal because they force the encoder to learn fine-grained discriminative features rather than coarse category boundaries.</div>
+
+<h2>6. The Projection Head Mystery</h2>
+
+<p>One of the most surprising findings in contrastive learning is the role of the projection head. SimCLR showed that adding a small MLP (typically two layers) between the encoder and the contrastive loss improved downstream performance by over 10%, yet the projection head itself is <em>discarded</em> after training. Downstream tasks use the encoder representations $h = f(x)$, not the projected representations $z = g(h)$.</p>
+
+<p>Why does this work? The projection head acts as an information bottleneck that absorbs the invariance pressure. The contrastive loss forces the projected representations to be augmentation-invariant: two crops of the same image should map to the same $z$. This invariance discards information (color distribution, spatial location of the crop) that may be useful for downstream tasks. By placing this invariance pressure on $z = g(h)$ rather than directly on $h = f(x)$, the encoder features $h$ can retain this information while still being shaped by the contrastive objective.</p>
+
+<p>In formal terms, the projection head learns a lossy mapping from the feature space to the contrastive space. The features $h$ contain both augmentation-invariant information (object identity, semantic content) and augmentation-variant information (color, position, scale). The contrastive loss selects for the invariant part, and the projection head performs this selection, leaving the encoder features richer than the contrastive objective alone would allow.</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Contrastive Learning at Scale and Beyond Negatives</div>
+<p>The landscape of self-supervised learning has advanced well beyond the original SimCLR/MoCo/BYOL generation. SigLIP (Zhai et al., 2023) replaced the softmax-based contrastive loss in CLIP with a per-pair sigmoid loss, eliminating the need for global synchronization of similarity scores across GPUs and enabling training on batch sizes exceeding 1 million pairs. This reformulation treats each image-text pair as an independent binary classification (match or not), which scales more efficiently on distributed hardware and achieves comparable or better zero-shot performance than the original CLIP objective. Meanwhile, DINOv2 (Oquab et al., 2024) combined self-distillation with curated, diverse pretraining data to produce vision encoders that match or surpass supervised pretraining on dense prediction tasks (segmentation, depth estimation) without any labeled data. For scientific applications, these developments are significant because SigLIP's per-pair formulation naturally handles the unbalanced and noisy pairings common in scientific datasets (molecule-description, spectrum-compound), while DINOv2's strong dense features transfer well to microscopy and remote sensing domains where pixel-level understanding matters.</p>
+</div>
+
+<h2>7. Architectural Comparison: SimCLR, MoCo, and CLIP</h2>
+
+<p>The three architectures we introduced in <a href="section-26.1.html">Section 26.1</a> make different tradeoffs along several axes. Understanding these tradeoffs guides architecture selection for scientific applications.</p>
+
+<p><strong>Negative source.</strong> SimCLR draws negatives from the current batch, requiring large batch sizes (4096+) and multi-GPU training. MoCo draws negatives from a momentum queue (65K+), enabling single-GPU training. CLIP draws negatives from cross-modal pairings within the batch, scaling with batch size but benefiting from natural diversity in image-text pairs.</p>
+
+<p><strong>Encoder consistency.</strong> SimCLR uses a single encoder for both views (perfectly consistent). MoCo uses a momentum encoder for keys, introducing a small inconsistency that smooths out over training. CLIP uses two separate encoders for the two modalities, which is necessary because images and text require fundamentally different architectures.</p>
+
+<p><strong>Augmentation requirements.</strong> SimCLR and MoCo require carefully designed augmentations for a single modality. CLIP requires paired data across modalities (image-caption pairs) but avoids the augmentation design problem because the natural variation between modalities provides the contrastive signal.</p>
+
+<p><strong>Transfer mechanism.</strong> SimCLR and MoCo produce a single-modality encoder whose representations transfer via fine-tuning or linear probing. CLIP produces aligned cross-modal representations that enable zero-shot transfer: classify images by comparing their embeddings to text descriptions of classes, with no training on the target task. We explore this zero-shot paradigm further in <a href="../module-27-foundation-models/index.html">Chapter 27</a>.</p>
+
+<pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CLIPDualEncoder(nn.Module):
+    """Simplified CLIP-style dual encoder for text-molecule pairing."""
+
+    def __init__(self, text_encoder: nn.Module, mol_encoder: nn.Module,
+                 text_dim: int, mol_dim: int, proj_dim: int = 256,
+                 temperature: float = 0.07):
+        super().__init__()
+        self.text_encoder = text_encoder
+        self.mol_encoder = mol_encoder
+
+        # Project both modalities to shared space
+        self.text_proj = nn.Linear(text_dim, proj_dim, bias=False)
+        self.mol_proj = nn.Linear(mol_dim, proj_dim, bias=False)
+
+        # Learnable temperature (CLIP uses log-parameterization)
+        self.log_temp = nn.Parameter(
+            torch.tensor(1.0 / temperature).log()
+        )
+
+    def forward(self, text_features: torch.Tensor,
+                mol_features: torch.Tensor):
+        """Compute CLIP-style symmetric contrastive loss.
+
+        Pairs are assumed aligned: text[i] describes mol[i].
+        """
+        # Project and normalize
+        t = F.normalize(self.text_proj(text_features), dim=1)
+        m = F.normalize(self.mol_proj(mol_features), dim=1)
+
+        # Temperature-scaled similarity
+        temp = self.log_temp.exp()
+        logits = torch.mm(t, m.t()) * temp  # (N, N)
+
+        # Symmetric loss: text->mol and mol->text
+        labels = torch.arange(t.size(0), device=t.device)
+        loss_t2m = F.cross_entropy(logits, labels)
+        loss_m2t = F.cross_entropy(logits.t(), labels)
+
+        return (loss_t2m + loss_m2t) / 2
+
+    @torch.no_grad()
+    def zero_shot_classify(self, mol_features: torch.Tensor,
+                           class_text_features: torch.Tensor):
+        """Zero-shot: classify molecules by similarity to text."""
+        m = F.normalize(self.mol_proj(mol_features), dim=1)
+        t = F.normalize(self.text_proj(class_text_features), dim=1)
+        sims = torch.mm(m, t.t())  # (N_mol, N_classes)
+        return sims.argmax(dim=1)
+
+# Example usage with simple encoders
+text_enc = nn.Sequential(nn.Linear(768, 256), nn.ReLU())
+mol_enc = nn.Sequential(nn.Linear(512, 256), nn.ReLU())
+
+clip_model = CLIPDualEncoder(
+    text_enc, mol_enc, text_dim=256, mol_dim=256, proj_dim=128
+)
+
+# Simulated paired data: descriptions and molecular fingerprints
+text_feats = torch.randn(64, 768)
+mol_feats = torch.randn(64, 512)
+
+loss = clip_model(text_enc(text_feats), mol_enc(mol_feats))
+print(f"CLIP loss: {loss.item():.4f}")</code></pre>
+<div class="code-caption">Listing 26.9: A CLIP-style dual encoder for aligning text descriptions with molecular representations. The symmetric loss ensures both modalities project into a shared space. The <code>zero_shot_classify</code> method enables classification without any labeled training data by comparing molecule embeddings to text descriptions of target classes.</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Fact: CLIP's Learnable Temperature</div>
+<p>Unlike SimCLR, which fixes $\tau$ as a hyperparameter, CLIP makes temperature learnable. The model starts with $\tau = 0.07$ and learns to adjust it during training, typically converging to a value around $\tau = 0.01$ for large models. The learnable temperature acts as an automatic calibration mechanism: as the model gets better at discriminating, it can afford sharper (lower temperature) distributions because the positive pair similarity reliably exceeds the hardest negative. Learned temperature is now standard practice in production embedding models, including those used for text retrieval by major providers.</p>
+</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: open_clip for CLIP Training</div>
+<p>The <a href="https://github.com/mlfoundations/open_clip" target="_blank">open_clip</a> library provides production-grade CLIP training with all the engineering details handled: gradient checkpointing, mixed-precision training, distributed data loading, and WebDataset integration. What takes ~100 lines above becomes:</p>
+<pre><code class="language-python">import open_clip
+
+model, preprocess_train, preprocess_val = (
+    open_clip.create_model_and_transforms(
+        'ViT-B-32', pretrained='laion2b_s34b_b79k'
+    )
+)
+tokenizer = open_clip.get_tokenizer('ViT-B-32')
+
+# Zero-shot classification in 3 lines
+image_features = model.encode_image(
+    preprocess_val(image).unsqueeze(0)
+)
+text_features = model.encode_text(tokenizer(["a dog", "a cat"]))
+probs = (image_features @ text_features.T).softmax(dim=-1)</code></pre>
+<p>open_clip provides pretrained checkpoints, tokenizers, and preprocessing pipelines. It reduces CLIP training from a multi-day engineering effort to a configuration file. For scientific applications, use it as the starting point and fine-tune with domain-specific paired data.</p>
+</div>
+
+<h2>8. When Contrastive Objectives Fail</h2>
+
+<p>Contrastive objectives are powerful but not universal. They can fail in several well-characterized ways that practitioners should watch for.</p>
+
+<p><strong>False negatives.</strong> When the dataset contains many semantically similar samples, random negatives from the batch may actually be positives. In a dataset of drug molecules, two random molecules might share the same mechanism of action. Treating them as negatives pushes apart representations that should be close. This is especially problematic in scientific domains with continuous similarity (protein sequence space, chemical property space) rather than discrete categories.</p>
+
+<p><strong>Augmentation misspecification.</strong> If augmentations are too weak, the model can distinguish views by augmentation artifacts rather than semantic content (a shortcut solution). If augmentations are too strong, they destroy the semantic information you want to preserve. For scientific data, the appropriate augmentation depends heavily on the downstream task, as we discussed in <a href="section-26.1.html">Section 26.1</a>.</p>
+
+<p><strong>Dimensional collapse.</strong> Even without full representation collapse, the model may use only a subset of the available dimensions, effectively reducing the capacity of the embedding space. The uniformity metric from subsection 4 can detect this: dimensional collapse manifests as poor uniformity even when alignment is good. Centering and whitening the representations (as in the W-MSE variant) can mitigate this failure mode.</p>
+
+<p>We will develop quantitative tools for detecting all three failure modes in <a href="section-26.3.html">Section 26.3</a>, where we cover representation evaluation in depth.</p>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Build a Contrastive Embedding Space from Scratch</h4>
+<p>Train a small contrastive model on CIFAR-10 (no labels needed) and visualize the learned embedding space to see alignment and uniformity in action. This project uses only PyTorch and matplotlib.</p>
+<p><strong>Step 1.</strong> Load CIFAR-10 using <code>torchvision.datasets.CIFAR10</code> (train split, no labels). Define a pair of augmentations: random resized crop (scale 0.2 to 1.0) plus random color jitter (brightness=0.4, contrast=0.4). Each image produces two augmented views.</p>
+<p><strong>Step 2.</strong> Build a small encoder: use a ResNet-18 (<code>torchvision.models.resnet18</code>) with the final classification layer replaced by an identity, followed by a two-layer MLP projection head (512 to 256 to 128) with ReLU activation between layers and L2 normalization on the output.</p>
+<p><strong>Step 3.</strong> Implement the NT-Xent loss from Listing 26.5 (or copy it directly). Train for 50 epochs with batch size 256, learning rate 3e-4 (Adam), and temperature 0.07. Every 10 epochs, compute and log the alignment and uniformity metrics from Listing 26.7 on a held-out validation batch of 500 samples.</p>
+<p><strong>Step 4.</strong> After training, extract encoder features (before the projection head) for 2000 test images. Apply t-SNE or UMAP to reduce to 2D. Color the points by their true CIFAR-10 class (which the model never saw during training) and observe whether semantically similar classes cluster together.</p>
+<p><strong>Step 5.</strong> Plot the alignment vs. uniformity trajectory from your logs as a scatter plot with epoch labels. Verify that alignment decreases (positive pairs converge) while uniformity stays low (representations remain spread). If uniformity rises sharply, your model may be collapsing; try increasing batch size or lowering the learning rate.</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+<ol>
+<li><strong>Conceptual:</strong> Explain why the InfoNCE bound $I(X;Y) \geq \log(K+1) - \mathcal{L}_{\text{InfoNCE}}$ implies that a dataset with very high mutual information between views (such as two near-identical augmentations) might paradoxically give <em>worse</em> representations than a dataset with moderate MI. (Hint: consider what the encoder needs to learn when the views are too similar versus when they differ in augmentation-irrelevant ways.)</li>
+<li><strong>Coding:</strong> Implement a training loop that logs both alignment and uniformity metrics every 50 steps while training a SimCLR model. Create a scatter plot of alignment vs. uniformity over training. At what point does alignment improve fastest? Does uniformity degrade during early training? Use the functions from Listing 26.7.</li>
+<li><strong>Analysis:</strong> A colleague trains a contrastive model on electron microscopy images of nanoparticles using random rotation, random brightness, and Gaussian blur as augmentations. The model achieves excellent retrieval of similar particle shapes but fails to distinguish particles of different sizes. Diagnose the problem in terms of the augmentation-invariance framework, and propose a fix.</li>
+</ol>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-26.1.html">&larr; 26.1 Self-Supervised Learning</a>
+<span class="nav-spacer"></span>
+<a href="section-26.3.html">26.3 Representation Evaluation &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

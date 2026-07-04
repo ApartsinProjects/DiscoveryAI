@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 43.3: Simulator Calibration. Approximate Bayesian Computation, ABC-SMC, summary statistics, and likelihood-free inference for scientific simulators." name="description"/>
+<title>Section 43.3: Simulator Calibration | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part V: Discovery Through Simulation &amp; Optimization</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 43: Scientific Simulation</a></div>
+<h1>43.3 Simulator Calibration</h1>
+</header>
+
+<main class="content" id="main-content">
+
+<blockquote class="epigraph">
+<p>"You want me to find the parameters that make my simulation match your data? Easy. You want a posterior distribution over those parameters? That is what keeps me up at night."</p>
+<cite>A Likelihood Function That Refused to Be Evaluated</cite>
+</blockquote>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>Every simulator has parameters. The Gillespie algorithm has rate constants. Molecular dynamics has force field parameters. Agent-based models have behavioral thresholds. Calibration is the process of finding parameter values that make the simulator's output match observed data. For simple models, you can write down a likelihood function and apply standard Bayesian inference. For the simulators in this chapter, you cannot: the likelihood function is either intractable (no closed-form expression) or computationally prohibitive. Approximate Bayesian Computation (ABC) solves this problem by replacing likelihood evaluation with simulation: if the simulator's output is "close enough" to the data, accept the parameters. ABC-SMC refines this idea with sequential particle filtering, converging efficiently to the posterior distribution.</p>
+</div>
+
+<h2>1. The Calibration Problem</h2>
+
+<p>Calibration is the inverse of simulation. Simulation maps parameters to data: given $\theta$, run the simulator and produce synthetic observations $\mathbf{y}_{\text{sim}}$. Calibration maps data to parameters: given real observations $\mathbf{y}_{\text{obs}}$, find the $\theta$ that could have produced them.</p>
+
+<p><strong>What.</strong> Simulator calibration infers the posterior distribution $p(\theta \mid \mathbf{y}_{\text{obs}})$ over parameters $\theta$ given observed data $\mathbf{y}_{\text{obs}}$, using Bayes' theorem:</p>
+
+$$p(\theta \mid \mathbf{y}_{\text{obs}}) = \frac{p(\mathbf{y}_{\text{obs}} \mid \theta) \, p(\theta)}{p(\mathbf{y}_{\text{obs}})}$$
+
+<p><strong>Why.</strong> Point estimates of parameters (e.g., from least-squares fitting) tell you the single best-fit value but hide the uncertainty. A posterior distribution tells you which parameter regions are consistent with the data and which are ruled out. This matters for prediction: if the posterior is wide, predictions will be uncertain; if it is narrow, predictions are reliable. It also matters for model comparison, a topic we touched on in <a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32</a>.</p>
+
+<p><strong>How.</strong> Standard Bayesian inference evaluates the likelihood $p(\mathbf{y}_{\text{obs}} \mid \theta)$, the probability of observing the data given the parameters. For a Gillespie simulation, computing this likelihood requires summing over all possible reaction sequences that produce the observed trajectory, a combinatorial explosion. For molecular dynamics, it requires integrating over all atomic trajectories consistent with the observed macroscopic properties. In both cases, the likelihood is intractable.</p>
+
+<p><strong>When.</strong> Use likelihood-free methods whenever you have a simulator that can generate synthetic data but cannot evaluate the probability of specific observations. This includes virtually all stochastic simulators, agent-based models, and molecular dynamics engines.</p>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Likelihood-Free Revolution</div>
+<p>The inability to evaluate a likelihood function was once a dead end for Bayesian inference. ABC changed this by observing that you do not <em>need</em> the likelihood if you can <em>simulate</em> from the model. Instead of asking "How probable is the data given these parameters?" you ask "Can the simulator produce data that looks like the observations?" This shift from evaluation to simulation opened Bayesian inference to an enormous class of models that were previously inaccessible: population genetics, epidemiology, ecology, systems biology, and cosmology all adopted ABC within a decade of its introduction.</p>
+</div>
+
+<h2>2. ABC Rejection Sampling</h2>
+
+<p>The simplest ABC algorithm is rejection sampling. The idea is to sample parameters from the prior, run the simulator, and keep only those parameter values whose simulated output is "close enough" to the observed data. "Close enough" is formalized through a distance function and a tolerance threshold.</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>Think of ABC rejection sampling as a detective reconstructing a recipe by tasting the final dish. The detective cannot reverse-engineer the cooking process step by step (the likelihood is intractable), so instead she tries hundreds of candidate recipes, cooks each one, and tastes the result. If a candidate dish tastes "close enough" to the original, the recipe is kept as plausible; otherwise it is discarded. Tightening the tolerance is like demanding a closer flavor match: fewer recipes survive, but the survivors are more faithful. The key mechanism is the same: replace an impossible backward calculation with many forward trials followed by a comparison.</p>
+</div>
+
+<p>The algorithm:</p>
+
+<ol>
+<li>Draw $\theta^* \sim p(\theta)$ from the prior distribution.</li>
+<li>Simulate: $\mathbf{y}^* \sim p(\mathbf{y} \mid \theta^*)$ by running the simulator with parameters $\theta^*$.</li>
+<li>Compute summary statistics: $s^* = S(\mathbf{y}^*)$ and $s_{\text{obs}} = S(\mathbf{y}_{\text{obs}})$.</li>
+<li>Compute the distance: $d = \rho(s^*, s_{\text{obs}})$.</li>
+<li>If $d \leq \epsilon$ (the tolerance), accept $\theta^*$; otherwise reject.</li>
+<li>Repeat until you have enough accepted samples.</li>
+</ol>
+
+<p>The accepted samples approximate the ABC posterior $p_\epsilon(\theta \mid s_{\text{obs}})$, which converges to the true posterior as $\epsilon \to 0$ (assuming the summary statistics are sufficient). In practice, $\epsilon$ is always positive, introducing an approximation whose quality depends on the choice of summary statistics and distance function.</p>
+
+<pre><code class="language-python">import numpy as np
+from scipy.spatial.distance import euclidean
+
+
+def abc_rejection(
+    simulator_fn,
+    summary_fn,
+    observed_summaries,
+    prior_sampler,
+    epsilon,
+    n_accepted=1000,
+    max_iterations=1_000_000,
+    seed=42,
+):
+    """ABC rejection sampling for likelihood-free inference.
+
+    Args:
+        simulator_fn: callable(params, seed) -> simulated data
+        summary_fn: callable(data) -> summary statistics vector
+        observed_summaries: summary statistics of the observed data
+        prior_sampler: callable(rng) -> parameter vector from the prior
+        epsilon: acceptance threshold
+        n_accepted: target number of accepted samples
+        max_iterations: safety limit on total simulations
+        seed: random seed
+
+    Returns:
+        accepted_params: array of shape (n_accepted, n_params)
+        acceptance_rate: fraction of simulations accepted
+    """
+    rng = np.random.default_rng(seed)
+    accepted = []
+    n_total = 0
+
+    while len(accepted) < n_accepted and n_total < max_iterations:
+        # Step 1: Sample from prior
+        theta = prior_sampler(rng)
+
+        # Step 2: Simulate
+        sim_seed = rng.integers(0, 2**31)
+        sim_data = simulator_fn(theta, seed=sim_seed)
+
+        # Step 3: Compute summary statistics
+        sim_summaries = summary_fn(sim_data)
+
+        # Step 4: Accept/reject
+        distance = euclidean(sim_summaries, observed_summaries)
+        if distance <= epsilon:
+            accepted.append(theta)
+
+        n_total += 1
+
+    accepted_params = np.array(accepted)
+    acceptance_rate = len(accepted) / n_total
+
+    print(f"ABC rejection: {len(accepted)}/{n_total} accepted "
+          f"(rate={acceptance_rate:.4f})")
+
+    return accepted_params, acceptance_rate</code></pre>
+<div class="code-caption">ABC rejection sampling. Parameters are drawn from the prior, the simulator generates synthetic data, and only those parameters whose simulated summary statistics fall within distance $\epsilon$ of the observed summaries are retained. The acceptance rate drops exponentially with the number of parameters and the stringency of $\epsilon$.</div>
+
+<h3>2.1 Choosing Summary Statistics</h3>
+
+<p>The summary statistics $S(\mathbf{y})$ are the most consequential design choice in ABC. Ideally, they would be <em>sufficient statistics</em>: functions that capture all the information in the data relevant to the parameters. In practice, sufficient statistics are rarely known for complex simulators, so you must choose informative but computable summaries.</p>
+
+<p data-agent="02">Summary statistics are deterministic functions that compress a simulator's raw output (which may be a high-dimensional time series, a spatial field, or a variable-length event log) into a fixed-length numeric vector. They matter because ABC compares simulated and observed data exclusively through these compressed representations; any information lost during compression is invisible to the inference and can never be recovered, no matter how many simulations you run. The mechanism is straightforward: you apply the same function $S(\cdot)$ to both the observed data and each simulated dataset, then measure the distance between the two resulting vectors. Use hand-crafted summary statistics when domain knowledge tells you which data features carry information about the parameters; switch to learned summaries (Section 6) when the parameter-to-data mapping is too complex for manual feature engineering or when initial calibration checks reveal that hand-crafted summaries miss important structure.</p>
+
+<p>For a stochastic biochemical system, good summary statistics typically include:</p>
+
+<ul>
+<li><strong>Moments</strong>: mean, variance, and covariance of species counts at specific time points.</li>
+<li><strong>Temporal features</strong>: autocorrelation at lag 1, period of oscillations (if present), time to steady state.</li>
+<li><strong>Distributional features</strong>: quantiles (10th, 50th, 90th percentiles) of species counts at equilibrium.</li>
+<li><strong>Event statistics</strong>: frequency of extinction events, time of first passage to a threshold.</li>
+</ul>
+
+<pre><code class="language-python">def biochemical_summary_statistics(trajectory, t_eval=None):
+    """Compute summary statistics for a stochastic biochemical trajectory.
+
+    Args:
+        trajectory: dict with 'times' and 'states' arrays
+        t_eval: time points at which to evaluate (default: use all)
+
+    Returns:
+        summary: 1D array of summary statistics
+    """
+    times = trajectory["times"]
+    states = trajectory["states"]
+    n_species = states.shape[1]
+
+    summaries = []
+
+    for s in range(n_species):
+        series = states[:, s]
+
+        # Moments
+        summaries.append(np.mean(series))
+        summaries.append(np.std(series))
+
+        # Quantiles
+        summaries.extend(np.percentile(series, [10, 50, 90]).tolist())
+
+        # Temporal: autocorrelation at lag 1
+        if len(series) > 1:
+            centered = series - np.mean(series)
+            var = np.var(series)
+            if var > 0:
+                ac1 = np.correlate(centered[:-1], centered[1:])[0]
+                ac1 /= (len(centered) - 1) * var
+            else:
+                ac1 = 0.0
+            summaries.append(ac1)
+        else:
+            summaries.append(0.0)
+
+    # Cross-species correlation (if multiple species)
+    if n_species >= 2:
+        corr = np.corrcoef(states[:, 0], states[:, 1])[0, 1]
+        summaries.append(corr if np.isfinite(corr) else 0.0)
+
+    return np.array(summaries)</code></pre>
+<div class="code-caption">Summary statistics for stochastic biochemical trajectories. Each species contributes its mean, standard deviation, three quantiles, and lag-1 autocorrelation. The cross-species correlation captures dependencies between interacting molecules. These summaries reduce a variable-length trajectory to a fixed-length vector suitable for distance computation.</div>
+
+<div class="callout warning">
+<div class="callout-title">Warning: Insufficient Statistics Bias the Posterior</div>
+<p>If your summary statistics discard information about the parameters, the ABC posterior will be wider than the true posterior (loss of precision) or, worse, centered on the wrong value (bias). A classic failure mode is using only the mean of a distribution when the variance also depends on the parameters. Always include at least one summary statistic per parameter you are trying to infer, and validate your choice by running ABC on synthetic data with known parameters (a "calibration check") before applying it to real data.</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>Students often assume that making the tolerance $\epsilon$ as small as possible always produces a better posterior. In reality, a very tight $\epsilon$ combined with insufficient summary statistics can produce a posterior that is both narrow and wrong: it concentrates confidently around incorrect parameter values because the summary statistics cannot distinguish the true parameters from nearby impostors. The correct practice is to validate summary statistic quality first (via calibration checks on synthetic data with known parameters) and only then tighten $\epsilon$; a well-chosen set of summaries at moderate tolerance outperforms a poor set of summaries at any tolerance.</p>
+</div>
+
+<h2>3. ABC-SMC: Sequential Monte Carlo for Efficient Calibration</h2>
+
+<p>ABC rejection sampling has a fatal scalability problem: as you tighten $\epsilon$ to improve accuracy, the acceptance rate drops exponentially. With three parameters and a moderately tight tolerance, acceptance rates below 0.01% are common, meaning you need millions of simulations to collect a thousand posterior samples.</p>
+
+<p>ABC-SMC (Sequential Monte Carlo) solves this by replacing the single, harsh rejection step with a sequence of increasingly strict filtering rounds. Each round starts from the accepted particles of the previous round (not the prior), so the proposal distribution is always concentrated near the posterior. The algorithm uses importance weights and a perturbation kernel to maintain proper sampling.</p>
+
+<p>The algorithm:</p>
+
+<ol>
+<li><strong>Generation 0</strong>: Run ABC rejection with a generous tolerance $\epsilon_0$. The accepted particles form the initial population.</li>
+<li><strong>Generation $t$</strong>: For each particle in the new population:
+    <ol type="a">
+    <li>Sample a particle $\theta^{**}$ from the previous generation's population (with weights).</li>
+    <li>Perturb: $\theta^* = \theta^{**} + K$, where $K$ is drawn from a perturbation kernel (typically Gaussian).</li>
+    <li>If $\theta^*$ has zero prior probability, return to (a).</li>
+    <li>Simulate and compute summary statistics.</li>
+    <li>If $\rho(s^*, s_{\text{obs}}) \leq \epsilon_t$, accept $\theta^*$; otherwise return to (a).</li>
+    <li>Assign weight: $w^* = p(\theta^*) \big/ \sum_{j} w_j^{(t-1)} K(\theta^* \mid \theta_j^{(t-1)})$.</li>
+    </ol>
+</li>
+<li>Decrease $\epsilon_t$ and repeat until convergence or budget exhaustion.</li>
+</ol>
+
+$$\epsilon_0 > \epsilon_1 > \epsilon_2 > \cdots > \epsilon_T$$
+
+<pre><code class="language-python">from scipy.stats import gaussian_kde
+
+
+def abc_smc(
+    simulator_fn,
+    summary_fn,
+    observed_summaries,
+    prior_sampler,
+    prior_pdf,
+    epsilons,
+    n_particles=500,
+    seed=42,
+):
+    """ABC-SMC for efficient likelihood-free posterior inference.
+
+    Args:
+        simulator_fn: callable(params, seed) -> simulated data
+        summary_fn: callable(data) -> summary statistics vector
+        observed_summaries: summary statistics of the observed data
+        prior_sampler: callable(rng) -> parameter vector from the prior
+        prior_pdf: callable(params) -> prior density at params
+        epsilons: decreasing sequence of tolerance thresholds
+        n_particles: number of particles per generation
+        seed: random seed
+
+    Returns:
+        particles: final population, shape (n_particles, n_params)
+        weights: normalized importance weights
+        all_populations: list of populations from each generation
+    """
+    rng = np.random.default_rng(seed)
+    all_populations = []
+
+    # Generation 0: ABC rejection with epsilon[0]
+    particles = []
+    while len(particles) < n_particles:
+        theta = prior_sampler(rng)
+        sim_data = simulator_fn(theta, seed=rng.integers(0, 2**31))
+        sim_summary = summary_fn(sim_data)
+        if euclidean(sim_summary, observed_summaries) <= epsilons[0]:
+            particles.append(theta)
+
+    particles = np.array(particles)
+    weights = np.ones(n_particles) / n_particles
+    all_populations.append(particles.copy())
+    print(f"Gen 0: eps={epsilons[0]:.4f}, {n_particles} particles accepted")
+
+    # Subsequent generations
+    for gen, eps in enumerate(epsilons[1:], start=1):
+        # Compute perturbation kernel bandwidth from previous population
+        n_params = particles.shape[1]
+        cov = 2.0 * np.cov(particles.T, aweights=weights)
+
+        new_particles = []
+        new_weights_raw = []
+
+        while len(new_particles) < n_particles:
+            # Sample a particle from previous generation
+            idx = rng.choice(n_particles, p=weights)
+            theta_star = particles[idx]
+
+            # Perturb
+            theta_proposed = rng.multivariate_normal(theta_star, cov)
+
+            # Check prior support
+            if prior_pdf(theta_proposed) == 0:
+                continue
+
+            # Simulate
+            sim_data = simulator_fn(
+                theta_proposed, seed=rng.integers(0, 2**31)
+            )
+            sim_summary = summary_fn(sim_data)
+
+            if euclidean(sim_summary, observed_summaries) <= eps:
+                new_particles.append(theta_proposed)
+
+                # Importance weight
+                kernel_sum = 0.0
+                for j in range(n_particles):
+                    diff = theta_proposed - particles[j]
+                    kernel_sum += weights[j] * np.exp(
+                        -0.5 * diff @ np.linalg.solve(cov, diff)
+                    )
+                w = prior_pdf(theta_proposed) / kernel_sum
+                new_weights_raw.append(w)
+
+        particles = np.array(new_particles)
+        weights = np.array(new_weights_raw)
+        weights /= weights.sum()
+        all_populations.append(particles.copy())
+        print(f"Gen {gen}: eps={eps:.4f}, {n_particles} particles accepted")
+
+    return particles, weights, all_populations</code></pre>
+<div class="code-caption">ABC-SMC algorithm with Gaussian perturbation kernel. Each generation tightens the acceptance threshold while resampling from the previous generation's particles, avoiding the wasteful exploration of prior regions that have already been ruled out. The importance weights correct for the difference between the perturbation kernel and the prior.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: ABC-SMC Is Particle Filtering for Parameters</div>
+<p>ABC-SMC applies the same particle filtering logic that sequential Monte Carlo uses for state estimation in hidden Markov models. Each "particle" is a candidate parameter vector. The "observation" is the real data's summary statistics. The "transition" is the perturbation kernel. The "likelihood" is replaced by the accept/reject decision. If you have studied particle filters in signal processing or robotics, ABC-SMC is the same algorithm applied to the parameter space of a simulator rather than the state space of a dynamical system. This connection to <a href="../../part-3-data-models/module-32-bayesian-discovery/index.html">Chapter 32's Bayesian methods</a> is not superficial; it is the same mathematical framework.</p>
+</div>
+
+<h2>4. pyABC: Production-Grade ABC-SMC</h2>
+
+<p>The implementation above illustrates the algorithm, but production calibration requires features that a textbook implementation lacks: adaptive epsilon schedules, distributed computing, early termination, model selection, and diagnostics. The pyABC library provides all of these.</p>
+
+<pre><code class="language-python">import pyabc
+from pyabc import (
+    ABCSMC, RV, Distribution,
+    MedianEpsilon, LocalTransition,
+)
+import tempfile
+import os
+
+
+def calibrate_with_pyabc(
+    simulator_fn,
+    summary_fn,
+    observed_summaries,
+    param_priors,
+    n_populations=10,
+    min_epsilon=0.1,
+    population_size=200,
+):
+    """Calibrate a simulator using pyABC's ABC-SMC implementation.
+
+    Args:
+        simulator_fn: callable(params_dict) -> simulated data
+        summary_fn: callable(data) -> dict of summary statistics
+        observed_summaries: dict of observed summary statistics
+        param_priors: dict mapping param name to pyabc.RV distribution
+        n_populations: maximum number of SMC generations
+        min_epsilon: stop when epsilon falls below this value
+        population_size: particles per generation
+
+    Returns:
+        history: pyABC History object with all generations
+    """
+    # Define the prior
+    prior = Distribution(**param_priors)
+
+    # Define the model (simulator + summary statistics)
+    def model(params):
+        sim_data = simulator_fn(params)
+        return summary_fn(sim_data)
+
+    # Distance function: weighted Euclidean
+    distance = pyabc.AdaptivePNormDistance(p=2)
+
+    # Epsilon schedule: adaptive median
+    epsilon = MedianEpsilon(initial_epsilon=50.0)
+
+    # Perturbation kernel: local (adapts to particle spread)
+    transition = LocalTransition(k_fraction=0.25)
+
+    # Create the ABC-SMC object
+    abc = ABCSMC(
+        models=model,
+        parameter_priors=prior,
+        distance_function=distance,
+        population_size=population_size,
+        transitions=transition,
+        eps=epsilon,
+    )
+
+    # Database for storing results
+    db_path = os.path.join(tempfile.gettempdir(), "abc_calibration.db")
+    abc.new(f"sqlite:///{db_path}", observed_summaries)
+
+    # Run the inference
+    history = abc.run(
+        minimum_epsilon=min_epsilon,
+        max_nr_populations=n_populations,
+    )
+
+    print(f"Calibration complete: {history.n_populations} generations")
+    print(f"Final epsilon: {history.get_all_populations()['epsilon'].min():.4f}")
+
+    return history
+
+
+# Example usage with the Lotka-Volterra system
+param_priors = {
+    "prey_birth": RV("uniform", 0.1, 1.5),
+    "predation": RV("uniform", 0.001, 0.02),
+    "predator_death": RV("uniform", 0.05, 0.8),
+}
+
+# In practice, you would pass your actual simulator and observed data:
+# history = calibrate_with_pyabc(
+#     simulator_fn=lotka_volterra_simulator,
+#     summary_fn=compute_summaries,
+#     observed_summaries={"mean_prey": 85.0, "mean_pred": 42.0, ...},
+#     param_priors=param_priors,
+# )</code></pre>
+<div class="code-caption">Calibration with pyABC. The library handles adaptive epsilon scheduling (MedianEpsilon shrinks the threshold based on the distance distribution at each generation), adaptive perturbation kernels (LocalTransition adjusts to the posterior's shape), and result storage in an SQLite database for reproducibility. Compared to the manual implementation, pyABC saves roughly 300 lines of infrastructure code and adds parallel execution, early stopping, and built-in diagnostics.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: pyABC vs. Manual ABC-SMC</div>
+<p>The manual ABC-SMC implementation above requires roughly 80 lines for the core algorithm plus additional code for epsilon scheduling, kernel adaptation, convergence diagnostics, serialization, and parallelism. pyABC provides all of this in about 20 lines of setup code. It also supports model selection (comparing multiple competing simulators), look-ahead scheduling for distributed computing, and integration with Redis for multi-machine parallelism. The library handles the sampling infrastructure; you provide the simulator, the summary statistics, and the prior.</p>
+</div>
+
+<h2>5. Diagnostics: Is the Calibration Trustworthy?</h2>
+
+<p>A calibration is only as good as its validation. Three diagnostic checks should be routine.</p>
+
+<h3>5.1 Prior Predictive Check</h3>
+
+<p>Before running ABC, verify that the prior is broad enough to include the data-generating parameters. Simulate from the prior and check that the observed summary statistics fall within the range of simulated summaries.</p>
+
+<pre><code class="language-python">def prior_predictive_check(
+    simulator_fn, summary_fn, prior_sampler, observed_summaries,
+    n_samples=1000, seed=42,
+):
+    """Check that the prior covers the observed data.
+
+    Returns the fraction of summary statistics for which the
+    observed value falls within the prior predictive range.
+    """
+    rng = np.random.default_rng(seed)
+    sim_summaries = []
+
+    for _ in range(n_samples):
+        theta = prior_sampler(rng)
+        sim_data = simulator_fn(theta, seed=rng.integers(0, 2**31))
+        sim_summaries.append(summary_fn(sim_data))
+
+    sim_summaries = np.array(sim_summaries)
+    n_stats = len(observed_summaries)
+    covered = 0
+
+    for j in range(n_stats):
+        lo, hi = np.percentile(sim_summaries[:, j], [1, 99])
+        if lo <= observed_summaries[j] <= hi:
+            covered += 1
+
+    coverage = covered / n_stats
+    print(f"Prior predictive coverage: {covered}/{n_stats} "
+          f"statistics covered ({coverage:.0%})")
+    return coverage</code></pre>
+<div class="code-caption">Prior predictive check. If the observed summary statistics fall outside the 1st-99th percentile range of prior predictive simulations, the prior is too narrow or the model is misspecified. Run this check before investing compute in ABC-SMC.</div>
+
+<h3>5.2 Posterior Predictive Check</h3>
+
+<p>After calibration, simulate from the posterior and compare the simulated summary statistics to the observed ones. If they match well, the calibration is consistent. If they do not, either the summary statistics are insufficient or the model is misspecified.</p>
+
+<pre><code class="language-python">def posterior_predictive_check(
+    simulator_fn, summary_fn, posterior_samples, observed_summaries,
+    n_simulations_per_sample=5, seed=42,
+):
+    """Validate calibration by simulating from the posterior.
+
+    Returns the distribution of distances between posterior-predictive
+    summaries and the observed summaries.
+    """
+    rng = np.random.default_rng(seed)
+    distances = []
+
+    for theta in posterior_samples:
+        for _ in range(n_simulations_per_sample):
+            sim_data = simulator_fn(theta, seed=rng.integers(0, 2**31))
+            sim_summary = summary_fn(sim_data)
+            d = euclidean(sim_summary, observed_summaries)
+            distances.append(d)
+
+    distances = np.array(distances)
+    print(f"Posterior predictive distances: "
+          f"median={np.median(distances):.4f}, "
+          f"p95={np.percentile(distances, 95):.4f}")
+    return distances</code></pre>
+<div class="code-caption">Posterior predictive check. Simulations from the calibrated posterior should produce summary statistics close to the observed ones. A large median distance indicates poor calibration; a wide spread indicates high posterior uncertainty. Compare these distances to the final ABC-SMC epsilon to assess whether the calibration has converged.</div>
+
+<h3>5.3 Calibration on Synthetic Data</h3>
+
+<p>The gold-standard diagnostic is to run the entire calibration pipeline on synthetic data generated with known parameters. If the posterior concentrates around the true values, the pipeline is working. If it does not, debug before applying to real data.</p>
+
+<pre><code class="language-python">def calibration_check(
+    simulator_fn, summary_fn, prior_sampler, prior_pdf,
+    true_params, epsilons, n_particles=300, seed=42,
+):
+    """Run ABC-SMC on synthetic data with known true parameters.
+
+    The posterior should concentrate around true_params if the
+    summary statistics are informative and the model is correct.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Generate "observed" data from true parameters
+    observed_data = simulator_fn(true_params, seed=rng.integers(0, 2**31))
+    observed_summaries = summary_fn(observed_data)
+
+    # Run ABC-SMC
+    particles, weights, _ = abc_smc(
+        simulator_fn=simulator_fn,
+        summary_fn=summary_fn,
+        observed_summaries=observed_summaries,
+        prior_sampler=prior_sampler,
+        prior_pdf=prior_pdf,
+        epsilons=epsilons,
+        n_particles=n_particles,
+        seed=seed + 1,
+    )
+
+    # Check: is the true value within the 95% credible region?
+    for j in range(len(true_params)):
+        weighted_mean = np.average(particles[:, j], weights=weights)
+        lo = np.percentile(particles[:, j], 2.5)
+        hi = np.percentile(particles[:, j], 97.5)
+        covered = lo <= true_params[j] <= hi
+        print(
+            f"Param {j}: true={true_params[j]:.4f}, "
+            f"posterior mean={weighted_mean:.4f}, "
+            f"95% CI=[{lo:.4f}, {hi:.4f}], "
+            f"covered={covered}"
+        )
+
+    return particles, weights</code></pre>
+<div class="code-caption">Calibration check on synthetic data. Running ABC-SMC against data generated from known parameters validates the entire pipeline: prior specification, summary statistics, distance function, and epsilon schedule. If the true parameters fall outside the 95% credible interval, something is wrong.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Calibrating an Epidemiological Model During an Outbreak</div>
+<p>During the early weeks of a novel pathogen outbreak, epidemiologists must estimate the basic reproduction number $R_0$ and the serial interval from sparse, noisy case data. The SEIR (Susceptible-Exposed-Infected-Recovered) model is a standard simulator, but its likelihood is intractable because the infection times are unobserved. ABC-SMC calibration with summary statistics (daily case counts, growth rate, generation interval distribution) provides posterior distributions over $R_0$ and other parameters within hours. The UK's Real-Time Assessment of Community Transmission (REACT) study used ABC-based calibration to provide weekly estimates of transmission rates during the COVID-19 pandemic, directly informing policy decisions on school closures and lockdown timing.</p>
+</div>
+
+<h2>6. Advanced Topics: Adaptive Summary Statistics</h2>
+
+<p>Choosing summary statistics by hand requires domain expertise and risks missing informative features. Recent work automates this step using neural networks trained to extract maximally informative summaries from simulated data.</p>
+
+<p>The idea is to train a neural network $f_\phi$ that maps raw simulation output to a low-dimensional embedding, where the embedding is trained to be maximally informative about the parameters $\theta$. Two approaches dominate:</p>
+
+<p><strong>Semi-automatic ABC</strong> (Fearnhead and Prangle, 2012): Train a regression model to predict $\theta$ from the raw data. The predicted values $\hat{\theta}$ serve as summary statistics, which are approximately sufficient by construction.</p>
+
+<p><strong>Neural posterior estimation</strong> (Papamakarios and Murray, 2016): Train a conditional density network to estimate $p(\theta \mid \mathbf{y})$ directly, bypassing ABC entirely. This approach, sometimes called "simulation-based inference" (SBI), is covered in detail in packages like <code>sbi</code> (Tejero-Cantero et al., 2020) and represents the frontier of likelihood-free inference.</p>
+
+<div class="callout research-frontier" data-agent="18">
+<h4>Research Frontier</h4>
+<p>Flow matching for simulation-based inference (FMPE, Wildberger et al., 2024) replaces the normalizing-flow density estimators used in earlier neural posterior estimation with continuous normalizing flows trained via flow matching objectives. The method, published at ICLR 2024 as "Flow Matching for Scalable Simulation-Based Inference," achieves state-of-the-art posterior approximation quality on standard SBI benchmarks while training significantly faster than comparable normalizing-flow approaches. It also scales more gracefully to high-dimensional parameter spaces (tested up to 100 dimensions) where traditional ABC-SMC becomes computationally infeasible. The <code>sbi</code> Python package (v0.22+) includes FMPE as a built-in method, making it accessible without custom implementation.</p>
+</div>
+
+<pre><code class="language-python">def train_summary_network(
+    simulator_fn, prior_sampler, n_train=10_000, n_summary_dims=5,
+    seed=42,
+):
+    """Train a neural network to learn informative summary statistics.
+
+    Uses a simple regression approach: the network learns to predict
+    parameters from raw simulation output. The network's penultimate
+    layer provides learned summary statistics.
+    """
+    import torch
+    import torch.nn as nn
+
+    rng = np.random.default_rng(seed)
+
+    # Generate training data: (simulation output, true parameters)
+    X_list, y_list = [], []
+    for _ in range(n_train):
+        theta = prior_sampler(rng)
+        sim_data = simulator_fn(theta, seed=rng.integers(0, 2**31))
+        # Flatten simulation output to a fixed-size vector
+        flat = np.concatenate([
+            np.mean(sim_data["states"], axis=0),
+            np.std(sim_data["states"], axis=0),
+            np.percentile(sim_data["states"], [25, 75], axis=0).flatten(),
+        ])
+        X_list.append(flat)
+        y_list.append(theta)
+
+    X = torch.tensor(np.array(X_list), dtype=torch.float32)
+    y = torch.tensor(np.array(y_list), dtype=torch.float32)
+
+    # Simple regression network
+    input_dim = X.shape[1]
+    param_dim = y.shape[1]
+
+    model = nn.Sequential(
+        nn.Linear(input_dim, 64),
+        nn.ReLU(),
+        nn.Linear(64, n_summary_dims),  # learned summaries
+        nn.ReLU(),
+        nn.Linear(n_summary_dims, param_dim),
+    )
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+
+    # Training loop
+    for epoch in range(200):
+        optimizer.zero_grad()
+        pred = model(X)
+        loss = loss_fn(pred, y)
+        loss.backward()
+        optimizer.step()
+        if (epoch + 1) % 50 == 0:
+            print(f"Epoch {epoch+1}: loss={loss.item():.4f}")
+
+    # Extract the summary network (everything up to the bottleneck)
+    summary_net = nn.Sequential(*list(model.children())[:3])
+    return summary_net, model</code></pre>
+<div class="code-caption">Learning summary statistics with a neural network. The network is trained to predict parameters from raw simulation output. The bottleneck layer (n_summary_dims=5) provides learned summary statistics that are approximately sufficient. These can replace hand-crafted summaries in ABC-SMC, often improving posterior quality.</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: ABC Calibration of a Gaussian Mixture</h4>
+<p>Build a complete ABC rejection sampler for a two-component Gaussian mixture model using only NumPy and SciPy. This exercise isolates the calibration logic from simulator complexity so you can focus on the ABC workflow itself.</p>
+<ol>
+<li><strong>Define a simulator.</strong> Write a function that takes parameters $\theta = (\mu_1, \mu_2, w)$ (two means and a mixing weight) and generates $n=200$ samples from the mixture $w \cdot \mathcal{N}(\mu_1, 1) + (1 - w) \cdot \mathcal{N}(\mu_2, 1)$.</li>
+<li><strong>Choose summary statistics.</strong> Implement a summary function that computes five quantities from a sample: the sample mean, sample variance, skewness (<code>scipy.stats.skew</code>), the 25th percentile, and the 75th percentile.</li>
+<li><strong>Generate synthetic "observed" data.</strong> Fix true parameters (e.g., $\mu_1 = -2$, $\mu_2 = 3$, $w = 0.4$), run the simulator once, and compute observed summaries.</li>
+<li><strong>Run ABC rejection.</strong> Sample 100,000 candidate parameter vectors from uniform priors ($\mu_i \in [-5, 5]$, $w \in [0, 1]$), simulate each, and accept those with Euclidean summary distance below a threshold $\epsilon$. Start with $\epsilon = 2.0$ and tighten to $\epsilon = 0.5$. Plot histograms of accepted $\mu_1$, $\mu_2$, and $w$ values using <code>matplotlib</code>.</li>
+<li><strong>Validate.</strong> Check whether the true parameter values fall within the central 95% of each accepted-parameter histogram. If not, add more summary statistics (e.g., bimodality coefficient or kernel density mode count) and repeat.</li>
+</ol>
+</div>
+
+<h2>7. Summary</h2>
+
+<p>Simulator calibration transforms a forward model (parameters to data) into an inverse inference engine (data to parameters). When the likelihood is intractable, ABC provides a principled alternative: simulate, summarize, compare. ABC-SMC improves efficiency by sequentially refining the particle population through decreasing tolerance thresholds. The quality of calibration depends critically on summary statistics, which can be chosen by domain expertise or learned from simulated data. Diagnostic checks (prior predictive, posterior predictive, calibration on synthetic data) are not optional; they are the only way to know whether the calibration is trustworthy. In the next section, we assemble all the components of this chapter into a complete calibrated simulator pipeline.</p>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p><a href="section-43.4.html">Section 43.4: Building a Calibrated Simulator</a> brings together the Gillespie algorithm from Section 43.2, the ABC-SMC calibration from this section, and the Discovery Workbench integration from Section 43.1 into a complete recipe. We will calibrate a stochastic model of a gene regulatory network against synthetic experimental data, then use the calibrated model for counterfactual interventions that test mechanistic hypotheses.</p>
+</section>
+
+</main>
+
+<footer>
+<p>© 2026 Alexander Apartsin &amp; Yehudit Aperstein · <a href="../../toc.html">Contents</a></p>
+<p class="edition-note">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+</footer>
+</body>
+</html>

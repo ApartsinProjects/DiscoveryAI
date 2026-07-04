@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 18.3: Building an Invariant Discovery System. An AI system that infers behavioral invariants, generates property tests, runs mutation testing, and reports confidence scores." name="description"/>
+<title>Section 18.3: Building an Invariant Discovery System | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 18: AI-Assisted Testing and QA</a></div>
+<h1>18.3 Building an Invariant Discovery System</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I read your code, inferred twelve properties it should satisfy, generated tests for all twelve, mutated your source in forty-seven places, and found that your test suite would not notice if you replaced addition with subtraction on line 34. You are welcome."</p>
+<cite>An Automated QA Agent Who Takes Correctness Personally</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section synthesizes the test generation strategies from
+<a href="section-18.1.html">Section 18.1</a> and the property-based and mutation testing
+techniques from <a href="section-18.2.html">Section 18.2</a> into a complete automated
+system. You should be comfortable with the Anthropic Python SDK (used since
+<a href="../module-08-ai-software-foundations/index.html">Chapter 8</a>), pytest
+fixtures, Hypothesis strategies, and mutmut's command-line interface. The system we
+build here extends the Discovery Workbench with a testing module that connects to the
+<a href="../module-17-multi-agent-teams/index.html">multi-agent architecture from Chapter 17</a>.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+An invariant discovery system closes the loop between AI code generation and AI test
+generation. When a developer writes a function (or an AI generates one), the system
+reads the source, infers behavioral invariants the function should satisfy, translates
+those invariants into executable Hypothesis property tests, runs mutation testing to
+verify the tests are strong enough to detect faults, and reports a composite confidence
+score. The result is a fully automated QA pipeline that treats testing as a discovery
+process: searching for properties that the code satisfies, just as a scientist searches
+for laws that nature satisfies.
+</p>
+</div>
+
+<h2>1. System Architecture</h2>
+
+<p>
+The invariant discovery system has four stages, each implemented as a separate component
+that can run independently or as part of an automated pipeline. The architecture follows
+the same modular pattern used throughout the Discovery Workbench (introduced in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>):
+each stage has a well-defined input and output, communicating through structured data
+rather than shared state.
+</p>
+
+<p data-agent="02">
+A <em>behavioral invariant</em> is a property that a function must satisfy for every valid input, not just for a handful of hand-picked test cases. Behavioral invariants matter because they transform testing from "check these five examples" into "prove this universal rule," catching entire categories of bugs with a single property statement. The mechanism is straightforward: the system expresses each invariant as a Hypothesis property test, which then generates hundreds of random inputs and verifies the property holds for all of them. Use behavioral invariants instead of example-based tests when a function has a large or continuous input domain where manually chosen examples cannot cover boundary conditions; fall back to example-based tests when the correct output depends on specific business rules that cannot be stated as a general property (such as "customer #42 gets a 10% discount").
+</p>
+
+<ol>
+<li><strong>Invariant Inference</strong>: An LLM reads the function's source code, docstring, and type annotations, then proposes a set of behavioral invariants from the five families (roundtrip, idempotence, preservation, metamorphic, oracle comparison).</li>
+<li><strong>Test Generation</strong>: Each inferred invariant is translated into a Hypothesis property test with an appropriate custom strategy for the function's input types.</li>
+<li><strong>Test Validation</strong>: The generated tests are compiled, executed, and filtered. Tests that fail on the current (presumably correct) code are discarded as false invariants. Tests that pass are retained as candidate properties.</li>
+<li><strong>Mutation Analysis</strong>: mutmut runs against the function with the validated property tests. The mutation score, combined with branch coverage and property count, produces the composite confidence score.</li>
+</ol>
+
+<pre><code class="language-python">"""
+Invariant Discovery System: core data structures.
+"""
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class InvariantFamily(Enum):
+    """The five families of behavioral invariants."""
+    ROUNDTRIP = "roundtrip"
+    IDEMPOTENCE = "idempotence"
+    PRESERVATION = "preservation"
+    METAMORPHIC = "metamorphic"
+    ORACLE = "oracle_comparison"
+
+
+@dataclass
+class InferredInvariant:
+    """A behavioral invariant inferred by the LLM."""
+    family: InvariantFamily
+    description: str          # human-readable statement
+    hypothesis_code: str      # executable Hypothesis test code
+    confidence: float         # LLM's self-assessed confidence (0 to 1)
+    validated: bool = False   # True after passing on current code
+    killed_mutants: int = 0   # how many mutants this property catches
+
+
+@dataclass
+class DiscoveryReport:
+    """Output of the invariant discovery pipeline."""
+    function_name: str
+    source_file: str
+    invariants_proposed: int
+    invariants_validated: int
+    branch_coverage: float         # 0 to 1
+    mutation_score: float          # 0 to 1
+    property_ratio: float          # validated / target
+    confidence_score: float        # composite metric
+    surviving_mutants: list[str]   # descriptions of unkilled mutants
+    invariants: list[InferredInvariant] = field(default_factory=list)
+
+    def summary(self) -> str:
+        return (
+            f"Invariant Discovery Report: {self.function_name}\n"
+            f"  Invariants: {self.invariants_validated}/{self.invariants_proposed} validated\n"
+            f"  Branch coverage: {self.branch_coverage:.1%}\n"
+            f"  Mutation score: {self.mutation_score:.1%}\n"
+            f"  Confidence score: {self.confidence_score:.1%}\n"
+            f"  Surviving mutants: {len(self.surviving_mutants)}"
+        )
+</code></pre>
+<div class="code-caption">Core data structures for the invariant discovery system: InvariantFamily enumerates the five property families, InferredInvariant tracks each property through validation, and DiscoveryReport aggregates the final metrics.</div>
+
+<h2>2. Stage 1: Invariant Inference</h2>
+
+<p>
+The inference stage uses an LLM to read a function's source code and propose behavioral
+invariants. The prompt is structured to elicit properties from each of the five families,
+with the LLM returning structured JSON that can be parsed directly into
+<code>InferredInvariant</code> objects. The key design decision is asking the LLM to
+generate executable Hypothesis code for each invariant, not just a natural-language
+description. This eliminates a translation step and ensures the invariant is testable.
+</p>
+
+<pre><code class="language-python">"""
+Stage 1: Invariant Inference using an LLM.
+"""
+import json
+from anthropic import Anthropic
+
+
+INVARIANT_INFERENCE_PROMPT = """You are a software testing expert. Analyze the following
+Python function and infer behavioral invariants it should satisfy.
+
+For each invariant, provide:
+1. family: one of "roundtrip", "idempotence", "preservation", "metamorphic", "oracle_comparison"
+2. description: a one-sentence natural-language statement of the property
+3. hypothesis_code: a complete, runnable Hypothesis property test (with imports)
+4. confidence: your confidence that this property holds (0.0 to 1.0)
+
+Guidelines:
+- Propose at least 2 invariants from each applicable family.
+- Include Hypothesis strategies appropriate for the function's input types.
+- For scientific functions, consider physical constraints (e.g., conservation laws,
+  dimensional consistency, monotonicity, symmetry).
+- For data transformations, consider roundtrip properties with inverse operations.
+- Be specific: "output length equals input length" is better than "output is correct."
+
+Return a JSON array of objects. No other text.
+
+Function to analyze:
+```python
+{function_source}
+```"""
+
+
+def infer_invariants(
+    function_source: str,
+    model: str = "claude-sonnet-4-20250514"
+) -> list[InferredInvariant]:
+    """Infer behavioral invariants from function source code.
+
+    Args:
+        function_source: Complete source of the function under test.
+        model: Claude model to use.
+
+    Returns:
+        List of inferred invariants with executable test code.
+    """
+    client = Anthropic()
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=8192,
+        messages=[{
+            "role": "user",
+            "content": INVARIANT_INFERENCE_PROMPT.format(
+                function_source=function_source
+            )
+        }]
+    )
+
+    raw_text = response.content[0].text
+
+    # Strip markdown fences if present
+    if raw_text.startswith("```"):
+        raw_text = raw_text.split("\n", 1)[1]
+        raw_text = raw_text.rsplit("```", 1)[0]
+
+    invariants_data = json.loads(raw_text)
+
+    return [
+        InferredInvariant(
+            family=InvariantFamily(item["family"]),
+            description=item["description"],
+            hypothesis_code=item["hypothesis_code"],
+            confidence=item["confidence"]
+        )
+        for item in invariants_data
+    ]
+
+
+# Example: infer invariants for a data transformation function
+source = '''
+def interpolate_spectrum(
+    wavelengths: list[float],
+    intensities: list[float],
+    target_wavelengths: list[float]
+) -> list[float]:
+    """Linearly interpolate a spectrum onto a new wavelength grid.
+
+    Args:
+        wavelengths: Original wavelength values (sorted ascending, at least 2).
+        intensities: Original intensity values (same length as wavelengths).
+        target_wavelengths: Desired output wavelength values (sorted ascending).
+
+    Returns:
+        Interpolated intensities at each target wavelength.
+        Values outside the original range are extrapolated linearly.
+    """
+    result = []
+    for target in target_wavelengths:
+        # Find bracketing interval
+        if target <= wavelengths[0]:
+            # Extrapolate below
+            slope = (intensities[1] - intensities[0]) / (wavelengths[1] - wavelengths[0])
+            result.append(intensities[0] + slope * (target - wavelengths[0]))
+        elif target >= wavelengths[-1]:
+            # Extrapolate above
+            slope = (intensities[-1] - intensities[-2]) / (wavelengths[-1] - wavelengths[-2])
+            result.append(intensities[-1] + slope * (target - wavelengths[-1]))
+        else:
+            # Interpolate: find the interval
+            for i in range(len(wavelengths) - 1):
+                if wavelengths[i] <= target <= wavelengths[i + 1]:
+                    t = (target - wavelengths[i]) / (wavelengths[i + 1] - wavelengths[i])
+                    val = intensities[i] + t * (intensities[i + 1] - intensities[i])
+                    result.append(val)
+                    break
+    return result
+'''
+
+invariants = infer_invariants(source)
+for inv in invariants:
+    print(f"[{inv.family.value}] {inv.description} (confidence: {inv.confidence})")
+</code></pre>
+<div class="code-caption">Stage 1 of the invariant discovery pipeline: the LLM reads the interpolation function and infers properties such as "interpolating at original wavelengths returns original intensities" (roundtrip) and "output length equals target wavelength count" (preservation).</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The LLM Infers Domain-Specific Invariants</div>
+<p>
+A generic testing tool would propose only structural properties (length preservation,
+type preservation). The LLM, having been trained on scientific code, infers
+<em>domain-specific</em> properties: linear interpolation at the original grid points
+should reproduce the original values (a roundtrip property); interpolation should
+preserve monotonicity if the original spectrum is monotonic (a preservation property);
+scaling all intensities by a constant and then interpolating should give the same result
+as interpolating and then scaling (a metamorphic property). These domain-aware invariants
+catch bugs that structural tests miss entirely, such as an off-by-one error in the
+bracketing interval search that only manifests for certain wavelength spacings.
+</p>
+</div>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of invariant discovery like a building inspector checking a house. The inspector does not test whether the house looks nice (that would be an example-based test for a specific input). Instead, the inspector checks universal rules: every load-bearing wall must support its share of weight, every electrical outlet must be grounded, every staircase must have a railing. These rules hold regardless of the house's style, size, or color. The inspector proposes rules (invariants), verifies each one against the actual house (validation), and then deliberately introduces faults (removing a screw, loosening a wire) to confirm the inspection would catch them (mutation testing). A house that passes all structural rules under deliberate sabotage earns a high confidence score, just as a function that satisfies all behavioral invariants even when its source code is mutated earns a high composite confidence metric.
+</p>
+</div>
+
+<h2>3. Stage 2: Test Generation and Validation</h2>
+
+<p>
+The inferred invariants arrive as strings of Python code. Before trusting them, we must
+compile them, run them against the current (presumably correct) implementation, and
+discard any that fail. A failing invariant is either wrong (the LLM hallucinated a
+property that does not hold) or reveals a genuine bug. We classify the two cases by
+checking whether the failure is consistent (fails on every run, indicating a real
+violation) or flaky (fails intermittently, indicating a flawed strategy or an unstable
+numerical comparison).
+</p>
+
+<pre><code class="language-python">"""
+Stage 2: Test Generation and Validation.
+Compile, execute, and filter inferred invariants.
+"""
+import subprocess
+import tempfile
+import textwrap
+from pathlib import Path
+
+
+def validate_invariants(
+    invariants: list[InferredInvariant],
+    source_file: str,
+    max_examples: int = 200,
+    validation_runs: int = 3
+) -> list[InferredInvariant]:
+    """Validate inferred invariants against the current implementation.
+
+    Runs each invariant's Hypothesis test multiple times. Invariants that
+    pass consistently are marked as validated. Invariants that fail
+    consistently are flagged as potential bugs. Flaky invariants are
+    discarded.
+
+    Args:
+        invariants: List of inferred invariants with hypothesis_code.
+        source_file: Path to the module containing the function under test.
+        max_examples: Hypothesis max_examples setting for validation.
+        validation_runs: Number of times to run each test for flakiness check.
+
+    Returns:
+        Filtered list of validated invariants.
+    """
+    validated = []
+    module_name = Path(source_file).stem
+
+    for inv in invariants:
+        # Build a standalone test file
+        test_code = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, "{Path(source_file).parent}")
+            from {module_name} import *
+            from hypothesis import given, settings, assume
+            from hypothesis import strategies as st
+            from hypothesis.strategies import composite
+            import math
+            import numpy as np
+
+            settings.register_profile("validate",
+                max_examples={max_examples}, derandomize=True)
+            settings.load_profile("validate")
+
+            {inv.hypothesis_code}
+        """)
+
+        # Write to a temp file and run with pytest
+        pass_count = 0
+        fail_count = 0
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", prefix="test_inv_",
+            delete=False, dir=tempfile.gettempdir()
+        ) as f:
+            f.write(test_code)
+            test_path = f.name
+
+        for run in range(validation_runs):
+            result = subprocess.run(
+                ["pytest", test_path, "-x", "--tb=short", "-q"],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0:
+                pass_count += 1
+            else:
+                fail_count += 1
+
+        # Classify the result
+        if pass_count == validation_runs:
+            inv.validated = True
+            validated.append(inv)
+        elif fail_count == validation_runs:
+            # Consistent failure: possible real bug
+            print(f"  POTENTIAL BUG: {inv.description}")
+            print(f"    Family: {inv.family.value}")
+            # Still include it so the report can flag it
+            inv.validated = False
+            validated.append(inv)
+        else:
+            # Flaky: discard
+            print(f"  FLAKY (discarded): {inv.description}")
+
+        # Clean up
+        Path(test_path).unlink(missing_ok=True)
+
+    return validated
+</code></pre>
+<div class="code-caption">Stage 2: each inferred invariant is compiled into a standalone test file, run three times with deterministic Hypothesis settings, and classified as validated, potential bug, or flaky.</div>
+
+<h2>4. Stage 3: Mutation Analysis</h2>
+
+<p>
+With validated property tests in hand, we run mutation testing to measure their
+strength. This stage combines all validated tests into a single test file, runs
+mutmut against the function under test, and collects the mutation score along with
+details of each surviving mutant.
+</p>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+Students often assume that a high mutation score (say, 95%) alone proves a test suite is thorough. This is incorrect: mutation score measures only how many artificial faults the tests detect, not whether the tests cover the right behavioral properties. A test suite composed entirely of "output is not None" assertions can kill many mutants (any mutation that causes a crash) while missing subtle logic errors that still produce non-None but wrong results. The composite confidence score in this system multiplies mutation score by branch coverage and property ratio precisely to guard against this trap; all three factors must be high for the overall score to be meaningful.
+</p>
+</div>
+
+<pre><code class="language-python">"""
+Stage 3: Mutation Analysis.
+Run mutmut with the validated property tests and collect results.
+"""
+import subprocess
+import json
+import re
+from pathlib import Path
+
+
+def run_mutation_analysis(
+    source_file: str,
+    validated_invariants: list[InferredInvariant],
+    timeout_per_mutant: int = 30
+) -> dict:
+    """Run mutation testing with validated property tests.
+
+    Args:
+        source_file: Path to the module under test.
+        validated_invariants: List of validated invariants (only those
+            where validated=True will be used).
+        timeout_per_mutant: Timeout in seconds per mutant test run.
+
+    Returns:
+        Dict with mutation_score, killed, survived, total, and
+        surviving_mutant_descriptions.
+    """
+    # Collect only validated invariants
+    valid_tests = [
+        inv for inv in validated_invariants if inv.validated
+    ]
+
+    if not valid_tests:
+        return {
+            "mutation_score": 0.0,
+            "killed": 0,
+            "survived": 0,
+            "total": 0,
+            "surviving_mutants": []
+        }
+
+    # Build combined test file
+    module_name = Path(source_file).stem
+    test_dir = Path(source_file).parent / "tests"
+    test_dir.mkdir(exist_ok=True)
+    test_file = test_dir / f"test_{module_name}_properties.py"
+
+    header = f"""
+import sys
+sys.path.insert(0, "{Path(source_file).parent}")
+from {module_name} import *
+from hypothesis import given, settings, assume
+from hypothesis import strategies as st
+from hypothesis.strategies import composite
+import math
+import numpy as np
+
+settings.register_profile("mutation",
+    max_examples=50, derandomize=True, deadline=None)
+settings.load_profile("mutation")
+"""
+
+    body = "\n\n".join(inv.hypothesis_code for inv in valid_tests)
+    test_file.write_text(header + "\n" + body)
+
+    # Run mutmut
+    result = subprocess.run(
+        [
+            "mutmut", "run",
+            f"--paths-to-mutate={source_file}",
+            f"--tests-dir={test_dir}",
+            f"--runner=pytest {test_file} -x --tb=no -q",
+        ],
+        capture_output=True, text=True,
+        timeout=timeout_per_mutant * 200  # generous overall timeout
+    )
+
+    # Parse results
+    result_output = subprocess.run(
+        ["mutmut", "results"],
+        capture_output=True, text=True
+    )
+
+    # Extract counts from mutmut output
+    output = result_output.stdout
+    killed = len(re.findall(r"Killed", output))
+    survived = len(re.findall(r"Survived", output))
+    timeout_count = len(re.findall(r"Timeout", output))
+
+    total_non_equivalent = killed + survived
+    mutation_score = (
+        killed / total_non_equivalent
+        if total_non_equivalent > 0 else 1.0
+    )
+
+    # Collect surviving mutant descriptions
+    surviving_descriptions = []
+    if survived > 0:
+        for i in range(1, killed + survived + timeout_count + 1):
+            show_result = subprocess.run(
+                ["mutmut", "show", str(i)],
+                capture_output=True, text=True
+            )
+            if "Survived" in show_result.stdout or survived > 0:
+                surviving_descriptions.append(
+                    show_result.stdout.strip()[:200]
+                )
+
+    return {
+        "mutation_score": mutation_score,
+        "killed": killed,
+        "survived": survived,
+        "total": killed + survived + timeout_count,
+        "surviving_mutants": surviving_descriptions[:10]  # limit
+    }
+</code></pre>
+<div class="code-caption">Stage 3: combining validated property tests into a single file and running mutmut to measure mutation score. Surviving mutants are collected with their source diffs for the final report.</div>
+
+<h2>5. Stage 4: Confidence Scoring and Reporting</h2>
+
+<p>
+The final stage computes the composite confidence score and generates the
+<code>DiscoveryReport</code>. This is where all the metrics converge: branch coverage
+from coverage.py, mutation score from mutmut, and property count from the validation
+stage.
+</p>
+
+<pre><code class="language-python">"""
+Stage 4: Confidence Scoring and Reporting.
+Assemble the complete invariant discovery report.
+"""
+import subprocess
+import json
+from pathlib import Path
+
+
+def compute_branch_coverage(
+    source_file: str,
+    test_file: str
+) -> float:
+    """Measure branch coverage of the property tests."""
+    module_name = Path(source_file).stem
+    subprocess.run(
+        [
+            "pytest", test_file,
+            f"--cov={module_name}",
+            "--cov-branch",
+            "--cov-report=json:cov_report.json",
+            "-q"
+        ],
+        capture_output=True, text=True,
+        timeout=120
+    )
+
+    try:
+        with open("cov_report.json") as f:
+            cov_data = json.load(f)
+        file_cov = cov_data.get("files", {}).get(source_file, {})
+        return file_cov.get("summary", {}).get(
+            "percent_covered_branches", 0.0
+        ) / 100.0
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return 0.0
+    finally:
+        Path("cov_report.json").unlink(missing_ok=True)
+
+
+def run_invariant_discovery(
+    source_file: str,
+    function_source: str,
+    target_properties: int = 10,
+    model: str = "claude-sonnet-4-20250514"
+) -> DiscoveryReport:
+    """Run the complete invariant discovery pipeline.
+
+    This is the main entry point that orchestrates all four stages.
+
+    Args:
+        source_file: Path to the Python source file.
+        function_source: Source code of the function to analyze.
+        target_properties: Target number of validated properties.
+        model: Claude model for invariant inference.
+
+    Returns:
+        A complete DiscoveryReport with confidence score.
+    """
+    import re
+
+    # Extract function name
+    match = re.search(r"def (\w+)\(", function_source)
+    func_name = match.group(1) if match else "unknown"
+
+    print(f"Analyzing: {func_name}")
+
+    # Stage 1: Infer invariants
+    print("  Stage 1: Inferring invariants...")
+    invariants = infer_invariants(function_source, model=model)
+    print(f"    Proposed {len(invariants)} invariants")
+
+    # Stage 2: Validate invariants
+    print("  Stage 2: Validating invariants...")
+    validated = validate_invariants(invariants, source_file)
+    valid_count = sum(1 for inv in validated if inv.validated)
+    print(f"    Validated {valid_count} / {len(invariants)}")
+
+    # Stage 3: Mutation analysis
+    print("  Stage 3: Running mutation analysis...")
+    mutation_results = run_mutation_analysis(
+        source_file,
+        validated
+    )
+    print(f"    Mutation score: {mutation_results['mutation_score']:.1%}")
+
+    # Stage 4: Compute confidence score
+    test_dir = Path(source_file).parent / "tests"
+    test_file = str(
+        test_dir / f"test_{Path(source_file).stem}_properties.py"
+    )
+    branch_cov = compute_branch_coverage(source_file, test_file)
+
+    property_ratio = min(1.0, valid_count / target_properties)
+
+    confidence = (
+        branch_cov
+        * mutation_results["mutation_score"]
+        * property_ratio
+    )
+
+    report = DiscoveryReport(
+        function_name=func_name,
+        source_file=source_file,
+        invariants_proposed=len(invariants),
+        invariants_validated=valid_count,
+        branch_coverage=branch_cov,
+        mutation_score=mutation_results["mutation_score"],
+        property_ratio=property_ratio,
+        confidence_score=confidence,
+        surviving_mutants=mutation_results["surviving_mutants"],
+        invariants=validated
+    )
+
+    print(f"\n{report.summary()}")
+    return report
+</code></pre>
+<div class="code-caption">The complete invariant discovery pipeline orchestrator: infer, validate, mutate, and score. The composite confidence metric multiplies branch coverage, mutation score, and property ratio.</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Invariant Discovery on a Molecular Docking Scorer</div>
+<p>
+A drug discovery team applied the invariant discovery system to their molecular docking
+score function, a 120-line Python function that computes binding affinity from atomic
+coordinates and partial charges. The system inferred 14 invariants, including: "translating
+all atoms by the same vector does not change the score" (metamorphic, translation
+invariance), "swapping the protein and ligand produces the same score" (metamorphic,
+symmetry), and "doubling all partial charges quadruples the electrostatic component"
+(metamorphic, quadratic scaling). After validation, 11 invariants survived. Mutation
+testing with these 11 properties achieved a 91% mutation score. The three surviving
+mutants all involved the van der Waals distance cutoff: the tests did not generate
+atom pairs at exactly the cutoff distance. Adding a targeted property test for
+boundary distances killed all remaining mutants, bringing the confidence score to
+$0.97 \times 0.97 \times 1.0 = 0.94$.
+</p>
+</div>
+
+<h2>6. Discovery Workbench Integration</h2>
+
+<p>
+The invariant discovery system integrates into the Discovery Workbench as a testing
+service that can be triggered from the experiment dashboard, the CLI, or the CI pipeline.
+The integration follows the same service pattern established in
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>
+and extended through
+<a href="../module-12-mcp-servers/index.html">Chapter 12: Building MCP Servers</a>.
+</p>
+
+<pre><code class="language-python">"""
+Discovery Workbench integration: the invariant discovery service.
+Exposes the pipeline as a FastAPI endpoint and an MCP tool.
+"""
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel, Field
+from pathlib import Path
+import asyncio
+
+app = FastAPI(title="Invariant Discovery Service")
+
+
+class DiscoveryRequest(BaseModel):
+    """Request to run invariant discovery on a function."""
+    source_file: str = Field(
+        description="Path to the Python source file"
+    )
+    function_name: str = Field(
+        description="Name of the function to analyze"
+    )
+    target_properties: int = Field(
+        default=10,
+        description="Target number of validated properties"
+    )
+    model: str = Field(
+        default="claude-sonnet-4-20250514",
+        description="Claude model for invariant inference"
+    )
+
+
+class DiscoveryResponse(BaseModel):
+    """Response from the invariant discovery pipeline."""
+    function_name: str
+    invariants_proposed: int
+    invariants_validated: int
+    branch_coverage: float
+    mutation_score: float
+    confidence_score: float
+    surviving_mutant_count: int
+    status: str  # "complete", "running", "failed"
+
+
+# In-memory store for async results (use a database in production)
+_results: dict[str, DiscoveryResponse] = {}
+
+
+async def _run_discovery_async(
+    request_id: str,
+    request: DiscoveryRequest
+):
+    """Run the discovery pipeline in the background."""
+    try:
+        source_path = Path(request.source_file)
+        source_code = source_path.read_text()
+
+        # Extract the target function's source
+        import ast
+        tree = ast.parse(source_code)
+        func_source = None
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.FunctionDef)
+                    and node.name == request.function_name):
+                func_source = ast.get_source_segment(
+                    source_code, node
+                )
+                break
+
+        if func_source is None:
+            _results[request_id] = DiscoveryResponse(
+                function_name=request.function_name,
+                invariants_proposed=0,
+                invariants_validated=0,
+                branch_coverage=0.0,
+                mutation_score=0.0,
+                confidence_score=0.0,
+                surviving_mutant_count=0,
+                status="failed"
+            )
+            return
+
+        report = run_invariant_discovery(
+            source_file=request.source_file,
+            function_source=func_source,
+            target_properties=request.target_properties,
+            model=request.model
+        )
+
+        _results[request_id] = DiscoveryResponse(
+            function_name=report.function_name,
+            invariants_proposed=report.invariants_proposed,
+            invariants_validated=report.invariants_validated,
+            branch_coverage=report.branch_coverage,
+            mutation_score=report.mutation_score,
+            confidence_score=report.confidence_score,
+            surviving_mutant_count=len(report.surviving_mutants),
+            status="complete"
+        )
+    except Exception as e:
+        _results[request_id] = DiscoveryResponse(
+            function_name=request.function_name,
+            invariants_proposed=0,
+            invariants_validated=0,
+            branch_coverage=0.0,
+            mutation_score=0.0,
+            confidence_score=0.0,
+            surviving_mutant_count=0,
+            status=f"failed: {str(e)[:200]}"
+        )
+
+
+@app.post("/discover", response_model=dict)
+async def start_discovery(
+    request: DiscoveryRequest,
+    background_tasks: BackgroundTasks
+):
+    """Start an invariant discovery analysis (runs in background)."""
+    import uuid
+    request_id = str(uuid.uuid4())
+    _results[request_id] = DiscoveryResponse(
+        function_name=request.function_name,
+        invariants_proposed=0,
+        invariants_validated=0,
+        branch_coverage=0.0,
+        mutation_score=0.0,
+        confidence_score=0.0,
+        surviving_mutant_count=0,
+        status="running"
+    )
+    background_tasks.add_task(
+        _run_discovery_async, request_id, request
+    )
+    return {"request_id": request_id, "status": "running"}
+
+
+@app.get("/discover/{request_id}", response_model=DiscoveryResponse)
+async def get_discovery_result(request_id: str):
+    """Check the status of a discovery analysis."""
+    if request_id not in _results:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Not found")
+    return _results[request_id]
+</code></pre>
+<div class="code-caption">Discovery Workbench integration: a FastAPI service that accepts invariant discovery requests, runs the pipeline asynchronously, and returns structured results. The same pipeline can be exposed as an MCP tool for use from AI coding assistants.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Hypothesis Ghost Writer</div>
+<p>
+Hypothesis includes a built-in <code>hypothesis.extra.ghostwriter</code> module that
+generates property tests automatically from function signatures and type annotations.
+Running <code>hypothesis write normalize_spectrum</code> on the command line produces
+a test file with roundtrip, idempotence, and equivalence tests. The ghostwriter
+handles approximately 60% of what our invariant discovery system does, in a single
+command with zero LLM cost. The LLM adds value for the remaining 40%: domain-specific
+metamorphic relations, physically meaningful invariants, and properties that require
+understanding the function's purpose rather than just its type signature. Use the
+ghostwriter as a fast baseline and the LLM for the deeper analysis.
+</p>
+</div>
+
+<h2>7. The Testing-as-Discovery Feedback Loop</h2>
+
+<p>
+The invariant discovery system creates a feedback loop that mirrors the scientific
+method. The LLM proposes hypotheses (invariants). The test framework designs experiments
+(Hypothesis examples). The mutation engine simulates faulty implementations (mutants).
+The confidence score quantifies how well the hypotheses explain the observed behavior.
+When the confidence score is low, the system can be re-run with an expanded prompt
+asking the LLM to target the specific mutant survival patterns, just as a scientist
+designs follow-up experiments to address gaps in their theory.
+</p>
+
+<p>
+This feedback loop connects directly to the broader discovery themes of the book. The
+search framework from <a href="../../part-1-foundations/module-01-discovery-as-search/index.html">Chapter 1</a>
+treats discovery as navigating a search space; here the search space is the space of
+behavioral invariants, and the objective is to find properties that are both true (validated)
+and strong (high mutation score). The hypothesis generation patterns from
+<a href="../../part-4-knowledge/module-39-hypothesis-generation/index.html">Chapter 39</a>
+apply directly: the LLM generates candidate hypotheses, and testing either confirms
+or refutes them. The evaluation metrics from
+<a href="../../part-7-autonomous-discovery/module-56-evaluating-discovery/index.html">Chapter 56</a>
+will revisit this confidence score as a component of overall system trustworthiness.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: LLM-Driven Specification Mining and Autonomous Test Repair</div>
+<p>
+Beyond the invariant discovery pattern presented here, recent systems push toward fully autonomous specification mining and test maintenance. MuTAP (Dakhel et al., 2024) demonstrated that LLMs can simultaneously generate tests and apply mutation analysis in a single feedback loop, achieving mutation scores 20-30% higher than standalone LLM-generated tests by iteratively refining properties based on surviving mutants. Meanwhile, Meta's TestGen-LLM (2024) showed that LLM-generated tests can be integrated into industrial CI pipelines at scale, automatically filtering for tests that improve line and branch coverage on the existing production codebase. The next frontier combines these threads: systems like CoverUp (Pizzorno and Berger, 2024) close the loop entirely by running coverage analysis after every code change, identifying uncovered branches, and generating targeted tests without human intervention, while also pruning redundant tests that kill no unique mutants. These advances point toward test suites that evolve alongside the code they protect, paralleling the self-driving laboratory concept explored in
+<a href="../../part-7-autonomous-discovery/module-55-self-driving-labs/index.html">Chapter 55</a>.
+</p>
+</div>
+
+<div class="callout fun-note">
+<div class="callout-title">Fun Note: The Mutation That Tests Itself</div>
+<p>
+There is a delightful recursive quality to mutation testing: you can run mutmut on
+mutmut's own source code to check whether mutmut's tests are strong enough to detect
+faults in mutmut itself. The mutmut project does exactly this, and their mutation score
+hovers around 85%. The remaining 15% of surviving mutants are mostly in logging and
+display formatting code, where the "correct" behavior is a matter of taste rather than
+correctness. This self-referential quality is fitting: a tool that measures test quality
+should itself have measurably high-quality tests.
+</p>
+</div>
+
+<div class="callout practical-example" data-agent="23">
+<h4>Try It: Invariant Discovery on a Sorting Function</h4>
+<p>
+Build a minimal invariant discovery pipeline for a custom sorting function using only standard Python libraries and Hypothesis. (1) Write a file <code>my_sort.py</code> containing a function <code>merge_sort(lst: list[int]) -> list[int]</code> that implements merge sort from scratch (no calls to <code>sorted()</code> or <code>list.sort()</code>). (2) Manually write five Hypothesis property tests covering the five invariant families: roundtrip (sorting a sorted list returns the same list), idempotence (sorting twice equals sorting once), preservation (output has the same length and same elements as the input), metamorphic (appending a value smaller than all elements places it first after sorting), and oracle comparison (output matches Python's built-in <code>sorted()</code>). (3) Run <code>pytest test_my_sort.py -v</code> and confirm all five properties pass. (4) Install mutmut (<code>pip install mutmut</code>) and run <code>mutmut run --paths-to-mutate=my_sort.py --tests-dir=.</code> to measure the mutation score. Record how many mutants survive. (5) For each surviving mutant, run <code>mutmut show &lt;id&gt;</code> to inspect the mutation, then write a targeted property test that kills it. Re-run mutmut and confirm the mutation score increases. This exercise takes about 30 minutes and requires only <code>pytest</code>, <code>hypothesis</code>, and <code>mutmut</code>.
+</p>
+</div>
+
+<section class="exercises">
+<h2>Exercises</h2>
+
+<div class="exercise">
+<p><strong>Exercise 18.3.1 (Conceptual):</strong>
+The invariant discovery system uses the LLM's self-assessed confidence score for each
+proposed invariant. Describe two failure modes of this self-assessment: a case where
+the LLM assigns high confidence to a false invariant, and a case where it assigns
+low confidence to a true (and important) invariant. How does the validation stage
+(Stage 2) mitigate these failures?
+</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 18.3.2 (Coding):</strong>
+Implement the complete invariant discovery pipeline for a function of your choice
+(at least 30 lines, with multiple branches and at least two input parameters). Run
+all four stages and report the final confidence score. Then, intentionally introduce
+a bug and verify that the confidence score drops. What is the minimum bug severity
+(single character change, operator replacement, constant change) that your discovered
+invariants can detect?
+</p>
+</div>
+
+<div class="exercise">
+<p><strong>Exercise 18.3.3 (Analysis):</strong>
+Compare the invariants generated by Hypothesis's ghostwriter
+(<code>hypothesis write your_function</code>) with those generated by the LLM-based
+Stage 1 of the invariant discovery system. For a scientific function of your choice,
+count the invariants unique to each approach, classify them by family, and measure
+the mutation score achieved by each set independently and combined. What does this
+tell you about the complementary strengths of type-driven and semantics-driven
+invariant inference?
+</p>
+</div>
+
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-18.2.html">&larr; 18.2 Property-Based Testing and Mutation</a>
+<span class="nav-separator">|</span>
+<a href="index.html">Chapter 18 Index</a>
+<span class="nav-separator">|</span>
+<a href="../module-19-ai-debugging/index.html">Chapter 19: AI-Assisted Debugging &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="Section 8.4: Building with a Coding Agent. Recipe for implementing a feature with tests and reasoning traces using a coding agent, extending the Discovery Workbench." name="description"/>
+<title>Section 8.4: Building with a Coding Agent | Building Discovery AI</title>
+<link href="../../styles/book.css" rel="stylesheet"/>
+<link href="../../styles/pygments.css" rel="stylesheet"/>
+<link href="../../vendor/katex/katex.min.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/katex/katex.min.js"></script>
+<script defer="" onload="renderMathInElement(document.body, {
+  delimiters: [
+  {left: '$$', right: '$$', display: true},
+  {left: '$', right: '$', display: false}
+  ],
+  throwOnError: false
+  });" src="../../vendor/katex/contrib/auto-render.min.js"></script>
+<link href="../../vendor/prism/prism-theme.css" rel="stylesheet"/>
+<script defer="" src="../../vendor/prism/prism-bundle.min.js"></script>
+<script defer="" src="../../scripts/book.js"></script>
+</head>
+<body>
+
+<header class="chapter-header">
+<nav class="header-nav">
+<a class="book-title-link" href="../../index.html">Building Discovery AI: From Vibe Coding to Autonomous Science</a>
+<a class="toc-link" href="../../toc.html" title="Table of Contents"><span class="toc-icon">&#9776;</span> Contents</a>
+</nav>
+<div class="part-label"><a href="../index.html">Part II: Discovery Through Software Engineering and Vibe Coding</a></div>
+<div class="chapter-label"><a href="index.html">Chapter 8: Foundations of AI Assisted Software Engineering</a></div>
+<h1>8.4 Building with a Coding Agent</h1>
+</header>
+
+<blockquote class="epigraph">
+<p>"I wrote the tests first, then wrote the code to pass them, then rewrote the tests because I had misunderstood the specification. Exactly like a human developer."</p>
+<cite>A Coding Agent Discovering Test-Driven Development</cite>
+</blockquote>
+
+<main class="content">
+
+<section class="prerequisites-section">
+<h2>Prerequisites</h2>
+<p>
+This section synthesizes everything from the chapter. You should have read
+<a href="section-8.1.html">Section 8.1</a> (code models),
+<a href="section-8.2.html">Section 8.2</a> (repository graphs), and
+<a href="section-8.3.html">Section 8.3</a> (collaboration patterns). We now build a
+concrete system that ties these ideas together. Familiarity with the Discovery
+Workbench concept from
+<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6: Discovery System Architecture</a>
+provides helpful context, though the recipe is self-contained.
+</p>
+</section>
+
+<div class="callout big-picture">
+<div class="callout-title">The Big Picture</div>
+<p>
+The previous three sections gave us the components: models that generate code,
+graphs that map repositories, and patterns for human-AI collaboration. This section
+assembles them into a working system. We build a coding agent that takes a
+natural-language feature specification, analyzes the existing codebase, generates
+an implementation with tests, validates the result, and produces a structured
+reasoning trace documenting every decision. This agent becomes the first
+software-engineering component of the Discovery Workbench, the platform that grows
+across Part II and beyond. By the end of this section, you will have a reusable
+blueprint for AI-assisted feature implementation that you can adapt to your own
+projects.
+</p>
+</div>
+
+<h2>1. The Feature Specification</h2>
+
+<p>
+Every coding agent session begins with a specification. The quality of the
+specification determines the quality of the result more than the capability of the
+model (recall the discussion of in-context learning in
+<a href="section-8.1.html">Section 8.1</a>). A good specification answers four questions:
+<strong>what</strong> should the feature do, <strong>why</strong> is it needed,
+<strong>how</strong> should it integrate with existing code, and <strong>what</strong> does
+"done" look like (acceptance criteria).
+</p>
+
+<p data-agent="02">
+A <strong>coding agent</strong> is an LLM-backed system that reads a codebase, plans changes, writes or modifies source files, runs tests, and iterates on failures, all within a single automated session. It matters because it shifts the developer's role from writing code line by line to specifying intent and reviewing results, compressing hours of routine implementation into minutes of guided generation. The mechanism is a loop: the agent calls the language model to produce code, executes validation tools (linters, test runners, type checkers) on that code, feeds the tool output back into the model as context, and repeats until the validation passes. Use a coding agent when the task is well specified with clear acceptance criteria and testable outputs; prefer manual coding or pair programming when the task requires ambiguous judgment calls, novel architectural decisions, or exploratory prototyping where the requirements themselves are still forming.
+</p>
+
+<p>
+For our recipe, we will implement a <strong>research paper metadata extractor</strong> for
+the Discovery Workbench. This component takes a paper's DOI or title, retrieves
+metadata from public APIs, and returns a structured record. This is a realistic
+feature that connects to the literature mining capabilities we develop in
+<a href="../../part-4-knowledge/module-36-literature-mining/index.html">Chapter 36</a>.
+</p>
+
+<pre><code class="language-python">from dataclasses import dataclass, field
+
+
+@dataclass
+class FeatureSpec:
+    """A structured specification for a coding agent task."""
+    name: str
+    description: str
+    acceptance_criteria: list[str]
+    integration_points: list[str]   # existing code this touches
+    constraints: list[str]          # non-functional requirements
+    examples: list[dict] = field(default_factory=list)
+
+
+paper_extractor_spec = FeatureSpec(
+    name="PaperMetadataExtractor",
+    description=(
+        "A component that retrieves structured metadata for research "
+        "papers given a DOI or title string. It queries the CrossRef "
+        "and Semantic Scholar APIs, merges results, and returns a "
+        "normalized PaperMetadata record."
+    ),
+    acceptance_criteria=[
+        "Given a valid DOI, returns title, authors, year, abstract, "
+        "and venue within 5 seconds.",
+        "Given a title string, returns the top-3 matching papers "
+        "ranked by relevance.",
+        "Handles API rate limits gracefully with exponential backoff.",
+        "Returns a clear error for invalid DOIs rather than crashing.",
+        "All public methods have type hints and docstrings.",
+        "Test coverage for the module exceeds 85%.",
+    ],
+    integration_points=[
+        "discovery_workbench/knowledge/paper_store.py",
+        "discovery_workbench/utils/http_client.py",
+    ],
+    constraints=[
+        "No API keys required (use only free tiers).",
+        "Response objects must be serializable to JSON.",
+        "Must work offline with cached responses for tests.",
+    ],
+    examples=[
+        {
+            "input": {"doi": "10.1038/s41586-023-06221-2"},
+            "expected_fields": ["title", "authors", "year",
+                                "abstract", "venue"],
+        },
+    ],
+)
+</code></pre>
+<div class="code-caption">Listing 8.13: A structured feature specification for a paper metadata extractor, defining acceptance criteria, integration points, and constraints that guide the coding agent.</div>
+
+<h2>2. The Agent Loop</h2>
+
+<p>
+With the specification in hand, the coding agent executes a structured loop. Each
+iteration refines the implementation based on feedback from tests and static
+analysis. The loop has five phases: <strong>plan</strong>, <strong>implement</strong>,
+<strong>test</strong>, <strong>validate</strong>, and <strong>reflect</strong>.
+</p>
+
+<p>
+The key design principle is <strong>test-driven iteration</strong>: the agent writes tests
+before or alongside the implementation, runs them after each change, and uses
+failures as feedback for the next iteration. This is not just good engineering
+practice; it provides the agent with a concrete, automated signal about correctness,
+reducing reliance on the model's uncertain self-assessment.
+</p>
+
+<div class="callout tip" data-agent="06">
+<h4>Mental Model</h4>
+<p>
+Think of the agent loop as a pastry chef following a recipe with a demanding food critic in the kitchen. The chef (the LLM) reads the recipe (the specification), bakes a first attempt (generates code), and then places it in front of the critic (the test suite). The critic does not offer vague opinions; the critic checks exact measurements: "the filling is 2mm too thin on the left side" (a specific failing assertion). The chef adjusts and rebakes, using the critic's precise complaints to guide each revision. Without the critic, the chef would rely on self-assessment ("this looks about right"), which is how language models hallucinate passing code. The test suite acts as an unambiguous, automated critic that converts subjective "does this work?" into objective pass/fail signals the agent can act on mechanically.
+</p>
+</div>
+
+<div class="callout warning" data-agent="10">
+<h4>Common Misconception</h4>
+<p>
+A common misconception is that a coding agent is autonomous: you give it a task, walk away, and return to finished, production-ready code. In practice, the agent is a <em>draft generator with a feedback loop</em>, not an independent engineer. It cannot judge whether the specification itself is correct, whether the acceptance criteria capture all edge cases, or whether the architectural choice it made fits the broader system. The human remains responsible for specification quality, architectural oversight, and final review. Treating the agent as fully autonomous leads to subtle bugs that pass tests but violate unstated requirements, precisely because the agent optimizes for the criteria it was given, not the ones you forgot to write down.
+</p>
+</div>
+
+<pre><code class="language-python">import json
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class AgentPhase(Enum):
+    PLAN = "plan"
+    IMPLEMENT = "implement"
+    TEST = "test"
+    VALIDATE = "validate"
+    REFLECT = "reflect"
+
+
+@dataclass
+class ReasoningStep:
+    """A single step in the agent's reasoning trace."""
+    phase: AgentPhase
+    thought: str          # what the agent is thinking
+    action: str           # what it decides to do
+    observation: str      # what happened after the action
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class CodingAgentSession:
+    """Manages a coding agent's work on a feature specification."""
+    spec: FeatureSpec
+    repo_path: str
+    trace: list[ReasoningStep] = field(default_factory=list)
+    files_created: list[str] = field(default_factory=list)
+    files_modified: list[str] = field(default_factory=list)
+    iteration: int = 0
+    max_iterations: int = 5
+
+    def run(self) -> dict:
+        """Execute the full agent loop."""
+        result = {"status": "started", "iterations": 0}
+
+        # Phase 1: Plan
+        plan = self._plan()
+        self._record(AgentPhase.PLAN,
+                     thought="Analyzing spec and existing code",
+                     action="Generate implementation plan",
+                     observation=plan)
+
+        for self.iteration in range(1, self.max_iterations + 1):
+            # Phase 2: Implement
+            impl_result = self._implement(plan)
+            self._record(AgentPhase.IMPLEMENT,
+                         thought=f"Iteration {self.iteration}: "
+                                 f"writing code",
+                         action=impl_result["action"],
+                         observation=impl_result["result"])
+
+            # Phase 3: Test
+            test_result = self._run_tests()
+            self._record(AgentPhase.TEST,
+                         thought="Running test suite",
+                         action="pytest",
+                         observation=test_result)
+
+            # Phase 4: Validate
+            validation = self._validate(test_result)
+            self._record(AgentPhase.VALIDATE,
+                         thought="Checking acceptance criteria",
+                         action="Validate against spec",
+                         observation=json.dumps(validation))
+
+            # Phase 5: Reflect
+            if validation["all_criteria_met"]:
+                self._record(AgentPhase.REFLECT,
+                             thought="All criteria met",
+                             action="Complete",
+                             observation="Task successful")
+                result["status"] = "success"
+                result["iterations"] = self.iteration
+                break
+
+            # Plan next iteration based on failures
+            feedback = self._extract_feedback(validation)
+            plan = self._replan(plan, feedback)
+            self._record(AgentPhase.REFLECT,
+                         thought=f"Criteria not met: {feedback}",
+                         action="Replan for next iteration",
+                         observation=plan)
+
+        result["trace"] = self.trace
+        result["files_created"] = self.files_created
+        result["files_modified"] = self.files_modified
+        return result
+
+    def _plan(self) -> str:
+        """Analyze the spec and generate an implementation plan.
+
+        In a real agent, this calls the LLM with the spec
+        and repository context.
+        """
+        # Read existing integration points
+        existing_code = self._read_integration_points()
+        plan = (
+            f"1. Create module: paper_metadata.py\n"
+            f"2. Define PaperMetadata dataclass\n"
+            f"3. Implement CrossRef client\n"
+            f"4. Implement Semantic Scholar client\n"
+            f"5. Implement merge logic\n"
+            f"6. Create test file: test_paper_metadata.py\n"
+            f"7. Write tests for each acceptance criterion\n"
+            f"Integration context: {len(existing_code)} files read"
+        )
+        return plan
+
+    def _read_integration_points(self) -> dict[str, str]:
+        """Read existing files that the new code must integrate with."""
+        context = {}
+        for path in self.spec.integration_points:
+            full_path = f"{self.repo_path}/{path}"
+            try:
+                with open(full_path, encoding="utf-8") as f:
+                    context[path] = f.read()
+            except FileNotFoundError:
+                context[path] = ""  # file does not exist yet
+        return context
+
+    def _implement(self, plan: str) -> dict:
+        """Generate or update implementation based on the plan.
+
+        In a real agent, this calls the LLM to generate code.
+        """
+        return {
+            "action": f"Write/update code per plan "
+                      f"(iteration {self.iteration})",
+            "result": "Code written successfully",
+        }
+
+    def _run_tests(self) -> str:
+        """Run the test suite and return results.
+
+        In a real agent, this executes pytest in a subprocess.
+        """
+        return "Tests executed: see output for details"
+
+    def _validate(self, test_result: str) -> dict:
+        """Check each acceptance criterion against test results."""
+        validation = {
+            "criteria_results": {},
+            "all_criteria_met": False,
+        }
+        for criterion in self.spec.acceptance_criteria:
+            # In a real agent, this parses test output and
+            # checks coverage reports
+            validation["criteria_results"][criterion] = {
+                "met": False,
+                "evidence": "pending verification",
+            }
+        return validation
+
+    def _extract_feedback(self, validation: dict) -> str:
+        """Extract actionable feedback from validation results."""
+        unmet = [c for c, r in validation["criteria_results"].items()
+                 if not r["met"]]
+        return f"Unmet criteria: {'; '.join(unmet[:3])}"
+
+    def _replan(self, previous_plan: str, feedback: str) -> str:
+        """Generate a revised plan based on feedback."""
+        return f"Revised plan addressing: {feedback}"
+
+    def _record(self, phase: AgentPhase, thought: str,
+                action: str, observation: str) -> None:
+        """Record a reasoning step in the trace."""
+        self.trace.append(ReasoningStep(
+            phase=phase,
+            thought=thought,
+            action=action,
+            observation=observation,
+        ))
+</code></pre>
+<div class="code-caption">Listing 8.14: The complete coding agent session loop with plan-implement-test-validate-reflect phases, iterating until all acceptance criteria are met or the maximum iteration count is reached.</div>
+
+<div class="callout key-insight">
+<div class="callout-title">Key Insight: The Reasoning Trace Is the Product</div>
+<p>
+The code the agent writes is valuable, but the reasoning trace is arguably more
+valuable. The trace documents <em>why</em> each decision was made, <em>what</em>
+alternatives were considered, and <em>how</em> failures were diagnosed. This
+documentation is produced automatically as a byproduct of the agent's work, solving
+one of software engineering's hardest problems: keeping decision records current.
+When a future developer (or a future agent) needs to understand why the code looks
+the way it does, the reasoning trace provides the answer. We formalize this as
+part of the Discovery Workbench's provenance system in
+<a href="../../part-5-simulation-optimization/module-47-experiment-registries/index.html">Chapter 47</a>.
+</p>
+</div>
+
+<h2>3. Implementing the Paper Metadata Extractor</h2>
+
+<p>
+Let us now build the actual feature. The following implementation shows the code
+that a well-configured coding agent would produce for our specification. We write
+it by hand here to demonstrate the target quality; in practice, the agent generates
+this through the iterative loop above.
+</p>
+
+<pre><code class="language-python">"""Paper metadata extraction for the Discovery Workbench.
+
+Retrieves structured metadata from CrossRef and Semantic Scholar,
+merges results, and returns normalized PaperMetadata records.
+"""
+import json
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+
+@dataclass
+class Author:
+    """A paper author with optional affiliation."""
+    given: str
+    family: str
+    affiliation: str = ""
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.given} {self.family}"
+
+
+@dataclass
+class PaperMetadata:
+    """Normalized metadata for a research paper."""
+    title: str
+    authors: list[Author]
+    year: int
+    abstract: str = ""
+    venue: str = ""
+    doi: str = ""
+    url: str = ""
+    citation_count: int = 0
+    source: str = ""   # which API provided this data
+
+    def to_json(self) -> str:
+        """Serialize to JSON (acceptance criterion: JSON-serializable)."""
+        return json.dumps(asdict(self), indent=2, ensure_ascii=False)
+
+    @classmethod
+    def from_crossref(cls, data: dict) -> "PaperMetadata":
+        """Construct from a CrossRef API response item."""
+        message = data if "message" not in data else data["message"]
+        authors = []
+        for a in message.get("author", []):
+            authors.append(Author(
+                given=a.get("given", ""),
+                family=a.get("family", ""),
+                affiliation=(a.get("affiliation", [{}])[0]
+                             .get("name", "")
+                             if a.get("affiliation") else ""),
+            ))
+
+        # Extract year from date-parts
+        year = 0
+        date_parts = (message.get("published-print", {})
+                      .get("date-parts", [[0]]))
+        if date_parts and date_parts[0]:
+            year = date_parts[0][0]
+
+        return cls(
+            title=message.get("title", [""])[0],
+            authors=authors,
+            year=year,
+            abstract=message.get("abstract", ""),
+            venue=message.get("container-title", [""])[0],
+            doi=message.get("DOI", ""),
+            url=message.get("URL", ""),
+            source="crossref",
+        )
+
+
+class RateLimiter:
+    """Simple rate limiter with exponential backoff."""
+
+    def __init__(self, min_interval: float = 1.0,
+                 max_retries: int = 3):
+        self.min_interval = min_interval
+        self.max_retries = max_retries
+        self._last_call = 0.0
+
+    def wait(self) -> None:
+        """Wait until the minimum interval has elapsed."""
+        elapsed = time.time() - self._last_call
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self._last_call = time.time()
+
+    def call_with_backoff(self, func: callable, *args) -> any:
+        """Call a function with exponential backoff on failure."""
+        for attempt in range(self.max_retries):
+            self.wait()
+            try:
+                return func(*args)
+            except urllib.error.HTTPError as e:
+                if e.code == 429:  # rate limited
+                    wait_time = self.min_interval * (2 ** attempt)
+                    time.sleep(wait_time)
+                else:
+                    raise
+        raise RuntimeError(
+            f"Failed after {self.max_retries} retries"
+        )
+
+
+class PaperMetadataExtractor:
+    """Retrieve and merge paper metadata from multiple sources.
+
+    Queries CrossRef (by DOI or title) and optionally
+    Semantic Scholar (for citation counts and abstracts).
+
+    Usage:
+        extractor = PaperMetadataExtractor()
+        paper = extractor.fetch_by_doi("10.1038/s41586-023-06221-2")
+        print(paper.title, paper.year)
+    """
+
+    CROSSREF_API = "https://api.crossref.org/works"
+    S2_API = "https://api.semanticscholar.org/graph/v1/paper"
+
+    def __init__(self, email: str = "discovery-workbench@example.com"):
+        self.email = email  # polite pool for CrossRef
+        self.rate_limiter = RateLimiter(min_interval=1.0)
+
+    def fetch_by_doi(self, doi: str) -> PaperMetadata:
+        """Fetch metadata for a paper by its DOI.
+
+        Args:
+            doi: A valid DOI string (e.g., "10.1038/s41586-023-06221-2")
+
+        Returns:
+            PaperMetadata with fields populated from CrossRef
+
+        Raises:
+            ValueError: If the DOI format is invalid
+            RuntimeError: If the API is unreachable after retries
+        """
+        if not doi or "/" not in doi:
+            raise ValueError(f"Invalid DOI format: {doi!r}")
+
+        url = f"{self.CROSSREF_API}/{urllib.parse.quote(doi, safe='')}"
+        data = self.rate_limiter.call_with_backoff(
+            self._fetch_json, url
+        )
+        paper = PaperMetadata.from_crossref(data)
+
+        # Enrich with Semantic Scholar data (citation count, abstract)
+        try:
+            s2_data = self._fetch_semantic_scholar(doi)
+            if s2_data:
+                paper.citation_count = s2_data.get("citationCount", 0)
+                if not paper.abstract and s2_data.get("abstract"):
+                    paper.abstract = s2_data["abstract"]
+        except Exception:
+            pass  # S2 enrichment is best-effort
+
+        return paper
+
+    def search_by_title(self, title: str,
+                        top_k: int = 3) -> list[PaperMetadata]:
+        """Search for papers matching a title string.
+
+        Args:
+            title: A search query string
+            top_k: Maximum number of results to return
+
+        Returns:
+            List of PaperMetadata, ranked by relevance
+        """
+        params = urllib.parse.urlencode({
+            "query.title": title,
+            "rows": top_k,
+            "mailto": self.email,
+        })
+        url = f"{self.CROSSREF_API}?{params}"
+        data = self.rate_limiter.call_with_backoff(
+            self._fetch_json, url
+        )
+
+        results = []
+        for item in data.get("message", {}).get("items", []):
+            try:
+                results.append(PaperMetadata.from_crossref(item))
+            except (KeyError, IndexError):
+                continue
+        return results[:top_k]
+
+    def _fetch_json(self, url: str) -> dict:
+        """Fetch JSON from a URL with proper headers."""
+        req = urllib.request.Request(url, headers={
+            "User-Agent": f"DiscoveryWorkbench/1.0 "
+                          f"(mailto:{self.email})",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _fetch_semantic_scholar(self, doi: str) -> Optional[dict]:
+        """Fetch enrichment data from Semantic Scholar."""
+        url = (f"{self.S2_API}/DOI:{doi}"
+               f"?fields=citationCount,abstract")
+        try:
+            return self.rate_limiter.call_with_backoff(
+                self._fetch_json, url
+            )
+        except Exception:
+            return None
+</code></pre>
+<div class="code-caption">Listing 8.15: The complete PaperMetadataExtractor implementation with CrossRef and Semantic Scholar integration, rate limiting with exponential backoff, and JSON serialization.</div>
+
+<h2>4. Writing Agent-Friendly Tests</h2>
+
+<p>
+Tests serve a dual purpose in agent-driven development: they verify correctness
+(the traditional purpose) and they provide the agent with structured feedback for
+its generate-test-refine loop. <strong>Agent-friendly tests</strong> have three properties
+that make them effective feedback signals:
+</p>
+
+<ol>
+<li><strong>Isolated:</strong> Each test exercises one behavior, so a failure points to a specific problem rather than a vague area.</li>
+<li><strong>Descriptive:</strong> Test names and assertion messages explain what should be true, so the agent can diagnose failures from the output without re-reading the test code.</li>
+<li><strong>Offline-capable:</strong> Tests use mocked or cached responses rather than live API calls, ensuring they run fast and deterministically (recall the constraint in our specification).</li>
+</ol>
+
+<pre><code class="language-python">"""Tests for the PaperMetadataExtractor.
+
+Uses cached API responses for deterministic, offline testing.
+"""
+import json
+import pytest
+from unittest.mock import patch, MagicMock
+
+# Assume paper_metadata module is importable
+# from discovery_workbench.knowledge.paper_metadata import (
+#     PaperMetadataExtractor, PaperMetadata, Author, RateLimiter
+# )
+
+
+# --- Fixtures: cached API responses ---
+
+CROSSREF_DOI_RESPONSE = {
+    "message": {
+        "title": ["Scaling deep learning for materials discovery"],
+        "author": [
+            {"given": "Amil", "family": "Merchant",
+             "affiliation": [{"name": "Google DeepMind"}]},
+            {"given": "Simon", "family": "Batzner",
+             "affiliation": [{"name": "Google DeepMind"}]},
+        ],
+        "published-print": {"date-parts": [[2023, 11, 29]]},
+        "abstract": "Graph networks for crystal stability.",
+        "container-title": ["Nature"],
+        "DOI": "10.1038/s41586-023-06221-2",
+        "URL": "https://doi.org/10.1038/s41586-023-06221-2",
+    }
+}
+
+S2_RESPONSE = {
+    "citationCount": 847,
+    "abstract": "A detailed abstract from Semantic Scholar.",
+}
+
+
+class TestPaperMetadataFromCrossRef:
+    """Test the CrossRef response parsing."""
+
+    def test_parses_title(self):
+        paper = PaperMetadata.from_crossref(CROSSREF_DOI_RESPONSE)
+        assert paper.title == "Scaling deep learning for materials discovery"
+
+    def test_parses_authors(self):
+        paper = PaperMetadata.from_crossref(CROSSREF_DOI_RESPONSE)
+        assert len(paper.authors) == 2
+        assert paper.authors[0].full_name == "Amil Merchant"
+        assert paper.authors[0].affiliation == "Google DeepMind"
+
+    def test_parses_year(self):
+        paper = PaperMetadata.from_crossref(CROSSREF_DOI_RESPONSE)
+        assert paper.year == 2023
+
+    def test_parses_venue(self):
+        paper = PaperMetadata.from_crossref(CROSSREF_DOI_RESPONSE)
+        assert paper.venue == "Nature"
+
+    def test_handles_missing_abstract(self):
+        data = {"message": {
+            "title": ["Test"], "author": [], "DOI": "10/test",
+            "published-print": {"date-parts": [[2024]]},
+            "container-title": ["Journal"],
+        }}
+        paper = PaperMetadata.from_crossref(data)
+        assert paper.abstract == ""
+
+
+class TestPaperMetadataExtractor:
+    """Test the extractor's public API with mocked HTTP calls."""
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_by_doi_returns_metadata(self, mock_urlopen):
+        """Acceptance: valid DOI returns title, authors, year,
+        abstract, and venue."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(
+            CROSSREF_DOI_RESPONSE).encode()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        extractor = PaperMetadataExtractor()
+        paper = extractor.fetch_by_doi("10.1038/s41586-023-06221-2")
+
+        assert paper.title != ""
+        assert len(paper.authors) > 0
+        assert paper.year > 0
+        assert paper.venue != ""
+
+    def test_invalid_doi_raises_valueerror(self):
+        """Acceptance: invalid DOI returns clear error."""
+        extractor = PaperMetadataExtractor()
+        with pytest.raises(ValueError, match="Invalid DOI format"):
+            extractor.fetch_by_doi("not-a-doi")
+
+    def test_empty_doi_raises_valueerror(self):
+        extractor = PaperMetadataExtractor()
+        with pytest.raises(ValueError, match="Invalid DOI format"):
+            extractor.fetch_by_doi("")
+
+
+class TestPaperMetadataSerialization:
+    """Acceptance: response objects must be JSON-serializable."""
+
+    def test_to_json_produces_valid_json(self):
+        paper = PaperMetadata(
+            title="Test Paper",
+            authors=[Author(given="Ada", family="Lovelace")],
+            year=1843,
+            abstract="An analytical engine program.",
+            venue="Notes",
+            doi="10.0000/test",
+        )
+        json_str = paper.to_json()
+        parsed = json.loads(json_str)  # should not raise
+        assert parsed["title"] == "Test Paper"
+        assert parsed["year"] == 1843
+
+
+class TestRateLimiter:
+    """Test rate limiting and backoff behavior."""
+
+    def test_respects_minimum_interval(self):
+        limiter = RateLimiter(min_interval=0.1)
+        import time
+        start = time.time()
+        limiter.wait()
+        limiter.wait()
+        elapsed = time.time() - start
+        assert elapsed >= 0.1, (
+            f"Second call should wait at least 0.1s, "
+            f"but elapsed={elapsed:.3f}s"
+        )
+
+    def test_backoff_retries_on_429(self):
+        limiter = RateLimiter(min_interval=0.01, max_retries=3)
+        call_count = 0
+
+        def flaky_func():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                err = MagicMock()
+                err.code = 429
+                raise type("HTTPError", (Exception,), {
+                    "code": 429})()
+            return "success"
+
+        # This should succeed on the 3rd attempt
+        # (simplified; real test uses urllib.error.HTTPError)
+</code></pre>
+<div class="code-caption">Listing 8.16: Agent-friendly tests for the PaperMetadataExtractor, using cached responses, descriptive assertions, and clear test names that map to acceptance criteria.</div>
+
+<div class="callout library-shortcut">
+<div class="callout-title">Library Shortcut: Habanero for CrossRef Access</div>
+<p>
+The manual <code>urllib</code>-based CrossRef client above is instructive but
+verbose. The <code>habanero</code> library wraps the entire CrossRef API in a
+Pythonic interface:
+</p>
+<pre><code class="language-python">from habanero import Crossref
+
+cr = Crossref(mailto="you@example.com")
+
+# Fetch by DOI
+result = cr.works(ids="10.1038/s41586-023-06221-2")
+title = result["message"]["title"][0]
+
+# Search by title
+results = cr.works(query_title="scaling deep learning materials",
+                   limit=3)
+</code></pre>
+<p>
+This reduces the CrossRef client from approximately 40 lines to 3, handling rate
+limiting, pagination, and error recovery internally.
+</p>
+</div>
+
+<h2>5. The Reasoning Trace</h2>
+
+<p>
+The reasoning trace captures the agent's decision-making process in a structured,
+auditable format. Each step records what the agent observed, what it thought, what
+it did, and what happened. This trace serves three audiences: the <strong>current developer</strong>
+reviewing the agent's work, <strong>future developers</strong> understanding why the code looks
+the way it does, and <strong>the agent itself</strong> during iterative refinement (the trace
+of previous attempts informs the next attempt).
+</p>
+
+<pre><code class="language-python">def format_reasoning_trace(trace: list[ReasoningStep]) -> str:
+    """Format a reasoning trace as a human-readable document.
+
+    Produces a Markdown-formatted trace suitable for inclusion
+    in a pull request description or commit message.
+    """
+    lines = ["# Agent Reasoning Trace\n"]
+
+    current_phase = None
+    for i, step in enumerate(trace, 1):
+        if step.phase != current_phase:
+            current_phase = step.phase
+            lines.append(f"\n## Phase: {current_phase.value.title()}\n")
+
+        lines.append(f"### Step {i}")
+        lines.append(f"**Thought:** {step.thought}")
+        lines.append(f"**Action:** {step.action}")
+        lines.append(f"**Observation:** {step.observation}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def compute_trace_metrics(trace: list[ReasoningStep]) -> dict:
+    """Compute summary metrics from a reasoning trace."""
+    phases = {}
+    for step in trace:
+        phase = step.phase.value
+        phases[phase] = phases.get(phase, 0) + 1
+
+    total_duration = 0
+    if len(trace) >= 2:
+        total_duration = trace[-1].timestamp - trace[0].timestamp
+
+    return {
+        "total_steps": len(trace),
+        "steps_per_phase": phases,
+        "total_duration_seconds": round(total_duration, 1),
+        "plan_steps": phases.get("plan", 0),
+        "implement_steps": phases.get("implement", 0),
+        "test_steps": phases.get("test", 0),
+        "reflect_steps": phases.get("reflect", 0),
+    }
+</code></pre>
+<div class="code-caption">Listing 8.17: Formatting and summarizing the agent's reasoning trace into a Markdown document with per-phase metrics for inclusion in pull request descriptions.</div>
+
+<h2>6. Connecting to the Discovery Workbench</h2>
+
+<p>
+The PaperMetadataExtractor we built in this section becomes a component of the
+Discovery Workbench. The agent-driven development process we followed, from structured
+specification through iterative implementation with tests and reasoning traces, is
+itself a reusable pattern. As the Workbench grows across Part II, each new component
+can be developed using the same loop:
+</p>
+
+<ol>
+<li>Write a <code>FeatureSpec</code> with clear acceptance criteria.</li>
+<li>Run the coding agent with the spec and existing codebase context.</li>
+<li>Review the reasoning trace and the generated tests.</li>
+<li>Accept, modify, or reject the result.</li>
+<li>Commit with the reasoning trace attached to the pull request.</li>
+</ol>
+
+<p>
+This pattern becomes more powerful as the codebase grows, because each new component
+inherits context from existing components through the repository graph. The agent
+that builds the citation network analyzer in
+<a href="../../part-4-knowledge/module-38-knowledge-graphs/index.html">Chapter 38</a>
+will read the <code>PaperMetadata</code> dataclass we defined here and generate code
+that integrates seamlessly, without manual coordination.
+</p>
+
+<div class="callout research-frontier" data-agent="18">
+<div class="callout-title">Research Frontier: Verified Multi-Step Coding Agents</div>
+<p>
+The agent loop in this section runs a fixed plan-implement-test cycle, but recent
+work pushes toward agents that verify their own reasoning at each step.
+<strong>SWE-agent</strong> (Yang et al., 2024) introduced an agent-computer interface
+specifically designed for repository-level coding tasks, achieving a 12.5% resolve
+rate on the SWE-bench benchmark of real GitHub issues. Building on this,
+<strong>SWE-bench Verified</strong> (Chowdhury et al., 2024) curated a human-validated
+subset of 500 problems that filters out ambiguous or underspecified issues,
+providing a more reliable signal for measuring agent progress. By late 2024,
+frontier agents surpassed 50% on this verified subset, a threshold that seemed
+unreachable months earlier. The key insight from this line of work is that the
+bottleneck is not code generation but <em>localization</em>: finding the right files
+and functions to edit in a large repository, exactly the repository graph reasoning
+from <a href="section-8.2.html">Section 8.2</a>. This connects to the autonomous
+software engineering trajectory explored in
+<a href="../module-24-autonomous-software/index.html">Chapter 24</a>.
+</p>
+</div>
+
+<div class="callout practical-example">
+<div class="callout-title">Practical Example: Running This Recipe with Claude Code</div>
+<p>
+To replicate this recipe with Claude Code on your own project:
+</p>
+<ol>
+<li>Create a <code>CLAUDE.md</code> file in your repo root describing your project's architecture, conventions, and testing patterns.</li>
+<li>Write your feature specification as a structured prompt (similar to <code>FeatureSpec</code> above).</li>
+<li>Run Claude Code in the terminal with your specification as the initial prompt.</li>
+<li>Let the agent read your codebase, propose a plan, and implement the feature.</li>
+<li>Review the diff and the test results before accepting.</li>
+</ol>
+<p>
+The <code>CLAUDE.md</code> file acts as persistent context, ensuring the agent
+follows your project's conventions across sessions. We explore this
+context-engineering pattern in depth in
+<a href="../module-11-context-engineering/index.html">Chapter 11</a>.
+</p>
+</div>
+
+<h2>Exercises</h2>
+
+<ol class="exercises">
+<li>
+<strong>(Conceptual)</strong> The agent loop in Listing 8.14 has a fixed maximum of 5
+iterations. Argue for or against making this limit adaptive: higher for complex
+tasks, lower for simple ones. What signal would you use to determine task complexity
+before the agent starts?
+</li>
+<li>
+<strong>(Coding)</strong> Extend the <code>PaperMetadataExtractor</code> to support a local
+cache: if a DOI has been fetched before, return the cached result without an API
+call. Use a JSON file as the cache backend. Write tests that verify cache hits and
+cache misses, including the case where the cache file does not yet exist.
+</li>
+<li>
+<strong>(Analysis)</strong> Compare the reasoning traces produced by two different coding
+agents (e.g., Claude Code and Codex CLI) on the same task. How do they differ in
+the number of tool calls, the granularity of their planning, and the quality of
+their self-diagnosis when tests fail? Propose three metrics for comparing trace
+quality across agents.
+</li>
+</ol>
+
+<section class="whats-next">
+<h2>What's Next</h2>
+<p>
+This chapter established the foundations: code models that generate programs,
+repository graphs that enable cross-file reasoning, collaboration patterns that
+structure human-AI interaction, and an agent-driven development recipe that ties
+everything together. In
+<a href="../module-09-vibe-coding/index.html">Chapter 9: Vibe Coding as Specification, Steering, Verification</a>,
+we shift perspective from the AI's internals to the developer's practice. Vibe coding
+redefines the developer's role: instead of writing code, you specify intent, steer
+the AI's exploration, and verify the output. The foundations from this chapter are
+the machinery that makes that new practice possible.
+</p>
+</section>
+
+</main>
+
+<nav class="chapter-nav">
+<a href="section-8.3.html">&larr; 8.3 Human-AI Collaboration Patterns</a>
+<a href="index.html">Chapter 8</a>
+<a href="../module-09-vibe-coding/index.html">Chapter 9: Vibe Coding &rarr;</a>
+</nav>
+
+<footer>
+<p class="footer-edition">Building Discovery AI: From Vibe Coding to Autonomous Science, First Edition</p>
+<p class="footer-copyright">&copy; 2026 Alexander Apartsin &amp; Yehudit Aperstein &middot; <a href="../../toc.html">Contents</a></p>
+</footer>
+
+</body>
+</html>
