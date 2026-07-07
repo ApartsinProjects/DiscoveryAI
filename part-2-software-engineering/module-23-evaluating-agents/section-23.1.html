@@ -306,6 +306,42 @@ def _validate_test_behavior(
 </code></pre>
 <div class="code-caption">Simplified task extraction pipeline that mirrors SWE-bench's construction logic. The <code>extract_task_from_pr</code> function takes a merged pull request and produces a <code>TaskInstance</code> with all four benchmark components: base commit, issue text, test patch, and gold patch. The validation step ensures the test patch genuinely distinguishes the buggy state from the fixed state.</div>
 
+<div class="callout practical-example" data-agent="26">
+<h4>Step-Through: Task Construction from a Pull Request</h4>
+<p>
+Trace through <code>extract_task_from_pr</code> with a concrete example. Suppose PR #4821
+in the <code>requests</code> library fixes a bug where <code>Session.resolve_redirects</code>
+drops query parameters on 303 redirects.
+</p>
+<p>
+<strong>Input:</strong> <code>merge_commit = "a1b2c3d"</code>,
+<code>test_files = ["tests/test_requests.py"]</code>,
+<code>issue_text = "Query params lost on 303 redirect"</code>.
+</p>
+<p>
+<strong>Step 1</strong> (find base commit): <code>git rev-parse a1b2c3d^</code> returns
+<code>"e4f5g6h"</code>. This is the commit where the bug still exists.
+</p>
+<p>
+<strong>Step 2</strong> (extract test patch): <code>git diff e4f5g6h a1b2c3d -- tests/test_requests.py</code>
+yields a 14-line diff adding <code>test_303_redirect_preserves_query</code>. The diff is
+non-empty, so we proceed.
+</p>
+<p>
+<strong>Step 3</strong> (extract gold patch): <code>git diff --name-only</code> lists two files:
+<code>tests/test_requests.py</code> and <code>requests/models.py</code>. After filtering out
+the test file, <code>src_files = ["requests/models.py"]</code>. The gold patch is a 7-line
+diff adding a query-string preservation check in <code>resolve_redirects</code>.
+</p>
+<p>
+<strong>Step 4</strong> (validate): checkout <code>e4f5g6h</code>, run
+<code>pytest tests/test_requests.py::test_303_redirect_preserves_query</code>: exit code 1
+(test fails, confirming the bug). Checkout <code>a1b2c3d</code>, run same test: exit code 0
+(test passes, confirming the fix). Validation succeeds; return a <code>TaskInstance</code>
+with all four fields populated.
+</p>
+</div>
+
 <h3>2.3 Task Validation and Difficulty</h3>
 
 <p>
@@ -512,6 +548,20 @@ might excel at single-file bug fixes with clear reproduction steps but fail comp
 at cross-module refactors described only in natural language. A suite that over-represents
 one task type produces misleading aggregate scores.
 </p>
+
+<div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
+<h4>Real-World Application: Google's Internal Coding Agent Evaluation</h4>
+<p>
+Google's Gemini-powered coding agent uses a repo-level task suite drawn from Google's
+own monorepo to evaluate performance before each deployment. Rather than relying on
+public benchmarks, the team constructs tasks from recently resolved internal bug reports
+across multiple languages (C++, Java, Python, Go), stratified by component and severity.
+This internal suite revealed that the agent's resolve rate on Google's codebase was
+roughly 15 percentage points lower than its SWE-bench score, primarily because Google's
+monorepo uses custom build tooling and style conventions that public benchmarks never
+exercise.
+</p>
+</div>
 
 <div class="callout research-frontier" data-agent="18">
 <div class="callout-title">Research Frontier</div>
@@ -879,6 +929,65 @@ task, checks out the base commit, applies the test patch, applies the gold patch
 it were the agent's output, and runs pytest. If the tests pass, your task construction
 is correct. If they fail, debug the patch extraction from step 2.</li>
 </ol>
+</div>
+
+<div class="callout exercise" data-agent="07">
+<h4>Exercise 23.1.1</h4>
+<p>
+You extract a benchmark task from a pull request and find that the test patch adds two
+assertions: one checks that <code>process_data([])</code> returns an empty list, and
+another checks that <code>process_data([1, 2, 3])</code> returns <code>[2, 4, 6]</code>.
+The gold patch fixes a bug in <code>process_data</code> that crashed on empty input.
+An agent submits a patch that hardcodes <code>if not data: return []</code> at the top
+of the function but leaves the original doubling logic (which already worked for
+non-empty input) untouched. Does this agent patch pass the oracle? Is the patch a
+correct fix? What additional test assertion would distinguish a correct fix from this
+shortcut?
+</p>
+<details><summary>Hint</summary>
+<p>
+Think about inputs the test patch does not cover. What happens with
+<code>process_data(None)</code> or <code>process_data("abc")</code>? The hardcoded
+empty-list check passes both existing assertions but may not handle the root cause
+(for example, a missing type check or a division-by-zero on <code>len(data)</code>).
+An assertion testing a boundary case like <code>process_data([0])</code> returning
+<code>[0]</code> would not help here, but one testing the specific crash trigger
+(say, <code>process_data(None)</code> raising <code>TypeError</code>) would expose
+whether the agent addressed the actual bug or just papered over the symptom.
+</p>
+</details>
+</div>
+
+<div class="callout lab" data-agent="41">
+<h4>Lab: Measuring Oracle Weakness in a Real Benchmark</h4>
+<p>
+<strong>Goal:</strong> Quantify how many SWE-bench tasks can be "solved" by trivially
+incorrect patches, revealing the gap between passing the oracle and producing a correct fix.
+</p>
+<p>
+<strong>Tools needed:</strong> Python 3.10+, the <code>datasets</code> library
+(<code>pip install datasets</code>), Git, and Docker (for the SWE-bench harness).
+</p>
+<p>
+<strong>Procedure (20-30 minutes):</strong> Load the SWE-bench Lite dataset from
+Hugging Face (<code>datasets.load_dataset("princeton-nlp/SWE-bench_Lite")</code>).
+Select five tasks at random. For each task, read the gold patch and construct a
+"degenerate" patch: one that hardcodes the expected output for the specific inputs
+tested by the test patch (for example, adding an early-return branch that matches the
+test's exact arguments). Run each degenerate patch through the evaluation harness.
+Record how many of the five pass the oracle despite being clearly incorrect.
+</p>
+<p>
+<strong>What to vary:</strong> Try different degeneracy strategies: hardcoded return
+values, input-specific branches, and monkey-patching the test expectations themselves.
+Compare against the SWE-bench+ strengthened test suites if available.
+</p>
+<p>
+<strong>What to observe:</strong> Track the fraction of tasks where degenerate patches
+pass (the "false positive rate" of the oracle). Note which tasks have strong enough test
+patches to reject all degenerate patches and examine what makes those test patches more
+robust (multiple assertions, diverse inputs, edge-case coverage).
+</p>
 </div>
 
 <section class="exercises">

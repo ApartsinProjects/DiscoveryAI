@@ -894,6 +894,40 @@ def feedback_to_benchmark(
 
 <p>The research copilot integrates naturally into the Discovery Workbench we have been building since <a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>. In the workbench architecture, the copilot serves as the <em>knowledge retrieval layer</em>: other components (hypothesis generators from <a href="../module-39-hypothesis-generation/index.html">Chapter 39</a>, research agents from <a href="../module-40-research-agents/index.html">Chapter 40</a>, claim validators from <a href="../module-41-claim-validation/index.html">Chapter 41</a>) query the copilot to ground their reasoning in published evidence. The faithfulness guarantees we built into this chapter ensure that downstream components can trust the evidence the copilot provides, preventing hallucination from propagating through the entire discovery pipeline.</p>
 
+<div class="callout exercise" data-agent="07">
+<h4>Exercise 37.3.1</h4>
+<p>The research copilot's <code>retrieve_and_rerank</code> method deduplicates candidates using the key <code>doc_id + ":" + passage[:100]</code>. Suppose two chunks from the same paper share the same first 100 characters but differ afterward (for example, overlapping chunks created by the sliding-window chunker). What happens to the second chunk? Propose a better deduplication key and explain why it avoids this failure mode.</p>
+<details><summary>Hint</summary>The <code>PaperChunk</code> dataclass already contains a deterministic, unique <code>chunk_id</code> derived from the paper ID and character offset. Using that as the deduplication key guarantees that overlapping chunks with shared prefixes are both retained, while true duplicates (same paper, same offset) are still collapsed.</details>
+</div>
+
+<div class="callout practical-example" data-agent="26">
+<h4>Step-Through: Multi-Hop Retrieval Pipeline</h4>
+<p>Trace through the <code>ask</code> method with the question "Does osimertinib overcome T790M resistance, and can liquid biopsy detect it early?"</p>
+<p><strong>Step 1 (Decompose):</strong> The LLM splits this into two sub-queries: SQ1 = "osimertinib activity against T790M resistance mutation" and SQ2 = "liquid biopsy detection of EGFR resistance mutations."</p>
+<p><strong>Step 2 (Retrieve):</strong> SQ1 retrieves 3 candidates with bi-encoder scores: soria_2018 (0.87), yu_2014 (0.82), leonetti_2019 (0.71). SQ2 retrieves: oxnard_2016 (0.91), leonetti_2019 (0.68). After deduplication, there are 4 unique candidates. The leonetti_2019 entry records both sub-queries in its <code>sub_queries_matched</code> list.</p>
+<p><strong>Step 3 (Rerank):</strong> The cross-encoder rescores all 4 candidates against the original question. New scores: oxnard_2016 = 0.93, soria_2018 = 0.88, yu_2014 = 0.74, leonetti_2019 = 0.61. All pass the 0.3 threshold. Top k_rerank = 5 keeps all four.</p>
+<p><strong>Step 4 (Generate):</strong> The four passages are formatted as [Source 1] through [Source 4] and sent to the LLM with citation instructions. The generated answer cites Sources 1, 2, and 3.</p>
+<p><strong>Step 5 (Evaluate):</strong> Faithfulness check decomposes the answer into 5 claims, verifies each against the source passages, and returns a score of 0.80 (4 of 5 claims supported; one inference combining data across two sources is flagged as unsupported).</p>
+</div>
+
+<div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
+<h4>Real-World Application: Biomedical Literature at Elicit</h4>
+<p>Elicit (elicit.com), an AI research assistant for scientists, uses a multi-hop RAG pipeline structurally similar to the copilot in this section. Given a research question, it decomposes it into sub-queries, retrieves relevant paper abstracts from a corpus of over 200 million papers via Semantic Scholar, reranks candidates with a learned relevance model, and generates cited summaries with per-claim source attribution. Their production system processes millions of queries per month and uses faithfulness evaluation to flag answers where citation support is weak, demonstrating that the retrieve-rerank-generate-evaluate architecture scales from a lab prototype to a commercial product.</p>
+</div>
+
+<div class="callout fun-note" data-agent="34">
+<h4>The Chunking Wars</h4>
+<p>In 2023 and 2024, the RAG community experimented with dozens of chunking strategies, from fixed-size windows to recursive character splitting to "semantic chunking" that places boundaries where embedding similarity between adjacent sentences drops below a threshold. After extensive benchmarking, multiple teams (including LlamaIndex's own evaluation suite and the MTEB retrieval leaderboard contributors) converged on a surprising finding: simple overlapping fixed-size chunks of 256 to 512 tokens, combined with a strong reranker, match or outperform sophisticated semantic chunking on most retrieval benchmarks. The reranker compensates for imperfect chunk boundaries by scoring full question-passage relevance, making the exact chunking strategy less critical than most practitioners assume. The lesson: invest your engineering budget in the reranker, not the chunker.</p>
+</div>
+
+<div class="callout lab" data-agent="41">
+<h4>Lab: Measuring How Chunk Size Affects Faithfulness</h4>
+<p><strong>Goal:</strong> Determine empirically how chunk size and overlap parameters affect retrieval recall and answer faithfulness in a research copilot.</p>
+<p><strong>Tools needed:</strong> Python 3.10+, <code>sentence-transformers</code>, <code>qdrant-client</code>, and access to any LLM API (or a local model via <code>ollama</code>). Use 20 to 30 arXiv abstracts as your test corpus (download via the arXiv API as shown in the "Try It" callout above).</p>
+<p><strong>What to vary:</strong> Run the ingestion and query pipeline three times with different chunk sizes: 128, 256, and 512 tokens, each with overlap set to 25% of the chunk size. Keep the same 5 benchmark questions across all runs.</p>
+<p><strong>What to observe:</strong> For each configuration, record (1) the number of chunks produced, (2) retrieval recall (did the top-5 results include the correct source abstract?), (3) the rerank score distribution, and (4) the faithfulness score of the generated answer. Plot chunk size on the x-axis against faithfulness and recall on the y-axis. You should observe that very small chunks improve recall (more fine-grained matching) but can reduce faithfulness (the generator lacks enough context per passage to avoid hallucinating connections), while very large chunks preserve context but dilute relevance scores.</p>
+</div>
+
 <h2>Section Summary</h2>
 
 <p>We built a complete multi-hop research copilot from components: a corpus ingestion pipeline that parses PDFs into searchable chunks (Listing 37.17-37.18), a multi-hop retrieval engine with query decomposition and cross-encoder reranking (Listing 37.19), a cited answer generator with faithfulness evaluation (Listing 37.20), and a benchmark harness for systematic evaluation (Listing 37.21). Production considerations include incremental ingestion, semantic query caching, and user feedback loops that convert failure cases into regression tests. The copilot's modular architecture positions it as the knowledge retrieval layer in the Discovery Workbench, supporting the research agents and hypothesis generators we will build in the chapters ahead.</p>

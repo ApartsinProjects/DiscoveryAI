@@ -654,6 +654,39 @@ A frequent misconception is that adding more security tools to the pipeline alwa
 </p>
 </div>
 
+<div class="callout exercise" data-agent="07">
+<h4>Exercise 20.3.1</h4>
+<p>
+The <code>UnifiedFinding.fingerprint()</code> method uses <code>f"{self.cwe_id}:{self.file_path}:{self.line_start}"</code> to deduplicate across tools. Suppose a developer refactors <code>app/main.py</code> by extracting the search endpoint into a new file <code>app/search.py</code> without changing the vulnerable SQL concatenation. After the refactor, Bandit reports the SQL injection at <code>app/search.py:12</code> and the previous pipeline run recorded it at <code>app/main.py:52</code>. Does the fingerprint correctly recognize these as the same vulnerability, or does it treat them as two separate findings? Write a modified <code>fingerprint()</code> method that handles this scenario correctly.
+</p>
+<details><summary>Hint</summary>
+<p>
+The current fingerprint includes the file path and line number, both of which change during a refactor. Consider fingerprinting on the code snippet content itself (or a normalized hash of it) combined with the CWE, so that the same vulnerable pattern produces the same fingerprint regardless of where it lives in the codebase.
+</p>
+</details>
+</div>
+
+<div class="callout practical-example" data-agent="26">
+<h4>Step-Through: Deduplication Across Three Tools</h4>
+<p>
+Trace through the <code>_deduplicate()</code> method with three findings from different tools, all targeting the SQL injection on line 42:
+</p>
+<p>
+<strong>Input findings (in order):</strong><br/>
+F0: id=<code>BAN-000</code>, source=BANDIT, cwe=CWE-89, file=<code>app/main.py</code>, line_start=42<br/>
+F1: id=<code>SEM-003</code>, source=SEMGREP, cwe=CWE-89, file=<code>app/main.py</code>, line_start=42<br/>
+F2: id=<code>LLM-007</code>, source=LLM_REVIEW, cwe=CWE-89, file=<code>app/main.py</code>, line_start=42
+</p>
+<p>
+<strong>Iteration 1 (F0):</strong> Compute fingerprint: <code>md5("CWE-89:app/main.py:42")[:12]</code> = <code>"a1b2c3d4e5f6"</code>. The <code>seen</code> dict is empty, so store <code>{"a1b2c3d4e5f6": "BAN-000"}</code>. F0 stays active.<br/>
+<strong>Iteration 2 (F1):</strong> Same fingerprint <code>"a1b2c3d4e5f6"</code>. Already in <code>seen</code>, so set F1.<code>is_duplicate = True</code>, F1.<code>duplicate_of = "BAN-000"</code>.<br/>
+<strong>Iteration 3 (F2):</strong> Same fingerprint again. Set F2.<code>is_duplicate = True</code>, F2.<code>duplicate_of = "BAN-000"</code>.
+</p>
+<p>
+<strong>Result:</strong> One active finding (BAN-000) with two corroborating duplicates. The report shows a single SQL injection entry instead of three, and the <code>deduplicated_count</code> increments by 2.
+</p>
+</div>
+
 <h2>3. Running the Pipeline</h2>
 
 <p>
@@ -1211,6 +1244,13 @@ jobs:
 </code></pre>
 <div class="code-caption">Listing 20.22: GitHub Actions workflow that runs the security pipeline on pull requests, blocks merges on critical findings, and archives reports as build artifacts.</div>
 
+<div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
+<h4>Real-World Application: GitLab's Multi-Scanner Security Pipeline</h4>
+<p>
+GitLab's DevSecOps platform implements exactly this multi-tool pipeline architecture in production. Its "Security Dashboard" aggregates findings from SAST (Semgrep), DAST (OWASP ZAP), dependency scanning (Gemnasium), container scanning (Trivy), and secret detection into a single unified view per merge request, using CWE-based deduplication and confidence scoring to collapse overlapping alerts. As of 2025, GitLab reports that teams using the integrated pipeline resolve vulnerabilities 3.5 times faster than teams running each scanner independently, primarily because engineers triage one consolidated list instead of context-switching between five separate dashboards.
+</p>
+</div>
+
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: Snyk, SonarQube, and GitHub Advanced Security</div>
 <p>
@@ -1404,6 +1444,18 @@ and writes the normalized findings to <code>report.json</code>. Run the full scr
 and verify that every intentional flaw in your <code>vulnerable_app.py</code> appears in the
 report. Then try fixing one flaw (replace <code>os.system()</code> with
 <code>subprocess.run()</code> using a list argument), rerun, and confirm the finding disappears.
+</p>
+</div>
+
+<div class="callout lab" data-agent="41">
+<h4>Lab: Measure Your Pipeline's Precision and Recall</h4>
+<p>
+<strong>Goal:</strong> Build a minimal security pipeline, run it against a file with known vulnerabilities, and compute precision, recall, and F1 score.<br/>
+<strong>Tools needed:</strong> Python 3.10+, <code>pip install bandit semgrep</code>, a text editor.<br/>
+<strong>Setup (5 min):</strong> Create a file <code>target.py</code> containing exactly five intentional flaws: (1) <code>os.system(user_input)</code> (CWE-78), (2) <code>eval(user_input)</code> (CWE-95), (3) <code>hashlib.md5(password)</code> (CWE-916), (4) <code>SECRET_KEY = "hunter2"</code> (CWE-798), (5) <code>subprocess.run(cmd, shell=True)</code> (CWE-78). Record these five as your ground truth with CWE, file, and line number.<br/>
+<strong>Run (10 min):</strong> Execute <code>bandit -f json target.py</code> and <code>semgrep --config auto target.py --json</code>. Parse both JSON outputs, normalize each finding to <code>{cwe, file, line}</code>, and deduplicate using the fingerprint method from this section.<br/>
+<strong>What to vary:</strong> (a) Try removing one flaw and rerunning to confirm the finding disappears. (b) Add a safe <code>hashlib.sha256()</code> call and check whether either tool false-positives on it. (c) Add a Semgrep custom rule targeting <code>eval()</code> and see whether the deduplication correctly merges it with the Bandit finding.<br/>
+<strong>What to observe:</strong> Compute precision, recall, and F1 after each variation. Notice how adding a second tool (Semgrep) changes recall (it may catch flaws Bandit misses) but can also change precision (it may introduce new false positives). Record which tool found which flaw to see where their coverage overlaps and where it diverges.
 </p>
 </div>
 

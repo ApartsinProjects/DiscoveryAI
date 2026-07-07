@@ -1109,6 +1109,49 @@ with mlflow.start_run(run_name="rf-baseline"):
 <p>The Workbench tracks provenance at the granularity of whole files and runs. Recent work pushes provenance tracking to a finer grain and across organizational boundaries. <strong>LakeHouse provenance in Unity Catalog</strong> (Databricks, 2023) captures column-level lineage automatically by analyzing query plans, so you can trace a single feature column back through every transformation that produced it. In the research domain, <strong>ChemCrow</strong> (Bran et al., 2024, "Augmenting large language models with chemistry tools," <em>Nature Machine Intelligence</em>, 6, 525&ndash;535) demonstrated an LLM-driven chemistry agent that chains tool calls (web search, reaction planning, robotic execution) and logs each call as a provenance node, producing lineage graphs that span digital computation and physical lab operations in a single DAG. These systems point toward a future where provenance is not bolted on after the fact but is emitted automatically by every tool in the discovery pipeline, from SQL queries to robotic liquid handlers.</p>
 </div>
 
+<div class="callout exercise" data-agent="07">
+<h4>Exercise 6.4.1</h4>
+<p>Suppose you register two CSV files that have identical contents but different filenames (<code>train_v1.csv</code> and <code>training_data_final.csv</code>). How many rows will the <code>artifacts</code> table contain after both registrations, and how many files will exist in the <code>data/</code> directory? Explain why.</p>
+<details><summary>Hint</summary>
+<p>Look at the <code>register_artifact</code> function. The primary key is the SHA-256 hash of the file contents, and the INSERT uses <code>OR IGNORE</code>. The blob copy is also guarded by <code>if not blob_path.exists()</code>. What happens when two different filenames produce the same content hash?</p>
+</details>
+</div>
+
+<div class="callout practical-example" data-agent="26">
+<h4>Step-Through: Content-Addressable Registration and Lineage Trace</h4>
+<p>Trace through <code>register_artifact</code> and <code>get_lineage</code> with concrete values:</p>
+<ol>
+<li><strong>Register dataset.</strong> File contents: <code>"a,b\n1,2\n"</code> (9 bytes). SHA-256 produces <code>id = "e3b0c44..."</code>. The blob is copied to <code>data/e3b0c44...</code>. The <code>artifacts</code> table gains one row: <code>(id="e3b0c44...", name="my-csv", kind="dataset")</code>.</li>
+<li><strong>Create run.</strong> UUID generated: <code>run_id = "d4e5f6a7-..."</code>. Git returns <code>commit = "f152d38"</code>, <code>dirty = False</code>. One row inserted into <code>runs</code>. One row inserted into <code>edges</code>: <code>(source="e3b0c44...", target="d4e5f6a7-...", role="input")</code>.</li>
+<li><strong>Finish run.</strong> Model file hashes to <code>"8b1a2c3d..."</code>. Blob copied. Artifact row inserted. Edge row inserted: <code>(source="d4e5f6a7-...", target="8b1a2c3d...", role="output")</code>. Metrics JSON hashes to <code>"9f0e1d2c..."</code>. Metric artifact row inserted. Edge row: <code>(source="d4e5f6a7-...", target="9f0e1d2c...", role="metric")</code>.</li>
+<li><strong>Query lineage for model <code>"8b1a2c3d..."</code>.</strong> <code>_trace("8b1a2c3d...", 10)</code> finds it in <code>artifacts</code>. Queries <code>edges WHERE target_id = "8b1a2c3d..."</code>, gets one row with <code>source = "d4e5f6a7-..."</code>, role <code>"output"</code>. Recurses: <code>_trace("d4e5f6a7-...", 9)</code> finds it in <code>runs</code>. Queries edges again, gets <code>source = "e3b0c44..."</code>, role <code>"input"</code>. Recurses: <code>_trace("e3b0c44...", 8)</code> finds it in <code>artifacts</code>, no upstream edges. Returns the nested dict: model &larr; run &larr; dataset.</li>
+</ol>
+</div>
+
+<div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
+<h4>Real-World Application: Materials Discovery at NIST</h4>
+<p>The National Institute of Standards and Technology (NIST) uses a content-addressable artifact registry in its <strong>Materials Genome Initiative</strong> data infrastructure. Every computed material property (band gap, elastic modulus, formation energy) is stored with a hash derived from the input crystal structure and the simulation parameters, so that two independent DFT calculations on the same structure with the same settings produce the same artifact ID. This deduplication saved NIST over 40 TB of redundant storage across collaborative projects and made cross-lab reproducibility checks a single hash comparison.</p>
+</div>
+
+<div class="callout fun-note" data-agent="34">
+<h4>The $440 Million Missing Hash</h4>
+<p>In 2012, Knight Capital deployed trading software that lacked a version-tracking mechanism analogous to the Workbench's Git hash capture. An operator reused an old deployment flag, activating defunct code on one of eight servers. The mismatch went undetected because there was no content-addressed record linking "the binary that is running" to "the binary that was tested." In 45 minutes, the firm lost $440 million and was forced into a rescue acquisition. A reproducibility harness that fingerprinted every deployed artifact (as the Workbench does for every run) would have flagged the inconsistency before the market opened.</p>
+</div>
+
+<div class="callout lab" data-agent="41">
+<h4>Lab: Build and Query a Provenance Graph</h4>
+<p><strong>Goal:</strong> Populate a Workbench database with a multi-step discovery pipeline and practice lineage queries that answer real audit questions.</p>
+<p><strong>Tools needed:</strong> Python 3.10+, SQLite (bundled), the Workbench code from this section (no external services required). Estimated time: 20 minutes.</p>
+<p><strong>Procedure:</strong></p>
+<ol>
+<li>Create three small CSV files representing raw data, cleaned data, and a feature matrix. Register each as an artifact.</li>
+<li>Create a "preprocessing" run that takes the raw CSV as input and produces the cleaned CSV as output. Create a "feature engineering" run that takes the cleaned CSV and produces the feature matrix. Create a "training" run that takes the feature matrix and produces a model file (a dummy <code>.pkl</code>).</li>
+<li>Call <code>get_lineage(model_id, depth=10)</code> and verify the chain is three hops deep: model &larr; training run &larr; feature matrix &larr; feature run &larr; cleaned CSV &larr; preprocessing run &larr; raw CSV.</li>
+</ol>
+<p><strong>What to vary:</strong> Try registering the same raw CSV under two different names, then register a modified version with one row changed. Observe how content addressing assigns the same ID to identical files and a different ID to the altered file.</p>
+<p><strong>What to observe:</strong> (1) The <code>edges</code> table should contain exactly six rows for the three-run pipeline. (2) Re-registering an identical file should not create a new artifact row. (3) The lineage JSON nests cleanly with no circular references, confirming the DAG property.</p>
+</div>
+
 <section class="exercises">
 <h2>Exercises</h2>
 <ol>

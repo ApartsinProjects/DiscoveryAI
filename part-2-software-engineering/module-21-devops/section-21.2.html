@@ -410,6 +410,35 @@ positive rate). For operational metrics, $k = 3$ is a common starting point, adj
 based on the cost of false positives versus missed detections.
 </p>
 
+<div class="callout practical-example" data-agent="26">
+<h4>Step-Through: EWMA Anomaly Detection</h4>
+<p>
+Trace through the exponentially weighted moving average detector with $\alpha = 0.2$,
+$k = 3$, and these five latency observations (in ms): 200, 210, 195, 205, 450.
+</p>
+<p>
+<strong>Step 1</strong> ($x_1 = 200$): First observation initializes the mean.
+$\hat{\mu}_1 = 200$, $\hat{\sigma}^2_1 = 0$. No anomaly check (warmup).<br/>
+<strong>Step 2</strong> ($x_2 = 210$): $\hat{\mu}_2 = 0.2 \times 210 + 0.8 \times 200 = 202$.
+$\hat{\sigma}^2_2 = 0.2 \times (210 - 202)^2 + 0.8 \times 0 = 12.8$,
+so $\hat{\sigma}_2 = 3.58$. $|210 - 202| = 8 < 3 \times 3.58 = 10.73$. Not anomalous.<br/>
+<strong>Step 3</strong> ($x_3 = 195$): $\hat{\mu}_3 = 0.2 \times 195 + 0.8 \times 202 = 200.6$.
+$\hat{\sigma}^2_3 = 0.2 \times (195 - 200.6)^2 + 0.8 \times 12.8 = 16.51$,
+so $\hat{\sigma}_3 = 4.06$. $|195 - 200.6| = 5.6 < 12.19$. Not anomalous.<br/>
+<strong>Step 4</strong> ($x_4 = 205$): $\hat{\mu}_4 = 0.2 \times 205 + 0.8 \times 200.6 = 201.48$.
+$\hat{\sigma}^2_4 = 0.2 \times (205 - 201.48)^2 + 0.8 \times 16.51 = 15.68$,
+so $\hat{\sigma}_4 = 3.96$. $|205 - 201.48| = 3.52 < 11.88$. Not anomalous.<br/>
+<strong>Step 5</strong> ($x_5 = 450$): $\hat{\mu}_5 = 0.2 \times 450 + 0.8 \times 201.48 = 251.18$.
+$\hat{\sigma}^2_5 = 0.2 \times (450 - 251.18)^2 + 0.8 \times 15.68 = 7929.98$,
+so $\hat{\sigma}_5 = 89.05$. $|450 - 251.18| = 198.82 > 3 \times 89.05 = 267.15$?
+No: 198.82 &lt; 267.15, so even this spike is <em>not</em> flagged, because the variance
+estimate bloated on the same step. This illustrates a known limitation: the EWMA updates
+mean and variance simultaneously, so a single extreme point inflates the variance
+enough to mask itself. Robust detectors address this by updating the variance with a
+lag or using the <em>previous</em> step's variance for the anomaly check.
+</p>
+</div>
+
 <div class="callout tip" data-agent="06">
 <h4>Mental Model</h4>
 <p>
@@ -903,6 +932,20 @@ Be specific. Cite exact metric values, log templates, and timestamps."""
     }</code></pre>
 <div class="code-caption">AI-driven root cause analysis that gathers evidence from golden signals, anomalous log patterns, deployment history, and configuration changes, then uses an LLM to generate ranked hypotheses with supporting evidence and recommended actions.</div>
 
+<div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
+<h4>Real-World Application: Google's Monarch Monitoring System</h4>
+<p>
+Google's Monarch system ingests billions of time series points per second across all
+of Google's production infrastructure, applying learned baselines rather than static
+thresholds to detect anomalies in golden signals. Monarch correlates metrics, logs,
+and traces through a unified query language, enabling SREs to ask ad hoc questions
+like "which RPCs to the Bigtable backend exceeded their latency SLO in the last hour,
+broken down by datacenter?" This correlation across pillars is what allowed Google to
+reduce mean time to detection (MTTD) for novel failure modes that no predefined alert
+would have caught.
+</p>
+</div>
+
 <div class="callout research-frontier" data-agent="18">
 <div class="callout-title">Research Frontier: Autonomous Incident Response Agents</div>
 <p>
@@ -1063,6 +1106,35 @@ the raw value, the detector's expected value, the confidence band
 incident (it keeps flagging after recovery) and fast adaptation produces false positives
 during normal daily transitions. Find a value that correctly brackets the injected
 incident window.
+</p>
+</div>
+
+<div class="callout lab" data-agent="41">
+<h4>Lab: Build a Log Cluster Investigator</h4>
+<p>
+<strong>Goal:</strong> Experience how log template extraction and frequency analysis
+surface incident-relevant messages from noisy production logs.<br/>
+<strong>Tools:</strong> Python 3.10+, no external libraries required (uses only
+<code>re</code>, <code>collections</code>, and <code>random</code>).<br/>
+<strong>Setup (5 min):</strong> Write a log generator that produces 10,000 log lines
+from 8 templates (health checks, request logs, cache hits, auth successes, DB queries,
+config reloads, retry warnings, timeout errors). Assign realistic frequencies: health
+checks at 40%, request logs at 30%, and the rest splitting the remainder. Timestamps
+should span a 2-hour window.<br/>
+<strong>Incident injection (2 min):</strong> In the last 15 minutes of the window,
+increase timeout errors from 1% to 20% of all messages and introduce a new template
+that never appeared in the baseline: "Connection pool exhausted for host {IP}, active={NUM}".<br/>
+<strong>Analysis (15 min):</strong> Implement the <code>extract_template</code> and
+<code>LogAnalyzer</code> classes from this section. Ingest the first 90 minutes as
+the baseline window and the last 15 minutes as the incident window. Call
+<code>find_anomalous_templates</code> with <code>min_ratio=3.0</code>.<br/>
+<strong>What to vary:</strong> Try <code>min_ratio</code> values of 2.0, 3.0, and 5.0.
+Observe how lower ratios surface more templates (including borderline noise) while
+higher ratios may miss the timeout spike but still catch the completely new template.<br/>
+<strong>What to observe:</strong> The analyzer should rank the new "connection pool
+exhausted" template first (infinite ratio, since it has zero baseline frequency) and
+the timeout error template second. Verify that routine templates (health checks,
+cache hits) do not appear in the anomaly list at any ratio setting above 2.0.
 </p>
 </div>
 
