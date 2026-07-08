@@ -337,7 +337,9 @@ for inv in invariants:
 
 <div class="callout practical-example" data-agent="26">
 <h4>Step-Through: Confidence Score Computation</h4>
-<p>
+<p data-agent="03">
+(This walkthrough previews the full confidence formula; the code behind each metric
+appears in Stages 3 and 4 below.)
 Trace the composite confidence score calculation with concrete numbers from a small
 run. Suppose the system proposes 8 invariants for a function, and after validation
 5 survive (3 are false invariants). The target property count is 10, so
@@ -384,7 +386,7 @@ properties that the function does not actually satisfy.
 </p>
 
 <p data-agent="17">
-<span data-agent="29">The inferred invariants arrive as strings of Python code. The system compiles each one, runs it against the current implementation, and discards any that fail.</span> A failing invariant either reflects a hallucinated property or exposes a genuine bug. Consistent failures (every run) signal real violations; intermittent failures signal flawed strategies or unstable numerical comparisons, and those invariants are discarded as flaky.
+<span data-agent="29">The inferred invariants arrive as strings of Python code. The system compiles each one, runs it against the current implementation, and discards any that fail.</span> A failing invariant either reflects a hallucinated property or exposes a genuine bug. Consistent failures (every run) signal real violations; intermittent failures signal flawed strategies or unstable numerical comparisons, and those invariants are discarded as flaky (a test is "flaky" when it passes on some runs and fails on others without any code change, typically due to nondeterminism or tight numerical tolerances) <span data-agent="04"></span>.
 </p>
 
 <pre><code class="language-python">"""
@@ -589,6 +591,9 @@ settings.load_profile("mutation")
     survived = len(re.findall(r"Survived", output))
     timeout_count = len(re.findall(r"Timeout", output))
 
+    # Timed-out mutants are excluded: they may be "equivalent mutants"
+    # (mutations that change the source without changing observable behavior),
+    # so counting them as survived would unfairly penalize the score.
     total_non_equivalent = killed + survived
     mutation_score = (
         killed / total_non_equivalent
@@ -623,7 +628,7 @@ settings.load_profile("mutation")
 <p>
 The final stage computes the composite confidence score and generates the
 <code>DiscoveryReport</code>. This is where all the metrics converge: branch coverage
-from coverage.py, mutation score from mutmut, and property count from the validation
+from <span data-agent="04">coverage.py (a Python tool that measures which lines and conditional branches the tests actually execute)</span>, mutation score from mutmut, and property count from the validation
 stage.
 </p>
 
@@ -722,6 +727,10 @@ def run_invariant_discovery(
 
     property_ratio = min(1.0, valid_count / target_properties)
 
+    # Multiplication (rather than, say, a weighted average) is deliberate:
+    # if ANY single factor is near zero the overall score collapses,
+    # reflecting the principle that high coverage with weak properties
+    # (or strong properties with low coverage) is not trustworthy.
     confidence = (
         branch_cov
         * mutation_results["mutation_score"]
@@ -745,6 +754,80 @@ def run_invariant_discovery(
     return report
 </code></pre>
 <div class="code-caption" data-agent="08 40">The complete invariant discovery pipeline orchestrator: infer, validate, mutate, and score. The composite confidence metric multiplies branch coverage, mutation score, and property ratio.</div>
+
+<h3 data-agent="01">The Re-Inference Loop</h3>
+
+<p data-agent="01">
+The dashed feedback arrow in Figure 18.3.1 represents the most important part of the
+pipeline: when surviving mutants indicate weak property coverage, the system re-runs
+Stage 1 with an augmented prompt that includes the surviving mutant diffs. This gives
+the LLM concrete evidence of what the current properties miss, so it can propose
+targeted invariants that address those gaps. The function below implements one
+iteration of this loop.
+</p>
+
+<pre data-agent="01"><code class="language-python">def reinfer_for_survivors(
+    function_source: str,
+    surviving_mutants: list[str],
+    existing_invariants: list[InferredInvariant],
+    model: str = "claude-sonnet-4-20250514"
+) -> list[InferredInvariant]:
+    """Re-run invariant inference targeting surviving mutants.
+
+    Args:
+        function_source: Source code of the function under test.
+        surviving_mutants: Diffs of mutants that the current tests
+            failed to detect.
+        existing_invariants: Already-validated invariants (to avoid
+            duplicates).
+        model: Claude model for inference.
+
+    Returns:
+        New invariants specifically targeting the surviving mutants.
+    """
+    existing_descriptions = [
+        inv.description for inv in existing_invariants
+    ]
+    survivors_text = "\n---\n".join(surviving_mutants[:5])
+
+    prompt = f"""You are a software testing expert. The following function
+has surviving mutants that the current property tests do not detect.
+
+Function:
+```python
+{function_source}
+```
+
+Surviving mutant diffs (each is a small code change that goes undetected):
+{survivors_text}
+
+Existing properties (do NOT repeat these):
+{chr(10).join(f'- {d}' for d in existing_descriptions)}
+
+Propose new behavioral invariants that would detect these specific mutations.
+Return a JSON array (same schema as before)."""
+
+    client = Anthropic()
+    response = client.messages.create(
+        model=model, max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.content[0].text
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+
+    import json
+    return [
+        InferredInvariant(
+            family=InvariantFamily(item["family"]),
+            description=item["description"],
+            hypothesis_code=item["hypothesis_code"],
+            confidence=item["confidence"]
+        )
+        for item in json.loads(raw)
+    ]
+</code></pre>
+<div class="code-caption" data-agent="01">The re-inference loop: surviving mutant diffs are fed back to the LLM so it can propose targeted invariants that close the coverage gap. In practice, one or two re-inference rounds typically suffice to push the mutation score above 90%.</div>
 
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Invariant Discovery on a Molecular Docking Scorer</div>
@@ -930,9 +1013,9 @@ async def get_discovery_result(request_id: str):
 Hypothesis includes a built-in <code>hypothesis.extra.ghostwriter</code> module that
 generates property tests automatically from function signatures and type annotations.
 Running <code>hypothesis write normalize_spectrum</code> on the command line produces
-a test file with roundtrip, idempotence, and equivalence tests. <span class="aha-moment" data-agent="24">The ghostwriter
-handles approximately 60% of what our invariant discovery system does, in a single
-command with zero LLM cost. The LLM adds value for the remaining 40%: domain-specific
+a test file with roundtrip, idempotence, and equivalence tests. <span class="aha-moment" data-agent="24">In practice, the ghostwriter
+typically handles a substantial fraction of what our invariant discovery system does, in a single
+command with zero LLM cost <span data-agent="28"></span>. The LLM adds value for the rest: domain-specific
 metamorphic relations, physically meaningful invariants, and properties that require
 understanding the function's purpose rather than just its type signature.</span> Use the
 ghostwriter as a fast baseline and the LLM for the deeper analysis.
@@ -969,6 +1052,8 @@ or refutes them. The evaluation metrics from
 <a href="../../part-7-autonomous-discovery/module-56-evaluating-discovery/index.html">Chapter 56</a>
 will revisit this confidence score as a component of overall system trustworthiness.
 </p>
+
+<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far: the invariant discovery system infers properties from source code, validates them against the running implementation, measures their fault-detection strength via mutation testing, and produces a composite confidence score; this same loop mirrors the scientific method of proposing hypotheses, running experiments, and refining theories based on gaps.</p></div>
 
 <div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
 <h4>Real-World Application: Netflix's Chaos Engineering Meets Property Testing</h4>
@@ -1022,8 +1107,8 @@ Beyond the invariant discovery pattern presented here, recent systems push towar
 <p>
 There is a delightful recursive quality to mutation testing: you can run mutmut on
 mutmut's own source code to check whether mutmut's tests are strong enough to detect
-faults in mutmut itself. The mutmut project does exactly this, and their mutation score
-hovers around 85%. The remaining 15% of surviving mutants are mostly in logging and
+faults in mutmut itself. The mutmut project does exactly this, and as of early versions their mutation score
+reportedly hovered around 85% <span data-agent="28"></span>. The remaining 15% of surviving mutants are mostly in logging and
 display formatting code, where the "correct" behavior is a matter of taste rather than
 correctness. This self-referential quality is fitting: a tool that measures test quality
 should itself have measurably high-quality tests.

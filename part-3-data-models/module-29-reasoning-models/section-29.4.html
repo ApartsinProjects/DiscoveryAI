@@ -200,7 +200,7 @@ class VerificationReport:
 
 <h2>2. Stage 1: Generate Candidate Solutions</h2>
 
-<p>The generation stage uses extended thinking to produce diverse, high-quality reasoning chains. We sample $N$ candidates at varying temperatures to ensure diversity: some chains will use standard approaches, while others may discover creative shortcuts.</p>
+<p>The generation stage uses <span data-agent="04">extended thinking (a mode that allocates additional internal reasoning tokens before the model produces its visible answer)</span> to produce diverse, high-quality reasoning chains. <span data-agent="28">We sample $N$ candidates with varying thinking budgets to encourage diversity: some chains will use standard approaches, while others, given more internal reasoning tokens, may discover creative shortcuts.</span></p>
 
 <pre><code class="language-python">def generate_candidates(
     problem: str,
@@ -337,11 +337,11 @@ def rank_candidates(
     scored.sort(key=lambda c: c.min_score, reverse=True)
     return scored
 </code></pre>
-<div class="code-caption" data-agent="08">Step-level PRM scoring and chain ranking. <code>score_step</code> evaluates one step against its predecessors and returns a 0.0 to 1.0 confidence score. <code>rank_candidates</code> sorts chains by their weakest step (minimum score), surfacing chains where every step is at least moderately confident.</div>
+<div class="code-caption" data-agent="08">Step-level PRM scoring and chain ranking. <code>score_step</code> evaluates one step against its predecessors and returns a 0.0 to 1.0 confidence score. <code>rank_candidates</code> sorts chains by their weakest step (minimum score)<span data-agent="04">, applying a weakest-link criterion: because a single erroneous step can invalidate an entire derivation, the chain's reliability is bounded by its least confident step</span>.</div>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Concentrate Verification on the Weakest Steps</div>
-<p>Formal verification is expensive (each Lean compilation takes seconds to minutes, and <span data-agent="21">autoformalization, where a language model translates informal mathematics into formal proof code,</span> may require multiple attempts). The PRM scores tell us exactly where to focus: steps with low PRM scores are the most likely to contain errors and the most valuable to verify formally. A step with PRM score 0.99 is almost certainly correct and formal verification adds little value. A step with PRM score 0.6 is suspicious and worth the verification cost. This targeted strategy reduces the number of Lean compilations by 60-80% compared to verifying every step, while catching the same proportion of errors. The principle is identical to risk-based testing in software engineering (<a href="../../part-2-software-engineering/module-18-ai-testing/index.html">Chapter 18</a>): concentrate quality assurance effort where the risk is highest.</p>
+<p>Formal verification is expensive (each Lean compilation takes seconds to minutes, and <span data-agent="21">autoformalization, where a language model translates informal mathematics into formal proof code,</span> may require multiple attempts). The PRM scores tell us exactly where to focus: steps with low PRM scores are the most likely to contain errors and the most valuable to verify formally. A step with PRM score 0.99 is almost certainly correct and formal verification adds little value. A step with PRM score 0.6 is suspicious and worth the verification cost. <span data-agent="28">This targeted strategy can typically reduce the number of Lean compilations by 60-80% compared to verifying every step, while catching a comparable proportion of errors.</span> The principle is identical to risk-based testing in software engineering (<a href="../../part-2-software-engineering/module-18-ai-testing/index.html">Chapter 18</a>): concentrate quality assurance effort where the risk is highest.</p>
 </div>
 
 <div class="callout warning" data-agent="10">
@@ -504,9 +504,15 @@ def verify_critical_steps(
     answer = chain.steps[-1].text if chain.steps else "No answer found"
 
     # Determine overall confidence level
-    if n_verified == n_total:
+    # A step is "covered" if it is Lean-verified or scored above the
+    # PRM threshold, meaning formal verification was not attempted.
+    n_uncovered = sum(
+        1 for s in chain.steps
+        if s.lean_verified is not True and s.prm_score < 0.85
+    )
+    if n_uncovered == 0 and n_verified > 0:
         confidence = "formally_verified"
-    elif chain.min_score >= 0.85 and n_verified > 0:
+    elif n_uncovered == 0:
         confidence = "prm_high"
     else:
         confidence = "prm_low"
@@ -535,7 +541,9 @@ def verify_critical_steps(
         }
     )
 </code></pre>
-<div class="code-caption" data-agent="08">Report assembly with three confidence tiers. The <code>build_report</code> function classifies the chain as "formally_verified" (every step checked by Lean), "prm_high" (all steps above threshold with at least one formally verified), or "prm_low" (at least one below-threshold step that could not be formally verified). Per-step detail is preserved in the <code>details</code> dictionary for downstream inspection.</div>
+<div class="code-caption" data-agent="08">Report assembly with three confidence tiers. The <code>build_report</code> function classifies the chain as <span data-agent="28">"formally_verified" (every below-threshold step verified by Lean and all others scored above threshold), "prm_high" (all steps scored above threshold so none required formal verification), or "prm_low" (at least one below-threshold step that could not be formally verified)</span>. Per-step detail is preserved in the <code>details</code> dictionary for downstream inspection.</div>
+
+<p data-agent="01">When the pipeline assigns a "prm_low" confidence label, the report identifies the specific steps that failed both PRM scoring and formal verification. The recommended workflow is to treat these steps as hypotheses requiring manual review: inspect the flagged step's text alongside the Lean error output (preserved in <code>lean_code</code>), determine whether the error is a formalization failure (the mathematics is correct but the translation to Lean was wrong) or a genuine reasoning error (the mathematics itself is flawed), and either rephrase the step for another verification attempt or correct the reasoning and re-run the pipeline. Without this triage step, the pipeline reports a problem but does not resolve it.</p>
 
 <h2>6. The Complete Pipeline</h2>
 
@@ -707,6 +715,8 @@ print(f"Dimensionally consistent: {result['consistent']}")
 </code></pre>
 <div class="code-caption" data-agent="08">Dimensional analysis checker using exponent-vector arithmetic. Each physical quantity is encoded as integer exponents over five SI base dimensions (mass, length, time, temperature, amount of substance). Multiplication adds exponents; division subtracts them. The example verifies that both sides of $\Delta G = RT \ln(K_d)$ reduce to J/mol.</div>
 
+<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far in this extension section: the pipeline's core four stages (generate, score, verify, report) handle mathematical derivations; dimensional analysis adds a lightweight physics-specific check that catches unit mismatches without invoking the full Lean theorem prover. Next, we address a different failure mode: computations that are mathematically correct but numerically unreliable.</p></div>
+
 <p data-agent="14">Dimensional consistency catches unit mismatches, but a derivation can pass that test and still produce catastrophic results when executed on a computer.</p>
 
 <h3>Numerical Stability Verification</h3>
@@ -833,7 +843,7 @@ class ScoreSteps(dspy.Module):
 
 <div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
 <h4>Real-World Application: Semiconductor Design Rule Verification</h4>
-<p><span data-agent="11">Semiconductor manufacturers have explored variants of this generate-score-verify pipeline to check lithographic design rule derivations in chip manufacturing.</span> Engineers specify constraints (minimum wire spacing, maximum current density) as optimization problems; the pipeline generates algebraic derivations, PRM-scores each step for physical plausibility, and routes critical inequalities to a <span data-agent="12">satisfiability modulo theories (SMT)</span> solver (Z3) for formal verification. Steps involving thermal expansion coefficients and process variation tolerances receive the heaviest scrutiny because errors in these steps have led to costly silicon re-spins in the past.</p>
+<p><span data-agent="11">Semiconductor manufacturers have explored variants of this generate-score-verify pipeline to check lithographic design rule derivations in chip manufacturing.</span> Engineers specify constraints (minimum wire spacing, maximum current density) as optimization problems; the pipeline generates algebraic derivations, PRM-scores each step for physical plausibility, and routes critical inequalities to a <span data-agent="12">satisfiability modulo theories (SMT)</span> solver <span data-agent="04">(Z3, a tool that automatically determines whether mathematical formulas involving arithmetic, inequalities, and logical constraints have satisfying assignments)</span> for formal verification. Steps involving thermal expansion coefficients and process variation tolerances receive the heaviest scrutiny because errors in these steps have led to costly silicon re-spins in the past.</p>
 </div>
 
 <div class="callout exercise" data-agent="07">

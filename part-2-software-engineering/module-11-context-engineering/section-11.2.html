@@ -302,6 +302,11 @@ the parent class signature for context, spending only the tokens needed for the
 signature rather than the entire class body.
 </p>
 
+<div class="callout key-insight" data-agent="05">
+<h4>Checkpoint</h4>
+<p>So far: naive fixed-size chunking fails because it ignores code structure; syntactic chunking uses tree-sitter to extract complete functions and classes as chunks; hierarchical chunking adds parent-child links so the retriever can include a class signature when it returns a method, balancing context against token budget.</p>
+</div>
+
 <div class="callout tip" data-agent="06">
 <h4>Mental Model</h4>
 <p>
@@ -599,7 +604,7 @@ def generate_summary(code: str, llm_client) -> str:
 <div class="callout research-frontier" data-agent="18">
 <h4>Research Frontier</h4>
 <p>
-Aider's "repository map" system (Gauthier, 2024) demonstrated that an LLM can chunk and summarize an entire repository into a compact, navigable outline using tree-sitter tags, then dynamically expand only the relevant sections into the context window. This approach, described in the Aider technical report, achieves near-oracle retrieval performance on the SWE-bench benchmark <span data-agent="21">(a standardized test suite of real GitHub issues used to evaluate autonomous code-generation agents)</span> by letting the model itself decide which chunks to "zoom into" across multiple turns. More recently, the 2025 wave of "code graph" systems (such as Sourcegraph's SCIP-based indexing and Cursor's codebase-wide semantic index) go further by building a <a href="../module-08-ai-software-foundations/section-8.2.html" data-agent="13">cross-file dependency graph</a> over chunks, so the retriever can follow import chains and call hierarchies rather than relying on embedding similarity alone. These graph-augmented approaches reduce the false-negative rate (missing a critical dependency that lives in another file) that plagues flat chunk-and-embed pipelines. The trade-off is indexing complexity: building and maintaining a cross-file graph requires incremental re-parsing on every commit, which tools like Aider and Cursor now handle with tree-sitter's incremental parsing mode.
+Aider's "repository map" system (Gauthier, 2024) demonstrated that an LLM can chunk and summarize an entire repository into a compact, navigable outline using tree-sitter tags, then dynamically expand only the relevant sections into the context window. This approach, described in the Aider technical report, reportedly achieves near-oracle retrieval performance on the SWE-bench benchmark <span data-agent="21">(a standardized test suite of real GitHub issues used to evaluate autonomous code-generation agents)</span> by letting the model itself decide which chunks to "zoom into" across multiple turns. More recently, the 2025 wave of "code graph" systems (such as Sourcegraph's SCIP-based indexing and Cursor's codebase-wide semantic index) go further by building a <a href="../module-08-ai-software-foundations/section-8.2.html" data-agent="13">cross-file dependency graph</a> over chunks, so the retriever can follow import chains and call hierarchies rather than relying on embedding similarity alone. These graph-augmented approaches reduce the false-negative rate (missing a critical dependency that lives in another file) that plagues flat chunk-and-embed pipelines. The trade-off is indexing complexity: building and maintaining a cross-file graph requires incremental re-parsing on every commit, which tools like Aider and Cursor now handle with tree-sitter's incremental parsing mode <span data-agent="04">(a technique where the parser updates only the parts of the syntax tree affected by an edit, rather than re-parsing the entire file)</span>.
 </p>
 </div>
 
@@ -705,7 +710,7 @@ class ChunkStore:
 
 <p>
 The indexing pipeline ties everything together: walk the repository, parse each file,
-extract hierarchical chunks, generate summaries at each level, and persist the result.
+extract hierarchical chunks, generate summaries at each level, and persist (upsert) <span data-agent="04">each record, meaning insert it if new or update it if it already exists</span>.
 </p>
 
 <pre><code class="language-python">def index_repository(repo_root: str, db_path: str,
@@ -798,9 +803,9 @@ signature when retrieving a method. For most applications, the simplicity is wor
 Well-documented code is easier to chunk and summarize. A function with a thorough
 docstring produces a high-quality signature summary for free. A function with no
 comments and single-letter variable names forces the summarizer to infer intent from
-structure alone. In experiments on open-source Python projects, the correlation between
+structure alone. <span data-agent="28">In informal experiments on open-source Python projects, the correlation between
 comment density and retrieval accuracy (measured by whether the correct function is
-returned for a natural-language query) is surprisingly strong: $r \approx 0.4$. This
+returned for a natural-language query) can be notable, with reported values around $r \approx 0.4$.</span> This
 is not because comments help the retrieval model directly (embeddings are computed on
 the full code), but because well-documented code tends to have descriptive function
 names and type annotations, which are the features that embedding models rely on most.
@@ -847,7 +852,7 @@ Build and compare three chunking strategies on a single Python file from any ope
 (2) Pick a Python file with at least 200 lines and multiple classes (for example, download <code>requests/models.py</code> from the Requests library on GitHub).
 (3) Implement a naive fixed-size chunker that splits the file into 512-token windows with 50% overlap, using <code>tiktoken</code> to count tokens accurately. Record how many chunks are produced and manually inspect two chunks to check whether they split a function in half.
 (4) Run the <code>extract_chunks</code> function from Listing 11.7 on the same file. Compare the chunk count, average chunk size, and whether each chunk is syntactically complete (check that every chunk parses without errors via <code>ast.parse</code>).
-(5) Measure the retrieval impact: embed all chunks from both strategies using a free embedding API or <code>sentence-transformers</code>, query with a natural-language description of one function in the file (for example, "prepare the HTTP request body"), and compare which strategy ranks the correct chunk highest. You should observe that the syntax-aware chunks consistently rank the target function in the top 3, while the fixed-size chunks scatter relevant code across multiple lower-ranked fragments.
+(5) Measure the retrieval impact: embed all chunks from both strategies using a free embedding API or <code>sentence-transformers</code>, query with a natural-language description of one function in the file (for example, "prepare the HTTP request body"), and compare which strategy ranks the correct chunk highest. You will typically observe that the syntax-aware chunks rank the target function higher (often in the top 3), while the fixed-size chunks tend to scatter relevant code across multiple lower-ranked fragments.
 </p>
 </div>
 
@@ -870,7 +875,7 @@ For (a), compute total tokens (600 words x 2 = 1,200 tokens), then apply the sli
 <strong>Tools needed:</strong> Python 3.10+, <code>tree-sitter</code>, <code>tree-sitter-python</code>, <code>sentence-transformers</code> (the <code>all-MiniLM-L6-v2</code> model runs on CPU in seconds; <span data-agent="20">as of 2025, newer models such as <code>all-mpnet-base-v2</code> or Nomic's <code>nomic-embed-text-v1.5</code> offer stronger retrieval quality at similar speed</span>), and a single open-source Python file with at least 10 functions (e.g., <code>httpx/_client.py</code>).<br/>
 <strong>Procedure (15 to 20 minutes):</strong> (1) Chunk the file three ways: fixed 256-token windows, fixed 512-token windows, and syntactic chunks via tree-sitter. (2) Embed all chunks with <code>SentenceTransformer.encode()</code>. (3) Write five natural-language queries describing specific functions in the file (e.g., "send an HTTP GET request with timeout"). (4) For each query, compute cosine similarity against all chunks and record the rank of the chunk containing the target function.<br/>
 <strong>What to vary:</strong> Window size (128, 256, 512), overlap ratio (0%, 25%, 50%), and whether you embed raw code or signature-only summaries.<br/>
-<strong>What to observe:</strong> Mean reciprocal rank (MRR) across your five queries for each configuration. You should find that syntactic chunks achieve the highest MRR, and that among fixed-size strategies, larger windows with overlap outperform smaller windows without it.
+<strong>What to observe:</strong> Mean reciprocal rank <span data-agent="04">(MRR; the average of 1/rank for each query's correct result, so higher is better)</span> across your five queries for each configuration. Syntactic chunks typically achieve the highest MRR <span data-agent="28">, and among fixed-size strategies, larger windows with overlap tend to outperform smaller windows without it</span>.
 </p>
 </div>
 

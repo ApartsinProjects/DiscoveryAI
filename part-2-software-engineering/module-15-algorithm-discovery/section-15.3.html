@@ -232,7 +232,7 @@ class PipelineConfig:
     warmup_iterations: int = 5
     benchmark_repetitions: int = 100
     significance_level: float = 0.05
-    min_effect_size: float = 0.1     # minimum meaningful rank-biserial correlation
+    min_effect_size: float = 0.1     # minimum meaningful rank-biserial correlation (defined in Stage 4)
     memory_budget_mb: float = 1024.0  # 1 GB default
 
 @dataclass
@@ -334,7 +334,8 @@ def propose_sorted_projection() -> AlgorithmCandidate:
         sorted_data = normalized[order]
         sorted_proj = projections[order]
         # Scan with adaptive window: two points with cosine sim >= threshold
-        # have projection difference <= sqrt(2(1 - threshold))
+        # have projection difference <= sqrt(2(1 - threshold)), because for
+        # unit vectors the squared Euclidean distance equals 2(1 - cos(theta))
         max_proj_diff = np.sqrt(2 * (1 - threshold)) + 0.01  # small margin
         pairs = set()
         for i in range(n):
@@ -374,6 +375,7 @@ def propose_lsh() -> AlgorithmCandidate:
             planes = np.random.randn(n_bits, d)
             hashes = (normalized @ planes.T > 0)
             # Convert boolean rows to integer hash keys
+            # Pack each row of booleans into a compact byte array serving as the hash key
             hash_keys = np.packbits(hashes, axis=1, bitorder="little")
             # Group by hash bucket
             buckets: dict[bytes, list[int]] = {}
@@ -519,7 +521,7 @@ def verify_duplicate_finder(
                 f"missed {oracle_pairs - impl_pairs}"
             )
         else:
-            # Approximate: check recall >= 50% (lenient for random hyperplane LSH)
+            # Approximate: check recall >= 30% (lenient for random hyperplane LSH)
             if len(oracle_pairs) > 0:
                 recall = len(impl_pairs & oracle_pairs) / len(oracle_pairs)
                 assert recall >= 0.3, f"Recall too low: {recall:.2f}"
@@ -652,7 +654,7 @@ def run_benchmarks(
                 timings_ms = []
                 for _ in range(config.benchmark_repetitions):
                     data = generate_input(n, d, dist)
-                    gc.disable()
+                    gc.disable()  # prevent GC pauses from inflating timings
                     start = timeit.default_timer()
                     candidate.implementation(data, threshold)
                     elapsed = timeit.default_timer() - start
@@ -695,6 +697,12 @@ config = PipelineConfig(
 # benchmark_results = run_benchmarks(candidates, config)
 </code></pre>
 <div class="code-caption" data-agent="08 40">Stage 3 benchmark harness with warmup, GC-disabled timing loops, and separate <code>tracemalloc</code> memory measurement. The <code>generate_input</code> function produces three distributions: uniform random, five Gaussian clusters, and adversarial near-identical vectors that maximize the number of detected pairs.</div>
+
+<p data-agent="01">
+Building a benchmark is not just writing a timing loop; it requires defending the measurements against threats to validity. The warmup iterations above allow CPU caches and (in JIT-compiled runtimes) the compiler to reach steady state. Disabling garbage collection during each timed call prevents GC pauses from appearing as algorithm slowdowns. Measuring memory in a separate pass avoids the overhead of <code>tracemalloc</code> distorting the timing results. Beyond these code-level precautions, be aware of system-level noise: background processes, CPU frequency scaling, and thermal throttling can all shift timing distributions. Running benchmarks on an otherwise idle machine and reporting the interquartile range (as this harness does) rather than the mean helps surface these effects.
+</p>
+
+<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far: the pipeline's data model captures candidates, configurations, and results; three candidate algorithms (brute-force, sorted-projection, and LSH) have been proposed with a shared function signature, verified against five correctness properties, and benchmarked across multiple input sizes and distributions with controlled timing and memory measurement.</p></div>
 
 <h2>5. Stage 4: Statistical Comparison</h2>
 
@@ -1103,14 +1111,14 @@ def run_algorithm_benchmark(
 <div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
 <h4>Real-World Application: Spotify's Algorithm Benchmark for Playlist Recommendations</h4>
 <p>
-Spotify's recommendation team uses an internal benchmark harness structurally similar to
+Spotify's recommendation team reportedly uses an internal benchmark harness structurally similar to
 this pipeline when evaluating candidate retrieval algorithms for the "Discover Weekly"
 playlist. Each candidate (approximate nearest neighbors via Annoy, <span data-agent="12">Hierarchical Navigable Small World (HNSW)</span> via hnswlib,
 and brute-force <span data-agent="12">Basic Linear Algebra Subprograms (BLAS)</span> dot products) is tested against a matrix of user embedding
 dimensions, catalog sizes, and latency budgets. The harness enforces a recall floor
 (the approximate candidates must retrieve at least 95% of the true top-100 neighbors)
 before any timing comparison proceeds, mirroring the correctness-before-speed cascade
-in Stage 5 of our pipeline. <span data-agent="20">(As of 2024, Annoy has been largely supplanted in production nearest-neighbor workloads by FAISS and Google's ScaNN, both of which offer GPU acceleration and richer index types; the benchmark harness pattern, however, remains the same regardless of which libraries populate the candidate list.)</span>
+in Stage 5 of our pipeline. <span data-agent="20">(As of 2024, Annoy has been increasingly displaced in many production nearest-neighbor workloads by FAISS and Google's ScaNN, both of which offer GPU acceleration and richer index types; the benchmark harness pattern, however, remains the same regardless of which libraries populate the candidate list.)</span>
 </p>
 </div>
 

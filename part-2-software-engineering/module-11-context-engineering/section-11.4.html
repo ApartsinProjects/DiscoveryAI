@@ -86,6 +86,11 @@ dependencies (parent signatures, imports), applies <span data-agent="21">U-shape
 a ready-to-use prompt string.</li>
 </ol>
 
+<div class="callout key-insight" data-agent="05">
+<h4>Checkpoint</h4>
+<p>So far: the Repository Intelligence Layer has three subsystems (Indexer, Retriever, Packer) that communicate through a shared chunk store, each handling one phase of the pipeline from raw source files to a token-budgeted prompt string.</p>
+</div>
+
 <figure id="fig-ril-architecture" data-agent="09">
 <svg viewBox="0 0 600 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architecture diagram of the Repository Intelligence Layer showing three subsystems: Indexer, Retriever, and Packer, connected through a central PostgreSQL plus pgvector store.">
   <style>
@@ -181,8 +186,8 @@ These three subsystems communicate through the chunk store (PostgreSQL + pgvecto
 The indexer writes; the retriever reads; the packer reads and assembles. This
 separation means the indexer can run as a background process (triggered by file
 changes), while the retriever and packer respond to interactive queries with
-sub-second latency.
-<span class="aha-moment" data-agent="24">On a 185,000-line codebase with over 4,000 indexed chunks, the full retrieve-and-pack pipeline completes in under 100 milliseconds, fast enough that the agent never waits for its context.</span>
+sub-second latency in typical configurations.
+<span class="aha-moment" data-agent="24">On a 185,000-line codebase with over 4,000 indexed chunks, the full retrieve-and-pack pipeline <span data-agent="28">typically</span> completes in under 100 milliseconds on modern hardware, fast enough that the agent never waits for its context.</span>
 <em data-agent="27">In short:</em> A Repository Intelligence Layer is a search engine that speaks code structure, not just text.
 </p>
 
@@ -369,9 +374,9 @@ when a chunk is updated, both stores must be updated atomically. pgvector elimin
 this by adding vector columns to regular PostgreSQL tables. A single
 <code>INSERT ... ON CONFLICT DO UPDATE</code> statement atomically updates the
 content, summary, and embedding in one transaction. For repositories under 1 million
-chunks (which covers codebases up to several million lines), pgvector's HNSW index
-provides query latencies under 10 milliseconds, making a dedicated vector database
-unnecessary.
+chunks (which covers codebases up to several million lines), <span data-agent="28">pgvector's HNSW index
+typically provides query latencies under 10 milliseconds in benchmarks on datasets of this size, making a dedicated vector database
+unnecessary for most repository-scale applications.</span>
 </p>
 </div>
 
@@ -430,6 +435,8 @@ class RepositoryIndexer:
         self.store.delete_stale(rel_path)
 
         # Build hierarchical chunks
+        # build_hierarchy and extract_docstrings are defined in
+        # Section 11.2; extract_signature is from Section 11.3.
         hierarchy = build_hierarchy(source, rel_path)
         docstrings = extract_docstrings(source)
 
@@ -515,12 +522,12 @@ increasing size:
 </tbody>
 </table>
 <p>
-Embedding computation dominates the indexing time (roughly 80%). On a machine with a
-GPU, the sentence-transformers model runs 5-10x faster, bringing scikit-learn's
-indexing time under 15 seconds. Incremental re-indexing after editing a single file
+Embedding computation dominates the indexing time (roughly 80%). <span data-agent="28">On a machine with a
+GPU, the sentence-transformers model typically runs 5-10x faster, bringing scikit-learn's
+indexing time under 15 seconds in our tests. Incremental re-indexing after editing a single file
 takes under 1 second regardless of project size, because only the changed file is
-re-parsed and re-embedded. Query latency (vector search + BM25 + re-ranking) is
-consistently under 100 milliseconds for all three projects.
+re-parsed and re-embedded. Query latency (vector search + BM25 + re-ranking) remained
+under 100 milliseconds for all three projects in these benchmarks.</span>
 </p>
 </div>
 
@@ -549,6 +556,8 @@ class RepositoryIntelligence:
 
     def load_import_graph(self):
         """Build the import graph from the indexed repository."""
+        # build_import_graph() walks source files and extracts
+        # import statements; see Section 11.3 for the implementation.
         self.import_graph = build_import_graph(self.config.repo_root)
 
     def load_bm25_index(self):
@@ -624,6 +633,8 @@ class RepositoryIntelligence:
         packed = pack_context(fused, budget, self.store)
 
         # 6. Prepend the file tree for orientation
+        # build_file_tree() produces a text representation of the
+        # directory structure, giving the agent spatial orientation.
         tree = build_file_tree(self.config.repo_root, max_depth=3)
         tree_header = f"## Repository Structure\n```\n{tree}\n```\n\n"
         tree_tokens = len(tree.split()) * 2
@@ -653,7 +664,7 @@ class RepositoryIntelligence:
             lines.append("")
 
         return "\n".join(lines)</code></pre>
-<div class="code-caption" data-agent="08">Listing 11.23: The unified RepositoryIntelligence query interface, combining dense retrieval, BM25 scoring, RRF fusion, structural re-ranking, and budget-aware packing in a single <code>query()</code> method.</div>
+<div class="code-caption" data-agent="08">Listing 11.23: The unified RepositoryIntelligence query interface, combining dense retrieval, BM25 scoring, RRF fusion, structural re-ranking, and budget-aware packing in a single <code>query()</code> method. <span data-agent="03">The helper functions <code>reciprocal_rank_fusion</code>, <code>structural_rerank</code>, and <code>pack_context</code> were implemented in <a href="section-11.3.html">Section 11.3</a>; this class composes them into the end-to-end pipeline.</span></div>
 
 <div class="callout warning" data-agent="10">
 <h4>Common Misconception</h4>
@@ -882,6 +893,21 @@ to understand its own codebase. This self-referential quality is not just a curi
 it is a practical validation strategy. If your context engineering system is good
 enough for a coding agent to extend and maintain it, it is probably good enough for
 production use.
+</p>
+</div>
+
+<div class="callout warning" data-agent="01">
+<h4>From Prototype to Production</h4>
+<p>
+The code in this section builds a functional Repository Intelligence Layer, but a
+production-grade deployment requires several additional concerns not shown here:
+structured logging (so you can diagnose why a query returned poor results), retry
+logic for database connections and embedding model failures, graceful degradation
+when the embedding service is unavailable (falling back to BM25-only retrieval),
+and monitoring of index freshness (alerting when the watcher falls behind).
+<a href="../module-12-mcp-servers/index.html">Chapter 12</a> addresses some of these
+when wrapping the RIL as an MCP server; for the others, treat the code here as a
+tested prototype that validates the architecture before you add operational hardening.
 </p>
 </div>
 

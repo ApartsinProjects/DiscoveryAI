@@ -79,7 +79,7 @@ A researcher hands you ten thousand field observations and asks: does a new soil
 <li><strong>Data preparation and <a href="../../part-3-data-models/module-25-exploratory-discovery/section-25.1.html" data-agent="13">exploratory analysis</a></strong>: load data, check covariate balance, assess <span data-agent="21">positivity (the requirement that every subgroup defined by covariates has a non-zero probability of receiving each treatment level)</span>, and identify potential confounders through <a href="../../part-1-foundations/module-03-knowledge-representation/section-3.1.html" data-agent="13">domain knowledge</a> and correlation analysis.</li>
 <li><strong>Causal graph specification</strong>: combine domain knowledge with causal discovery algorithms to construct a plausible <span data-agent="12">directed acyclic graph (DAG)</span>. Run multiple algorithms and compare.</li>
 <li><strong>Identification</strong>: apply the <span data-agent="21">backdoor criterion (a graphical test that determines whether conditioning on a set of variables blocks all non-causal paths between treatment and outcome)</span>, or alternatives such as the front-door criterion or instrumental variables, to determine the estimand and valid adjustment sets.</li>
-<li><strong>Estimation</strong>: compute <span data-agent="12">Average Treatment Effect (ATE), Average Treatment on the Treated (ATT)</span>, and CATE using <span data-agent="21">doubly robust estimators (methods that combine an outcome model and a treatment model so that the estimate remains consistent if either model is correctly specified)</span> or <span data-agent="12">Double Machine Learning (DML)</span> estimators. Compare multiple estimators as a robustness check.</li>
+<li><strong>Estimation</strong>: compute <span data-agent="12">Average Treatment Effect (ATE), Average Treatment on the Treated (ATT)</span>, and CATE using <span data-agent="21">doubly robust estimators (methods that combine an outcome model and a treatment model so that the estimate remains consistent if either model is correctly specified)</span> or <span data-agent="12 04">Double Machine Learning (DML, a method that uses sample-splitting to separate nuisance parameter estimation from treatment effect estimation, reducing regularization bias)</span> estimators. Compare multiple estimators as a robustness check.</li>
 <li><strong>Refutation and sensitivity</strong>: run placebo, random common cause, subset, and <span data-agent="21">E-value tests (where the E-value quantifies the minimum strength an unmeasured confounder would need to fully explain away the observed effect)</span>. Flag estimates that fail any refutation.</li>
 <li><strong>Reporting</strong>: generate a structured report with the DAG, estimates, confidence intervals, refutation results, and a plain-language interpretation.</li>
 </ol>
@@ -413,7 +413,7 @@ graph_dot = build_causal_graph_dot(
 Researchers sometimes worry that incorporating domain knowledge into causal discovery
 "contaminates" a purely data-driven analysis. The opposite is true: ignoring domain
 knowledge is the mistake. Causal discovery algorithms operate under strong assumptions
-(<span data-agent="21">faithfulness, which requires that every conditional independence in the data reflects a genuine structural separation in the graph,</span> <span data-agent="21">causal sufficiency, which assumes that all common causes of measured variables are also measured,</span> and correct conditional independence tests) that frequently
+(<span data-agent="21">faithfulness, which requires that every conditional independence in the data reflects a genuine structural separation in the graph,</span> <span data-agent="21">causal sufficiency, which assumes that all common causes of measured variables are also measured,</span> and correct conditional independence tests) that <span data-agent="28">can</span>
 fail in practice. Domain knowledge constrains the search space, prevents absurd graphs (rain
 does not cause soil pH), and resolves equivalence class ambiguities that no algorithm can
 break from observational data alone. The scientific question is not "what can the data tell
@@ -422,6 +422,8 @@ This philosophy connects to the <a href="../module-32-bayesian-discovery/index.h
 reasoning</a> of Chapter 32, where prior knowledge is formalized as a prior distribution.
 </p>
 </div>
+
+<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far: you have seen how to assess covariate balance with standardized mean differences, run multiple causal discovery algorithms to build a consensus graph, and merge data-driven edges with domain knowledge into a final DAG suitable for identification.</p></div>
 
 <h2>4. The Complete Pipeline</h2>
 
@@ -471,7 +473,7 @@ class CausalAnalysisPipeline:
             outcome=self.config.outcome,
             graph=graph_dot,
         )
-        estimand = model.identify_effect(proceed_when_unidentifiable=True)
+        estimand = model.identify_effect(proceed_when_unidentifiable=True)  # <span data-agent="04">warns rather than halting when no valid adjustment set exists, letting the analyst inspect the partial result</span>
         self.result.identified_estimand = estimand
         print(f"Estimand type: {estimand.estimands}")
 
@@ -559,6 +561,8 @@ class CausalAnalysisPipeline:
         print(f"  ATE: {estimate.value:.2f}")
 
         # CATE via CausalForestDML for heterogeneity
+        # CausalForestDML extends DML by replacing the final-stage linear model
+        # with a causal random forest, capturing nonlinear effect heterogeneity
         cate_model = CausalForestDML(
             model_y=GradientBoostingRegressor(
                 n_estimators=200, max_depth=4, min_samples_leaf=20
@@ -602,6 +606,8 @@ class CausalAnalysisPipeline:
                 num_simulations=self.config.n_refutation_sims,
             )
             placebo_effect = ref_placebo.new_effect
+            # 10% threshold is a common heuristic, not a universal standard;
+            # adjust based on domain-specific tolerance for residual signal
             placebo_pass = abs(placebo_effect) < abs(estimate.value) * 0.1
             self.result.refutation_results["placebo"] = {
                 "effect": placebo_effect,
@@ -741,6 +747,10 @@ Think of refutation testing like a home inspection before buying a house. The ho
 A frequent misconception is that passing all refutation tests proves the causal estimate is correct and free of bias from unmeasured confounders. Refutation tests check internal consistency (stability under data perturbation, robustness to random noise confounders, and absence of effect under placebo treatment), but they cannot detect a real unmeasured confounder that is systematically related to both treatment and outcome. An estimate can pass every refutation test and still be biased if a strong confounder is missing from the data entirely. Refutation tests raise confidence that the estimate is not an artifact of obvious model misspecification; they do not substitute for domain knowledge about what variables might be missing from the analysis.
 </p>
 </div>
+
+<p data-agent="01">
+When a refutation test fails, the appropriate response depends on which test flagged the problem. A failed placebo test (the scrambled treatment still shows an effect) typically indicates that the estimator is picking up a spurious association rather than a causal signal; revisit the graph structure and check whether a confounder is missing or misspecified. A failed random common cause test (adding a noise variable shifts the estimate) suggests the estimate is fragile and sensitive to model specification; try alternative estimators or add covariates. A failed subset test (the estimate changes substantially on random 80% subsamples) points to instability driven by outliers or small-sample regions of the covariate space; inspect positivity and consider trimming extreme propensity scores. In each case, treat the failure as a diagnostic, not a dead end: adjust the graph, estimator, or data scope, then re-run the full pipeline to see whether the fix resolves the issue.
+</p>
 
 <h2>6. CATE Visualization and Interpretation</h2>
 
@@ -944,7 +954,7 @@ Including a non-confounding variable in the adjustment set does not introduce bi
 <div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
 <h4>Real-World Application: Uber's Causal Inference Platform</h4>
 <p>
-Uber built an internal causal inference platform that mirrors the pipeline architecture in this section. Their system automatically runs covariate balance checks, applies doubly robust estimation, and executes a battery of refutation tests (including placebo and sensitivity analyses) on every A/B test and observational study across the company. The platform enforces that no causal claim reaches a product decision without passing refutation gates, <span class="aha-moment" data-agent="24">reducing the rate of false-positive feature launches by over 30%</span> compared to their earlier t-test-only workflow.
+Uber built an internal causal inference platform that mirrors the pipeline architecture in this section. Their system automatically runs covariate balance checks, applies doubly robust estimation, and executes a battery of refutation tests (including placebo and sensitivity analyses) on every A/B test and observational study across the company. The platform enforces that no causal claim reaches a product decision without passing refutation gates, <span class="aha-moment" data-agent="24 28">reportedly reducing the rate of false-positive feature launches by an estimated 30%</span> compared to their earlier t-test-only workflow.
 </p>
 </div>
 

@@ -260,7 +260,7 @@ Consider designing a novel enzyme that positions a serine-histidine-aspartate ca
 Using RFDiffusion's motif scaffolding mode, you specify the 3D coordinates of the three
 catalytic residues as fixed constraints. The model generates thousands of diverse backbone
 scaffolds, each positioning the triad with sub-angstrom accuracy relative to the target
-geometry. ProteinMPNN then designs amino acid sequences for each scaffold, and <span data-agent="20">AlphaFold2 (or, as of 2024, AlphaFold3, which handles ligands and nucleic acids natively)</span>
+geometry in reported experiments (Watson et al., 2023). ProteinMPNN then designs amino acid sequences for each scaffold, and <span data-agent="20">AlphaFold2 (or, as of 2024, AlphaFold3, which handles ligands and nucleic acids natively)</span>
 filters for designs whose predicted structures match the generated backbone. This pipeline
 has produced experimentally validated enzymes with catalytic activity, demonstrating that
 equivariant diffusion can design functional proteins from scratch. The catalytic triad
@@ -292,7 +292,7 @@ function $R(x)$. The objective is to maximize the expected reward:
 $$J(\theta) = \mathbb{E}_{x \sim \pi_\theta}[R(x)]$$
 
 <p>
-The gradient of this objective is given by the log-derivative trick:
+The gradient of this objective is given by the log-derivative trick (rewriting the gradient of an expectation as an expectation of the score function weighted by the reward, so that we never need to differentiate through $R$ itself):
 </p>
 
 $$\nabla_\theta J(\theta) = \mathbb{E}_{x \sim \pi_\theta}[R(x) \cdot \nabla_\theta \log \pi_\theta(x)]$$
@@ -302,8 +302,10 @@ This gradient does not require differentiating through the reward function $R(x)
 requires evaluating $R(x)$ and computing the log-probability $\log \pi_\theta(x)$ of the
 generated sample. For autoregressive molecular generators, $\log \pi_\theta(x)$ is the sum
 of log-probabilities at each generation step. For diffusion models, it can be approximated
-via the <span data-agent="12">probability flow ordinary differential equation (ODE)</span> (Section 34.2).
+via the <span data-agent="12">probability flow ordinary differential equation (ODE)</span>, <span data-agent="04">which recasts the stochastic diffusion process as a deterministic trajectory whose log-likelihood can be computed exactly</span> (Section 34.2).
 </p>
+
+<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far: REINFORCE treats the generator as a policy and the property evaluator as a reward, then uses the log-derivative trick to compute gradients without differentiating through the reward function; the only ingredients needed are the reward value and the log-probability of each generated sample.</p></div>
 
 <div class="callout warning" data-agent="10">
 <h4>Common Misconception</h4>
@@ -375,7 +377,9 @@ class REINFORCETrainer:
         rewards, properties = self.compute_reward(smiles_list)
         rewards = rewards.to(log_probs.device)
 
-        # Update baseline (variance reduction)
+        # Update baseline (variance reduction): subtracting a near-mean
+        # value from each reward centers the advantages around zero,
+        # which sharply reduces gradient variance without introducing bias.
         self.baseline = (self.config.baseline_ema * self.baseline +
                         (1 - self.config.baseline_ema) * rewards.mean().item())
 
@@ -466,8 +470,8 @@ organized into four categories.
 <p>
 <strong>Validity</strong> measures whether generated molecules satisfy basic chemical
 rules: correct valences, no impossible bonds, parseable SMILES strings. For SMILES-based
-generators, validity rates range from 30% (early <a href="section-34.1.html" data-agent="13"><span data-agent="12">variational autoencoders, or VAEs</span></a>) to <span class="aha-moment" data-agent="24">99%+ (graph-based generators
-with action masking, where the model's output space is restricted at each step to only chemically valid bond additions), a threefold improvement driven entirely by switching from string representations to graph representations that enforce valence rules by construction</span>. For 3D structure generators, validity includes bond length and angle
+generators, validity rates <span data-agent="28">in published benchmarks</span> range from 30% (early <a href="section-34.1.html" data-agent="13"><span data-agent="12">variational autoencoders, or VAEs</span></a>) to <span class="aha-moment" data-agent="24">99%+ (graph-based generators
+with action masking, where the model's output space is restricted at each step to only chemically valid bond additions), a roughly threefold improvement driven primarily by switching from string representations to graph representations that enforce valence rules by construction</span>. For 3D structure generators, validity includes bond length and angle
 distributions matching reference data.
 </p>
 
@@ -490,9 +494,18 @@ uniqueness but 0% novelty. High novelty is essential for discovery.
 <p>
 <strong>Distribution similarity</strong> measures how closely the generated distribution
 matches a reference distribution. The Frechet ChemNet Distance (FCD; Preuer et al., 2018)
-computes the Frechet distance between the activations of a pretrained ChemNet model on
+computes the Frechet distance (a measure of how far apart two multivariate Gaussian fits to the activation vectors are) between the activations of a pretrained <span data-agent="04">ChemNet model (a neural network trained on molecular activity data to learn general-purpose chemical representations)</span> on
 generated and reference molecules, analogous to the <span data-agent="12">Frechet Inception Distance (FID)</span> score for images. Lower FCD indicates
 more similar distributions.
+</p>
+
+<p data-agent="01">
+<strong>Internal diversity</strong> measures how different the generated molecules are from one
+another, complementing the four categories above. A generator may achieve high validity,
+uniqueness, and novelty yet still produce molecules clustered around a single scaffold. Internal
+diversity, computed as the average pairwise Tanimoto distance between molecular fingerprints,
+detects this clustering: values near 1.0 indicate highly diverse outputs, while values near 0.0
+indicate near-identical structures differing only in minor substituents.
 </p>
 
 <pre><code class="language-python">from rdkit import Chem
@@ -601,7 +614,7 @@ field:
 <strong>MOSES</strong> (Polykovskiy et al., 2020) provides a curated subset of <span data-agent="21">ZINC, a freely available database of commercially available compounds for virtual screening,</span> with
 standardized train/test splits and a comprehensive metric suite (validity, uniqueness, novelty,
 FCD, fragment similarity, scaffold similarity). It is the most widely used benchmark for
-unconditional molecular generation <span data-agent="20">(as of 2024, MOSES is considered largely saturated for state-of-the-art models; the PMO benchmark described below and task-specific TDC leaderboards have become the preferred evaluation targets for goal-directed generation)</span>.
+unconditional molecular generation <span data-agent="20">(as of 2024, MOSES is <span data-agent="28">widely regarded as</span> largely saturated for state-of-the-art models, with top methods achieving near-perfect scores on most metrics; the PMO benchmark described below and task-specific TDC leaderboards have become the preferred evaluation targets for goal-directed generation)</span>.
 </p>
 
 <p>
@@ -618,6 +631,8 @@ generation benchmarks with clinically relevant endpoints. TDC is the closest to 
 discovery workflows and connects to the domain-specific applications in
 <a href="../../part-6-scientific-domains/module-49-chemistry-materials/index.html">Chapter 49</a>.
 </p>
+
+<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far: three standardized benchmarks partition the evaluation landscape: MOSES tests unconditional generation quality, GuacaMol tests goal-directed property targeting, and TDC connects to real-world drug discovery endpoints with clinically relevant tasks.</p></div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Right Tool: TDC for Standardized Molecular Generation Benchmarks</div>
@@ -653,7 +668,7 @@ above to 5 lines. It also provides leaderboards for comparing against published 
 <div class="callout practical-example" data-agent="33">
 <h4>Real-World Application: Drug Discovery at Insilico Medicine</h4>
 <p>
-Insilico Medicine used a conditional generative model (Chemistry42) with REINFORCE-based optimization to design a novel inhibitor of CDK20, a kinase implicated in hepatocellular carcinoma. The generator was conditioned on binding affinity, ADMET properties, and synthetic accessibility simultaneously, producing candidates that satisfied all constraints. The top-ranked molecule entered preclinical testing within 18 months of generation, roughly one quarter of the typical timeline, demonstrating that conditional molecular generation can compress the early stages of drug discovery from years to months.
+Insilico Medicine used a conditional generative model (Chemistry42) with REINFORCE-based optimization to design a novel inhibitor of CDK20, a kinase implicated in hepatocellular carcinoma. The generator was conditioned on binding affinity, ADMET properties, and synthetic accessibility simultaneously, producing candidates that satisfied all constraints. The top-ranked molecule entered preclinical testing within 18 months of generation, roughly one quarter of the typical timeline <span data-agent="28">according to the company's published reports</span>, suggesting that conditional molecular generation can compress the early stages of drug discovery from years to months.
 </p>
 </div>
 
@@ -792,7 +807,7 @@ generator is working correctly.
 
 <p>
 <strong>Stage 5: Iterate.</strong> Feed top-scoring candidates back as conditioning signals
-or training data for the next round. This iterative refinement converges toward the target
+or training data for the next round. This iterative refinement <span data-agent="28">typically</span> converges toward the target
 property region while maintaining diversity.
 </p>
 

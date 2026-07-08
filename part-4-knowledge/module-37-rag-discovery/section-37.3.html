@@ -154,11 +154,11 @@ def detect_section(text: str) -> str:
         if any(marker in text_lower for marker in markers):
             return section_name
     return "body"</code></pre>
-<div class="code-caption" data-agent="08">Listing 37.17: Paper chunking pipeline with section-aware splitting and deterministic chunk IDs. Each <code>PaperChunk</code> carries metadata about its source paper, section label, and character offset. The chunker prefers paragraph boundaries over fixed-size splits, and the overlap parameter ensures context is not lost at chunk edges. The deterministic chunk ID (derived from paper ID and start offset) enables idempotent re-ingestion.</div>
+<div class="code-caption" data-agent="08">Listing 37.17: Paper chunking pipeline with section-aware splitting and deterministic chunk IDs. Each <code>PaperChunk</code> carries metadata about its source paper, section label, and character offset. The chunker prefers paragraph boundaries over fixed-size splits, and the overlap parameter ensures context is not lost at chunk edges. The deterministic chunk ID (derived from paper ID and start offset) enables idempotent re-ingestion <span data-agent="04">(re-running the pipeline produces the same result without creating duplicates)</span>.</div>
 
 <h2>2. The Ingestion Pipeline</h2>
 
-<p>With chunking defined, the ingestion pipeline parses PDFs, chunks them, computes embeddings, and indexes everything in <span data-agent="21">Qdrant (an open-source vector database optimized for nearest-neighbor search over high-dimensional embeddings)</span>. This pipeline runs once per corpus update (when new papers are added) and is the most time-consuming part of the system.</p>
+<p>With chunking defined, the ingestion pipeline parses PDFs, chunks them, computes embeddings, and indexes everything in <span data-agent="21">Qdrant (an open-source vector database optimized for nearest-neighbor search over high-dimensional embeddings)</span>. This pipeline <span data-agent="28">typically</span> runs once per corpus update (when new papers are added) and is the most time-consuming part of the system.</p>
 
 <pre><code class="language-python">from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
@@ -304,7 +304,7 @@ class CorpusIndex:
 
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Ingesting a Lab's Paper Collection</div>
-<p>A computational biology lab has 2,400 PDFs collected over a decade of research on protein-protein interactions. The ingestion pipeline processes them in 45 minutes on a machine with a mid-range GPU (for embedding computation). The result: approximately 180,000 chunks indexed in Qdrant, consuming about 1.5 GB of disk space for vectors and payloads. Queries return in under 50 milliseconds. A new postdoc can now ask questions like "What experimental evidence exists for the interaction between BRCA1 and PALB2?" and receive cited answers drawing on the lab's entire publication history, not just the papers they happened to read during their first week.</p>
+<p>A computational biology lab has 2,400 PDFs collected over a decade of research on protein-protein interactions. The ingestion pipeline processes them in 45 minutes on a machine with a mid-range GPU (for embedding computation). The result: approximately 180,000 chunks indexed in Qdrant, consuming about 1.5 GB of disk space for vectors and payloads. Queries <span data-agent="28">typically</span> return in under 50 milliseconds, depending on index size and hardware. A new postdoc can now ask questions like "What experimental evidence exists for the interaction between BRCA1 and PALB2?" and receive cited answers drawing on the lab's entire publication history, not just the papers they happened to read during their first week.</p>
 </div>
 
 <h2>3. The Multi-Hop Research Engine</h2>
@@ -409,6 +409,10 @@ class CorpusIndex:
 <p data-agent="29">Multi-hop retrieval breaks a complex question into simpler sub-queries, retrieves evidence for each one independently, and merges the results before generating an answer. Real scientific questions almost never map to a single passage in a single paper. A question like "How does drug X overcome resistance mechanism Y?" requires passages about the drug's pharmacology, the molecular basis of the resistance mechanism, and any clinical trials testing the combination.</p>
 
 <p data-agent="29">The <span data-agent="12">large language model (LLM)</span> decomposes the original question into self-contained retrieval queries and runs each query against the vector index in parallel. The engine then deduplicates and reranks the pooled candidates with <strong data-agent="27">cross-encoder reranking</strong> (where a single model jointly encodes the query and each candidate passage to produce a fine-grained relevance score, as shown in stage 3 of Figure 37.6) against the original question, passing only the top-scoring passages to the generator. Use <strong data-agent="27">multi-hop retrieval</strong> whenever a question involves two or more distinct concepts unlikely to co-occur in a single chunk. For factual lookups ("What was the sample size in the FLAURA trial?"), a single query with reranking is faster and sufficient.</p>
+
+<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far: the corpus is parsed, chunked, embedded, and indexed in a vector store; a complex question will be decomposed into sub-queries, each sub-query will retrieve candidates independently, and a cross-encoder will rescore the pooled candidates before generation.</p></div>
+
+<p data-agent="01">The implementation below also calls <code>compute_faithfulness</code>, the claim-level verification function built in <a href="section-37.2.html">Section 37.2</a>. If you have not read that section yet, the key idea is straightforward: the function decomposes an answer into individual claims, checks whether each claim is entailed by the retrieved passages, and returns the fraction of supported claims as a score between 0 and 1.</p>
 
 <pre><code class="language-python">import anthropic
 import json
@@ -579,9 +583,12 @@ Provide a detailed, well-organized, cited answer.""",
         answer: str,
         evidence: list[dict],
     ) -> tuple[float, list[dict]]:
-        """Evaluate faithfulness of the generated answer."""
+        """Evaluate faithfulness of the generated answer.
+
+        Uses compute_faithfulness from Section 37.2.
+        """
         evidence_passages = [e["passage"] for e in evidence]
-        result = compute_faithfulness(answer, evidence_passages)
+        result = compute_faithfulness(answer, evidence_passages)  # Section 37.2
         return result["faithfulness_score"], result["details"]
 
     def ask(self, question: str) -> ResearchResult:
@@ -1003,7 +1010,7 @@ def feedback_to_benchmark(
 <h4>Step-Through: Multi-Hop Retrieval Pipeline</h4>
 <p>Trace through the <code>ask</code> method with the question "Does osimertinib overcome T790M resistance, and can liquid biopsy detect it early?"</p>
 <p><strong>Step 1 (Decompose):</strong> The LLM splits this into two sub-queries: SQ1 = "osimertinib activity against T790M resistance mutation" and SQ2 = "liquid biopsy detection of EGFR resistance mutations."</p>
-<p><strong>Step 2 (Retrieve):</strong> SQ1 retrieves 3 candidates with bi-encoder scores: soria_2018 (0.87), yu_2014 (0.82), leonetti_2019 (0.71). SQ2 retrieves: oxnard_2016 (0.91), leonetti_2019 (0.68). After deduplication, there are 4 unique candidates. The leonetti_2019 entry records both sub-queries in its <code>sub_queries_matched</code> list.</p>
+<p><strong>Step 2 (Retrieve):</strong> SQ1 retrieves 3 candidates with <span data-agent="04">bi-encoder scores (cosine similarity between the query embedding and each passage embedding)</span>: soria_2018 (0.87), yu_2014 (0.82), leonetti_2019 (0.71). SQ2 retrieves: oxnard_2016 (0.91), leonetti_2019 (0.68). After deduplication, there are 4 unique candidates. The leonetti_2019 entry records both sub-queries in its <code>sub_queries_matched</code> list.</p>
 <p><strong>Step 3 (Rerank):</strong> The cross-encoder rescores all 4 candidates against the original question. New scores: oxnard_2016 = 0.93, soria_2018 = 0.88, yu_2014 = 0.74, leonetti_2019 = 0.61. All pass the 0.3 threshold. Top k_rerank = 5 keeps all four.</p>
 <p><strong>Step 4 (Generate):</strong> The four passages are formatted as [Source 1] through [Source 4] and sent to the LLM with citation instructions. The generated answer cites Sources 1, 2, and 3.</p>
 <p><strong>Step 5 (Evaluate):</strong> Faithfulness check decomposes the answer into 5 claims, verifies each against the source passages, and returns a score of 0.80 (4 of 5 claims supported; one inference combining data across two sources is flagged as unsupported).</p>
@@ -1011,12 +1018,12 @@ def feedback_to_benchmark(
 
 <div class="callout practical-example" data-agent="33">
 <h4>Real-World Application: Biomedical Literature at Elicit</h4>
-<p>Elicit (elicit.com), an AI research assistant for scientists, uses a multi-hop RAG pipeline structurally similar to the copilot in this section. Given a research question, it decomposes it into sub-queries, retrieves relevant paper abstracts from a corpus of over 200 million papers via Semantic Scholar, reranks candidates with a learned relevance model, and generates cited summaries with per-claim source attribution. Their production system processes millions of queries per month and uses faithfulness evaluation to flag answers where citation support is weak, demonstrating that the retrieve-rerank-generate-evaluate architecture scales from a lab prototype to a commercial product.</p>
+<p>Elicit (elicit.com), an AI research assistant for scientists, uses a multi-hop RAG pipeline structurally similar to the copilot in this section. Given a research question, it decomposes it into sub-queries, retrieves relevant paper abstracts from a corpus of over 200 million papers via Semantic Scholar, reranks candidates with a learned relevance model, and generates cited summaries with per-claim source attribution. Their production system <span data-agent="28">reportedly</span> processes millions of queries per month and uses faithfulness evaluation to flag answers where citation support is weak, demonstrating that the retrieve-rerank-generate-evaluate architecture scales from a lab prototype to a commercial product.</p>
 </div>
 
 <div class="callout fun-note" data-agent="34">
 <h4>The Chunking Wars</h4>
-<p>In 2023 and 2024, the RAG community experimented with dozens of chunking strategies, from fixed-size windows to recursive character splitting to "semantic chunking" that places boundaries where embedding similarity between adjacent sentences drops below a threshold. After extensive benchmarking, multiple teams (including LlamaIndex's own evaluation suite and the <span data-agent="12">Massive Text Embedding Benchmark (MTEB)</span> retrieval leaderboard contributors) converged on a surprising finding: <span class="aha-moment" data-agent="24">simple overlapping fixed-size chunks of 256 to 512 tokens, combined with a strong reranker, match or outperform sophisticated semantic chunking on most retrieval benchmarks</span>. The reranker compensates for imperfect chunk boundaries by scoring full question-passage relevance, making the exact chunking strategy less critical than most practitioners assume. The lesson: invest your engineering budget in the reranker, not the chunker.</p>
+<p>In 2023 and 2024, the RAG community experimented with dozens of chunking strategies, from fixed-size windows to recursive character splitting to "semantic chunking" that places boundaries where embedding similarity between adjacent sentences drops below a threshold. After extensive benchmarking, multiple teams (including LlamaIndex's own evaluation suite and the <span data-agent="12">Massive Text Embedding Benchmark (MTEB)</span> retrieval leaderboard contributors) <span data-agent="28">have generally</span> converged on a finding: <span class="aha-moment" data-agent="24">simple overlapping fixed-size chunks of 256 to 512 tokens, combined with a strong reranker, match or outperform sophisticated semantic chunking on most retrieval benchmarks</span>. The reranker compensates for imperfect chunk boundaries by scoring full question-passage relevance, making the exact chunking strategy less critical than most practitioners assume. The lesson: invest your engineering budget in the reranker, not the chunker.</p>
 </div>
 
 <div class="callout lab" data-agent="41">

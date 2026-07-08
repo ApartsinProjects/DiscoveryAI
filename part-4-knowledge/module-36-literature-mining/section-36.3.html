@@ -224,7 +224,7 @@ class MiningState:
     community_info: list[dict] = field(default_factory=list)
     top_papers_pagerank: list[dict] = field(default_factory=list)
     bridging_papers: list[dict] = field(default_factory=list)
-    structural_holes: list[dict] = field(default_factory=dict)
+    structural_holes: list[dict] = field(default_factory=list)
     trend_data: dict = field(default_factory=dict)
     entity_counts: dict = field(default_factory=dict)
     claims_summary: dict = field(default_factory=dict)
@@ -298,7 +298,7 @@ papers have at least one citation, filtering out preprints and working drafts th
 <div class="callout warning" data-agent="10">
 <h4>Common Misconception</h4>
 <p>
-A common mistake is believing that harvesting more papers always produces better analysis. In practice, setting <code>max_papers</code> too high (say, 5,000+) degrades community detection quality because the citation graph becomes so dense that Louvain merges distinct subcommunities into a few giant clusters, and structural hole scores converge toward zero. The pipeline works best with a focused corpus of 300 to 1,500 papers; if your initial query returns tens of thousands of results, narrow the topic, tighten the year range, or add concept filters rather than raising the limit.
+A common mistake is believing that harvesting more papers always produces better analysis. In practice, setting <code>max_papers</code> too high (say, 5,000+) tends to degrade community detection quality because the citation graph becomes so dense that Louvain merges distinct subcommunities into a few giant clusters, and structural hole scores converge toward zero. The pipeline works best with a focused corpus of 300 to 1,500 papers; if your initial query returns tens of thousands of results, narrow the topic, tighten the year range, or add concept filters rather than raising the limit.
 </p>
 </div>
 
@@ -320,6 +320,8 @@ for bridging, and Louvain for community structure. It also computes basic graph 
     from community import community_louvain
 
     # Build the directed citation graph
+    # build_citation_graph, rank_papers_by_influence, and
+    # find_bridging_papers are defined in Section 36.1.
     G = build_citation_graph(state.papers)
     logger.info(f"Citation graph: {G.number_of_nodes()} nodes, "
                 f"{G.number_of_edges()} edges")
@@ -393,7 +395,7 @@ The extraction stage processes each paper's abstract through the NER and claim-e
 from <a href="section-36.2.html">Section 36.2</a>. For a 500-paper corpus, abstract-level
 extraction takes about 2 to 5 minutes on a CPU. Full-text PDF extraction is available as an
 optional mode but requires downloading PDFs (which may not be openly accessible) and takes
-roughly 30 seconds per paper with <span data-agent="21">Docling, an open-source PDF parsing library that converts scientific documents into structured text with section boundaries, tables, and figure captions preserved</span>.
+roughly 20 to 40 seconds per paper with <span data-agent="21">Docling, an open-source PDF parsing library that converts scientific documents into structured text with section boundaries, tables, and figure captions preserved</span>.
 </p>
 
 <pre><code class="language-python">import collections
@@ -422,8 +424,8 @@ def stage_extract(state: MiningState) -> MiningState:
             total_entities += 1
 
         # Claim-evidence extraction
-        sentences = _split_sentences(paper.abstract)
-        claims = extract_claims_and_evidence(sentences, context_window=2)
+        sentences = _split_sentences(paper.abstract)   # simple regex splitter on sentence boundaries
+        claims = extract_claims_and_evidence(sentences, context_window=2)  # from Section 36.2
         for c in claims:
             all_claim_types[c.claim_type] += 1
             total_claims += 1
@@ -456,6 +458,8 @@ def stage_extract(state: MiningState) -> MiningState:
 </code></pre>
 <div class="code-caption" data-agent="08">Listing 36.18: Knowledge extraction stage running NER and claim-evidence pipelines over paper abstracts with per-type aggregate counters.</div>
 
+<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far the pipeline has harvested papers from OpenAlex, built a citation graph with community structure and influence rankings, and extracted entities and claims from abstracts; the remaining stages make the corpus searchable by meaning (embedding) and surface actionable gaps and trends (analysis and reporting).</p></div>
+
 <h2>5. Stage 4: Embedding and Search Index</h2>
 
 <p data-agent="14">Once the extraction stage has turned raw abstracts into structured entities and claims, the next step is to make the entire corpus searchable by meaning rather than by keyword.</p>
@@ -465,7 +469,7 @@ def stage_extract(state: MiningState) -> MiningState:
 to disk. This index enables two capabilities. Semantic search finds papers relevant to a
 natural language query. Embedding-based clustering captures topical similarity even when papers
 do not cite each other, complementing citation-based community detection.</span>
-<span data-agent="20">The default model <code>all-MiniLM-L6-v2</code> remains a solid baseline; as of 2025, newer sentence-transformers models such as <code>all-mpnet-base-v2</code> and domain-specific models like <span data-agent="21">SPECTER2 (a transformer model trained specifically on scientific paper text for tasks like citation prediction and paper similarity)</span> offer improved retrieval quality for scientific text at the cost of larger model size.</span>
+<span data-agent="20">The default model <code>all-MiniLM-L6-v2</code> remains a solid baseline; as of 2025, newer models from the <span data-agent="04">sentence-transformers library (a Python framework for computing dense vector representations of text, built on top of Hugging Face Transformers)</span> such as <code>all-mpnet-base-v2</code> and domain-specific models like <span data-agent="21">SPECTER2 (a transformer model trained specifically on scientific paper text for tasks like citation prediction and paper similarity)</span> offer improved retrieval quality for scientific text at the cost of larger model size.</span>
 </p>
 
 <pre><code class="language-python">def stage_embed(state: MiningState) -> MiningState:
@@ -781,6 +785,18 @@ if __name__ == "__main__":
 </code></pre>
 <div class="code-caption" data-agent="08">Listing 36.22: Complete pipeline runner with sequential stage execution, error handling, and resume-from-stage support for interrupted runs.</div>
 
+<p data-agent="01">
+Note that the runner above skips completed stages when resuming but does not reload their
+outputs from checkpoint files. A production implementation would deserialize the most recent
+checkpoint into <code>MiningState</code> before resuming, so that later stages can access
+earlier results (for example, the analysis stage needs the papers and communities produced
+by the harvest and graph stages). The checkpoint files written by <code>save_checkpoint</code>
+store summary statistics; to support full resumability, serialize the complete
+<code>MiningState</code> (or at minimum the <code>papers</code> list, <code>communities</code>
+dict, and <code>graph_stats</code>) using <code>pickle</code> or a JSON-serializable format
+at each stage boundary.
+</p>
+
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Mining the AI-for-Drug-Discovery Landscape</div>
 <p>
@@ -1039,14 +1055,14 @@ Step 5: Counts of [8, 7, 5, 4, 3] would yield a slope of roughly &minus;1.3, cla
 <div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
 <h4>Real-World Application: Semantic Scholar's Research Feed</h4>
 <p>
-Semantic Scholar (developed by the Allen Institute for AI) uses a production literature mining pipeline similar to the one built here, combining citation graph analysis with dense embeddings of paper abstracts to power its "Research Feed" feature. The system harvests millions of papers, computes influence scores analogous to PageRank, clusters them into topical communities, and then recommends papers at the intersection of a researcher's reading history and trending structural holes in their field. The key architectural parallel is the staged pipeline: Semantic Scholar separates ingestion, graph construction, embedding, and recommendation into independently scalable services, exactly mirroring the six-stage checkpoint design of this section.
+Semantic Scholar (developed by the Allen Institute for AI) uses a production literature mining pipeline that shares architectural principles with the one built here, combining citation graph analysis with dense embeddings of paper abstracts to power its "Research Feed" feature. The system harvests millions of papers, computes influence scores analogous to PageRank, clusters them into topical communities, and then recommends papers at the intersection of a researcher's reading history and trending structural holes in their field. The key architectural parallel is the staged pipeline: Semantic Scholar separates ingestion, graph construction, embedding, and recommendation into independently scalable services, exactly mirroring the six-stage checkpoint design of this section.
 </p>
 </div>
 
 <div class="callout fun-note" data-agent="34">
 <h4>The Paper That Cited Itself Into Existence</h4>
 <p>
-In 2005, a group of researchers submitted a paper to a conference whose acceptance was partly predicted by a citation analysis algorithm. The paper's topic was citation analysis itself, and the authors included a self-citation in the references, creating a bootstrap loop: the algorithm used to evaluate the paper's importance counted the very paper it was evaluating. This edge case, known as a "citation fixed point," is surprisingly common in bibliometrics research and occasionally distorts PageRank scores in small citation graphs. The literature miner sidesteps this by filtering self-citations during graph construction, but if you remove that filter on a bibliometrics corpus, you will find that papers about citation metrics consistently appear more influential than they should be.
+In 2005, a group of researchers submitted a paper to a conference whose acceptance was partly predicted by a citation analysis algorithm. The paper's topic was citation analysis itself, and the authors included a self-citation in the references, creating a bootstrap loop: the algorithm used to evaluate the paper's importance counted the very paper it was evaluating. This edge case, known as a "citation fixed point," is surprisingly common in bibliometrics research and occasionally distorts PageRank scores in small citation graphs. The literature miner sidesteps this by filtering self-citations during graph construction, but if you remove that filter on a bibliometrics corpus, you will find that papers about citation metrics tend to appear more influential than they should be.
 </p>
 </div>
 

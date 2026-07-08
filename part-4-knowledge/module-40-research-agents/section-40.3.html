@@ -191,8 +191,7 @@ of hypotheses. We cap this outer loop at two iterations to control cost.
 <p data-agent="14">
 <span data-agent="15">Each role needs a concrete implementation.</span>
 The OpenAI Agents SDK provides a lightweight framework for defining agents with system
-prompts, tools, and handoff rules. Each agent is a Python object with a
-<code>run()</code> method. <span data-agent="15">The five agents and their typed interfaces follow:</span>
+prompts, tools, and handoff rules. Each agent is a Python object whose <code>run()</code> method sends the agent's system prompt and tools to the LLM, executes any tool calls, and returns a typed result. <span data-agent="15">The five agents and their typed interfaces follow:</span>
 </p>
 
 <pre><code class="language-python">"""
@@ -363,6 +362,16 @@ meta_reviewer = Agent(
 </code></pre>
 <div class="code-caption" data-agent="08 40">Five research agents with typed Pydantic outputs and PaperQA2 tools: LiteratureReport, HypothesisCandidate, CritiqueReport, RankedHypotheses, and ResearchBrief define the coordination protocol between agents.</div>
 
+<p data-agent="01">
+Notice that only four of the five roles receive explicit <code>Agent()</code> definitions
+here. The Ranker is implemented as procedural logic inside the LangGraph
+<code>rank_node</code> function (Section 3) rather than as an LLM agent with a system
+prompt, because its task (running the Elo tournament and updating scores) is
+algorithmic: the LLM serves only as a pairwise judge inside the loop, not as an
+autonomous decision-maker. Keeping the Ranker procedural makes the tournament
+deterministic up to the LLM judgments themselves.
+</p>
+
 <div class="callout tip" data-agent="06">
 <h4>Mental Model</h4>
 <p>
@@ -397,8 +406,9 @@ Without structured debate, a solo generator agent converges on a narrow cluster 
 The Agents SDK defines individual agents; LangGraph connects them into a stateful
 workflow with conditional edges, persistence, and streaming. The debate loop is the
 heart of the system: hypotheses are generated, critiqued, and then compared in a
-pairwise tournament. LangGraph's <code>StateGraph</code> makes this loop explicit and
-debuggable.
+pairwise tournament (using a position-swapped judging technique explained in the
+"Position Bias" callout later in this section). LangGraph's <code>StateGraph</code>
+makes this loop explicit and debuggable.
 </p>
 
 <pre><code class="language-python">"""
@@ -496,7 +506,8 @@ async def rank_node(state: ResearchState) -> dict:
     hypotheses = state["hypotheses"]
     critiques = {c["hypothesis_id"]: c for c in state["critiques"]}
 
-    # initialize Elo ratings
+    # initialize Elo ratings (1200 is the conventional neutral starting
+    # value; all hypotheses begin on equal footing)
     elo = {h["id"]: h.get("elo_rating", 1200.0) for h in hypotheses}
     comparisons = 0
 
@@ -857,6 +868,9 @@ def compile_research_team():
 
     # compile: DSPy finds better prompts through bootstrapping
     team = ResearchTeamDSPy(num_hypotheses=4)
+    # BootstrapFewShot generates candidate prompts by running the
+    # module on training examples and keeping the traces that satisfy
+    # the metric, then injects those traces as few-shot demonstrations.
     optimizer = dspy.BootstrapFewShot(
         metric=lambda example, pred, trace=None: (
             len(pred.promising) >= 1  # at least one promising hypothesis
@@ -1038,8 +1052,8 @@ A frequent mistake is assuming that adding more agents, more tournament rounds, 
 <strong>Model tiering.</strong> Use the most capable model (GPT-4o, Claude Sonnet) only for
 tasks where quality matters most: hypothesis generation and the meta-review. Use a
 cheaper model (GPT-4o-mini, Claude Haiku) for tasks where consistency matters more than
-creativity: the critic and the tournament judge. This typically reduces cost by 60 to
-70 percent with minimal quality loss.
+creativity: the critic and the tournament judge. In the battery-electrolyte example above, this reduced cost by roughly 60 to
+70 percent with only modest quality loss on the final rankings.
 </p>
 
 <p>
@@ -1050,8 +1064,10 @@ implements this check.
 </p>
 
 <p>
-<strong>Caching.</strong> Literature search results, paper extractions, and novelty checks
-are deterministic for the same inputs. Cache them across runs so that repeated
+<strong>Caching.</strong> Literature search results and paper extractions are largely
+deterministic for the same inputs (novelty checks may vary slightly if the
+underlying LLM is non-deterministic, but caching still avoids redundant retrieval).
+Cache them across runs so that repeated
 experiments on the same topic do not re-query PaperQA2. LangGraph's built-in
 checkpointing provides workflow-level caching; for tool-level caching, wrap each tool
 with a simple hash-based cache:
@@ -1100,6 +1116,8 @@ class ToolCache:
         return self.hits / total if total > 0 else 0.0
 </code></pre>
 <div class="code-caption" data-agent="08 40">ToolCache class with SHA-256 keyed file storage: caches PaperQA2 search results and novelty checks to avoid redundant API calls across repeated runs on the same research topic.</div>
+
+<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far: you have three levers for controlling research-team cost without redesigning the pipeline: assign cheaper models to mechanical tasks (model tiering), stop the loop early when quality plateaus (early termination), and avoid redundant API calls on repeated runs (caching).</p></div>
 
 <p>
 For evaluation, research agent teams present a unique challenge: there is no ground
@@ -1300,13 +1318,13 @@ that human experts had not previously prioritized.
 <p>
 The double-comparison trick used in <code>_judge_pair</code> (presenting A-then-B and
 B-then-A, then reconciling) exists because LLMs exhibit a strong and consistent
-position bias (where position bias is the tendency of a model to favor whichever option appears first or second in the prompt, regardless of actual quality): GPT-4 picks whichever option appears first roughly 60% of the time,
-regardless of quality. LMSYS discovered this while building Chatbot Arena and found
+position bias (where position bias is the tendency of a model to favor whichever option appears first or second in the prompt, regardless of actual quality): in early Chatbot Arena experiments, GPT-4 favored whichever option appeared first in roughly 60% of comparisons,
+regardless of quality (Zheng et al., 2023). LMSYS found
 that without position-swapped comparisons, rankings were significantly contaminated
 by presentation order rather than actual quality. The same bias affects every
-LLM-as-judge application, from hypothesis ranking to automated paper review. A single
-swap cuts the bias nearly in half; three independent judges with randomized order
-reduce it to under 5%.
+LLM-as-judge application, from hypothesis ranking to automated paper review. In their
+experiments, a single swap typically cut the bias roughly in half; three independent
+judges with randomized order reduced it to under 5% in the configurations they tested.
 </p>
 </div>
 
