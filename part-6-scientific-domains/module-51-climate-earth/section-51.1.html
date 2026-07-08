@@ -55,7 +55,7 @@ $$\frac{\partial \mathbf{u}}{\partial t} = -(\mathbf{u} \cdot \nabla)\mathbf{u} 
 
 <p><strong>Why AI changes the game.</strong> The parameterization bottleneck is the key. Sub-grid physics accounts for the majority of forecast error in traditional NWP models. These parameterizations are hand-tuned, computationally expensive, and structurally limited. Neural networks, trained on decades of reanalysis data, learn these relationships implicitly from observations rather than from simplified theoretical models.</p>
 
-<p><strong>How.</strong> All leading AI weather models share a common setup. They are trained on ERA5 reanalysis data (ECMWF's best estimate of the atmospheric state from 1979 to present, on a 0.25-degree global grid with 37 pressure levels). The models learn to map two consecutive atmospheric states to the state 6 hours later, then roll out autoregressively for longer forecasts.</p>
+<p><strong>How.</strong> All leading AI weather models share a common setup. They are trained on ERA5 reanalysis data (ECMWF's best estimate of the atmospheric state from 1979 to present, on a 0.25-degree global grid with 37 pressure levels). The models learn to map two consecutive atmospheric states to the state 6 hours later, then roll out autoregressively (each predicted time step feeds as input to the next) for longer forecasts.
 
 <h4 data-agent="30">What Is Reanalysis Data?</h4>
 
@@ -75,7 +75,7 @@ $$\frac{\partial \mathbf{u}}{\partial t} = -(\mathbf{u} \cdot \nabla)\mathbf{u} 
 
 <h2>2. GraphCast: Graph Neural Networks for Weather</h2>
 
-<p>GraphCast (Lam et al., 2023) treats the atmosphere as a graph. The Earth's surface is discretized into a multi-resolution mesh, with nodes representing grid cells and edges encoding spatial adjacency. The atmospheric state at each node includes temperature, specific humidity, wind components, and geopotential on 37 pressure levels, plus surface variables (mean sea level pressure, 2-meter temperature, 10-meter wind).</p>
+<p>GraphCast (Lam et al., 2023) treats the atmosphere as a graph. The Earth's surface is discretized into a multi-resolution icosahedral mesh (a sphere-covering triangulation built by repeatedly subdividing the faces of a regular icosahedron), with nodes representing grid cells and edges encoding spatial adjacency. The atmospheric state at each node includes temperature, specific humidity, wind components, and geopotential on 37 pressure levels, plus surface variables (mean sea level pressure, 2-meter temperature, 10-meter wind).</p>
 
 <p>The architecture has three stages. An <strong>encoder</strong> maps the input atmospheric state onto mesh nodes using learned embeddings. A <strong>processor</strong> runs 16 rounds of message passing on the mesh graph, allowing information to propagate globally. A <strong>decoder</strong> maps the processed mesh back to the latitude-longitude grid to produce the forecast.</p>
 
@@ -83,6 +83,8 @@ $$\frac{\partial \mathbf{u}}{\partial t} = -(\mathbf{u} \cdot \nabla)\mathbf{u} 
 <h4>Mental Model</h4>
 <p>Think of message passing on the mesh graph like a telephone tree during a school snow day. Each parent calls two or three neighbors, who each call their neighbors, and within a few rounds the entire community knows the school is closed. In GraphCast, each mesh node "calls" its neighbors with information about local temperature, wind, and pressure. After 16 rounds of these calls, a node in the western Pacific can incorporate information from the jet stream over North America, because the messages have relayed through intermediate nodes spanning the globe. The multi-resolution mesh acts like having both local neighborhood contacts and long-distance relatives: coarse mesh edges carry information across continents in fewer hops, while fine mesh edges preserve local detail. This is how the model captures teleconnections (distant weather systems influencing each other) without needing to process the entire globe in a single, expensive attention operation.</p>
 </div>
+
+<p data-agent="39">Figure 51.1 implements the three core components of the GraphCast architecture: the icosahedral mesh construction, the grid-to-mesh encoder, and the message-passing processor.</p>
 
 <pre><code class="language-python">"""
 GraphCast-style mesh graph construction for weather prediction.
@@ -229,13 +231,13 @@ class MessagePassingLayer(nn.Module):
         node_input = torch.cat([nodes, agg], dim=-1)
         nodes = nodes + self.node_mlp(node_input)
         return nodes</code></pre>
-<div class="code-caption">Figure 51.1: GraphCast-style architecture components. The icosahedral mesh provides multi-resolution spatial structure, the encoder maps ERA5 grid features onto mesh nodes, and the processor runs 16 rounds of message passing to propagate information globally before the decoder maps back to the forecast grid.</div>
+<div class="code-caption" data-agent="08 40">Figure 51.1: GraphCast-style architecture components: icosahedral mesh construction, grid-to-mesh encoder, and 16-round message-passing processor for global information propagation.</div>
 
 <h2>3. Pangu-Weather: 3D Vision Transformers</h2>
 
 <p>While GraphCast uses an explicit mesh, Pangu-Weather (Bi et al., 2023) treats the atmosphere as a 3D volume and processes it with a modified <a href="../../part-3-data-models/module-27-foundation-models/section-27.1.html" data-agent="13">vision Transformer</a>. The key insight is <em>Earth-specific positional encoding</em>: the model learns separate positional embeddings for latitude, longitude, and pressure level, reflecting the fact that atmospheric dynamics have fundamentally different structure in horizontal vs. vertical directions.</p>
 
-<p>Pangu-Weather trains four separate models for 1-hour, 3-hour, 6-hour, and 24-hour lead times. To produce a 7-day forecast, the system chains the 24-hour model seven times rather than rolling out a single 6-hour model 28 times. This reduces error accumulation at the cost of training four models.</p>
+<p>Pangu-Weather trains four separate models for 1-hour, 3-hour, 6-hour, and 24-hour lead times. To produce a 7-day forecast, the system chains the 24-hour model seven times rather than rolling out a single 6-hour model 28 times. This reduces error accumulation at the cost of training four models. Figure 51.2 shows how the Earth-specific position encoding decomposes 3D atmospheric coordinates into separate learnable embeddings.</p>
 
 <pre><code class="language-python">"""
 Pangu-Weather-style Earth-specific 3D Transformer block.
@@ -298,7 +300,7 @@ class EarthSpecificPositionEncoding(nn.Module):
 class PanguBlock(nn.Module):
     """3D Earth-specific Transformer block with window attention.
 
-    Uses shifted window attention (Swin-style) adapted for
+    Uses shifted window attention (Swin-style, where attention is computed within local windows that shift between layers to enable cross-window connections) adapted for
     the spherical geometry: windows wrap around at the dateline
     and handle polar convergence.
     """
@@ -331,7 +333,7 @@ class PanguBlock(nn.Module):
         # MLP with residual
         x = x + self.mlp(self.norm2(x))
         return x</code></pre>
-<div class="code-caption">Figure 51.2: Pangu-Weather's Earth-specific position encoding decomposes 3D atmospheric coordinates into separate latitude, longitude, and pressure-level embeddings. This reflects the physical asymmetry between horizontal advection and vertical stratification in atmospheric dynamics.</div>
+<div class="code-caption" data-agent="08 40">Figure 51.2: Pangu-Weather's Earth-specific position encoding, decomposing 3D atmospheric coordinates into separate latitude, longitude, and pressure-level embeddings with a Swin-style windowed attention block.</div>
 
 <p data-agent="14">GraphCast and Pangu-Weather both operate in the spatial domain, processing atmospheric variables on grids or meshes; FourCastNet instead asks whether the frequency domain offers a more natural representation of the planetary wave patterns that govern weather.</p>
 
@@ -339,12 +341,14 @@ class PanguBlock(nn.Module):
 
 <p><span data-agent="29">FourCastNet (Pathak et al., 2022) takes a spectral approach, <span data-agent="12">building on the Fourier Neural Operator (FNO) architecture covered in <a href="../../part-3-data-models/module-33-scientific-ml/index.html">Chapter 33</a>.</span></span> <span data-agent="20">FourCastNet v2 (2023) later replaced the AFNO backbone with a spherical harmonics transformer for improved accuracy at longer lead times.</span> <span data-agent="29">The key modification is the <strong>Adaptive Fourier Neural Operator</strong> (AFNO), which applies self-attention in the Fourier domain. Standard attention costs $O(N^2)$ for $N$ grid points. AFNO instead transforms each channel to the frequency domain, applies a learnable filter, and transforms back.</span> <span class="aha-moment" data-agent="24">(On a 0.25-degree global grid with roughly one million points, this cuts the mixing cost from a trillion operations to about twenty million: a 50,000-fold reduction.)</span></p>
 
-<p>This spectral bias is physically motivated. Atmospheric dynamics are dominated by large-scale wave patterns (Rossby waves, Kelvin waves) that have clean representations in Fourier space. By operating in the frequency domain, AFNO naturally captures these planetary-scale structures.</p>
+<p>This spectral bias is physically motivated. Atmospheric dynamics are dominated by large-scale wave patterns (Rossby waves, where large planetary waves propagate westward due to Earth's rotation, and Kelvin waves) that have clean representations in Fourier space. By operating in the frequency domain, AFNO naturally captures these planetary-scale structures.</p>
 
 <div class="callout tip" data-agent="06">
 <h4>Mental Model</h4>
 <p>Think of AFNO like tuning a graphic equalizer on a stereo system. When you listen to a song in normal playback (spatial domain), adjusting one moment in time affects only that moment. But when you switch to the equalizer view (frequency domain), you see the music decomposed into bass, midrange, and treble bands, and turning a single knob boosts or cuts that frequency everywhere in the song at once. AFNO does the same thing with weather data: it transforms the global atmosphere into its constituent wave patterns (planetary waves in the "bass," storm-scale features in the "treble"), applies learnable filters to amplify or suppress each frequency band, then transforms back. This is why it captures continent-spanning Rossby waves so efficiently: in the frequency domain, a pattern that spans the entire globe is just one coefficient to adjust, not millions of grid points to process individually. The sparsity threshold acts like a noise gate on the equalizer, silencing frequency bands below a certain energy level to keep the forecast clean.</p>
 </div>
+
+<p data-agent="39">Figure 51.3 implements the AFNO block, showing the 2D FFT, learnable complex-valued MLP, sparsity thresholding, and inverse FFT stages.</p>
 
 <pre><code class="language-python">"""
 Adaptive Fourier Neural Operator (AFNO) block
@@ -444,13 +448,13 @@ class AFNOBlock(nn.Module):
         x = torch.fft.irfft2(x_ft, s=(H, W), dim=(1, 2), norm="ortho")
 
         return x</code></pre>
-<div class="code-caption">Figure 51.3: The Adaptive Fourier Neural Operator (AFNO) block from FourCastNet. Token mixing happens in the Fourier domain via a learnable complex-valued MLP, making it naturally suited to the planetary wave structures that dominate atmospheric dynamics. The hard thresholding step enforces spectral sparsity.</div>
+<div class="code-caption" data-agent="08 40">Figure 51.3: FourCastNet's Adaptive Fourier Neural Operator (AFNO) block, performing token mixing via a complex-valued MLP in the Fourier domain with hard sparsity thresholding on spectral coefficients.</div>
 
 <h2>5. NeuralGCM: Hybrid Learned-Physics Models</h2>
 
 <p><span data-agent="17">NeuralGCM (Kochkov et al., 2024) diverges from the pure data-driven models. It retains a differentiable dynamical core for the primitive equations and replaces only the sub-grid physics with learned neural networks, preserving conservation laws by construction while letting data teach the hard parts.</span></p>
 
-<p>The architecture couples a spectral dynamical core (solving the primitive equations on a cubed-sphere grid) with neural network parameterizations for radiation, convection, cloud microphysics, and turbulent diffusion. The entire system is end-to-end differentiable, trained by backpropagating through both the dynamical core and the neural parameterizations using JAX's automatic differentiation.</p>
+<p>The architecture couples a spectral dynamical core (solving the primitive equations on a cubed-sphere grid, where six square patches are mapped onto a sphere to avoid polar singularities) with neural network parameterizations for radiation, convection, cloud microphysics, and turbulent diffusion. The entire system is end-to-end differentiable, trained by backpropagating through both the dynamical core and the neural parameterizations using JAX's automatic differentiation. Figure 51.4 implements a simplified version of this hybrid architecture, with the differentiable dynamical core and learned physics parameterization as separate, composable modules.</p>
 
 <pre><code class="language-python">"""
 NeuralGCM-style hybrid model: a differentiable dynamical core
@@ -600,7 +604,7 @@ def neuralgcm_step(state: AtmosphericState,
         v_wind=state.v_wind,
         surface_pressure=state.surface_pressure,
     )</code></pre>
-<div class="code-caption">Figure 51.4: NeuralGCM-style hybrid model in JAX. The differentiable dynamical core handles resolved-scale dynamics (advection, Coriolis force, pressure gradients), while a learned neural network replaces hand-tuned parameterizations for sub-grid physics. End-to-end differentiability allows training by backpropagating through both components.</div>
+<div class="code-caption" data-agent="08 40">Figure 51.4: NeuralGCM-style hybrid model in JAX, coupling a differentiable dynamical core (advection, Coriolis force) with a learned neural network for sub-grid physics parameterization.</div>
 
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Tropical Cyclone Forecasting</div>
@@ -703,7 +707,7 @@ def spectral_loss(
     eps = 1e-30
     log_ratio = np.log(spec_pred + eps) - np.log(spec_target + eps)
     return float(np.mean(log_ratio ** 2))</code></pre>
-<div class="code-caption">Figure 51.5: Computing kinetic energy spectra to verify that neural weather models maintain realistic energy cascades. The spectral loss penalizes deviations from the observed $k^{-3}$ (synoptic) and $k^{-5/3}$ (mesoscale) power laws.</div>
+<div class="code-caption" data-agent="08 40">Figure 51.5: Kinetic energy spectrum computation and spectral loss for verifying that neural weather models maintain realistic $k^{-3}$ (synoptic) and $k^{-5/3}$ (mesoscale) energy cascades.</div>
 
 <h3>6.3 Pressure-Level Consistency</h3>
 
@@ -798,7 +802,7 @@ def anomaly_correlation(forecast: xr.DataArray,
     denom_o = np.sqrt((weights_da * o_anom ** 2).sum(["lat", "lon"]))
 
     return numerator / (denom_f * denom_o + 1e-10)</code></pre>
-<div class="code-caption">Figure 51.6: WeatherBench2-style evaluation metrics. The latitude-weighted RMSE accounts for grid cell area variation, while the anomaly correlation coefficient (ACC) measures whether the forecast captures departures from climatology. These are the standard metrics used by operational weather centers worldwide.</div>
+<div class="code-caption" data-agent="08 40">Figure 51.6: WeatherBench2-style evaluation: latitude-weighted RMSE accounting for grid cell area variation and anomaly correlation coefficient (ACC) measuring forecast skill relative to climatology.</div>
 
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Ensemble Forecasting at Scale</div>
@@ -809,7 +813,96 @@ def anomaly_correlation(forecast: xr.DataArray,
 
 <h2>8. Architecture Comparison</h2>
 
-<p>Table 51.1 summarizes the four leading architectures and their trade-offs.</p>
+<p>Figure 51.7 illustrates how all four architectures share the same ERA5 input and forecast output but differ in their internal processing strategy. Table 51.1 then summarizes their trade-offs in detail.</p>
+
+<figure data-agent="09">
+<svg viewBox="0 0 600 300" xmlns="http://www.w3.org/2000/svg" style="max-width:100%;height:auto" role="img" aria-label="Architecture comparison of four AI weather prediction models showing shared ERA5 input, four distinct processing pipelines, and common forecast output">
+<style>
+  .svg-box { fill: #f0f4f8; stroke: #334155; stroke-width: 1.5; rx: 6; }
+  .svg-label { font-family: system-ui, sans-serif; font-size: 11px; fill: #1e293b; text-anchor: middle; }
+  .svg-title { font-family: system-ui, sans-serif; font-size: 10px; fill: #64748b; text-anchor: middle; }
+  .svg-arrow { stroke: #64748b; stroke-width: 1.5; fill: none; marker-end: url(#arrowhead); }
+  .svg-io { fill: #dbeafe; stroke: #2563eb; stroke-width: 1.5; rx: 6; }
+  .svg-io-label { font-family: system-ui, sans-serif; font-size: 12px; fill: #1e40af; text-anchor: middle; font-weight: bold; }
+  @media (prefers-color-scheme: dark) {
+    .svg-box { fill: #1e293b; stroke: #94a3b8; }
+    .svg-label { fill: #e2e8f0; }
+    .svg-title { fill: #94a3b8; }
+    .svg-arrow { stroke: #94a3b8; }
+    .svg-io { fill: #1e3a5f; stroke: #60a5fa; }
+    .svg-io-label { fill: #93c5fd; }
+  }
+</style>
+<defs>
+  <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+    <path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/>
+  </marker>
+</defs>
+<!-- ERA5 Input -->
+<rect class="svg-io" x="10" y="110" width="100" height="80"/>
+<text class="svg-io-label" x="60" y="145">ERA5</text>
+<text class="svg-title" x="60" y="162">Reanalysis</text>
+<text class="svg-title" x="60" y="174">0.25 deg grid</text>
+<!-- Arrows from input -->
+<line class="svg-arrow" x1="110" y1="130" x2="155" y2="55"/>
+<line class="svg-arrow" x1="110" y1="140" x2="155" y2="120"/>
+<line class="svg-arrow" x1="110" y1="155" x2="155" y2="185"/>
+<line class="svg-arrow" x1="110" y1="165" x2="155" y2="250"/>
+<!-- GraphCast -->
+<rect class="svg-box" x="158" y="25" width="130" height="55"/>
+<text class="svg-label" x="223" y="47" font-weight="bold">GraphCast</text>
+<text class="svg-title" x="223" y="62">GNN on icosahedral</text>
+<text class="svg-title" x="223" y="73">mesh, 16-round MP</text>
+<!-- Pangu-Weather -->
+<rect class="svg-box" x="158" y="95" width="130" height="55"/>
+<text class="svg-label" x="223" y="117" font-weight="bold">Pangu-Weather</text>
+<text class="svg-title" x="223" y="132">3D Swin Transformer</text>
+<text class="svg-title" x="223" y="143">Earth-specific pos. enc.</text>
+<!-- FourCastNet -->
+<rect class="svg-box" x="158" y="165" width="130" height="55"/>
+<text class="svg-label" x="223" y="187" font-weight="bold">FourCastNet</text>
+<text class="svg-title" x="223" y="202">Adaptive Fourier</text>
+<text class="svg-title" x="223" y="213">Neural Operator</text>
+<!-- NeuralGCM -->
+<rect class="svg-box" x="158" y="235" width="130" height="55"/>
+<text class="svg-label" x="223" y="252" font-weight="bold">NeuralGCM</text>
+<text class="svg-title" x="223" y="267">Physics core +</text>
+<text class="svg-title" x="223" y="278">learned params</text>
+<!-- Key operation labels -->
+<rect class="svg-box" x="310" y="25" width="130" height="55"/>
+<text class="svg-title" x="375" y="45">Message passing</text>
+<text class="svg-title" x="375" y="57">on multi-res mesh</text>
+<text class="svg-title" x="375" y="69">(spatial domain)</text>
+<rect class="svg-box" x="310" y="95" width="130" height="55"/>
+<text class="svg-title" x="375" y="115">Windowed attention</text>
+<text class="svg-title" x="375" y="127">on 3D volume</text>
+<text class="svg-title" x="375" y="139">(spatial domain)</text>
+<rect class="svg-box" x="310" y="165" width="130" height="55"/>
+<text class="svg-title" x="375" y="185">Complex MLP in</text>
+<text class="svg-title" x="375" y="197">Fourier space</text>
+<text class="svg-title" x="375" y="209">(spectral domain)</text>
+<rect class="svg-box" x="310" y="235" width="130" height="55"/>
+<text class="svg-title" x="375" y="250">Differentiable PDE</text>
+<text class="svg-title" x="375" y="262">solver + neural</text>
+<text class="svg-title" x="375" y="274">sub-grid physics</text>
+<!-- Connecting arrows model to operation -->
+<line class="svg-arrow" x1="288" y1="52" x2="308" y2="52"/>
+<line class="svg-arrow" x1="288" y1="122" x2="308" y2="122"/>
+<line class="svg-arrow" x1="288" y1="192" x2="308" y2="192"/>
+<line class="svg-arrow" x1="288" y1="262" x2="308" y2="262"/>
+<!-- Arrows to output -->
+<line class="svg-arrow" x1="440" y1="55" x2="485" y2="130"/>
+<line class="svg-arrow" x1="440" y1="122" x2="485" y2="140"/>
+<line class="svg-arrow" x1="440" y1="192" x2="485" y2="155"/>
+<line class="svg-arrow" x1="440" y1="262" x2="485" y2="165"/>
+<!-- Forecast Output -->
+<rect class="svg-io" x="488" y="110" width="102" height="80"/>
+<text class="svg-io-label" x="539" y="140">Global</text>
+<text class="svg-io-label" x="539" y="157">Forecast</text>
+<text class="svg-title" x="539" y="177">3 to 15 days</text>
+</svg>
+<figcaption>Figure 51.7: Four AI weather prediction architectures share the same ERA5 reanalysis input and global forecast output but differ in how they process atmospheric state: graph neural networks on a mesh (GraphCast), 3D vision Transformers (Pangu-Weather), spectral operators in Fourier space (FourCastNet), or a hybrid of physics-based dynamics with learned parameterizations (NeuralGCM).</figcaption>
+</figure>
 
 <figure class="table-figure">
 <table>
@@ -890,7 +983,7 @@ def anomaly_correlation(forecast: xr.DataArray,
 <p><strong>Step 3 (Day 3):</strong> One more pass produces the state at 2024-01-18 00:00 UTC. Total: 3 autoregressive steps, roughly 4.2 seconds. By contrast, ECMWF's IFS would take approximately 1 hour on a supercomputer for the same 3-day forecast. The critical trade-off: each chaining step compounds forecast error, which is why Pangu-Weather uses a 24-hour model (3 steps for 3 days) rather than a 6-hour model (12 steps for 3 days, accumulating error four times as often).</p>
 </div>
 
-<div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
+<div class="callout practical-example" data-agent="25 33">
 <h4>Real-World Application: ECMWF's Operational AI Integration</h4>
 <p>Since late 2023, ECMWF has integrated AI weather models into its operational forecasting pipeline through the AIFS (Artificial Intelligence Forecasting System). AIFS runs GraphCast-derived architectures alongside the traditional IFS physics-based system, providing forecasters with side-by-side comparisons. In operational use during the 2024 Atlantic hurricane season, AIFS matched or exceeded HRES track forecasts for 78% of named storms at 5-day lead time, while producing results in under 60 seconds rather than the hours required by the full IFS ensemble.</p>
 </div>
