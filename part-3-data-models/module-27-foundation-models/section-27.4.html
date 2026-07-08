@@ -49,15 +49,15 @@
 
 <p>Consider fine-tuning <a href="section-27.2.html" data-agent="13">ESM-2</a> (650M parameters) on a protein thermostability dataset with 2,000 labeled proteins. Full fine-tuning updates all 650 million parameters using gradients computed from 2,000 examples. This creates two problems:</p>
 
-<p><strong>Overfitting.</strong> With 650M trainable parameters and 2,000 training examples, the model has roughly 325,000 parameters per training example. Even with strong regularization, the model can memorize the training set rather than learning generalizable patterns. The representations learned during <a href="../module-26-representation-learning/section-26.1.html" data-agent="13">pretraining</a> (which are the model's primary value) can be catastrophically overwritten.</p>
+<p><strong>Overfitting.</strong> With 650M trainable parameters and 2,000 training examples, the model has roughly 325,000 parameters per training example. Even with strong regularization, the model can memorize the training set rather than learning generalizable patterns. The representations learned during <a href="../module-26-representation-learning/section-26.1.html" data-agent="13">pretraining</a> (which are the model's primary value) can be catastrophically overwritten, a phenomenon called <span data-agent="21">catastrophic forgetting, where new training erases previously learned knowledge</span>.</p>
 
-<p><strong>Memory.</strong> Fine-tuning requires storing the model weights, the gradients, and the optimizer states (for Adam, two additional copies of each parameter). For ESM-2 at 650M parameters in float32, this totals roughly $650M \times (4 + 4 + 8) = 10.4$ GB, plus activation memory. A single GPU with 16 GB of <span data-agent="12">video random-access memory (VRAM)</span> can barely fit this, leaving almost no room for batch processing.</p>
+<p><strong>Memory.</strong> Fine-tuning requires storing the model weights, the gradients, and the optimizer states (for <span data-agent="21">Adam, a widely used optimizer that maintains per-parameter running averages of the gradient and its square,</span> two additional copies of each parameter). For ESM-2 at 650M parameters in <span data-agent="21">float32 (32-bit floating point, using 4 bytes per number)</span>, this totals roughly $650M \times (4 + 4 + 8) = 10.4$ GB, plus activation memory. A single GPU with 16 GB of <span data-agent="12">video random-access memory (VRAM)</span> can barely fit this, leaving almost no room for batch processing.</p>
 
 <p>The core question is: how can we adapt a pretrained model using far fewer trainable parameters while preserving the quality of the pretrained representations?</p>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Task-Specific Adaptations Live in a Low-Dimensional Subspace</div>
-<p>Aghajanyan et al. (2021) showed empirically that the weight updates during fine-tuning have low intrinsic dimensionality. Even when a model has millions of parameters, the "direction" in weight space that matters for a specific downstream task can be described by a handful of dimensions. LoRA exploits this observation directly: instead of updating the full weight matrix, it constrains the update to a low-rank subspace. This is not just a computational trick; it is a statement about the geometry of fine-tuning.</p>
+<p>Aghajanyan et al. (2021) showed empirically that the weight updates during fine-tuning have low <span data-agent="21">intrinsic dimensionality, meaning only a small number of independent directions in parameter space account for virtually all of the performance gain</span>. Even when a model has millions of parameters, the "direction" in weight space that matters for a specific downstream task can be described by a handful of dimensions. LoRA exploits this observation directly: instead of updating the full weight matrix, it constrains the update to a low-rank subspace. This is not just a computational trick; it is a statement about the geometry of fine-tuning.</p>
 </div>
 
 <div class="callout tip" data-agent="06">
@@ -77,13 +77,107 @@ $$W = W_0 + \Delta W = W_0 + BA$$
 
 <p>where $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times k}$, with rank $r \ll \min(d, k)$. The pretrained weights $W_0$ are frozen (not updated during training). Only $B$ and $A$ are trainable.</p>
 
-<p>The number of trainable parameters drops from $d \times k$ (full fine-tuning) to $r \times (d + k)$ (LoRA). For ESM-2's attention layers, $d = k = 1280$. With full fine-tuning, each weight matrix has $1280 \times 1280 = 1{,}638{,}400$ parameters. With LoRA at rank $r = 8$, it has $8 \times (1280 + 1280) = 20{,}480$ parameters, <span class="aha-moment" data-agent="24">a reduction of 80x</span>.</p>
+<p>The number of trainable parameters drops from $d \times k$ (full fine-tuning) to $r \times (d + k)$ (LoRA). For ESM-2's <span data-agent="21">attention layers, the components of a <a href="../../part-2-learning/module-18-attention/section-18.1.html" data-agent="13">transformer</a> that learn which parts of the input to focus on,</span> $d = k = 1280$. With full fine-tuning, each weight matrix has $1280 \times 1280 = 1{,}638{,}400$ parameters. With LoRA at rank $r = 8$, it has $8 \times (1280 + 1280) = 20{,}480$ parameters, <span class="aha-moment" data-agent="24">a reduction of 80x</span>.</p>
 
 <p>The forward pass computes:</p>
 
 $$h = W_0 x + \frac{\alpha}{r} B A x$$
 
 <p>where $\alpha$ is a scaling constant (typically set equal to $r$ or tuned as a hyperparameter) and $x$ is the input. The scaling factor $\alpha / r$ ensures that the magnitude of the LoRA update is roughly independent of the rank, making it easier to tune the learning rate.</p>
+
+<p>Figure 27.6 illustrates this architecture: the frozen pretrained weights and the trainable low-rank branch operate in parallel, and their outputs are summed to produce the final result.</p>
+
+<figure data-agent="09">
+<svg viewBox="0 0 600 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="LoRA forward pass architecture showing frozen weights and trainable low-rank branch" style="max-width:100%;height:auto;">
+  <style>
+    .lora-text { font-family: sans-serif; font-size: 13px; fill: #333; }
+    .lora-label { font-family: sans-serif; font-size: 11px; fill: #555; }
+    .lora-math { font-family: serif; font-size: 13px; fill: #333; font-style: italic; }
+    .lora-frozen { fill: #e8f0fe; stroke: #4a86c8; stroke-width: 1.5; }
+    .lora-train { fill: #fef3e0; stroke: #e8960c; stroke-width: 1.5; }
+    .lora-sum { fill: #e6f4ea; stroke: #34a853; stroke-width: 1.5; }
+    .lora-arrow { stroke: #666; stroke-width: 1.5; fill: none; marker-end: url(#arrowhead); }
+    .lora-arrow-train { stroke: #e8960c; stroke-width: 1.5; fill: none; marker-end: url(#arrowhead-train); }
+    @media (prefers-color-scheme: dark) {
+      .lora-text { fill: #e0e0e0; }
+      .lora-label { fill: #aaa; }
+      .lora-math { fill: #e0e0e0; }
+      .lora-frozen { fill: #1e3a5f; stroke: #6da7e0; }
+      .lora-train { fill: #4a3600; stroke: #f0a820; }
+      .lora-sum { fill: #1a3d26; stroke: #5ec97a; }
+      .lora-arrow { stroke: #aaa; }
+      .lora-arrow-train { stroke: #f0a820; }
+    }
+  </style>
+  <defs>
+    <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#666"/>
+    </marker>
+    <marker id="arrowhead-train" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#e8960c"/>
+    </marker>
+  </defs>
+
+  <!-- Input node -->
+  <rect x="30" y="125" width="70" height="40" rx="6" class="lora-frozen"/>
+  <text x="65" y="150" text-anchor="middle" class="lora-math">x</text>
+  <text x="65" y="170" text-anchor="middle" class="lora-label">input</text>
+
+  <!-- Frozen path: W0 -->
+  <rect x="180" y="55" width="110" height="40" rx="6" class="lora-frozen"/>
+  <text x="235" y="78" text-anchor="middle" class="lora-text">W&#x2080; (frozen)</text>
+
+  <!-- LoRA path: A then B -->
+  <rect x="150" y="195" width="80" height="36" rx="6" class="lora-train"/>
+  <text x="190" y="218" text-anchor="middle" class="lora-math">A</text>
+  <text x="190" y="240" text-anchor="middle" class="lora-label">r x k</text>
+
+  <rect x="270" y="195" width="80" height="36" rx="6" class="lora-train"/>
+  <text x="310" y="218" text-anchor="middle" class="lora-math">B</text>
+  <text x="310" y="240" text-anchor="middle" class="lora-label">d x r</text>
+
+  <!-- Scale node -->
+  <rect x="380" y="195" width="60" height="36" rx="6" class="lora-train"/>
+  <text x="410" y="217" text-anchor="middle" class="lora-math">&#x3b1;/r</text>
+
+  <!-- Sum node -->
+  <circle cx="470" cy="145" r="22" class="lora-sum"/>
+  <text x="470" y="151" text-anchor="middle" class="lora-text" style="font-size:20px;font-weight:bold;">+</text>
+
+  <!-- Output node -->
+  <rect x="520" y="125" width="60" height="40" rx="6" class="lora-frozen"/>
+  <text x="550" y="150" text-anchor="middle" class="lora-math">h</text>
+  <text x="550" y="170" text-anchor="middle" class="lora-label">output</text>
+
+  <!-- Arrows: input to frozen path -->
+  <path d="M100,140 L120,140 L120,75 L178,75" class="lora-arrow"/>
+
+  <!-- Arrows: input to LoRA path -->
+  <path d="M100,150 L120,150 L120,213 L148,213" class="lora-arrow-train"/>
+
+  <!-- Arrow: A to B -->
+  <path d="M230,213 L268,213" class="lora-arrow-train"/>
+
+  <!-- Arrow: B to scale -->
+  <path d="M350,213 L378,213" class="lora-arrow-train"/>
+
+  <!-- Arrow: frozen to sum -->
+  <path d="M290,75 L470,75 L470,121" class="lora-arrow"/>
+
+  <!-- Arrow: scale to sum -->
+  <path d="M440,213 L470,213 L470,169" class="lora-arrow-train"/>
+
+  <!-- Arrow: sum to output -->
+  <path d="M492,145 L518,145" class="lora-arrow"/>
+
+  <!-- Legend -->
+  <rect x="30" y="270" width="14" height="10" rx="2" class="lora-frozen"/>
+  <text x="50" y="279" class="lora-label">Frozen</text>
+  <rect x="110" y="270" width="14" height="10" rx="2" class="lora-train"/>
+  <text x="130" y="279" class="lora-label">Trainable</text>
+</svg>
+<figcaption data-agent="39">Figure 27.6: LoRA forward pass architecture. The input x flows through the frozen pretrained weight matrix W&#x2080; (top path) and through the trainable low-rank matrices A and B scaled by &#x3b1;/r (bottom path). The two paths are summed to produce the output h. Only the orange components receive gradients during training.</figcaption>
+</figure>
 
 <p>Two initialization choices are critical:</p>
 
@@ -165,13 +259,13 @@ with torch.no_grad():
     y_lora = lora_layer(x)
     diff = (y_original - y_lora).abs().max().item()
     print(f"Max difference at init: {diff:.2e} (should be ~0)")</code></pre>
-<div class="code-caption">Listing 27.14: A from-scratch implementation of LoRA. The <code>LoRALinear</code> class wraps a frozen linear layer with trainable low-rank matrices B and A. At initialization, B=0 ensures the output matches the original layer exactly.</div>
+<div class="code-caption" data-agent="08,40">Listing 27.14: From-scratch LoRA implementation wrapping a frozen linear layer with trainable low-rank matrices B and A, including zero-initialization of B to guarantee the output matches the original layer at the start of training.</div>
 
 <pre><code class="language-text">Original parameters: 1,638,400
 LoRA parameters:     20,480
 Reduction:           80.0x
 Max difference at init: 0.00e+00 (should be ~0)</code></pre>
-<div class="code-caption">Output 27.14: LoRA at rank 8 reduces the trainable parameters by 80x. The zero initialization of B guarantees that the model starts from the exact pretrained behavior.</div>
+<div class="code-caption" data-agent="08,40">Output 27.14: LoRA at rank 8 reduces trainable parameters by 80x, and the zero initialization of B produces exactly zero difference from the pretrained output.</div>
 
 <h2>3. Choosing the Rank</h2>
 
@@ -200,7 +294,7 @@ for rank in [1, 2, 4, 8, 16, 32, 64]:
 
 print(f"\n{'Full':>6s} | {full_params:12,d} | {'100.00':>9s}% | "
       f"{full_params * 4 / 1e6:11.1f}")</code></pre>
-<div class="code-caption">Listing 27.15: Parameter budget comparison across LoRA ranks for ESM-2 (650M). Even at rank 64, LoRA uses less than 2% of the full fine-tuning parameter count.</div>
+<div class="code-caption" data-agent="08,40">Listing 27.15: Parameter budget comparison across LoRA ranks for all four attention projections (Q, K, V, O) in ESM-2 (650M), showing that even rank 64 uses under 10% of full fine-tuning parameters.</div>
 
 <pre><code class="language-text">  Rank |    Trainable |   % of Full |  Memory (MB)
 -------------------------------------------------------
@@ -213,11 +307,11 @@ print(f"\n{'Full':>6s} | {full_params:12,d} | {'100.00':>9s}% | "
     64 |   21,626,880 |     10.00% |        86.5
 
   Full |  216,268,800 |    100.00% |       865.1</code></pre>
-<div class="code-caption">Output 27.15: At rank 8, LoRA adds only 2.7M trainable parameters (1.25% of full) and 10.8 MB of additional memory. The remaining 650M pretrained parameters are frozen and require no gradient storage.</div>
+<div class="code-caption" data-agent="08,40">Output 27.15: Rank 8 adds 2.7M trainable parameters (1.25%) and 10.8 MB of memory; the remaining 650M pretrained parameters are frozen and require no gradient storage.</div>
 
 <h2>4. Which Layers to Adapt</h2>
 
-<p data-agent="29"><span data-agent="29">LoRA can target any linear layer in the transformer, but not all layers benefit equally. Hu et al. found that adapting the query and value projections ($W_Q$ and $W_V$) yields the best performance-to-parameter ratio. Adding the key and output projections ($W_K$, $W_O$) provides only marginal gains. Adapting the feed-forward network (FFN) layers helps when the task requires new feature representations, not just new attention patterns.</span></p>
+<p data-agent="29"><span data-agent="29">LoRA can target any linear layer in the transformer, but not all layers benefit equally. Hu et al. found that adapting the <span data-agent="21">query and value projections ($W_Q$ and $W_V$), where the query projection computes what each token is looking for and the value projection computes what each token contributes to others,</span> yields the best performance-to-parameter ratio. Adding the key and output projections ($W_K$, $W_O$) provides only marginal gains. Adapting the feed-forward network (FFN) layers helps when the task requires new feature representations, not just new attention patterns.</span></p>
 
 <p>For scientific foundation models, we recommend starting with $W_Q$ and $W_V$ and adding more layers only if validation performance plateaus:</p>
 
@@ -246,7 +340,7 @@ print("\nTrainable parameter groups:")
 for name, param in model.named_parameters():
     if param.requires_grad:
         print(f"  {name}: {param.shape}")</code></pre>
-<div class="code-caption">Listing 27.16: Applying LoRA to ESM-2 using Hugging Face PEFT. The <code>target_modules</code> parameter specifies which attention projections to adapt. The <code>print_trainable_parameters</code> method reports the exact parameter reduction.</div>
+<div class="code-caption" data-agent="08,40">Listing 27.16: Applying LoRA to ESM-2 via Hugging Face PEFT, targeting only the query and value attention projections and reporting the resulting parameter reduction.</div>
 
 <pre><code class="language-text">trainable params: 1,351,680 || all params: 653,460,736 || trainable%: 0.2069
 
@@ -256,7 +350,7 @@ Trainable parameter groups:
   esm.encoder.layer.0.attention.self.value.lora_A.default.weight: torch.Size([8, 1280])
   esm.encoder.layer.0.attention.self.value.lora_B.default.weight: torch.Size([1280, 8])
   ... (repeats for all 33 layers)</code></pre>
-<div class="code-caption">Output 27.16: Only 0.2% of parameters are trainable. Each layer gets four LoRA matrices (A and B for both query and value projections), totaling 40,960 parameters per layer.</div>
+<div class="code-caption" data-agent="08,40">Output 27.16: PEFT reports 0.2% trainable parameters; each of the 33 layers receives four LoRA matrices (A and B for both query and value), totaling 40,960 new parameters per layer.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: PEFT for Any Hugging Face Model</div>
@@ -346,7 +440,7 @@ print(f"{'Strategy':<22s} | {'Trainable Params':<28s} | {'GPU Memory':<12s}")
 print("-" * 70)
 for name, info in strategies.items():
     print(f"{name:<22s} | {info['trainable']:<28s} | {info['memory']:<12s}")</code></pre>
-<div class="code-caption">Listing 27.17: Three adaptation strategies for protein property prediction, with approximate parameter counts and memory requirements for ESM-2 (650M). The prediction head architecture is the same across strategies.</div>
+<div class="code-caption" data-agent="08,40">Listing 27.17: Protein property predictor supporting three adaptation strategies (frozen, LoRA, full), with a shared mean-pooling head and a summary table of parameter counts and GPU memory requirements for ESM-2 (650M).</div>
 
 <h2>6. Practical Considerations for Scientific LoRA</h2>
 
