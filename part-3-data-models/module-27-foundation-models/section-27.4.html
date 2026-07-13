@@ -40,54 +40,54 @@
 
 <div class="callout big-picture">
 <div class="callout-title">The Big Picture</div>
-<p><a href="section-27.1.html" data-agent="13">Foundation models</a> are powerful but enormous. Fine-tuning all parameters of a 650M-parameter <span data-agent="12">Evolutionary Scale Modeling 2 (ESM-2)</span> on a small dataset risks overfitting and requires substantial <span data-agent="12">graphics processing unit (GPU)</span> memory. <span data-agent="12">Low-Rank Adaptation (LoRA)</span> solves both problems by freezing the pretrained weights and adding small, trainable low-rank matrices. This section derives the LoRA formulation from first principles, implements it from scratch, shows how to apply it using the Hugging Face <span data-agent="12">Parameter-Efficient Fine-Tuning (PEFT)</span> library, and discusses practical considerations: how to choose the rank, which layers to adapt, and when LoRA outperforms full fine-tuning.</p>
+<p><a href="section-27.1.html">Foundation models</a> are powerful but enormous. Fine-tuning all parameters of a 650M-parameter <span>Evolutionary Scale Modeling 2 (ESM-2)</span> on a small dataset risks overfitting and requires substantial <span>graphics processing unit (GPU)</span> memory. <span>Low-Rank Adaptation (LoRA)</span> solves both problems by freezing the pretrained weights and adding small, trainable low-rank matrices. This section derives the LoRA formulation from first principles, implements it from scratch, shows how to apply it using the Hugging Face <span>Parameter-Efficient Fine-Tuning (PEFT)</span> library, and discusses practical considerations: how to choose the rank, which layers to adapt, and when LoRA outperforms full fine-tuning.</p>
 </div>
 
 <h2>1. The Problem: Too Many Parameters, Too Few Labels</h2>
 
-<p data-agent="22">What if you could adapt a 650-million-parameter protein model to a new task by training less than 1% of its weights, using less memory than a single video game, and still match the accuracy of retraining the whole thing?</p>
+<p>What if you could adapt a 650-million-parameter protein model to a new task by training less than 1% of its weights, using less memory than a single video game, and still match the accuracy of retraining the whole thing?</p>
 
-<p>Consider fine-tuning <a href="section-27.2.html" data-agent="13">ESM-2</a> (650M parameters) on a protein thermostability dataset with 2,000 labeled proteins. Full fine-tuning updates all 650 million parameters using gradients computed from 2,000 examples. This creates two problems:</p>
+<p>Consider fine-tuning <a href="section-27.2.html">ESM-2</a> (650M parameters) on a protein thermostability dataset with 2,000 labeled proteins. Full fine-tuning updates all 650 million parameters using gradients computed from 2,000 examples. This creates two problems:</p>
 
-<p><strong>Overfitting.</strong> With 650M trainable parameters and 2,000 training examples, the model has roughly 325,000 parameters per training example. Even with strong regularization, the model can memorize the training set rather than learning generalizable patterns. The representations learned during <a href="../module-26-representation-learning/section-26.1.html" data-agent="13">pretraining</a> (which are the model's primary value) can be catastrophically overwritten, a phenomenon called <span data-agent="21">catastrophic forgetting, where new training erases previously learned knowledge</span>.</p>
+<p><strong>Overfitting.</strong> With 650M trainable parameters and 2,000 training examples, the model has roughly 325,000 parameters per training example. Even with strong regularization, the model can memorize the training set rather than learning generalizable patterns. The representations learned during <a href="../module-26-representation-learning/section-26.1.html">pretraining</a> (which are the model's primary value) can be catastrophically overwritten, a phenomenon called <span>catastrophic forgetting, where new training erases previously learned knowledge</span>.</p>
 
-<p><strong>Memory.</strong> Fine-tuning requires storing the model weights, the gradients, and the optimizer states (for <span data-agent="21">Adam, a widely used optimizer that maintains per-parameter running averages of the gradient and its square,</span> two additional copies of each parameter). For ESM-2 at 650M parameters in <span data-agent="21">float32 (32-bit floating point, using 4 bytes per number)</span>, this totals roughly $650M \times (4 + 4 + 8) = 10.4$ GB, plus activation memory. A single GPU with 16 GB of <span data-agent="12">video random-access memory (VRAM)</span> can barely fit this, leaving almost no room for batch processing.</p>
+<p><strong>Memory.</strong> Fine-tuning requires storing the model weights, the gradients, and the optimizer states (for <span>Adam, a widely used optimizer that maintains per-parameter running averages of the gradient and its square,</span> two additional copies of each parameter). For ESM-2 at 650M parameters in <span>float32 (32-bit floating point, using 4 bytes per number)</span>, this totals roughly \(650M \times (4 + 4 + 8) = 10.4\) GB, plus activation memory. A single GPU with 16 GB of <span>video random-access memory (VRAM)</span> can barely fit this, leaving almost no room for batch processing.</p>
 
 <p>The core question is: how can we adapt a pretrained model using far fewer trainable parameters while preserving the quality of the pretrained representations?</p>
 
 <div class="callout key-insight">
 <div class="callout-title">Key Insight: Task-Specific Adaptations Live in a Low-Dimensional Subspace</div>
-<p>Aghajanyan et al. (2021) showed empirically that the weight updates during fine-tuning have low <span data-agent="21">intrinsic dimensionality, meaning only a small number of independent directions in parameter space account for virtually all of the performance gain</span>. Even when a model has millions of parameters, the "direction" in weight space that matters for a specific downstream task can be described by a handful of dimensions. LoRA exploits this observation directly: instead of updating the full weight matrix, it constrains the update to a low-rank subspace. This is not just a computational trick; it is a statement about the geometry of fine-tuning.</p>
+<p>Aghajanyan et al. (2021) showed empirically that the weight updates during fine-tuning have low <span>intrinsic dimensionality, meaning only a small number of independent directions in parameter space account for virtually all of the performance gain</span>. Even when a model has millions of parameters, the "direction" in weight space that matters for a specific downstream task can be described by a handful of dimensions. LoRA exploits this observation directly: instead of updating the full weight matrix, it constrains the update to a low-rank subspace. This is not just a computational trick; it is a statement about the geometry of fine-tuning.</p>
 </div>
 
-<div class="callout tip" data-agent="06">
+<div class="callout tip">
 <h4>Mental Model</h4>
 <p>Think of a pretrained model as a fully tuned grand piano. Full fine-tuning is like rebuilding every hammer, string, and felt pad from scratch for each new concert hall; it works, but it is expensive, slow, and risks ruining the instrument. LoRA is like attaching a small set of adjustable dampeners to a few specific strings. The piano itself stays intact (frozen weights), and the dampeners (the low-rank matrices B and A) make only the targeted tonal corrections needed for the new room's acoustics. Because the corrections are small and targeted, you need far fewer parts (parameters), the piano stays in tune for its original repertoire (no catastrophic forgetting), and you can swap dampener sets between concert halls (multiple task adapters on one backbone) in seconds.</p>
 </div>
 
 <h2>2. The LoRA Formulation</h2>
 
-<p data-agent="16">In practice, teams that skip parameter-efficient methods pay a steep price: full fine-tuning on small labeled sets routinely overfits within a few epochs, producing models that look excellent on training data and fail silently on new samples. LoRA was designed to break exactly this failure mode.</p>
+<p>In practice, teams that skip parameter-efficient methods pay a steep price: full fine-tuning on small labeled sets routinely overfits within a few epochs, producing models that look excellent on training data and fail silently on new samples. LoRA was designed to break exactly this failure mode.</p>
 
-<p>LoRA (Hu et al., 2022) modifies a pretrained weight matrix $W_0 \in \mathbb{R}^{d \times k}$ by adding a low-rank update:</p>
+<p>LoRA (Hu et al., 2022) modifies a pretrained weight matrix \(W_0 \in \mathbb{R}^{d \times k}\) by adding a low-rank update:</p>
 
-<p data-agent="02,29"><span data-agent="29">Low-Rank Adaptation (LoRA) injects small, trainable matrices into a frozen pretrained model instead of updating all weights. This reduces GPU memory by an order of magnitude and acts as an implicit regularizer, making fine-tuning feasible with as few as a hundred labeled examples.</span> <span data-agent="29">The core mechanism is matrix factorization: LoRA replaces a full $d \times k$ weight update with the product of two smaller matrices ($d \times r$ and $r \times k$, where $r$ is typically 4 to 16). Only a fraction of a percent of parameters ever receive gradients.</span> <span data-agent="29">Choose LoRA over full fine-tuning when labeled data is scarce or hardware is limited. Choose full fine-tuning when you have tens of thousands of labeled examples and sufficient GPU memory. Choose feature extraction (frozen backbone with a trainable head) when the pretrained representations already match the target task closely.</span></p>
+<p><span>Low-Rank Adaptation (LoRA) injects small, trainable matrices into a frozen pretrained model instead of updating all weights. This reduces GPU memory by an order of magnitude and acts as an implicit regularizer, making fine-tuning feasible with as few as a hundred labeled examples.</span> <span>The core mechanism is matrix factorization: LoRA replaces a full \(d \times k\) weight update with the product of two smaller matrices (\(d \times r\) and \(r \times k\), where \(r\) is typically 4 to 16). Only a fraction of a percent of parameters ever receive gradients.</span> <span>Choose LoRA over full fine-tuning when labeled data is scarce or hardware is limited. Choose full fine-tuning when you have tens of thousands of labeled examples and sufficient GPU memory. Choose feature extraction (frozen backbone with a trainable head) when the pretrained representations already match the target task closely.</span></p>
 
 $$W = W_0 + \Delta W = W_0 + BA$$
 
-<p>where $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times k}$, with rank $r \ll \min(d, k)$. The pretrained weights $W_0$ are frozen (not updated during training). Only $B$ and $A$ are trainable.</p>
+<p>where \(B \in \mathbb{R}^{d \times r}\) and \(A \in \mathbb{R}^{r \times k}\), with rank \(r \ll \min(d, k)\). The pretrained weights \(W_0\) are frozen (not updated during training). Only \(B\) and \(A\) are trainable.</p>
 
-<p>The number of trainable parameters drops from $d \times k$ (full fine-tuning) to $r \times (d + k)$ (LoRA). For ESM-2's <span data-agent="21">attention layers, the components of a <a href="../../part-2-learning/module-18-attention/section-18.1.html" data-agent="13">transformer</a> that learn which parts of the input to focus on,</span> $d = k = 1280$. With full fine-tuning, each weight matrix has $1280 \times 1280 = 1{,}638{,}400$ parameters. With LoRA at rank $r = 8$, it has $8 \times (1280 + 1280) = 20{,}480$ parameters, <span class="aha-moment" data-agent="24">a reduction of 80x</span>.</p>
+<p>The number of trainable parameters drops from \(d \times k\) (full fine-tuning) to \(r \times (d + k)\) (LoRA). For ESM-2's <span>attention layers, the components of a <a href="../../part-2-learning/module-18-attention/section-18.1.html">transformer</a> that learn which parts of the input to focus on,</span> \(d = k = 1280\). With full fine-tuning, each weight matrix has \(1280 \times 1280 = 1{,}638{,}400\) parameters. With LoRA at rank \(r = 8\), it has \(8 \times (1280 + 1280) = 20{,}480\) parameters, <span class="aha-moment">a reduction of 80x</span>.</p>
 
 <p>The forward pass computes:</p>
 
 $$h = W_0 x + \frac{\alpha}{r} B A x$$
 
-<p>where $\alpha$ is a scaling constant (typically set equal to $r$ or tuned as a hyperparameter) and $x$ is the input. The scaling factor $\alpha / r$ ensures that the magnitude of the LoRA update is roughly independent of the rank, making it easier to tune the learning rate.</p>
+<p>where \(\alpha\) is a scaling constant (typically set equal to \(r\) or tuned as a hyperparameter) and \(x\) is the input. The scaling factor \(\alpha / r\) ensures that the magnitude of the LoRA update is roughly independent of the rank, making it easier to tune the learning rate.</p>
 
 <p>Figure 27.6 illustrates this architecture: the frozen pretrained weights and the trainable low-rank branch operate in parallel, and their outputs are summed to produce the final result.</p>
 
-<figure data-agent="09">
+<figure>
 <svg viewBox="0 0 600 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="LoRA forward pass architecture showing frozen weights and trainable low-rank branch" style="max-width:100%;height:auto;">
   <style>
     .lora-text { font-family: sans-serif; font-size: 13px; fill: #333; }
@@ -176,19 +176,19 @@ $$h = W_0 x + \frac{\alpha}{r} B A x$$
   <rect x="110" y="270" width="14" height="10" rx="2" class="lora-train"/>
   <text x="130" y="279" class="lora-label">Trainable</text>
 </svg>
-<figcaption data-agent="39">Figure 27.6: LoRA forward pass architecture. The input x flows through the frozen pretrained weight matrix W&#x2080; (top path) and through the trainable low-rank matrices A and B scaled by &#x3b1;/r (bottom path). The two paths are summed to produce the output h. Only the orange components receive gradients during training.</figcaption>
+<figcaption>Figure 27.6: LoRA forward pass architecture. The input x flows through the frozen pretrained weight matrix W&#x2080; (top path) and through the trainable low-rank matrices A and B scaled by &#x3b1;/r (bottom path). The two paths are summed to produce the output h. Only the orange components receive gradients during training.</figcaption>
 </figure>
 
 <p>Two initialization choices are critical:</p>
 
 <ul>
-<li>$A$ is initialized from a random Gaussian distribution: $A \sim \mathcal{N}(0, \sigma^2)$</li>
-<li>$B$ is initialized to zero: $B = 0$</li>
+<li>\(A\) is initialized from a random Gaussian distribution: \(A \sim \mathcal{N}(0, \sigma^2)\)</li>
+<li>\(B\) is initialized to zero: \(B = 0\)</li>
 </ul>
 
-<p>This means that at the start of training, $\Delta W = BA = 0$, so the adapted model's behavior is identical to the pretrained model. Training gradually moves the model away from its pretrained initialization in a controlled, low-rank direction. <em data-agent="27">In short:</em> LoRA lets you steer a giant model with a tiny rudder, because the course correction for any single task turns out to need only a few degrees of freedom.</p>
+<p>This means that at the start of training, \(\Delta W = BA = 0\), so the adapted model's behavior is identical to the pretrained model. Training gradually moves the model away from its pretrained initialization in a controlled, low-rank direction. <em>In short:</em> LoRA lets you steer a giant model with a tiny rudder, because the course correction for any single task turns out to need only a few degrees of freedom.</p>
 
-<div class="callout key-insight" data-agent="05"><h4>Checkpoint</h4><p>So far: pretrained models have too many parameters for small datasets, but the weight updates needed for a new task occupy a low-rank subspace; LoRA exploits this by factoring the update into two small matrices $B$ and $A$, scaled by $\alpha/r$, with $B$ initialized to zero so the model starts from its pretrained behavior.</p></div>
+<div class="callout key-insight"><h4>Checkpoint</h4><p>So far: pretrained models have too many parameters for small datasets, but the weight updates needed for a new task occupy a low-rank subspace; LoRA exploits this by factoring the update into two small matrices \(B\) and \(A\), scaled by \(\alpha/r\), with \(B\) initialized to zero so the model starts from its pretrained behavior.</p></div>
 
 <pre><code class="language-python">import torch
 import torch.nn as nn
@@ -261,21 +261,21 @@ with torch.no_grad():
     y_lora = lora_layer(x)
     diff = (y_original - y_lora).abs().max().item()
     print(f"Max difference at init: {diff:.2e} (should be ~0)")</code></pre>
-<div class="code-caption" data-agent="08,40">Listing 27.14: From-scratch LoRA implementation wrapping a frozen linear layer with trainable low-rank matrices B and A, including zero-initialization of B to guarantee the output matches the original layer at the start of training.</div>
+<div class="code-caption">Listing 27.14: From-scratch LoRA implementation wrapping a frozen linear layer with trainable low-rank matrices B and A, including zero-initialization of B to guarantee the output matches the original layer at the start of training.</div>
 
 <pre><code class="language-text">Original parameters: 1,638,400
 LoRA parameters:     20,480
 Reduction:           80.0x
 Max difference at init: 0.00e+00 (should be ~0)</code></pre>
-<div class="code-caption" data-agent="08,40">Output 27.14: LoRA at rank 8 reduces trainable parameters by 80x, and the zero initialization of B produces exactly zero difference from the pretrained output.</div>
+<div class="code-caption">Output 27.14: LoRA at rank 8 reduces trainable parameters by 80x, and the zero initialization of B produces exactly zero difference from the pretrained output.</div>
 
 <h2>3. Choosing the Rank</h2>
 
-<p data-agent="14,15"><span data-agent="15">The rank $r$ is the primary hyperparameter in LoRA, controlling the dimensionality of the adaptation subspace.</span></p>
+<p><span>The rank \(r\) is the primary hyperparameter in LoRA, controlling the dimensionality of the adaptation subspace.</span></p>
 
-<p>The rank $r$ controls the expressiveness of the adaptation. Higher rank allows the model to learn more complex task-specific patterns; lower rank provides stronger regularization against overfitting. The optimal rank depends on the complexity of the downstream task and the size of the training set.</p>
+<p>The rank \(r\) controls the expressiveness of the adaptation. Higher rank allows the model to learn more complex task-specific patterns; lower rank provides stronger regularization against overfitting. The optimal rank depends on the complexity of the downstream task and the size of the training set.</p>
 
-<p>Empirically, ranks between 4 and 64 typically work well for most scientific fine-tuning tasks. The original LoRA paper found that ranks as low as 1 or 2 often suffice for <span data-agent="12">natural language processing (NLP)</span> tasks, suggesting that the task-specific update is extremely low-dimensional. For scientific tasks, where the domain shift from pretraining to fine-tuning can be larger, slightly higher ranks (8 to 16) tend to perform better in practice. <span data-agent="20">(As of 2024, the rank selection guidance here remains broadly accepted. Newer variants such as <span data-agent="04">rsLoRA (rank-stabilized LoRA; Kalajdzievski, 2024)</span>, which adjusts the scaling factor to $\alpha / \sqrt{r}$ for more stable training at higher ranks, can shift the optimal rank upward without degrading generalization.)</span></p>
+<p>Empirically, ranks between 4 and 64 typically work well for most scientific fine-tuning tasks. The original LoRA paper found that ranks as low as 1 or 2 often suffice for <span>natural language processing (NLP)</span> tasks, suggesting that the task-specific update is extremely low-dimensional. For scientific tasks, where the domain shift from pretraining to fine-tuning can be larger, slightly higher ranks (8 to 16) tend to perform better in practice. <span>(As of 2024, the rank selection guidance here remains broadly accepted. Newer variants such as <span>rsLoRA (rank-stabilized LoRA; Kalajdzievski, 2024)</span>, which adjusts the scaling factor to \(\alpha / \sqrt{r}\) for more stable training at higher ranks, can shift the optimal rank upward without degrading generalization.)</span></p>
 
 <pre><code class="language-python">import torch.nn as nn
 
@@ -296,7 +296,7 @@ for rank in [1, 2, 4, 8, 16, 32, 64]:
 
 print(f"\n{'Full':>6s} | {full_params:12,d} | {'100.00':>9s}% | "
       f"{full_params * 4 / 1e6:11.1f}")</code></pre>
-<div class="code-caption" data-agent="08,40">Listing 27.15: Parameter budget comparison across LoRA ranks for all four attention projections (Q, K, V, O) in ESM-2 (650M), showing that even rank 64 uses under 10% of full fine-tuning parameters.</div>
+<div class="code-caption">Listing 27.15: Parameter budget comparison across LoRA ranks for all four attention projections (Q, K, V, O) in ESM-2 (650M), showing that even rank 64 uses under 10% of full fine-tuning parameters.</div>
 
 <pre><code class="language-text">  Rank |    Trainable |   % of Full |  Memory (MB)
 -------------------------------------------------------
@@ -309,13 +309,13 @@ print(f"\n{'Full':>6s} | {full_params:12,d} | {'100.00':>9s}% | "
     64 |   21,626,880 |     10.00% |        86.5
 
   Full |  216,268,800 |    100.00% |       865.1</code></pre>
-<div class="code-caption" data-agent="08,40">Output 27.15: Rank 8 adds 2.7M trainable parameters (1.25%) and 10.8 MB of memory; the remaining 650M pretrained parameters are frozen and require no gradient storage.</div>
+<div class="code-caption">Output 27.15: Rank 8 adds 2.7M trainable parameters (1.25%) and 10.8 MB of memory; the remaining 650M pretrained parameters are frozen and require no gradient storage.</div>
 
 <h2>4. Which Layers to Adapt</h2>
 
-<p data-agent="29"><span data-agent="29">LoRA can target any linear layer in the transformer, but not all layers benefit equally. Hu et al. found that adapting the <span data-agent="21">query and value projections ($W_Q$ and $W_V$), where the query projection computes what each token is looking for and the value projection computes what each token contributes to others,</span> yields the best performance-to-parameter ratio. Adding the key and output projections ($W_K$, $W_O$) provides only marginal gains. Adapting the feed-forward network (FFN) layers helps when the task requires new feature representations, not just new attention patterns.</span></p>
+<p><span>LoRA can target any linear layer in the transformer, but not all layers benefit equally. Hu et al. found that adapting the <span>query and value projections (\(W_Q\) and \(W_V\)), where the query projection computes what each token is looking for and the value projection computes what each token contributes to others,</span> yields the best performance-to-parameter ratio. Adding the key and output projections (\(W_K\), \(W_O\)) provides only marginal gains. Adapting the feed-forward network (FFN) layers helps when the task requires new feature representations, not just new attention patterns.</span></p>
 
-<p>For scientific foundation models, we recommend starting with $W_Q$ and $W_V$ and adding more layers only if validation performance plateaus:</p>
+<p>For scientific foundation models, we recommend starting with \(W_Q\) and \(W_V\) and adding more layers only if validation performance plateaus:</p>
 
 <pre><code class="language-python">from peft import LoraConfig, get_peft_model, TaskType
 from transformers import EsmModel
@@ -342,7 +342,7 @@ print("\nTrainable parameter groups:")
 for name, param in model.named_parameters():
     if param.requires_grad:
         print(f"  {name}: {param.shape}")</code></pre>
-<div class="code-caption" data-agent="08,40">Listing 27.16: Applying LoRA to ESM-2 via Hugging Face PEFT, targeting only the query and value attention projections and reporting the resulting parameter reduction.</div>
+<div class="code-caption">Listing 27.16: Applying LoRA to ESM-2 via Hugging Face PEFT, targeting only the query and value attention projections and reporting the resulting parameter reduction.</div>
 
 <pre><code class="language-text">trainable params: 1,351,680 || all params: 653,460,736 || trainable%: 0.2069
 
@@ -352,26 +352,26 @@ Trainable parameter groups:
   esm.encoder.layer.0.attention.self.value.lora_A.default.weight: torch.Size([8, 1280])
   esm.encoder.layer.0.attention.self.value.lora_B.default.weight: torch.Size([1280, 8])
   ... (repeats for all 33 layers)</code></pre>
-<div class="code-caption" data-agent="08,40">Output 27.16: PEFT reports 0.2% trainable parameters; each of the 33 layers receives four LoRA matrices (A and B for both query and value), totaling 40,960 new parameters per layer.</div>
+<div class="code-caption">Output 27.16: PEFT reports 0.2% trainable parameters; each of the 33 layers receives four LoRA matrices (A and B for both query and value), totaling 40,960 new parameters per layer.</div>
 
 <div class="callout library-shortcut">
 <div class="callout-title">Library Shortcut: PEFT for Any Hugging Face Model</div>
-<p>The Hugging Face PEFT library applies LoRA (and other parameter-efficient methods) to any model in the Transformers ecosystem in four lines: create a <code>LoraConfig</code>, call <code>get_peft_model(base_model, config)</code>, train normally, and save with <code>model.save_pretrained()</code>. The saved adapter weighs only a few megabytes (vs. gigabytes for the full model). To reload, call <code>PeftModel.from_pretrained(base_model, adapter_path)</code>. This replaces what would otherwise be 50+ lines of manual weight freezing, custom module injection, and checkpoint management. PEFT also supports <span data-agent="04">QLoRA (quantized LoRA, which applies 4-bit quantization to the frozen weights to further reduce memory)</span>, prefix tuning, prompt tuning, and <span data-agent="04">IA3 (Infused Adapter by Inhibiting and Amplifying Inner Activations, which rescales activations with learned vectors instead of adding low-rank matrices)</span>, all through the same interface. <span data-agent="20">(As of 2025, PEFT additionally supports DoRA, LongLoRA, and LoRA+ out of the box, making it the standard entry point for parameter-efficient adaptation across the Hugging Face ecosystem.)</span></p>
+<p>The Hugging Face PEFT library applies LoRA (and other parameter-efficient methods) to any model in the Transformers ecosystem in four lines: create a <code>LoraConfig</code>, call <code>get_peft_model(base_model, config)</code>, train normally, and save with <code>model.save_pretrained()</code>. The saved adapter weighs only a few megabytes (vs. gigabytes for the full model). To reload, call <code>PeftModel.from_pretrained(base_model, adapter_path)</code>. This replaces what would otherwise be 50+ lines of manual weight freezing, custom module injection, and checkpoint management. PEFT also supports <span>QLoRA (quantized LoRA, which applies 4-bit quantization to the frozen weights to further reduce memory)</span>, prefix tuning, prompt tuning, and <span>IA3 (Infused Adapter by Inhibiting and Amplifying Inner Activations, which rescales activations with learned vectors instead of adding low-rank matrices)</span>, all through the same interface. <span>(As of 2025, PEFT additionally supports DoRA, LongLoRA, and LoRA+ out of the box, making it the standard entry point for parameter-efficient adaptation across the Hugging Face ecosystem.)</span></p>
 </div>
 
 <h2>5. LoRA vs. Full Fine-Tuning vs. Feature Extraction</h2>
 
 <p>Three adaptation strategies compete for scientific foundation models:</p>
 
-<p><strong>Feature extraction</strong> freezes the entire model and trains only a task-specific head (e.g., a linear layer or small <span data-agent="12">multi-layer perceptron (MLP)</span> on top of the frozen <a href="../../part-1-foundations/module-03-knowledge-representation/section-3.3.html" data-agent="13">embeddings</a>). This is the cheapest approach but cannot adapt the representations to the downstream task. It works well when the pretrained representations already capture the relevant features (e.g., using ESM-2 embeddings for protein classification).</p>
+<p><strong>Feature extraction</strong> freezes the entire model and trains only a task-specific head (e.g., a linear layer or small <span>multi-layer perceptron (MLP)</span> on top of the frozen <a href="../../part-1-foundations/module-03-knowledge-representation/section-3.3.html">embeddings</a>). This is the cheapest approach but cannot adapt the representations to the downstream task. It works well when the pretrained representations already capture the relevant features (e.g., using ESM-2 embeddings for protein classification).</p>
 
 <p><strong>Full fine-tuning</strong> updates all parameters, allowing maximum adaptation. It works best when you have enough labeled data to justify the parameter count and enough GPU memory to store gradients and optimizer states for the entire model.</p>
 
 <p><strong>LoRA</strong> sits between these extremes: it adapts the representations (unlike feature extraction) but constrains the adaptation to a low-rank subspace (unlike full fine-tuning). This makes it the default choice when labeled data is limited (hundreds to low thousands of examples) or GPU memory is constrained.</p>
 
-<div class="callout warning" data-agent="10">
+<div class="callout warning">
 <h4>Common Misconception</h4>
-<p>A frequent misunderstanding is that LoRA must sacrifice accuracy because it uses far fewer trainable parameters. In reality, the low-rank constraint acts as a form of structured regularization: it prevents the model from overfitting on small datasets by restricting updates to the directions in weight space that matter most for the downstream task. On small to medium datasets (the typical scientific setting), <span data-agent="28">LoRA often matches, and in some benchmarks exceeds, full fine-tuning accuracy, likely because it avoids memorizing noise in the training labels.</span></p>
+<p>A frequent misunderstanding is that LoRA must sacrifice accuracy because it uses far fewer trainable parameters. In reality, the low-rank constraint acts as a form of structured regularization: it prevents the model from overfitting on small datasets by restricting updates to the directions in weight space that matter most for the downstream task. On small to medium datasets (the typical scientific setting), <span>LoRA often matches, and in some benchmarks exceeds, full fine-tuning accuracy, likely because it avoids memorizing noise in the training labels.</span></p>
 </div>
 
 <pre><code class="language-python">import torch.nn as nn
@@ -442,30 +442,30 @@ print(f"{'Strategy':<22s} | {'Trainable Params':<28s} | {'GPU Memory':<12s}")
 print("-" * 70)
 for name, info in strategies.items():
     print(f"{name:<22s} | {info['trainable']:<28s} | {info['memory']:<12s}")</code></pre>
-<div class="code-caption" data-agent="08,40">Listing 27.17: Protein property predictor supporting three adaptation strategies (frozen, LoRA, full), with a shared mean-pooling head and a summary table of parameter counts and GPU memory requirements for ESM-2 (650M).</div>
+<div class="code-caption">Listing 27.17: Protein property predictor supporting three adaptation strategies (frozen, LoRA, full), with a shared mean-pooling head and a summary table of parameter counts and GPU memory requirements for ESM-2 (650M).</div>
 
 <h2>6. Practical Considerations for Scientific LoRA</h2>
 
-<p data-agent="15,17"><span data-agent="17">Several training details distinguish LoRA for scientific models from standard language-model recipes:</span></p>
+<p><span>Several training details distinguish LoRA for scientific models from standard language-model recipes:</span></p>
 
 <p><strong>Learning rate.</strong> LoRA parameters typically need a higher learning rate than full fine-tuning parameters (2e-4 to 1e-3, vs. 1e-5 to 5e-5 for full fine-tuning). The pretrained weights are frozen, so there is no risk of catastrophic forgetting from a high learning rate; the LoRA matrices start at zero and must move quickly to have any effect.</p>
 
 <p><strong>Warmup.</strong> A linear warmup over 5% to 10% of training steps helps stabilize early training. Without warmup, the LoRA matrices can overshoot in early steps when the gradients are largest.</p>
 
-<h4 data-agent="30">After Training</h4>
+<h4>After Training</h4>
 
-<p><strong>Merging for inference.</strong> After training, the LoRA matrices can be merged back into the original weights: $W_{\text{merged}} = W_0 + (\alpha / r) BA$. This eliminates any inference overhead: the merged model has the same architecture and latency as the original, with no additional matrix multiplications. The <code>merge</code> method in Listing 27.14 implements this.</p>
+<p><strong>Merging for inference.</strong> After training, the LoRA matrices can be merged back into the original weights: \(W_{\text{merged}} = W_0 + (\alpha / r) BA\). This eliminates any inference overhead: the merged model has the same architecture and latency as the original, with no additional matrix multiplications. The <code>merge</code> method in Listing 27.14 implements this.</p>
 
 <p><strong>Multiple adapters.</strong> One pretrained model can serve multiple tasks by swapping LoRA adapters. For example, you might train one adapter for thermostability prediction, another for solubility prediction, and a third for subcellular localization, all sharing the same frozen ESM-2 backbone. Each adapter adds only a few megabytes of storage. This is particularly valuable in the Discovery Workbench (<a href="../../part-1-foundations/module-06-system-architecture/index.html">Chapter 6</a>), where a single GPU can serve many specialized predictors by loading different adapters on demand.</p>
 
-<div class="callout research-frontier" data-agent="18">
+<div class="callout research-frontier">
 <div class="callout-title">Research Frontier: DoRA and Weight-Decomposed Adaptation</div>
 <p>DoRA (Liu et al., 2024, "DoRA: Weight-Decomposed Low-Rank Adaptation") decomposes each pretrained weight matrix into a magnitude component and a directional component, then applies LoRA only to the directional part. This decomposition is motivated by the empirical observation that full fine-tuning changes weight directions far more than magnitudes, while standard LoRA conflates both. By separating the two, DoRA consistently outperforms LoRA across vision, language, and multimodal benchmarks with no additional inference cost after merging. On the commonsense reasoning suite, DoRA with rank 32 matches the accuracy of standard LoRA at rank 64, halving the adapter size for equivalent performance. For scientific foundation models, DoRA is especially promising because domain adaptation (e.g., pretraining corpus to experimental assay data) often involves large directional shifts in representation space. QLoRA (Dettmers et al., 2023), which combines LoRA with 4-bit quantization of frozen weights, remains complementary: DoRA and QLoRA can be combined to achieve both the accuracy gains of weight decomposition and the memory savings of quantization.</p>
 </div>
 
 <div class="callout practical-example">
 <div class="callout-title">Practical Example: Multi-Task Protein Analysis Server</div>
-<p>A structural biology core facility serves researchers with diverse protein characterization needs. They deploy a single ESM-2 (650M) instance on a 16 GB GPU and train five LoRA adapters: thermostability, solubility, secondary structure, subcellular localization, and disorder prediction. <span data-agent="28">Each adapter is roughly 5 MB on disk and takes only seconds to swap at runtime.</span> Researchers submit protein sequences through a web interface and select which properties to predict. The server loads the appropriate adapter, runs inference, and returns results in under a second. Without LoRA, serving five specialized models would require five copies of the 2.5 GB backbone in GPU memory, or a painful model-swapping protocol. With LoRA, one backbone serves all five tasks simultaneously, limited only by the adapter swap time.</p>
+<p>A structural biology core facility serves researchers with diverse protein characterization needs. They deploy a single ESM-2 (650M) instance on a 16 GB GPU and train five LoRA adapters: thermostability, solubility, secondary structure, subcellular localization, and disorder prediction. <span>Each adapter is roughly 5 MB on disk and takes only seconds to swap at runtime.</span> Researchers submit protein sequences through a web interface and select which properties to predict. The server loads the appropriate adapter, runs inference, and returns results in under a second. Without LoRA, serving five specialized models would require five copies of the 2.5 GB backbone in GPU memory, or a painful model-swapping protocol. With LoRA, one backbone serves all five tasks simultaneously, limited only by the adapter swap time.</p>
 </div>
 
 <div class="callout fun-note">
@@ -473,49 +473,49 @@ for name, info in strategies.items():
 <p>In linear algebra, the rank of a matrix is the number of linearly independent rows or columns. A rank-8 matrix in a 1280-dimensional space captures only 8 of the 1280 possible directions of variation. This sounds limiting, but it reflects a deep empirical observation: the "corrections" needed to adapt a pretrained model to a new task are remarkably simple in structure. Most of the model's knowledge is already in the right place; fine-tuning only needs to adjust a few knobs. The analogy in physics is a perturbation expansion: you start with the exact solution to a nearby problem and compute a small correction, rather than solving the full problem from scratch.</p>
 </div>
 
-<div class="callout practical-example" data-agent="23">
+<div class="callout practical-example">
 <h4>Try It: LoRA Rank Sweep on a Toy Regression Task</h4>
 <p>Build a complete LoRA training loop and measure how rank affects generalization, using only PyTorch and a synthetic dataset (no GPU or Hugging Face account required).</p>
-<p>1. Create a synthetic dataset: generate 500 random input vectors of dimension 128, compute labels as $y = \mathbf{v}^T \tanh(W_{\text{true}}\, \mathbf{x})$ where $W_{\text{true}}$ is a fixed random matrix and $\mathbf{v}$ is a fixed random projection to a scalar, then split 400/100 for train/test.</p>
+<p>1. Create a synthetic dataset: generate 500 random input vectors of dimension 128, compute labels as \(y = \mathbf{v}^T \tanh(W_{\text{true}}\, \mathbf{x})\) where \(W_{\text{true}}\) is a fixed random matrix and \(\mathbf{v}\) is a fixed random projection to a scalar, then split 400/100 for train/test.</p>
 <p>2. Build a two-layer network (Linear(128, 128) followed by Linear(128, 1)) and pretrain it on a different random target for 200 epochs so the weights are non-trivial. Save these weights as your "pretrained checkpoint."</p>
 <p>3. Wrap the first Linear layer with the <code>LoRALinear</code> class from Listing 27.14. Freeze the pretrained weights and train only the LoRA matrices on the real target for 100 epochs using Adam at learning rate 5e-4.</p>
-<p>4. Repeat step 3 for ranks r = 1, 2, 4, 8, 16, 32, and 64. Record the final test <span data-agent="12">mean squared error (MSE)</span> for each rank. Also record the test MSE from full fine-tuning (all parameters trainable) as a baseline.</p>
+<p>4. Repeat step 3 for ranks r = 1, 2, 4, 8, 16, 32, and 64. Record the final test <span>mean squared error (MSE)</span> for each rank. Also record the test MSE from full fine-tuning (all parameters trainable) as a baseline.</p>
 <p>5. Plot test MSE vs. rank using Matplotlib. You should observe that test error drops steeply from rank 1 to 4, flattens between 8 and 16, and that LoRA at moderate rank matches or beats full fine-tuning (which overfits on this small dataset). This confirms the low intrinsic dimensionality claim from the text.</p>
 </div>
 
-<div class="callout exercise" data-agent="07">
+<div class="callout exercise">
 <h4>Exercise 27.4.1</h4>
-<p>Suppose you apply LoRA with rank $r = 8$ to a linear layer with dimensions $d_{\text{out}} = 1280$ and $d_{\text{in}} = 1280$. You set $\alpha = 16$. After training, the learned matrices are $B \in \mathbb{R}^{1280 \times 8}$ and $A \in \mathbb{R}^{8 \times 1280}$. What is the effective scaling factor applied to the product $BA$ during the forward pass? If you now change the rank to $r = 16$ while keeping $\alpha = 16$, how does this scaling factor change, and why does that matter for comparing runs at different ranks?</p>
+<p>Suppose you apply LoRA with rank \(r = 8\) to a linear layer with dimensions \(d_{\text{out}} = 1280\) and \(d_{\text{in}} = 1280\). You set \(\alpha = 16\). After training, the learned matrices are \(B \in \mathbb{R}^{1280 \times 8}\) and \(A \in \mathbb{R}^{8 \times 1280}\). What is the effective scaling factor applied to the product \(BA\) during the forward pass? If you now change the rank to \(r = 16\) while keeping \(\alpha = 16\), how does this scaling factor change, and why does that matter for comparing runs at different ranks?</p>
 <details><summary>Hint</summary>
-<p>The scaling factor is $\alpha / r$. With $r = 8$ and $\alpha = 16$, the factor is 2.0. With $r = 16$ and $\alpha = 16$, the factor is 1.0. The scaling normalizes the magnitude of the LoRA update so that increasing the rank does not automatically double the update's norm. This lets you reuse the same learning rate across rank sweeps without retuning it for each rank.</p>
+<p>The scaling factor is \(\alpha / r\). With \(r = 8\) and \(\alpha = 16\), the factor is 2.0. With \(r = 16\) and \(\alpha = 16\), the factor is 1.0. The scaling normalizes the magnitude of the LoRA update so that increasing the rank does not automatically double the update's norm. This lets you reuse the same learning rate across rank sweeps without retuning it for each rank.</p>
 </details>
 </div>
 
-<div class="callout practical-example" data-agent="26">
+<div class="callout practical-example">
 <h4>Step-Through: LoRA Forward Pass</h4>
-<p>Trace through the LoRA forward pass with concrete values. Let $d = 3$, $r = 2$, $\alpha = 2$.</p>
-<p><strong>Pretrained weight (frozen):</strong> $W_0 = \begin{pmatrix} 1 & 0 & -1 \\ 0 & 2 & 1 \\ 1 & 1 & 0 \end{pmatrix}$</p>
-<p><strong>LoRA matrices (trained):</strong> $B = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & -1 \end{pmatrix}$, $A = \begin{pmatrix} 0.5 & 0 & 0.5 \\ 0 & 1 & 0 \end{pmatrix}$</p>
-<p><strong>Input:</strong> $x = (1, 2, 0)^T$</p>
-<p><strong>Step 1:</strong> Original output: $W_0 x = (1 \cdot 1 + 0 \cdot 2 + (-1) \cdot 0,\; 0 \cdot 1 + 2 \cdot 2 + 1 \cdot 0,\; 1 \cdot 1 + 1 \cdot 2 + 0 \cdot 0) = (1, 4, 3)^T$.</p>
-<p><strong>Step 2:</strong> Compute $Ax = (0.5 \cdot 1 + 0 \cdot 2 + 0.5 \cdot 0,\; 0 \cdot 1 + 1 \cdot 2 + 0 \cdot 0) = (0.5, 2)^T$.</p>
-<p><strong>Step 3:</strong> Compute $B(Ax) = (1 \cdot 0.5 + 0 \cdot 2,\; 0 \cdot 0.5 + 1 \cdot 2,\; 1 \cdot 0.5 + (-1) \cdot 2) = (0.5, 2, -1.5)^T$.</p>
-<p><strong>Step 4:</strong> Scale by $\alpha / r = 2 / 2 = 1.0$: LoRA correction = $(0.5, 2, -1.5)^T$.</p>
-<p><strong>Step 5:</strong> Final output: $h = W_0 x + \frac{\alpha}{r} BAx = (1, 4, 3)^T + (0.5, 2, -1.5)^T = (1.5, 6, 1.5)^T$.</p>
-<p>Notice that the correction lives in a rank-2 subspace (spanned by the two columns of $B$), while the full weight space is 3-dimensional. Even in this tiny example, the adaptation cannot reach every direction in output space.</p>
+<p>Trace through the LoRA forward pass with concrete values. Let \(d = 3\), \(r = 2\), \(\alpha = 2\).</p>
+<p><strong>Pretrained weight (frozen):</strong> \(W_0 = \begin{pmatrix} 1 & 0 & -1 \\ 0 & 2 & 1 \\ 1 & 1 & 0 \end{pmatrix}\)</p>
+<p><strong>LoRA matrices (trained):</strong> \(B = \begin{pmatrix} 1 & 0 \\ 0 & 1 \\ 1 & -1 \end{pmatrix}\), \(A = \begin{pmatrix} 0.5 & 0 & 0.5 \\ 0 & 1 & 0 \end{pmatrix}\)</p>
+<p><strong>Input:</strong> \(x = (1, 2, 0)^T\)</p>
+<p><strong>Step 1:</strong> Original output: \(W_0 x = (1 \cdot 1 + 0 \cdot 2 + (-1) \cdot 0,\; 0 \cdot 1 + 2 \cdot 2 + 1 \cdot 0,\; 1 \cdot 1 + 1 \cdot 2 + 0 \cdot 0) = (1, 4, 3)^T\).</p>
+<p><strong>Step 2:</strong> Compute \(Ax = (0.5 \cdot 1 + 0 \cdot 2 + 0.5 \cdot 0,\; 0 \cdot 1 + 1 \cdot 2 + 0 \cdot 0) = (0.5, 2)^T\).</p>
+<p><strong>Step 3:</strong> Compute \(B(Ax) = (1 \cdot 0.5 + 0 \cdot 2,\; 0 \cdot 0.5 + 1 \cdot 2,\; 1 \cdot 0.5 + (-1) \cdot 2) = (0.5, 2, -1.5)^T\).</p>
+<p><strong>Step 4:</strong> Scale by \(\alpha / r = 2 / 2 = 1.0\): LoRA correction = \((0.5, 2, -1.5)^T\).</p>
+<p><strong>Step 5:</strong> Final output: \(h = W_0 x + \frac{\alpha}{r} BAx = (1, 4, 3)^T + (0.5, 2, -1.5)^T = (1.5, 6, 1.5)^T\).</p>
+<p>Notice that the correction lives in a rank-2 subspace (spanned by the two columns of \(B\)), while the full weight space is 3-dimensional. Even in this tiny example, the adaptation cannot reach every direction in output space.</p>
 </div>
 
-<div class="callout practical-example" style="border-left-color:#2a9d8f" data-agent="33">
+<div class="callout practical-example" style="border-left-color:#2a9d8f">
 <h4>Real-World Application: Drug Discovery</h4>
-<p><span data-agent="28">Therapeutics Data Commons (TDC) benchmarks suggest that pharmaceutical teams, including groups at Pfizer, have applied LoRA to ESM-2 for predicting drug-target binding affinity. By fine-tuning with rank-8 adapters on proprietary assay data (typically 1,000 to 5,000 measurements per target), they reportedly achieve accuracy competitive with full fine-tuning</span> while keeping each adapter under 10 MB, enabling rapid iteration across hundreds of protein targets without retraining the full 2.5 GB backbone for each one.</p>
+<p><span>Therapeutics Data Commons (TDC) benchmarks suggest that pharmaceutical teams, including groups at Pfizer, have applied LoRA to ESM-2 for predicting drug-target binding affinity. By fine-tuning with rank-8 adapters on proprietary assay data (typically 1,000 to 5,000 measurements per target), they reportedly achieve accuracy competitive with full fine-tuning</span> while keeping each adapter under 10 MB, enabling rapid iteration across hundreds of protein targets without retraining the full 2.5 GB backbone for each one.</p>
 </div>
 
-<div class="callout lab" data-agent="41">
+<div class="callout lab">
 <h4>Lab: LoRA Rank vs. Generalization on MNIST</h4>
 <p><strong>Goal:</strong> Observe how LoRA rank controls the trade-off between underfitting and overfitting on a real classification task.</p>
 <p><strong>Tools:</strong> PyTorch, torchvision (for MNIST), and Matplotlib. No GPU required.</p>
 <p><strong>Setup:</strong> Train a simple two-layer MLP (784 to 256 to 10) on the full MNIST training set for 5 epochs (this is your "pretrained" model). Then subsample 200 training examples from a single digit pair (e.g., 3 vs. 8) to simulate a low-data fine-tuning scenario.</p>
-<p><strong>What to vary:</strong> Apply <code>LoRALinear</code> from Listing 27.14 to the first hidden layer. Sweep rank $r$ through {1, 2, 4, 8, 16, 32, 64, 128}. Also run full fine-tuning (unfreeze everything) and feature extraction (freeze everything, train only the final layer) as baselines.</p>
+<p><strong>What to vary:</strong> Apply <code>LoRALinear</code> from Listing 27.14 to the first hidden layer. Sweep rank \(r\) through {1, 2, 4, 8, 16, 32, 64, 128}. Also run full fine-tuning (unfreeze everything) and feature extraction (freeze everything, train only the final layer) as baselines.</p>
 <p><strong>What to observe:</strong> Plot train accuracy and test accuracy vs. rank on the same axes. You should see: (1) feature extraction underfits because the pretrained features are not specialized for the 3-vs-8 distinction; (2) full fine-tuning overfits on 200 examples; (3) LoRA at moderate rank (4 to 16) hits a sweet spot with the highest test accuracy. Record the gap between train and test accuracy at each rank as a direct measure of overfitting.</p>
 <p><strong>Time:</strong> 15 to 20 minutes. Each rank trains in under 30 seconds on CPU.</p>
 </div>
@@ -524,7 +524,7 @@ for name, info in strategies.items():
 <h2>Exercises</h2>
 
 <div class="exercise">
-<p><strong>Exercise 27.10 (Conceptual):</strong> The LoRA decomposition $\Delta W = BA$ constrains the weight update to a rank-$r$ subspace. What happens if the true task-specific update has rank greater than $r$? How would you diagnose this situation in practice, and what would you do about it?</p>
+<p><strong>Exercise 27.10 (Conceptual):</strong> The LoRA decomposition \(\Delta W = BA\) constrains the weight update to a rank-\(r\) subspace. What happens if the true task-specific update has rank greater than \(r\)? How would you diagnose this situation in practice, and what would you do about it?</p>
 </div>
 
 <div class="exercise">
